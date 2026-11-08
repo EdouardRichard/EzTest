@@ -27,6 +27,14 @@
 - [概述](#概述)
 - [工作方式](#工作方式)
 - [截图](#截图)
+  - [需求与澄清](#需求与澄清)
+  - [版本工作区](#版本工作区)
+  - [用例设计](#用例设计)
+  - [执行与证据](#执行与证据)
+  - [交付](#交付)
+  - [探索与代码智能](#探索与代码智能)
+  - [视觉回归](#视觉回归)
+  - [平台](#平台)
 - [使用方式](#使用方式)
   - 方式 A —— 免安装可运行包（Windows / Linux）
   - 方式 B —— Docker Compose
@@ -118,65 +126,79 @@ sequenceDiagram
 
 ## 截图
 
+*以下截图均来自 2026-11-07 的 v0.2.2 最终验收（FA）运行：真实 Chromium 执行器 + 真实
+OpenAI 兼容模型。*
+
 ![在对话中与 AI 团队澄清需求](assets/screenshots/01-hero-requirements.png)
 
 *在对话中与 AI 团队澄清需求；需求列表、待解决问题与进入设计的交接都留在同一个工作区。*
 
+### 需求与澄清
+
+![结构化提问卡](assets/screenshots/02-question-card.png)
+
+*澄清 Host 以结构化提问卡一次提出一批问题并暂停等待回答；每个回答都会成为下游 Agent 可引用的
+事实。*
+
 ### 版本工作区
-
-![版本列表](assets/screenshots/02-versions.png)
-
-*每个发布版本都是一个工作区，包含状态、需求与已绑定系统。*
 
 ![版本总览](assets/screenshots/03-version-overview.png)
 
-*版本总览：覆盖情况、SUT 绑定、执行状态与该版本的收尾条件。*
+*版本工作区：阶段、收尾原因、版本计划与 Host 决策；需求、用例、执行、问题与报告都在一个页签之内。*
 
 ### 用例设计
 
 ![用例设计](assets/screenshots/04-case-design.png)
 
-*用例设计工作台：场景、用例、步骤与断言在这里评审与确认；设计团队结合需求与代码上下文起草它们。*
+*用例设计工作区：设计 Host 结合需求与代码上下文起草场景与用例；确认、视觉断言与用例工作区都在
+同一处。*
 
 ### 执行与证据
 
 ![执行波次](assets/screenshots/05-execution-waves.png)
 
-*执行波次运行已确认用例；实时轨迹与逐用例结果和证据放在一起。*
+*执行波次按 SUT 运行已确认用例；实时轨迹、步骤结果与逐用例结论和证据放在一起。*
 
 ![证据查看器](assets/screenshots/06-evidence.png)
 
-*每条结论背后都是按内容寻址、不可变的证据，附带 sha256 元数据。*
+*每条结论背后都是按内容寻址、不可变的证据：sha256 寻址、可深链。*
 
 ### 交付
 
-![问题与合并链路](assets/screenshots/07-issues-merged-chain.png)
+![问题详情与复测](assets/screenshots/07-issues.png)
 
-*失败自动转为带证据与代码锚点的问题；重复问题合并成一条可追溯链路。*
+*失败用例转为带结构化证据引用的问题；问题可对当前版本复测，每次状态变化都有审计记录。*
 
 ![报告详情](assets/screenshots/08-reports.png)
 
-*只追加的报告修订，带 HTML/PDF 输出、覆盖与风险；输入变化时报告会变为过期，可重新生成而不改写历史。*
+*只追加的报告修订，带 HTML/PDF 输出、产物、证据网格与引用；输入变化时报告会变为过期，可重新
+生成而不改写历史。*
 
-### 探索链路
+### 探索与代码智能
 
-![探索链路](assets/screenshots/09-exploration-chain.png)
+![探索发现](assets/screenshots/09-exploration-discovery.png)
 
-*探索链路串联需求、用例、波次、执行、结果、证据、问题与报告。*
+*探索运行会提出观察到的页面与 API；只有被批准的资源才进入共享资源库，未被覆盖的缺口保持可见。*
+
+![代码智能](assets/screenshots/10-code-intelligence.png)
+
+*代码智能：仓库索引、变更分析与候选锚点，把需求与用例关联到真实文件。*
+
+### 视觉回归
+
+![视觉断言](assets/screenshots/11-visual-regression.png)
+
+*视觉断言将截图与已批准基线比对：像素差异、阈值与环境指纹共同决定是否通过。*
 
 ### 平台
 
-![公共资源](assets/screenshots/10-resources.png)
+![公共资源](assets/screenshots/12-resources.png)
 
 *公共资源：被测系统及其环境、页面、API、只读数据库、测试账号与本地 Git 仓库。*
 
-![全局知识](assets/screenshots/11-knowledge.png)
+![Agent 中心](assets/screenshots/13-agent-center.png)
 
-*全局知识由管理员审核后注入 Agent 提示词，带引用预算与使用记录。*
-
-![Agent 中心](assets/screenshots/12-agent-center.png)
-
-*Agent 中心：14 个内置 Agent profile，展示所属团队、工具、预算、提示词修订与运行统计。*
+*Agent 中心：内置 Agent profile 及其团队、工具、预算、提示词修订与运行统计。*
 
 ---
 
