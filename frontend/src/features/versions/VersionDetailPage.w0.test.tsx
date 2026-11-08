@@ -569,7 +569,11 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         })
       }
       if (url.includes("/api/content/")) {
-        return new Response(new Blob(["png"], { type: "image/png" }), {
+        // A byte body, not a jsdom `Blob`: on Node 22 undici's
+        // `Response.blob()` calls `body.stream()`, which jsdom's Blob does not
+        // implement, so a Blob-bodied Response rejects with "object.stream is
+        // not a function" and the panel would render "原图加载失败".
+        return new Response(new TextEncoder().encode("png"), {
           status: 200,
           headers: { "Content-Type": "image/png" },
         })

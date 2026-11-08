@@ -774,7 +774,10 @@ describe("ChainTab", () => {
     expect(layerTruncation).toHaveTextContent("问题")
 
     expect(screen.getByTestId("chain-replay-truncated")).toHaveTextContent("event_limit")
-    expect(api.listChainEvents).toHaveBeenCalledWith("2001", { limit: 5 })
+    // The history read fires once at mount with the default limit and again once
+    // the chain (and its replay.event_limit) lands; wait for the second request
+    // instead of assuming the effect already flushed on a slow CI runner.
+    await waitFor(() => expect(api.listChainEvents).toHaveBeenCalledWith("2001", { limit: 5 }))
   })
 
   it("shows P6 typed meta in the node list and detail sheet", async () => {
