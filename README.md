@@ -29,11 +29,13 @@
 - [Overview](#overview)
 - [How it works](#how-it-works)
 - [Screenshots](#screenshots)
+  - [Requirements and clarification](#requirements-and-clarification)
   - [Version workspace](#version-workspace)
   - [Case design](#case-design)
   - [Execution and evidence](#execution-and-evidence)
   - [Delivery](#delivery)
-  - [Exploration chain](#exploration-chain)
+  - [Exploration and code intelligence](#exploration-and-code-intelligence)
+  - [Visual regression](#visual-regression)
   - [Platform](#platform)
 - [Getting started](#getting-started)
   - [Option A — Portable packages (Windows / Linux)](#option-a--portable-packages-windows--linux)
@@ -139,70 +141,87 @@ sequenceDiagram
 
 ## Screenshots
 
+*Every screenshot below was captured from the v0.2.2 final-acceptance run on 2026-11-07, driving the
+real Chromium executor and a real OpenAI-compatible model.*
+
 ![Clarify requirements in a conversation with the AI team](assets/screenshots/01-hero-requirements.png)
 
 *Clarify requirements in a conversation with the AI team; the requirement list, open questions and the
 hand-off to design stay in one workspace.*
 
+### Requirements and clarification
+
+![Structured question card](assets/screenshots/02-question-card.png)
+
+*The clarification host asks one batch of structured questions and pauses until the user answers; each
+answer becomes a fact the downstream agents can cite.*
+
 ### Version workspace
-
-![Version list](assets/screenshots/02-versions.png)
-
-*Every release version is a workspace with its status, requirements and bound systems.*
 
 ![Version overview](assets/screenshots/03-version-overview.png)
 
-*Version overview: coverage, SUT bindings, execution state and the closure criteria of the version.*
+*Version workspace: stage, closure reason, plan items and the host decisions behind them, with
+requirements, cases, execution, issues and reports one tab away.*
 
 ### Case design
 
 ![Case design](assets/screenshots/04-case-design.png)
 
-*Case design workspace: scenarios, cases, steps and assertions are reviewed and confirmed here; the
-design team drafts them from requirements plus code context.*
+*Case design workspace: the design host drafts scenarios and cases from the requirements plus code
+context; confirmations, visual assertions and the case work area stay in one place.*
 
 ### Execution and evidence
 
 ![Execution waves](assets/screenshots/05-execution-waves.png)
 
-*Execution waves run the confirmed cases; the live trace and per-case results stay next to the evidence.*
+*Execution waves run the confirmed cases per SUT; the live trace, step results and per-case verdicts
+stay next to the evidence.*
 
 ![Evidence viewer](assets/screenshots/06-evidence.png)
 
-*Content-addressed evidence behind every verdict, with sha256 metadata and immutable storage.*
+*Content-addressed evidence behind every verdict: immutable, sha256-addressed and deep-linkable.*
 
 ### Delivery
 
-![Issues and merged chain](assets/screenshots/07-issues-merged-chain.png)
+![Issue detail and retest](assets/screenshots/07-issues.png)
 
-*Failures become issues with evidence and code anchors; duplicate reports merge into one traced chain.*
+*Failed cases become issues with structured evidence links; an issue can be retested against the
+current version and every state change stays auditable.*
 
 ![Report detail](assets/screenshots/08-reports.png)
 
-*Append-only report revisions with HTML/PDF output, coverage and risks; a report becomes stale when its
-inputs change and can be regenerated without rewriting history.*
+*Append-only report revisions with HTML/PDF output, artifacts, the evidence grid and citations; a
+report becomes stale when its inputs change and can be regenerated without rewriting history.*
 
-### Exploration chain
+### Exploration and code intelligence
 
-![Exploration chain](assets/screenshots/09-exploration-chain.png)
+![Exploration discovery](assets/screenshots/09-exploration-discovery.png)
 
-*The exploration chain links requirements, cases, waves, runs, results, evidence, issues and reports.*
+*Exploration runs propose the pages and APIs they observed; only approved resources enter the shared
+resource library, and uncovered resources stay visible.*
+
+![Code intelligence](assets/screenshots/10-code-intelligence.png)
+
+*Code intelligence: repository index, change analysis and candidate anchors that tie requirements and
+cases to real files.*
+
+### Visual regression
+
+![Visual assertion](assets/screenshots/11-visual-regression.png)
+
+*Visual assertions compare screenshots against an approved baseline: pixel diff, threshold and the
+environment fingerprint decide whether a run passes.*
 
 ### Platform
 
-![Shared resources](assets/screenshots/10-resources.png)
+![Shared resources](assets/screenshots/12-resources.png)
 
 *Shared resources: systems under test with their environments, pages, APIs, read-only databases,
 accounts and local Git repositories.*
 
-![Global knowledge](assets/screenshots/11-knowledge.png)
+![Agent center](assets/screenshots/13-agent-center.png)
 
-*Global knowledge is reviewed by the administrator and injected into agent prompts with citation
-budgets and usage records.*
-
-![Agent center](assets/screenshots/12-agent-center.png)
-
-*Agent center: 14 built-in agent profiles with their teams, tools, budgets, prompt revisions and run
+*Agent center: built-in agent profiles with their teams, tools, budgets, prompt revisions and run
 statistics.*
 
 ---
