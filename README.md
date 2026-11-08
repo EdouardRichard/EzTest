@@ -553,7 +553,3 @@ LICENSE                  Apache License 2.0
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
-
-EzTest's product design was inspired by ideas explored in the ARTEX project (AGPL-3.0); no ARTEX source
-code is included. Third-party components (Go modules, npm packages, Node.js, Playwright and Chromium)
-are distributed under their own licenses; the portable packages include a `THIRD_PARTY_NOTICES.md`.
