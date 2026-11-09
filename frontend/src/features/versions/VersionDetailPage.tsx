@@ -338,13 +338,13 @@ function VersionAttachmentsSection({
                   {ATTACHMENT_STATUS_LABEL[attachment.extraction_status] ??
                     attachment.extraction_status}
                 </Badge>
-                {attachment.image_count > 0 ? (
-                  <span className="text-muted-foreground">{attachment.image_count} 张图片</span>
-                ) : null}
+                <span className="text-muted-foreground">{attachment.image_count} 张图片</span>
                 {attachment.error_text !== "" ? (
                   <span className="text-destructive">{attachment.error_text}</span>
                 ) : null}
-                <span className="ml-auto text-muted-foreground">查看图片 →</span>
+                {attachment.image_count > 0 ? (
+                  <span className="ml-auto text-muted-foreground">查看图片 →</span>
+                ) : null}
               </a>
             </li>
           ))}
@@ -995,9 +995,16 @@ export function VersionDetailPage({
   /** C-05: open one attachment's image panel from the overview list. */
   function selectAttachment(id: string): void {
     setSelectedAttachmentId(id)
-    router.replace(
-      `/versions/${encodeURIComponent(versionId)}?tab=overview&attachment=${encodeURIComponent(id)}`,
-    )
+    // Same style as `handleTabChange`: start from the tab URL and keep every
+    // unrelated workspace param (conversation/requirement/…) instead of
+    // dropping it when the image panel opens.
+    const params = new URLSearchParams({ tab: "overview" })
+    for (const [key, value] of searchParams.entries()) {
+      if (key === "tab" || key === "attachment") continue
+      params.set(key, value)
+    }
+    params.set("attachment", id)
+    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
   if (loading) {

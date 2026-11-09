@@ -576,6 +576,11 @@ function readPendingStage(value: unknown): AttachmentPendingStage | null {
  * `details.attachment_id`; the composer then keeps the manual retry fallback.
  * A legacy server with only `{attachment_id,name}` still auto-retries with the
  * default delay and no stage/percent to display.
+ *
+ * Contract note: `done`/`failed` are parsed here (and handled defensively by the
+ * composer) but the current backend's `isAttachmentPending` only reports
+ * `pending`/`processing`, so those two stages are not emitted today. Do not rely
+ * on them without a server contract change.
  */
 export function getAttachmentPendingDetails(error: unknown): AttachmentPendingProgress | null {
   if (!(error instanceof ApiError) || error.code !== "attachment_pending") return null

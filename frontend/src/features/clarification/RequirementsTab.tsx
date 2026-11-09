@@ -403,6 +403,10 @@ export function RequirementsTab({
   const [bulkConfirming, setBulkConfirming] = useState(false)
   const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const [bulkError, setBulkError] = useState<unknown>(null)
+  // C-06: the editor is keyed by `current_version_id`, so a rollback/save
+  // remounts it. The success notice must live here to survive that remount and
+  // actually paint after `requirementUpdated` replaces the detail.
+  const [editorNotice, setEditorNotice] = useState<string | null>(null)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [cleanupNotice, setCleanupNotice] = useState<string | null>(null)
   const [cleanupError, setCleanupError] = useState<unknown>(null)
@@ -622,6 +626,7 @@ export function RequirementsTab({
   function selectRequirement(requirementId: string): void {
     setSelectedRequirementId(requirementId)
     setBulkNotice(null)
+    setEditorNotice(null)
     router.replace(buildWorkspaceUrl(versionId, activeConversationId, requirementId))
   }
 
@@ -821,6 +826,7 @@ export function RequirementsTab({
   }
 
   function requirementUpdated(next: RequirementDetail): void {
+    setEditorNotice(null)
     setDetail(next)
     void loadRequirements().catch(() => {})
     void loadVersion().catch(() => {})
@@ -989,13 +995,25 @@ export function RequirementsTab({
             }
             editor={
               detail !== null ? (
-                <RequirementEditor
-                  key={`${detail.id}-${detail.current_version_id}`}
-                  versionId={versionId}
-                  requirement={detail}
-                  targetOptions={targetOptions}
-                  onUpdated={requirementUpdated}
-                />
+                <>
+                  {editorNotice !== null ? (
+                    <p
+                      data-testid="requirement-notice"
+                      role="status"
+                      className="border-t border-border bg-card px-3 py-2 text-[11px] text-success"
+                    >
+                      {editorNotice}
+                    </p>
+                  ) : null}
+                  <RequirementEditor
+                    key={`${detail.id}-${detail.current_version_id}`}
+                    versionId={versionId}
+                    requirement={detail}
+                    targetOptions={targetOptions}
+                    onUpdated={requirementUpdated}
+                    onNotice={setEditorNotice}
+                  />
+                </>
               ) : null
             }
           />

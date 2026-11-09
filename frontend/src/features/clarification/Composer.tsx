@@ -17,7 +17,7 @@ import { ApiError } from "@/lib/api-client"
 
 import { AttachmentUploader, type AttachmentUploaderHandle } from "./AttachmentUploader"
 import { type AttachmentPendingProgress, getAttachmentPendingDetails } from "./api"
-import type { NewMessagePart, UploadedAttachment } from "./types"
+import type { NewMessagePart, SendOptions, UploadedAttachment } from "./types"
 
 /** Hard cap of one automatic retry chain (~5 minutes, C-04). */
 export const AUTO_RETRY_MAX_MS = 5 * 60 * 1000
@@ -25,11 +25,6 @@ export const AUTO_RETRY_MAX_MS = 5 * 60 * 1000
 /** True once the automatic retry window is exhausted; exported for its test. */
 export function autoRetryExpired(startedAt: number, now: number = Date.now()): boolean {
   return now - startedAt >= AUTO_RETRY_MAX_MS
-}
-
-/** Extra send options: a stable id makes every retry of the same message idempotent. */
-export type SendOptions = {
-  clientMessageId?: string
 }
 
 export type ComposerProps = {
@@ -65,7 +60,7 @@ const STAGE_LABEL: Record<string, string> = {
   failed: "解析失败",
 }
 
-/** One in-flight automatic retry chain: the message, its stable id and its age. */
+/** One in-flight automatic retry chain: the message snapshot, its stable id and its age. */
 type RetryChain = {
   clientMessageId: string
   parts: NewMessagePart[]
@@ -73,6 +68,11 @@ type RetryChain = {
   cancelled: boolean
   doneSent: boolean
   inFlight: boolean
+}
+
+/** Structural equality of two outgoing messages (used to detect a new draft). */
+function sameParts(a: readonly NewMessagePart[], b: readonly NewMessagePart[]): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
 }
 
 /** Image detection for the draft; the mime comes from `POST /api/content`. */
@@ -115,6 +115,10 @@ export function Composer({
   const [retrying, setRetrying] = useState(false)
   const [autoActive, setAutoActive] = useState(false)
   const [retryNote, setRetryNote] = useState<string | null>(null)
+  // A `done` auto-send whose snapshot no longer matches the draft keeps the new
+  // draft and reports here; the note deliberately survives the parent clearing
+  // `error` after the successful POST.
+  const [sentNote, setSentNote] = useState<string | null>(null)
   const uploaderRef = useRef<AttachmentUploaderHandle>(null)
   // C-04: one automatic retry chain per failed message. The stable client id
   // makes the eventual POST idempotent; the timers must be cleared on
@@ -136,7 +140,6 @@ export function Composer({
   // 409. Task 10 adds the progress details used by the automatic retry chain;
   // an old server without `attachment_id` keeps the manual retry fallback.
   const attachmentPending = error instanceof ApiError && error.code === "attachment_pending"
-  const pendingDetails = getAttachmentPendingDetails(error)
   const draftHasImages = hasImageAttachment(attachments)
 
   // Publish the image-draft signal that gates non-vision models (0.2.1). The
@@ -199,8 +202,14 @@ export function Composer({
     }
   }
 
-  /** A successful send ends the chain and clears the delivered draft exactly once. */
-  function finishChain(): void {
+  /**
+   * A successful send ends the chain. The delivered message is the snapshot
+   * taken when the chain started, so the current draft is only cleared while it
+   * still matches that snapshot; text/attachments/references typed during the
+   * parse wait are kept and a `已发送` note explains why.
+   */
+  function finishChain(chain: RetryChain): void {
+    const draftUnchanged = sameParts(buildParts(), chain.parts)
     chainRef.current = null
     clearRetryTimers()
     setProgress(null)
@@ -208,7 +217,11 @@ export function Composer({
     setRetrying(false)
     setAutoActive(false)
     setRetryNote(null)
-    clearDraft()
+    if (draftUnchanged) {
+      clearDraft()
+      return
+    }
+    setSentNote("已发送；等待期间输入的新草稿已保留")
   }
 
   async function runSend(chain: RetryChain): Promise<boolean> {
@@ -216,7 +229,7 @@ export function Composer({
     chain.inFlight = true
     try {
       const sent = await onSend(chain.parts, { clientMessageId: chain.clientMessageId })
-      if (sent) finishChain()
+      if (sent) finishChain(chain)
       return sent
     } catch {
       return false
@@ -316,29 +329,31 @@ export function Composer({
     if (blocked || sendBlocked || !hasContent) return
     const parts = buildParts()
     const existing = chainRef.current
-    // A retry of the same still-pending message keeps its id and its 5-minute
-    // window; every other send starts a fresh chain with a fresh id.
-    const chain: RetryChain =
-      existing !== null && pendingDetails !== null
-        ? { ...existing, parts, cancelled: false }
-        : {
-            clientMessageId: createClientMessageId(),
-            parts,
-            startedAt: Date.now(),
-            cancelled: false,
-            doneSent: false,
-            inFlight: false,
-          }
+    // A resend of the exact pending message keeps the chain's stable id and its
+    // 5-minute window (manual retry, old server without progress details). A
+    // changed draft is a new message and gets a fresh id/window.
+    const retryOfChain = existing !== null && sameParts(parts, existing.parts)
+    const chain: RetryChain = retryOfChain
+      ? { ...existing, parts, cancelled: false, doneSent: false }
+      : {
+          clientMessageId: createClientMessageId(),
+          parts,
+          startedAt: Date.now(),
+          cancelled: false,
+          doneSent: false,
+          inFlight: false,
+        }
     chainRef.current = chain
     clearRetryTimers()
     setCountdown(null)
     setRetryNote(null)
+    setSentNote(null)
 
     setSending(true)
     chain.inFlight = true
     try {
       const sent = await onSend(parts, { clientMessageId: chain.clientMessageId })
-      if (sent) finishChain()
+      if (sent) finishChain(chain)
     } catch {
       // The parent surfaces send errors through `error`; keep the draft.
     } finally {
@@ -352,6 +367,12 @@ export function Composer({
   // next poll. `failed` stops, `done` auto-sends once, and the 5-minute cap
   // falls back to the manual retry. The effect only depends on `error` because
   // that is the wire event; refs keep the timers and chain stable.
+  //
+  // DEFENSIVE ONLY: the backend's `isAttachmentPending` currently reports true
+  // only for `pending`/`processing`, so it never emits a `done`/`failed` 409
+  // stage (`attachmentPendingDetails` supports them for a future contract). The
+  // `done`/`failed` branches below are therefore unreachable in production
+  // today; do not remove them without changing the server contract first.
   // biome-ignore lint/correctness/useExhaustiveDependencies: `error` is the only wire trigger; timers/chain live in refs.
   useEffect(() => {
     const details = getAttachmentPendingDetails(error)
@@ -381,6 +402,8 @@ export function Composer({
       stopForCap()
       return
     }
+    // Defensive (see the effect header): the current backend only emits
+    // pending/processing, so `failed`/`done` stages never arrive today.
     if (details.stage === "failed") {
       clearRetryTimers()
       setCountdown(null)
@@ -517,36 +540,37 @@ export function Composer({
       {progress !== null ? (
         <div
           data-testid="composer-retry-progress"
-          role="status"
           className="mt-1.5 rounded-lg border border-border bg-muted/40 px-2.5 py-2 text-[11px] text-foreground"
         >
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span className="font-medium">
-              {STAGE_LABEL[progress.stage ?? ""] ?? "等待附件解析"}
-            </span>
-            {progress.stage === "analyzing_images" ? (
-              <span>
-                图片 {progress.imagesDone}/{progress.imagesTotal}
+          <div role="status">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="font-medium">
+                {STAGE_LABEL[progress.stage ?? ""] ?? "等待附件解析"}
               </span>
+              {progress.stage === "analyzing_images" ? (
+                <span>
+                  图片 {progress.imagesDone}/{progress.imagesTotal}
+                </span>
+              ) : null}
+              {progress.stage === "analyzing_images" && progress.percent !== null ? (
+                <span>{progress.percent}%</span>
+              ) : null}
+              {progress.stage === "analyzing_images" && progress.etaSeconds !== null ? (
+                <span>预计剩余 {progress.etaSeconds} 秒</span>
+              ) : null}
+              {countdown !== null && countdown > 0 ? <span>{countdown} 秒后自动重试</span> : null}
+              {progress.stage === "analyzing_images" &&
+              (progress.imagesFailed > 0 || progress.imagesSkipped > 0) ? (
+                <span className="text-muted-foreground">
+                  失败 {progress.imagesFailed} 张 · 跳过 {progress.imagesSkipped} 张
+                </span>
+              ) : null}
+            </div>
+            {progress.stage === "failed" && progress.error !== "" ? (
+              <p className="mt-1 text-destructive">失败原因：{progress.error}</p>
             ) : null}
-            {progress.stage === "analyzing_images" && progress.percent !== null ? (
-              <span>{progress.percent}%</span>
-            ) : null}
-            {progress.stage === "analyzing_images" && progress.etaSeconds !== null ? (
-              <span>预计剩余 {progress.etaSeconds} 秒</span>
-            ) : null}
-            {countdown !== null && countdown > 0 ? <span>{countdown} 秒后自动重试</span> : null}
-            {progress.stage === "analyzing_images" &&
-            (progress.imagesFailed > 0 || progress.imagesSkipped > 0) ? (
-              <span className="text-muted-foreground">
-                失败 {progress.imagesFailed} 张 · 跳过 {progress.imagesSkipped} 张
-              </span>
-            ) : null}
+            {retryNote !== null ? <p className="mt-1 text-muted-foreground">{retryNote}</p> : null}
           </div>
-          {progress.stage === "failed" && progress.error !== "" ? (
-            <p className="mt-1 text-destructive">失败原因：{progress.error}</p>
-          ) : null}
-          {retryNote !== null ? <p className="mt-1 text-muted-foreground">{retryNote}</p> : null}
           {autoActive ? (
             <Button className="mt-1.5" variant="secondary" size="sm" onClick={cancelAutoRetry}>
               取消自动重试
@@ -560,6 +584,15 @@ export function Composer({
           className="mt-1.5 text-[11px] text-muted-foreground"
         >
           {retryNote}
+        </p>
+      ) : null}
+      {sentNote !== null ? (
+        <p
+          data-testid="composer-sent-note"
+          role="status"
+          className="mt-1.5 text-[11px] text-success"
+        >
+          {sentNote}
         </p>
       ) : null}
       {error !== undefined ? (

@@ -33,6 +33,13 @@ export type RequirementEditorProps = {
   targetOptions: TargetOptions
   /** Called after save/confirm with the new requirement detail. */
   onUpdated: (requirement: RequirementDetail) => void
+  /**
+   * Lifts success notices to the parent (C-06). `RequirementsTab` keys this
+   * editor by `current_version_id`, so a local notice is lost when a rollback /
+   * save remounts it; the parent then renders the notice above the keyed editor.
+   * Without the callback (unit use) the notice stays local.
+   */
+  onNotice?: (notice: string | null) => void
 }
 
 type EditorErrors = {
@@ -72,6 +79,7 @@ export function RequirementEditor({
   requirement,
   targetOptions,
   onUpdated,
+  onNotice,
 }: RequirementEditorProps) {
   const current = requirement.current_version
   const [title, setTitle] = useState(current.title)
@@ -117,6 +125,12 @@ export function RequirementEditor({
   const reopenSubmitDisabled = reopening || reopenReason.trim().length === 0
   const rollbackSubmitDisabled = rollingBack || rollbackReason.trim().length === 0
 
+  /** Reports a success notice locally or to the lifting parent when provided. */
+  function notify(message: string | null): void {
+    if (onNotice !== undefined) onNotice(message)
+    else setNotice(message)
+  }
+
   async function rollback(): Promise<void> {
     const reason = rollbackReason.trim()
     if (reason.length === 0) return
@@ -125,7 +139,7 @@ export function RequirementEditor({
     try {
       const updated = await rollbackRequirement(versionId, requirement.id, { reason })
       onUpdated(updated)
-      setNotice(`已回退为草案 v${updated.revision}`)
+      notify(`已回退为草案 v${updated.revision}`)
       setRollbackOpen(false)
       setRollbackReason("")
     } catch (cause) {
@@ -143,7 +157,7 @@ export function RequirementEditor({
     try {
       const updated = await reopenRequirement(versionId, requirement.id, { reason })
       onUpdated(updated)
-      setNotice("已重新打开为草案")
+      notify("已重新打开为草案")
       setReopenOpen(false)
       setReopenReason("")
     } catch (cause) {
@@ -157,7 +171,7 @@ export function RequirementEditor({
     const nextErrors = validate({ title, description, acceptance })
     setErrors(nextErrors)
     setError(null)
-    setNotice(null)
+    notify(null)
     if (Object.keys(nextErrors).length > 0) return
 
     setSaving(true)
@@ -171,7 +185,7 @@ export function RequirementEditor({
         targets: { version_suts: suts, pages, apis },
       })
       onUpdated(updated)
-      setNotice(`已保存为草案 v${updated.revision}`)
+      notify(`已保存为草案 v${updated.revision}`)
     } catch (cause) {
       setError(cause)
     } finally {
@@ -181,12 +195,12 @@ export function RequirementEditor({
 
   async function confirm(): Promise<void> {
     setError(null)
-    setNotice(null)
+    notify(null)
     setSaving(true)
     try {
       const result = await confirmRequirement(versionId, requirement.id)
       onUpdated(result.requirement)
-      setNotice("已确认")
+      notify("已确认")
     } catch (cause) {
       setError(cause)
     } finally {
@@ -357,18 +371,16 @@ export function RequirementEditor({
             >
               {saving ? "保存中…" : "保存"}
             </Button>
-            {clarified ? null : (
-              <Button
-                size="sm"
-                data-testid="editor-confirm"
-                disabled={saving}
-                onClick={() => {
-                  void confirm()
-                }}
-              >
-                确认已澄清
-              </Button>
-            )}
+            <Button
+              size="sm"
+              data-testid="editor-confirm"
+              disabled={saving}
+              onClick={() => {
+                void confirm()
+              }}
+            >
+              确认已澄清
+            </Button>
           </>
         )}
         {notice !== null ? (

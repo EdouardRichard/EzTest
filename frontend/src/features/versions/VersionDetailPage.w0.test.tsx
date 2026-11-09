@@ -4,7 +4,6 @@ import "@testing-library/jest-dom/vitest"
 
 import type { QuestionBatch } from "@/features/clarification/api"
 import { ApiError } from "@/lib/api-client"
-import { formatDateTime } from "@/lib/format"
 
 const versionApi = vi.hoisted(() => ({
   getVersion: vi.fn(),
@@ -646,13 +645,25 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     expect(screen.getByTestId("version-attachment-56")).toHaveTextContent("解析失败")
     expect(screen.getByTestId("version-attachment-56")).toHaveTextContent("解析器崩溃")
 
+    const failedRow = screen.getByTestId("version-attachment-56")
+    // A zero-image attachment still reports the count but has no image panel to
+    // open, so the "查看图片 →" affordance is hidden.
+    expect(failedRow).toHaveTextContent("0 张图片")
+    expect(within(failedRow).queryByText("查看图片 →")).not.toBeInTheDocument()
+    expect(within(doneRow).getByText("查看图片 →")).toBeInTheDocument()
+
     const link = within(doneRow).getByRole("link")
     expect(link).toHaveAttribute("href", "/versions/2001?tab=overview&attachment=55")
+    // Opening the image panel preserves unrelated workspace URL params.
+    search.params.set("conversation", "4001")
+    search.params.set("requirement", "6001")
     fireEvent.click(link)
 
     expect(await screen.findByTestId("attachment-images")).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalled()
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=overview&attachment=55")
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=overview&conversation=4001&requirement=6001&attachment=55",
+    )
   })
 
   it("shows an empty state when the version has no attachments", async () => {
@@ -699,7 +710,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         status: "done",
         caption: "登录页面",
         error: "",
-        updated_at: "2026-11-10T02:00:00Z",
+        updated_at: "2026-11-10T02:00:00",
       },
       {
         id: "78",
@@ -710,7 +721,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         status: "failed",
         caption: "",
         error: "模型超时",
-        updated_at: "2026-11-10T02:01:00Z",
+        updated_at: "2026-11-10T02:01:00",
       },
       {
         id: "79",
@@ -721,7 +732,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         status: "skipped",
         caption: "",
         error: "无文字图片",
-        updated_at: "2026-11-10T02:02:00Z",
+        updated_at: "2026-11-10T02:02:00",
       },
     ]
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -750,7 +761,8 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
 
     const notice = await screen.findByTestId("attachment-reanalyze-notice")
     expect(notice).toHaveTextContent("已重新分析：1 成功 / 1 失败 / 1 跳过")
-    expect(notice).toHaveTextContent(`最近更新 ${formatDateTime("2026-11-10T02:02:00Z")}`)
+    // Literal expectation, not the same formatter the component uses.
+    expect(notice).toHaveTextContent("最近更新 2026-11-10 02:02")
     expect(await screen.findByTestId("attachment-image-77")).toHaveTextContent("更新于")
     expect(screen.getByTestId("attachment-image-78")).toHaveTextContent("失败")
     expect(screen.getByTestId("attachment-image-79")).toHaveTextContent("跳过")

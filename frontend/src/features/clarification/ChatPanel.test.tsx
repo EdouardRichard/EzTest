@@ -47,6 +47,7 @@ describe("ChatPanel", () => {
     api.postMessage.mockReset()
     api.rollbackRequirement.mockReset()
     api.uploadContent.mockReset()
+    api.getAttachmentPendingDetails.mockReset()
     api.listMessages.mockResolvedValue([messageFixture, userMessageFixture])
   })
 
@@ -95,6 +96,48 @@ describe("ChatPanel", () => {
     expect(payload.client_message_id.length).toBeLessThanOrEqual(64)
     expect(await screen.findByText("新增退款时效需求")).toBeInTheDocument()
     expect(onRequirementSelect).not.toHaveBeenCalled()
+  })
+
+  it("reuses the first client_message_id when the 409 auto-retry re-POSTs", async () => {
+    // C-04: the composer keeps one stable id per retry chain and the panel must
+    // put that id on the wire; a second mint would let the retried POST create a
+    // duplicate message once the first attempt actually inserted.
+    api.getAttachmentPendingDetails.mockReturnValue({
+      attachmentId: "55",
+      name: "spec.md",
+      stage: "done",
+      imagesTotal: 0,
+      imagesDone: 0,
+      imagesFailed: 0,
+      imagesSkipped: 0,
+      percent: null,
+      etaSeconds: null,
+      retryAfterSeconds: 1,
+      error: "",
+    })
+    const pending = new ApiError({
+      status: 409,
+      code: "attachment_pending",
+      message: "附件解析中，可重试",
+      retryable: true,
+      details: { attachment_id: "55", name: "spec.md", stage: "done" },
+    })
+    api.postMessage
+      .mockRejectedValueOnce(pending)
+      .mockResolvedValueOnce({ ...userMessageFixture, id: "5010" })
+
+    renderPanel()
+    await screen.findByText("我已载入版本上下文，请描述需求。")
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await waitFor(() => expect(api.postMessage).toHaveBeenCalledTimes(2))
+    const firstId = api.postMessage.mock.calls[0][2].client_message_id
+    const secondId = api.postMessage.mock.calls[1][2].client_message_id
+    expect(firstId).toEqual(expect.any(String))
+    expect(firstId.length).toBeGreaterThan(0)
+    expect(secondId).toBe(firstId)
   })
 
   it("merges live SSE messages without refetching the thread", async () => {

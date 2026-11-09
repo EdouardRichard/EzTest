@@ -121,6 +121,37 @@ describe("RequirementsTab integration", () => {
 
   afterEach(cleanup)
 
+  it("keeps the rollback success notice visible after the editor remount (C-06)", async () => {
+    const rolledBack = {
+      ...secondDetail,
+      status: "draft" as const,
+      revision: 2,
+      current_version_id: "6103",
+      confirmed_at: null,
+    }
+    api.rollbackRequirement.mockResolvedValue(rolledBack)
+
+    render(<RequirementsTab versionId="2001" initialRequirementId="6002" />)
+    const editor = await screen.findByTestId("requirement-editor")
+    expect(within(editor).getByTestId("editor-rollback")).toBeInTheDocument()
+    fireEvent.click(within(editor).getByTestId("editor-rollback"))
+
+    const dialog = await screen.findByRole("dialog", { name: "回退为草案" })
+    fireEvent.change(within(dialog).getByLabelText("回退原因"), {
+      target: { value: "验收口径变更，需要重新澄清" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "回退为草案" }))
+
+    await waitFor(() => expect(api.rollbackRequirement).toHaveBeenCalledTimes(1))
+    // `requirementUpdated` replaces `detail` and the editor key changes with the
+    // new current_version_id, so the notice must live in the parent tab rather
+    // than in the editor's local state.
+    const notice = await screen.findByTestId("requirement-notice")
+    expect(notice).toHaveTextContent("已回退为草案 v2")
+    const editorAfter = screen.getByTestId("requirement-editor")
+    expect(within(editorAfter).queryByTestId("requirement-notice")).not.toBeInTheDocument()
+  })
+
   it("assembles chat, sidebar, design CTA, team panel and loads workspace data", async () => {
     render(<RequirementsTab versionId="2001" />)
 

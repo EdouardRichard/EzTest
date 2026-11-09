@@ -31,6 +31,14 @@ const deliveryApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/delivery/api", () => deliveryApi)
 
+// The overview mounts `VersionAttachmentsSection`, which fetches on mount; this
+// test has no API server, so keep the read local and empty.
+const clarificationApi = vi.hoisted(() => ({ listVersionAttachments: vi.fn() }))
+vi.mock("@/features/clarification/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/clarification/api")>()
+  return { ...actual, ...clarificationApi }
+})
+
 const executionApi = vi.hoisted(() => ({
   listHumanRequests: vi.fn(),
   resolveHumanRequest: vi.fn(),
@@ -199,6 +207,8 @@ describe("VersionDetailPage", () => {
     executionApi.listHumanRequests.mockReset()
     executionApi.listHumanRequests.mockResolvedValue([])
     executionApi.resolveHumanRequest.mockReset()
+    clarificationApi.listVersionAttachments.mockReset()
+    clarificationApi.listVersionAttachments.mockResolvedValue([])
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
