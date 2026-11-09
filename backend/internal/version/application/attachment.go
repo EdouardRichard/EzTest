@@ -1038,13 +1038,19 @@ func (s *AttachmentService) attachmentImageViews(ctx context.Context, attachment
 	if err != nil {
 		return nil, mapAttachmentRepositoryError(err)
 	}
-	refs, err := s.storage.ListRefs(ctx, version.AttachmentOwnerKind, attachmentID)
-	if err != nil {
-		return nil, err
-	}
-	objectByRef := make(map[int64]string, len(refs))
-	for _, ref := range refs {
-		objectByRef[ref.ID] = ref.ObjectID
+	// A partial service (tests, degraded wiring) may carry no content store.
+	// The persisted image rows still carry their metadata, so only the SHA-256
+	// join is skipped and the views keep an empty SHA instead of panicking.
+	objectByRef := make(map[int64]string)
+	if s.storage != nil {
+		refs, err := s.storage.ListRefs(ctx, version.AttachmentOwnerKind, attachmentID)
+		if err != nil {
+			return nil, err
+		}
+		objectByRef = make(map[int64]string, len(refs))
+		for _, ref := range refs {
+			objectByRef[ref.ID] = ref.ObjectID
+		}
 	}
 	views := make([]AttachmentImageView, 0, len(rows))
 	for _, row := range rows {

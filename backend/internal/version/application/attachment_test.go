@@ -894,6 +894,37 @@ func TestReadAttachmentTextBoundsImages(t *testing.T) {
 	}
 }
 
+// TestReadAttachmentTextToleratesNilStorage pins the graceful degradation for
+// partial services: a test (or degraded wiring) may construct the service with
+// no content store, and reading image rows must still return the persisted
+// metadata views with an empty SHA instead of panicking on the refs join.
+func TestReadAttachmentTextToleratesNilStorage(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("5", 64)
+	view := registerAttachment(t, env, sha, "with-images.docx", docxMIME, []byte("docx"))
+	env.repo.images[9101] = version.AttachmentImageRecord{
+		ID: 9101, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面",
+	}
+
+	svc := versionapp.NewAttachmentService(
+		env.repo, nil, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	read, err := svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText with nil storage: %v", err)
+	}
+	if read.ImageCount != 1 || len(read.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", read.Images)
+	}
+	if read.Images[0].SHA256 != "" {
+		t.Fatalf("sha256 = %q, want empty without a content store", read.Images[0].SHA256)
+	}
+	if read.Images[0].Seq != 1 || read.Images[0].Caption != "登录界面" {
+		t.Fatalf("image = %#v, want seq/caption preserved", read.Images[0])
+	}
+}
+
 // TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit on
 // the real UAT path: a docx attachment whose embedded images were extracted and
 // analyzed returns those persisted rows/captions. The previous version of this
