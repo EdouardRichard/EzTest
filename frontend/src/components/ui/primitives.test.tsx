@@ -276,7 +276,7 @@ describe("localized error rendering", () => {
       />,
     )
 
-    expect(screen.getByText("用户名或密码错误")).toBeInTheDocument()
+    expect(screen.getByText("登录状态已失效，请重新登录")).toBeInTheDocument()
     expect(screen.queryByText("authentication required")).not.toBeInTheDocument()
     expect(screen.getByText(/req_login/)).toBeInTheDocument()
   })
