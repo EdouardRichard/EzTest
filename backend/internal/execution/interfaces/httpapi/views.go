@@ -330,19 +330,25 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 	terminalCause, nextAction := execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
 	// A non-terminal row has no terminal explanation: never expose a persisted
 	// verdict reason/cause that an older deployment wrote on a running row
-	// (X-07 running-row fallback).
-	settled := run.Status.Finished()
+	// (X-07 running-row fallback). interrupted is non-terminal too (it is
+	// redispatched), so Terminal() is the correct check, not Finished().
+	settled := run.Status.Terminal()
 	if !settled {
 		terminalCause, nextAction = "", ""
 	}
 	verdictReason := run.Summary.VerdictReason
 	failureClass := string(run.FailureClass)
 	if !settled {
-		// A non-terminal row (pending/running/paused) has no terminal verdict:
-		// a failure class/verdict reason persisted by an older deployment must
-		// not be surfaced as its conclusion (X-07).
+		// A non-terminal row (pending/running/paused/interrupted) has no terminal
+		// verdict: a failure class/verdict reason persisted by an older
+		// deployment must not be surfaced as its conclusion (X-07).
 		verdictReason = ""
 		failureClass = ""
+	} else if isRawFailureClass(verdictReason) {
+		// Legacy recovery rows stored the raw failure class (executor_lost, ...)
+		// in verdict_reason; the mapped terminal cause carries that information
+		// now, never the enum as the human verdict reason (X-07).
+		verdictReason = ""
 	}
 	lastError := strings.TrimSpace(run.Summary.LastError)
 	// Do not surface a raw failure enum (executor_lost, agent_failure, ...) as
@@ -419,6 +425,12 @@ func toCaseRunDispatchView(dispatch *execution.CaseRunDispatchDiagnostic) *CaseR
 		view.LastHeartbeat = &heartbeat
 	}
 	return view
+}
+
+// isRawFailureClass reports whether value is a bare persisted failure class
+// (executor_lost, environment, ...) rather than a human verdict reason.
+func isRawFailureClass(value string) bool {
+	return value != "" && execution.FailureClass(value).Valid()
 }
 
 // isRawCaseRunCause reports whether value is a bare persisted enum (a failure

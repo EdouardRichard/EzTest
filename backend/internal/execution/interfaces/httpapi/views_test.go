@@ -356,6 +356,49 @@ func TestCaseRunSummaryViewExposesDispatchAndStableCause(t *testing.T) {
 	}
 }
 
+// TestCaseRunViewBlanksLegacyRawVerdictReason: legacy recovery rows stored the
+// raw executor_lost enum in verdict_reason; the view must not surface a failure
+// class as the human verdict reason (X-07).
+func TestCaseRunViewBlanksLegacyRawVerdictReason(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3003, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunFailed, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{VerdictReason: "executor_lost", LastError: "executor_lost"},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["verdict_reason"] != "" {
+		t.Fatalf("legacy raw verdict_reason leaked: %v", summary["verdict_reason"])
+	}
+	if summary["last_error"] != "" {
+		t.Fatalf("raw failure enum leaked as last_error: %v", summary["last_error"])
+	}
+}
+
+// TestCaseRunViewInterruptedIsNonTerminal: interrupted runs can be redispatched
+// (Finished() true, Terminal() false); the view must not expose terminal
+// verdict/class/cause for them.
+func TestCaseRunViewInterruptedIsNonTerminal(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3004, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunInterrupted, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			TerminalCause: execution.TerminalCauseExecutorTimeout,
+			NextAction:    execution.NextActionRerun,
+			LastError:     "executor_lost",
+		},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if payload["failure_class"] != "" {
+		t.Fatalf("interrupted row exposes failure_class %v", payload["failure_class"])
+	}
+	if summary["verdict_reason"] != "" || summary["terminal_cause"] != "" || summary["next_action"] != "" {
+		t.Fatalf("interrupted row exposes terminal semantics: %+v", summary)
+	}
+}
+
 func viewJSON(t *testing.T, view CaseRunView) map[string]any {
 	t.Helper()
 	encoded, err := json.Marshal(view)

@@ -73,13 +73,11 @@ const (
 	TerminalCauseLeaseExpired = "lease_expired"
 )
 
-// executorLimitationSuffixes are the structured code shapes the executor uses
-// for a missing action capability. The transport codes (executor_unavailable /
-// executor_timeout) are deliberately excluded: those are not capability limits.
-var executorLimitationSuffixes = []string{"_unavailable", "_unsupported", "_not_supported"}
-
-// executorLimitationCodes are the known concrete capability codes. The suffix
-// rule keeps future executor codes working without a migration.
+// executorLimitationCodes is the closed set of executor capability limitation
+// codes. The producer and the reader both accept only these concrete codes: a
+// generic *_unavailable/*_unsupported suffix (service_unavailable,
+// endpoint_unavailable, ...) can describe a real SUT/environment failure, so it
+// must never turn a product defect into an executor block.
 var executorLimitationCodes = map[string]struct{}{
 	"file_chooser_unavailable": {},
 	"hover_unavailable":        {},
@@ -111,10 +109,19 @@ func StepExecutorLimitation(step StepResult) (code string, ok bool) {
 		if normalized == "" || normalized == "false" {
 			return "", false
 		}
+		if !IsExecutorLimitationCode(normalized) {
+			return "", false
+		}
 		return normalized, true
 	case map[string]any:
 		value, _ := typed[ExecutorLimitationCodeKey].(string)
-		return normalizeLimitationCode(value), true
+		normalized := normalizeLimitationCode(value)
+		if normalized != "" && !IsExecutorLimitationCode(normalized) {
+			// A marker carrying an unknown code (for example service_unavailable
+			// written by an older deployment) is not a capability limitation.
+			return "", false
+		}
+		return normalized, true
 	default:
 		return "", true
 	}
@@ -183,8 +190,9 @@ func ExecutorLimitationCodeFromError(text string) (string, bool) {
 	return "", false
 }
 
-// IsExecutorLimitationCode reports whether code is a structured executor
-// capability limitation code (not a transport/failure-class code).
+// IsExecutorLimitationCode reports whether code is one of the closed-set
+// executor capability limitation codes (never a transport/failure-class code and
+// never an arbitrary *_unavailable suffix).
 func IsExecutorLimitationCode(code string) bool {
 	normalized := normalizeLimitationCode(code)
 	if normalized == "" || !isCodeToken(normalized) {
@@ -195,11 +203,22 @@ func IsExecutorLimitationCode(code string) bool {
 		// Transport/failure attribution codes are not action capabilities.
 		return false
 	}
-	if _, ok := executorLimitationCodes[normalized]; ok {
-		return true
-	}
-	for _, suffix := range executorLimitationSuffixes {
-		if strings.HasSuffix(normalized, suffix) {
+	_, ok := executorLimitationCodes[normalized]
+	return ok
+}
+
+// ExecutorDialRefused reports whether recorded transport text proves the
+// executor could not be reached at all (a refused dial or an unreachable
+// network), as opposed to a reachable executor that returned an error.
+func ExecutorDialRefused(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"connection refused",
+		"no route to host",
+		"network is unreachable",
+		"host is unreachable",
+	} {
+		if strings.Contains(lower, marker) {
 			return true
 		}
 	}

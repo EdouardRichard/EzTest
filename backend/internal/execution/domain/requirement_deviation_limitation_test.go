@@ -112,6 +112,49 @@ func TestExecutorLimitationCodeFromToolError(t *testing.T) {
 	}
 }
 
+// TestExecutorLimitationCodeClosedAllowlist: only known executor capability
+// codes qualify. A generic *_unavailable/*_unsupported suffix (service_unavailable,
+// endpoint_unavailable, ...) can describe a real SUT/environment failure and must
+// never become an executor capability block.
+func TestExecutorLimitationCodeClosedAllowlist(t *testing.T) {
+	for _, code := range []string{
+		"file_chooser_unavailable", "hover_unavailable", "download_unavailable",
+		"upload_unavailable", "dialog_unavailable", "clipboard_unavailable", "drag_unavailable",
+	} {
+		if !IsExecutorLimitationCode(code) {
+			t.Fatalf("%q should be a known executor capability code", code)
+		}
+	}
+	for _, code := range []string{
+		"service_unavailable", "endpoint_unavailable", "database_unavailable",
+		"selector_unsupported", "feature_not_supported", "executor_unavailable",
+		"executor_timeout", "executor_context_create_failed", "executor_lost",
+		"executor_capability", "",
+	} {
+		if IsExecutorLimitationCode(code) {
+			t.Fatalf("%q must not be treated as an executor capability code", code)
+		}
+	}
+	if _, ok := ExecutorLimitationCodeFromError("service_unavailable: the SUT returned 503"); ok {
+		t.Fatal("free-text service_unavailable was accepted as an executor limitation")
+	}
+}
+
+// TestStepExecutorLimitationRejectsUnknownCode: a legacy/hand-written marker
+// carrying an unknown code is ignored instead of blocking a real defect.
+func TestStepExecutorLimitationRejectsUnknownCode(t *testing.T) {
+	step := StepResult{
+		Status: StepFailed,
+		Observed: map[string]any{
+			"summary":             "服务不可用",
+			ExecutorLimitationKey: map[string]any{"code": "service_unavailable"},
+		},
+	}
+	if code, ok := StepExecutorLimitation(step); ok {
+		t.Fatalf("unknown marker code %q was read as a limitation", code)
+	}
+}
+
 func TestExecutorLimitationStepFindsFirstMarkedStep(t *testing.T) {
 	steps := []StepResult{
 		{Seq: 1, Status: StepPassed},

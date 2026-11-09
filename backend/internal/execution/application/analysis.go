@@ -495,19 +495,15 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 		return nil, platform.Invalid("failure_class", "must be one of application, environment, session, model, automation, timeout, executor_lost, blocked, unknown")
 	}
 	if requested == execution.FailureClassApplication {
-		// v0.2.3 X-02: a run blocked by an executor capability limitation is an
+		// v0.2.3 X-02: a run limited by the executor's own capability is an
 		// execution-environment condition, never a SUT application defect. The
 		// analyst cannot escalate it with assertion evidence.
 		steps, err := s.results.ListSteps(ctx, run.ID)
 		if err != nil {
 			return nil, mapExecutionError(err, "step result")
 		}
-		if _, code, limited := execution.ExecutorLimitationStep(steps); limited {
-			reason := "executor capability limitation"
-			if code != "" {
-				reason = "executor capability limitation " + code
-			}
-			return nil, platform.StateConflict(reason + " cannot be classified as an application defect")
+		if err := executorCapabilityEscalationError(steps); err != nil {
+			return nil, err
 		}
 	}
 	if run.FailureClass != execution.FailureClassApplication && requested == execution.FailureClassApplication {

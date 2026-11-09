@@ -4,6 +4,8 @@ import (
 	"context"
 	"sort"
 	"time"
+
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // Report input size caps (spec §6.1). A report never includes more than these
@@ -46,8 +48,9 @@ const (
 	FailureClassBlocked = "blocked"
 	// TerminalCauseExecutorCapability is the shared stable cause of a run blocked
 	// by an executor capability limitation. Execution, issue candidates and the
-	// report/triage vocabulary use the same code (no DB enum/migration).
-	TerminalCauseExecutorCapability = "executor_capability"
+	// report/triage vocabulary use the same code (no DB enum/migration); the
+	// execution domain owns the constant.
+	TerminalCauseExecutorCapability = execution.TerminalCauseExecutorCapability
 	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
 	// run failed but the platform triage classified that failure as flaky. It
 	// is a flaky gap, not a product coverage failure.

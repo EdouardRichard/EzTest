@@ -367,6 +367,12 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		}
 	}
 	result.hasRequirementDeviation = deviationStep != nil
+	// Legacy rows may only carry the capability conclusion in
+	// summary.terminal_cause (no structured step marker); it is the same
+	// authoritative block and must keep the run out of the issue scan.
+	if run.Summary.TerminalCause == execution.TerminalCauseExecutorCapability {
+		result.hasExecutorLimitation = true
+	}
 
 	evidenceRows := make([]execution.Evidence, 0)
 	if m.deps.Evidence != nil {
@@ -505,6 +511,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
 		ExecutorCapability: result.hasExecutorLimitation,
+		TerminalCause:      run.Summary.TerminalCause,
 		Summary:            failureSummary,
 		StepCount:          stepCount,
 		StepFailedCount:    stepFailedCount,
@@ -1328,6 +1335,7 @@ func (m *readModel) appWaveSnapshot(model delivery.ReportSnapshot) deliveryapp.W
 			ID: run.ID, VersionID: run.VersionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
 			CaseTitle: run.CaseTitle, VersionSUTID: run.VersionSUTID, VersionSUTIDs: run.VersionSUTIDs,
 			Status: run.Status, FailureClass: run.FailureClass, Summary: run.Summary,
+			ExecutorCapability: run.ExecutorCapabilityBlocked(), TerminalCause: run.TerminalCause,
 			StepCount: run.StepCount, StepFailedCount: run.StepFailedCount,
 			AssertionCount: run.AssertionCount, AssertionFailedCount: run.AssertionFailedCount,
 			FailedStepSeq: run.FailedStepSeq, FailedAssertionSeq: run.FailedAssertionSeq,
@@ -1380,6 +1388,7 @@ func (m *readModel) appVersionSnapshot(model delivery.ReportSnapshot, view versi
 			ID: run.ID, VersionID: run.VersionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
 			CaseTitle: run.CaseTitle, VersionSUTID: run.VersionSUTID, VersionSUTIDs: run.VersionSUTIDs,
 			Status: run.Status, FailureClass: run.FailureClass, Summary: run.Summary,
+			ExecutorCapability: run.ExecutorCapabilityBlocked(), TerminalCause: run.TerminalCause,
 			StepCount: run.StepCount, StepFailedCount: run.StepFailedCount,
 			AssertionCount: run.AssertionCount, AssertionFailedCount: run.AssertionFailedCount,
 			FailedStepSeq: run.FailedStepSeq, FailedAssertionSeq: run.FailedAssertionSeq,

@@ -369,6 +369,10 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		if run.StartedAt == nil {
 			run.StartedAt = &now
 		}
+		// A new dispatch starts a new attempt: the previous attempt's retry
+		// reason / last error must not type a later interruption (X-01 follow-up).
+		run.Summary.RetryReason = ""
+		run.Summary.LastError = ""
 		run.LeaseUntil = timePtr(now.Add(s.leaseTTL))
 		run.OwnerInstance = s.instance
 		run.OwnerExecutorID = int64PtrValue(executor.ID)

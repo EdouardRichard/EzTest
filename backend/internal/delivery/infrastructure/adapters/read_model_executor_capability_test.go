@@ -13,6 +13,67 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
+// TestTerminalCauseExecutorCapabilityBlocksIssueCandidate: legacy rows carry the
+// capability conclusion only in summary.terminal_cause (no structured step
+// marker); the read model must still keep them out of the issue-candidate scan.
+func TestTerminalCauseExecutorCapabilityBlocksIssueCandidate(t *testing.T) {
+	deps, _ := newReadModelFixture()
+	runs := deps.CaseRuns.(*fakeCaseRuns)
+	runs.runs[0].Summary.TerminalCause = execution.TerminalCauseExecutorCapability
+
+	reader := NewExecutionReader(deps)
+	snapshots, err := reader.ListFailedApplicationCaseRuns(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("ListFailedApplicationCaseRuns: %v", err)
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.ID == runs.runs[0].ID {
+			t.Fatalf("terminal-cause capability run %d reached the issue candidate scan", snapshot.ID)
+		}
+	}
+}
+
+// TestWaveAndVersionSnapshotsCopyExecutorCapability: the application wave/version
+// projections must carry the capability flag and stable cause, otherwise triage
+// and the report silently lose the block.
+func TestWaveAndVersionSnapshotsCopyExecutorCapability(t *testing.T) {
+	deps, _ := newReadModelFixture()
+	runs := deps.CaseRuns.(*fakeCaseRuns)
+	runs.runs[0].Status = execution.CaseRunBlocked
+	runs.runs[0].FailureClass = execution.FailureClassBlocked
+	runs.runs[0].Summary.TerminalCause = execution.TerminalCauseExecutorCapability
+	reader := NewExecutionReader(deps)
+
+	assertCopied := func(t *testing.T, label string, snapshots []deliveryapp.CaseRunSnapshot) {
+		t.Helper()
+		for _, run := range snapshots {
+			if run.ID != runs.runs[0].ID {
+				continue
+			}
+			if !run.ExecutorCapability {
+				t.Fatalf("%s snapshot lost executor_capability", label)
+			}
+			if run.TerminalCause != execution.TerminalCauseExecutorCapability {
+				t.Fatalf("%s snapshot terminal cause = %q, want %q", label, run.TerminalCause, execution.TerminalCauseExecutorCapability)
+			}
+			return
+		}
+		t.Fatalf("%s snapshot has no case run %d", label, runs.runs[0].ID)
+	}
+
+	wave, err := reader.WaveSnapshot(context.Background(), 7, 11)
+	if err != nil {
+		t.Fatalf("WaveSnapshot: %v", err)
+	}
+	assertCopied(t, "wave", wave.CaseRuns)
+
+	version, err := reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot: %v", err)
+	}
+	assertCopied(t, "version", version.CaseRuns)
+}
+
 func TestExecutorCapabilityLimitationNotIssueCandidate(t *testing.T) {
 	deps, _ := newReadModelFixture()
 	sutRef := int64(70)

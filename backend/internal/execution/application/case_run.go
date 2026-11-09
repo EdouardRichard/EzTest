@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -319,6 +320,11 @@ type CaseRunner struct {
 	heartbeats  map[int64]*leaseHeartbeat
 	waitTotals  map[int64]time.Duration
 	waitStarted map[int64]time.Time
+	// executorLimitations carries the structured executor capability code
+	// returned by the browser tool (an executor action error) to the next
+	// failed/blocked step record of the same run. It is the structured origin of
+	// the X-02 marker; the step-record free text is only a fallback.
+	executorLimitations map[int64]string
 }
 
 // leaseHeartbeat is one independent renewal timer. The dispatch epoch is part of
@@ -371,20 +377,21 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		knowledge:   deps.KnowledgeHook,
 		// knowledgeFailure is optional: a nil field disables the failed-case
 		// notification.
-		knowledgeFailure: deps.KnowledgeFailureHook,
-		settings:         deps.Settings,
-		clock:            deps.Clock,
-		ids:              deps.IDs,
-		events:           deps.Events,
-		audit:            deps.Audit,
-		instanceID:       deps.InstanceID,
-		leaseTTL:         lease,
-		heartbeat:        heartbeat,
-		attribution:      exploreapp.NewFailureAttribution(),
-		activeRuns:       map[int64]context.CancelFunc{},
-		heartbeats:       map[int64]*leaseHeartbeat{},
-		waitTotals:       map[int64]time.Duration{},
-		waitStarted:      map[int64]time.Time{},
+		knowledgeFailure:    deps.KnowledgeFailureHook,
+		settings:            deps.Settings,
+		clock:               deps.Clock,
+		ids:                 deps.IDs,
+		events:              deps.Events,
+		audit:               deps.Audit,
+		instanceID:          deps.InstanceID,
+		leaseTTL:            lease,
+		heartbeat:           heartbeat,
+		attribution:         exploreapp.NewFailureAttribution(),
+		activeRuns:          map[int64]context.CancelFunc{},
+		heartbeats:          map[int64]*leaseHeartbeat{},
+		waitTotals:          map[int64]time.Duration{},
+		waitStarted:         map[int64]time.Time{},
+		executorLimitations: map[int64]string{},
 	}
 }
 
@@ -417,6 +424,42 @@ func (s *CaseRunner) ClearRun(caseRunID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.activeRuns, caseRunID)
+	delete(s.executorLimitations, caseRunID)
+}
+
+// rememberExecutorLimitation records the structured executor capability code of
+// the last failed browser action. It is consumed by the next failed/blocked step
+// record of the same run, so the marker is sourced from the executor error code
+// instead of the model's prose (X-02).
+func (s *CaseRunner) rememberExecutorLimitation(caseRunID int64, code string) {
+	if caseRunID <= 0 || !execution.IsExecutorLimitationCode(code) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.executorLimitations == nil {
+		s.executorLimitations = map[int64]string{}
+	}
+	s.executorLimitations[caseRunID] = code
+}
+
+// takeExecutorLimitation consumes the structured capability code remembered for
+// this run. A legacy step-record fallback may still supply a code in the error
+// text; the remembered executor code wins when both exist.
+func (s *CaseRunner) takeExecutorLimitation(caseRunID int64) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	code, ok := s.executorLimitations[caseRunID]
+	delete(s.executorLimitations, caseRunID)
+	return code, ok
+}
+
+// clearExecutorLimitation forgets any structured capability code of a previous
+// attempt so a redispatch cannot attribute a new step to a stale executor error.
+func (s *CaseRunner) clearExecutorLimitation(caseRunID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.executorLimitations, caseRunID)
 }
 
 // Prepare validates and claims one execute.case work item, then returns the
@@ -518,6 +561,9 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	if !ok {
 		return execution.TaskSnapshot{}, platform.LeaseLost()
 	}
+	// A new attempt starts clean: never attribute its first step to an executor
+	// action error observed by a previous attempt.
+	s.clearExecutorLimitation(caseRun.ID)
 	startedRun, err := s.caseRuns.Get(ctx, caseRun.ID)
 	if err != nil {
 		return execution.TaskSnapshot{}, mapExecutionError(err, "case_run")
@@ -601,15 +647,25 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	}
 	// The executor action error carries a structured capability code when the
 	// executor cannot perform the action at all (for example
-	// file_chooser_unavailable). Persist it as a structured marker so the
-	// analysis reads it before the text heuristics (v0.2.3 X-02). Nothing is
-	// inferred from prose: only a code-shaped token qualifies.
-	if status != execution.StepPassed {
-		if code, ok := execution.ExecutorLimitationCodeFromError(in.Error); ok {
+	// file_chooser_unavailable). The browser tool remembers that executor code and
+	// it is attached to this step, so the marker does not depend on the model
+	// copying the code into free text (v0.2.3 X-02). A code token inside the
+	// recorded error is a closed-allowlist fallback for older producers; nothing
+	// is inferred from prose.
+	if status == execution.StepFailed || status == execution.StepBlocked {
+		if code, ok := s.takeExecutorLimitation(caseRun.ID); ok {
+			result.Observed[execution.ExecutorLimitationKey] = map[string]any{
+				execution.ExecutorLimitationCodeKey: code,
+			}
+		} else if code, ok := execution.ExecutorLimitationCodeFromError(in.Error); ok {
 			result.Observed[execution.ExecutorLimitationKey] = map[string]any{
 				execution.ExecutorLimitationCodeKey: code,
 			}
 		}
+	} else if status == execution.StepPassed || status == execution.StepSkipped {
+		// The action error was not attributed to this passed/skipped step: drop
+		// the remembered code so a later unrelated step is not misread.
+		s.clearExecutorLimitation(caseRun.ID)
 	}
 	if status == execution.StepRunning {
 		result.StartedAt = &now
@@ -836,6 +892,12 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 			// carries no terminal failure class/verdict reason.
 			now := s.now()
 			_, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
+				// A human pause moves running->paused without bumping the epoch or
+				// token, so the fence alone cannot reject this retry. Never reset a
+				// row the human has taken over (X-01 follow-up).
+				if run.Status != execution.CaseRunRunning {
+					return execution.ErrStateConflict
+				}
 				run.Status = execution.CaseRunPending
 				run.FailureClass = ""
 				run.Summary.VerdictReason = ""
@@ -849,6 +911,11 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 				run.UpdatedAt = now
 				return nil
 			})
+			if errors.Is(err, execution.ErrStateConflict) {
+				// The run left running between the read and the CAS (paused by a
+				// human or taken over): it is not ours to retry.
+				return nil
+			}
 			if err != nil {
 				return mapExecutionError(err, "case_run")
 			}
@@ -1300,9 +1367,10 @@ const executorContextsPath = "/v1/contexts"
 // executor returning 5xx/protocol failures is an environment failure (v0.2.3
 // X-01).
 func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
-	}
+	// A typed run error is the authoritative cause. The caller context may have
+	// expired for a run-level reason (budget, model failure), so a
+	// DeadlineExceeded alone must not relabel it as an executor timeout
+	// (X-01 follow-up).
 	var runErr *agentapp.RunError
 	if errors.As(err, &runErr) {
 		switch runErr.Reason {
@@ -1327,6 +1395,9 @@ func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
 			return finalRunFailure{Class: execution.FailureClassUnknown, Retryable: runErr.Retryable}
 		}
 	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
 	}
@@ -1337,7 +1408,8 @@ func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
 // reports the transport phase in Details.phase; only a dial failure (connection
 // refused/unreachable) keeps the executor_lost class.
 func classifyExecutorError(apiErr *platform.Error) (execution.FailureClass, string, bool) {
-	contextCreate := executorErrorField(apiErr, "path") == executorContextsPath
+	contextCreate := executorErrorField(apiErr, "method") == http.MethodPost &&
+		executorErrorField(apiErr, "path") == executorContextsPath
 	switch apiErr.Code {
 	case "executor_timeout":
 		cause := execution.TerminalCauseExecutorTimeout

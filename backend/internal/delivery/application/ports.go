@@ -389,7 +389,10 @@ type CaseRunSnapshot struct {
 	// ExecutorCapability marks a run blocked by an executor capability
 	// limitation (structured step marker, v0.2.3 X-02). It is never a SUT issue
 	// candidate even when an older classifier stored failed(application).
-	ExecutorCapability       bool
+	ExecutorCapability bool
+	// TerminalCause is the stable case_run.summary.terminal_cause (for example
+	// executor_capability), copied so triage/report projections keep the cause.
+	TerminalCause            string
 	DedupeHint               string
 	Summary                  string
 	StepCount                int

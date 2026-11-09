@@ -264,6 +264,12 @@ func (s *Recovery) classifyInterruptedRun(ctx context.Context, run execution.Cas
 	if cause == "" {
 		cause = execution.ExecutorFailureCause(run.Summary.LastError)
 	}
+	// A recorded refused dial / unreachable network proves the executor is lost,
+	// even when the text also carries the generic executor_unavailable code. This
+	// is checked before the environment default (X-01 follow-up).
+	if execution.ExecutorDialRefused(run.Summary.LastError) {
+		return execution.FailureClassExecutorLost, string(execution.FailureClassExecutorLost)
+	}
 	switch cause {
 	case execution.TerminalCauseExecutorContextCreateFailed, execution.TerminalCauseExecutorTimeout:
 		return execution.FailureClassTimeout, cause
