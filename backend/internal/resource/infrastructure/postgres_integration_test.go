@@ -45,6 +45,9 @@ func (f *fakeUsage) AccountInUse(context.Context, int64) (bool, error) {
 func (f *fakeUsage) RepositoryInUse(context.Context, int64) (bool, error) {
 	return f.inUse["repository"], nil
 }
+func (f *fakeUsage) ReferencingVersions(context.Context, string, int64) ([]resourceapp.VersionRef, error) {
+	return nil, nil
+}
 
 var testNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 

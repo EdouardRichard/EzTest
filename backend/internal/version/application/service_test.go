@@ -3,6 +3,7 @@ package versionapp_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -496,6 +497,106 @@ func (f *fakeRepo) RepositoryInUse(_ context.Context, id int64) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (f *fakeRepo) ReferencingVersions(_ context.Context, kind string, id int64) ([]version.ReferencingVersion, error) {
+	matched := map[int64]struct{}{}
+	add := func(versionID int64) { matched[versionID] = struct{}{} }
+	switch kind {
+	case "sut":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if binding.SUTID == id {
+					add(versionID)
+				}
+			}
+		}
+	case "environment":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if binding.EnvironmentID == id {
+					add(versionID)
+				}
+			}
+		}
+	case "page", "api", "database":
+		if f.catalog != nil {
+			var environmentID, sutID, status string
+			switch kind {
+			case "page":
+				page := f.catalog.pages[id]
+				environmentID, sutID, status = page.EnvironmentID, page.SUTID, page.Status
+			case "api":
+				api := f.catalog.apis[id]
+				environmentID, sutID, status = api.EnvironmentID, api.SUTID, api.Status
+			case "database":
+				database := f.catalog.databases[id]
+				environmentID, sutID, status = database.EnvironmentID, database.SUTID, database.Status
+			}
+			if status == "approved" || status == "active" {
+				for versionID, bindings := range f.bindings {
+					for _, binding := range bindings {
+						if idString(binding.EnvironmentID) != environmentID || idString(binding.SUTID) != sutID {
+							continue
+						}
+						var excluded bool
+						switch kind {
+						case "page":
+							excluded = containsInt64(binding.ScopeExclude.Pages, id)
+						case "api":
+							excluded = containsInt64(binding.ScopeExclude.APIs, id)
+						case "database":
+							excluded = containsInt64(binding.ScopeExclude.Databases, id)
+						}
+						if !excluded {
+							add(versionID)
+						}
+					}
+				}
+			}
+		}
+	case "account":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				for _, account := range binding.Accounts {
+					if account.AccountID == id {
+						add(versionID)
+					}
+				}
+			}
+		}
+	case "repository":
+		sutIDs := map[string]struct{}{}
+		if f.catalog != nil {
+			for _, associations := range f.catalog.sutRepos {
+				for _, association := range associations {
+					if association.Repository.ID == idString(id) {
+						sutIDs[association.SUTID] = struct{}{}
+					}
+				}
+			}
+		}
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if _, ok := sutIDs[idString(binding.SUTID)]; ok {
+					add(versionID)
+				}
+				for _, override := range binding.RepositoryOverrides {
+					if override.RepoID == id {
+						add(versionID)
+					}
+				}
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown resource kind %q", kind)
+	}
+	out := make([]version.ReferencingVersion, 0, len(matched))
+	for versionID := range matched {
+		out = append(out, version.ReferencingVersion{ID: versionID, Title: f.versions[versionID].Title})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 var _ version.Repository = (*fakeRepo)(nil)
@@ -1236,6 +1337,15 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
 	}
+	// The conflict-details port resolves the same range to the referencing
+	// versions, carrying the version title the resource context cannot read.
+	refs, err := usage.ReferencingVersions(requestContext(), "page", 1302)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(page): %v", err)
+	}
+	if len(refs) != 1 || refs[0].ID != created.ID || refs[0].Title != "Version" {
+		t.Fatalf("page referencing versions = %#v", refs)
+	}
 	// An explicit exclusion removes the resource from the version range, so the
 	// guard must stop blocking its deletion. In-range resources and explicit
 	// repository overrides still count.
@@ -1266,6 +1376,20 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 		if used != tc.want {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
+	}
+	excludedRefs, err := usage.ReferencingVersions(requestContext(), "page", 1301)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(excluded page): %v", err)
+	}
+	if len(excludedRefs) != 0 {
+		t.Fatalf("excluded page referencing versions = %#v", excludedRefs)
+	}
+	repositoryRefs, err := usage.ReferencingVersions(requestContext(), "repository", 1203)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(repository override): %v", err)
+	}
+	if len(repositoryRefs) != 1 || repositoryRefs[0].ID != created.ID {
+		t.Fatalf("repository referencing versions = %#v", repositoryRefs)
 	}
 }
 

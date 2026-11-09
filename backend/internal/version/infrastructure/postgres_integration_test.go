@@ -560,3 +560,98 @@ func TestRepositoryUsageQueries(t *testing.T) {
 		}
 	}
 }
+
+// TestRepositoryReferencingVersions pins the join used by the resource delete
+// conflict details: every referencing version carries its title, the resource
+// range matches the usage guards (status, environment, exclusions) and a
+// repository is referenced through both the inherited SUT association and an
+// explicit version override.
+func TestRepositoryReferencingVersions(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("seed %q: %v", query, err)
+		}
+	}
+	exec(`INSERT INTO sut (id, name, intro, created_by) VALUES (1001, 'Orders', '', 42)`)
+	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
+		VALUES (1101, 1001, 'prod', 'https://orders.example.test'),
+		       (1102, 1001, 'staging', 'https://staging.example.test')`)
+	exec(`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template, status)
+		VALUES (1301, 1001, 1101, 'excluded', 'https://orders.example.test/excluded', '/excluded', 'approved'),
+		       (1305, 1001, 1102, 'staging', 'https://staging.example.test/page', '/staging-page', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name, status)
+		VALUES (1401, 1001, 1101, 'GET', '/api/excluded', 'excluded', 'approved'),
+		       (1402, 1001, 1101, 'GET', '/api/in-range', 'in range', 'approved')`)
+	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, status)
+		VALUES (1501, 1001, 1101, 'excluded', 'postgres://excluded', 'reader', 'active'),
+		       (1502, 1001, 1101, 'in-range', 'postgres://in-range', 'reader', 'active')`)
+	exec(`INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled)
+		VALUES (7001, 1001, 1201, 'backend', true)`)
+
+	q4 := sampleVersion(ids, 42)
+	q4.Title = "Orders Q4"
+	q4Binding := sampleBinding(ids, q4.ID)
+	q5 := sampleVersion(ids, 42)
+	q5.Title = "Orders Q5"
+	q5Binding := sampleBinding(ids, q5.ID)
+	q5Binding.EnvironmentID = 1102
+	q5Binding.ScopeExclude = version.NewScopeExclude(nil, nil, nil)
+	q5Binding.RepositoryOverrides = nil
+	q5Binding.Accounts = nil
+	if err := repo.Create(ctx, q4, []version.Binding{q4Binding}); err != nil {
+		t.Fatalf("Create Q4: %v", err)
+	}
+	if err := repo.Create(ctx, q5, []version.Binding{q5Binding}); err != nil {
+		t.Fatalf("Create Q5: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		kind string
+		id   int64
+		want []version.ReferencingVersion
+	}{
+		{"sut both", "sut", 1001, []version.ReferencingVersion{
+			{ID: q4.ID, Title: "Orders Q4"}, {ID: q5.ID, Title: "Orders Q5"},
+		}},
+		{"sut unbound", "sut", 1003, nil},
+		{"environment prod", "environment", 1101, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"environment staging", "environment", 1102, []version.ReferencingVersion{{ID: q5.ID, Title: "Orders Q5"}}},
+		{"page excluded", "page", 1301, nil},
+		{"page staging", "page", 1305, []version.ReferencingVersion{{ID: q5.ID, Title: "Orders Q5"}}},
+		{"api excluded", "api", 1401, nil},
+		{"api prod", "api", 1402, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"database excluded", "database", 1501, nil},
+		{"database prod", "database", 1502, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"account bound", "account", 1601, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"account unbound", "account", 1604, nil},
+		{"repository inherited", "repository", 1201, []version.ReferencingVersion{
+			{ID: q4.ID, Title: "Orders Q4"}, {ID: q5.ID, Title: "Orders Q5"},
+		}},
+		{"repository override", "repository", 1203, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"repository unbound", "repository", 1204, nil},
+	}
+	for _, tc := range cases {
+		refs, err := repo.ReferencingVersions(ctx, tc.kind, tc.id)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if len(refs) != len(tc.want) {
+			t.Fatalf("%s = %#v, want %#v", tc.name, refs, tc.want)
+		}
+		for index := range refs {
+			if refs[index] != tc.want[index] {
+				t.Fatalf("%s[%d] = %#v, want %#v", tc.name, index, refs[index], tc.want[index])
+			}
+		}
+	}
+	if _, err := repo.ReferencingVersions(ctx, "unknown", 1); err == nil {
+		t.Fatal("unknown resource kind returned no error")
+	}
+}

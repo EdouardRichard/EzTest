@@ -317,7 +317,7 @@ func (s *Service) UpdateSUT(ctx context.Context, id int64, patch SUTPatch, actor
 
 // DeleteSUT deletes a SUT when no version binding references it.
 func (s *Service) DeleteSUT(ctx context.Context, id int64, actorID int64) error {
-	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) { return s.usage.SUTInUse(ctx, id) }, "sut"); err != nil {
+	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) { return s.usage.SUTInUse(ctx, id) }, "sut", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteSUT(ctx, id); err != nil {
@@ -434,7 +434,7 @@ func (s *Service) UpdateEnvironment(ctx context.Context, id int64, patch Environ
 func (s *Service) DeleteEnvironment(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.EnvironmentInUse(ctx, id)
-	}, "environment"); err != nil {
+	}, "environment", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteEnvironment(ctx, id); err != nil {
@@ -649,7 +649,7 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 func (s *Service) DeletePage(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.PageInUse(ctx, id)
-	}, "page"); err != nil {
+	}, "page", id); err != nil {
 		return err
 	}
 	page, err := s.repo.GetPage(ctx, id)
@@ -847,7 +847,7 @@ func (s *Service) UpdateAPI(ctx context.Context, id int64, patch APIPatch, actor
 func (s *Service) DeleteAPI(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.APIInUse(ctx, id)
-	}, "api"); err != nil {
+	}, "api", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteAPI(ctx, id); err != nil {
@@ -1332,7 +1332,7 @@ func (s *Service) UpdateDatabase(ctx context.Context, id int64, patch DatabasePa
 func (s *Service) DeleteDatabase(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.DatabaseInUse(ctx, id)
-	}, "database"); err != nil {
+	}, "database", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteDatabase(ctx, id); err != nil {
@@ -1453,7 +1453,7 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 func (s *Service) DeleteAccount(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.AccountInUse(ctx, id)
-	}, "account"); err != nil {
+	}, "account", id); err != nil {
 		return err
 	}
 	account, err := s.repo.GetAccount(ctx, id)
@@ -1613,7 +1613,7 @@ func (s *Service) UpdateRepository(ctx context.Context, id int64, patch Reposito
 func (s *Service) DeleteRepository(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.RepositoryInUse(ctx, id)
-	}, "repository"); err != nil {
+	}, "repository", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteRepository(ctx, id); err != nil {
@@ -1763,8 +1763,15 @@ func (s *Service) record(ctx context.Context, actorID int64, action, kind, targe
 	}
 }
 
-// checkUsage runs a usage guard; a nil guard means "not referenced".
-func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (bool, error), kind string) error {
+// maxReferencingVersions caps the version list carried by a 409 conflict. The
+// most useful references come first (the version repository orders by ID), so a
+// long list never bloats the error envelope.
+const maxReferencingVersions = 20
+
+// checkUsage runs a usage guard; a nil guard means "not referenced". When the
+// resource is referenced, the version context resolves the referencing versions
+// so the 409 carries stable, actionable details instead of a bare conflict.
+func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (bool, error), kind string, id int64) error {
 	if s.usage == nil {
 		return nil
 	}
@@ -1772,10 +1779,73 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 	if err != nil {
 		return err
 	}
-	if inUse {
-		return platform.Conflict(kind + " is referenced by a version binding")
+	if !inUse {
+		return nil
 	}
-	return nil
+	refs, err := s.usage.ReferencingVersions(ctx, kind, id)
+	if err != nil {
+		return err
+	}
+	return resourceReferencedError(kind, refs)
+}
+
+// resourceReferencedError builds the stable 409 returned when a delete is
+// blocked by a version binding. The message stays English (clients localize by
+// code/details); referencing_versions is capped and de-duplicated by version ID.
+func resourceReferencedError(kind string, refs []VersionRef) error {
+	apiErr := platform.NewError(http.StatusConflict, "resource_referenced", kind+" is referenced by a version binding")
+	apiErr.Details = map[string]any{
+		"kind":                 kind,
+		"referencing_versions": referencingVersionDetails(refs),
+		"resolution":           resourceReferencedResolution(kind),
+	}
+	return apiErr
+}
+
+// referencingVersionDetails projects the version references into JSON-ready
+// details: at most maxReferencingVersions entries, de-duplicated by version ID,
+// preserving the caller's order. An empty result is a non-nil empty slice so
+// the envelope always carries an array.
+func referencingVersionDetails(refs []VersionRef) []map[string]any {
+	out := make([]map[string]any, 0, maxReferencingVersions)
+	seen := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if len(out) >= maxReferencingVersions {
+			break
+		}
+		if _, duplicate := seen[ref.ID]; duplicate {
+			continue
+		}
+		seen[ref.ID] = struct{}{}
+		out = append(out, map[string]any{
+			"id":    platformid.Format(ref.ID),
+			"title": ref.Title,
+		})
+	}
+	return out
+}
+
+// resourceReferencedResolution is the human-resolution hint for one resource
+// kind: what the operator can change so the delete is no longer blocked.
+func resourceReferencedResolution(kind string) string {
+	switch kind {
+	case "sut":
+		return "Delete the referencing versions, or bind a different SUT, before deleting this SUT."
+	case "environment":
+		return "Delete the referencing versions, or select another environment in their binding, before deleting this environment."
+	case "page":
+		return "Exclude this page from the version scope, or change the version's environment binding, before deleting it."
+	case "api":
+		return "Exclude this API from the version scope, or change the version's environment binding, before deleting it."
+	case "database":
+		return "Exclude this database from the version scope, deactivate it, or change the version's environment binding, before deleting it."
+	case "account":
+		return "Disable this account in the referencing versions before deleting it."
+	case "repository":
+		return "Remove the SUT repository association or the version repository override before deleting this repository."
+	default:
+		return "Remove this resource from the referencing version bindings before deleting it."
+	}
 }
 
 // removedStrings returns the trimmed values of before that are absent from

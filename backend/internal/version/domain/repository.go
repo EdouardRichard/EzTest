@@ -36,6 +36,14 @@ type VersionStats struct {
 	ConversationCount int
 }
 
+// ReferencingVersion identifies one version whose binding references a
+// resource. It backs the resource delete-guard conflict details, which need the
+// version title the resource context cannot read itself.
+type ReferencingVersion struct {
+	ID    int64
+	Title string
+}
+
 // Repository persists versions, their SUT bindings and the selected database/
 // account rows. Create must write the whole aggregate in one transaction.
 type Repository interface {
@@ -81,6 +89,13 @@ type Repository interface {
 	DatabaseInUse(ctx context.Context, id int64) (bool, error)
 	AccountInUse(ctx context.Context, id int64) (bool, error)
 	RepositoryInUse(ctx context.Context, id int64) (bool, error)
+	// ReferencingVersions lists the versions whose binding references the
+	// resource of the given kind ("sut", "environment", "page", "api",
+	// "database", "account", "repository"), joined with the version title. It
+	// uses the same range rules as the usage guards, so a positive guard is
+	// always explained by at least one reference unless the reference comes
+	// from a SUT-level repository association no version binds.
+	ReferencingVersions(ctx context.Context, kind string, id int64) ([]ReferencingVersion, error)
 }
 
 // StageState is the persisted deterministic stage-machine projection of one

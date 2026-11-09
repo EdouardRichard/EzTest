@@ -1368,6 +1368,22 @@ func (s *Service) RepositoryInUse(ctx context.Context, id int64) (bool, error) {
 	return s.repo.RepositoryInUse(ctx, id)
 }
 
+// ReferencingVersions lists the versions whose binding references the resource
+// of one kind, carrying the version title for the resource delete conflict
+// details. The resource context only understands its own VersionRef shape, so
+// this adapter converts the version-domain rows.
+func (s *Service) ReferencingVersions(ctx context.Context, kind string, id int64) ([]resourceapp.VersionRef, error) {
+	refs, err := s.repo.ReferencingVersions(ctx, kind, id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]resourceapp.VersionRef, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, resourceapp.VersionRef{ID: ref.ID, Title: ref.Title})
+	}
+	return out, nil
+}
+
 var _ resourceapp.UsageChecker = (*Service)(nil)
 
 // ---------- events, audit and errors ----------
