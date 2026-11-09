@@ -120,6 +120,28 @@ describe("DesignMindmap", () => {
     expect(await screen.findByTestId("case-batch-bar")).toBeInTheDocument()
   })
 
+  it("scrolls the mindmap section when a compact selection pushes past the 220px graph pane", async () => {
+    // D-01 follow-up: a 220px graph pane cannot hold compact filters (~41) +
+    // the batch bar (~45) + the 180px canvas floor. The section owns the
+    // internal scroll instead of clipping the canvas and its bottom-right
+    // minimap; the bars must not be squeezed by the flex column.
+    renderMindmap({ compact: true })
+
+    await screen.findByTestId("case-card-7001")
+    fireEvent.click(screen.getByTestId("case-checkbox-7001"))
+
+    const batchBar = await screen.findByTestId("case-batch-bar")
+    expect(batchBar).toHaveClass("shrink-0")
+
+    const section = screen.getByTestId("design-mindmap")
+    expect(section).toHaveClass("overflow-auto")
+    expect(section).not.toHaveClass("overflow-hidden")
+
+    expect(screen.getByTestId("design-case-filters")).toHaveClass("shrink-0")
+    expect(screen.getByTestId("design-mindmap-canvas")).toHaveClass("min-h-[180px]")
+    expect(screen.getByTestId("rf__minimap")).toBeInTheDocument()
+  })
+
   it("renders compact filters with accessible labels on a single short row", async () => {
     renderMindmap({ compact: true })
 

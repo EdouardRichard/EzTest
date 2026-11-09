@@ -371,7 +371,7 @@ function MindmapCanvas({
     <section
       data-testid="design-mindmap"
       aria-label="用例脑图"
-      className="flex h-full w-full flex-col overflow-hidden rounded-xl border border-border bg-card"
+      className="flex h-full w-full flex-col overflow-auto rounded-xl border border-border bg-card"
     >
       <CaseFilters
         values={filters}
@@ -387,7 +387,7 @@ function MindmapCanvas({
           data-testid="case-batch-bar"
           role="toolbar"
           aria-label="用例批量操作"
-          className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5"
+          className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5"
         >
           <span data-testid="case-selection-count" className="text-[11px] text-muted-foreground">
             已选 {selection.selectedIds.length} 条
