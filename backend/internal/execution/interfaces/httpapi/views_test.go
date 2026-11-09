@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
@@ -287,4 +288,83 @@ func TestCaseRunSummaryViewCarriesVisualCounts(t *testing.T) {
 		view.Summary.VisualInconclusive != 3 || view.Summary.VisualSkipped != 0 {
 		t.Fatalf("summary view = %+v", view.Summary)
 	}
+}
+
+// v0.2.3 X-07: the case_run view exposes the dispatch snapshot and a stable
+// terminal cause, and never surfaces a raw failure enum as the human reason
+// when a mapped cause exists.
+func TestCaseRunSummaryViewExposesDispatchAndStableCause(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunFailed, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			LastError:     "executor_lost",
+			RetryReason:   execution.TerminalCauseExecutorTimeout,
+			Dispatch: &execution.CaseRunDispatchDiagnostic{
+				OwnerExecutorID: 7,
+				Endpoint:        "http://127.0.0.1:13336",
+				ExecutorStatus:  "active",
+				RegistryHit:     true,
+				DispatchAt:      "2026-11-01T01:00:00Z",
+				Attempt:         2,
+			},
+		},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["terminal_cause"] != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal_cause = %v, want executor_lost", summary["terminal_cause"])
+	}
+	if summary["last_error"] != "" {
+		t.Fatalf("raw failure enum leaked as last_error: %v", summary["last_error"])
+	}
+	dispatch, ok := summary["dispatch"].(map[string]any)
+	if !ok {
+		t.Fatalf("summary.dispatch missing: %+v", summary)
+	}
+	if dispatch["owner_executor_id"] != "7" || dispatch["endpoint"] != "http://127.0.0.1:13336" {
+		t.Fatalf("dispatch = %+v", dispatch)
+	}
+	if dispatch["registry_hit"] != true || dispatch["attempt"] != float64(2) {
+		t.Fatalf("dispatch route/attempt = %+v", dispatch)
+	}
+	if summary["retry_reason"] != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("retry_reason = %v, want executor_timeout", summary["retry_reason"])
+	}
+
+	// A non-terminal running row must not expose a terminal verdict reason even
+	// when an older deployment persisted one (X-07 running-row fallback).
+	running := toCaseRunView(execution.CaseRun{
+		ID: 3002, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunRunning, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			LastError:     "executor_lost",
+		},
+	}, caseMeta{}, nil, 0)
+	runningPayload := viewJSON(t, running)
+	runningSummary := runningPayload["summary"].(map[string]any)
+	if runningSummary["verdict_reason"] != "" {
+		t.Fatalf("running row exposes verdict_reason %v", runningSummary["verdict_reason"])
+	}
+	if runningPayload["failure_class"] != "" {
+		t.Fatalf("running row exposes failure_class %v", runningPayload["failure_class"])
+	}
+	if runningSummary["last_error"] != "" {
+		t.Fatalf("running row exposes raw last_error %v", runningSummary["last_error"])
+	}
+}
+
+func viewJSON(t *testing.T, view CaseRunView) map[string]any {
+	t.Helper()
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal view: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("decode view: %v", err)
+	}
+	return payload
 }

@@ -560,3 +560,135 @@ func TestRecoveryCleansStaleAndOrphanContexts(t *testing.T) {
 		t.Fatal("non-execution context must not be deleted")
 	}
 }
+
+// v0.2.3 X-01: an expired lease on an ONLINE executor is not automatically an
+// executor_lost. Only an offline (or heartbeat-expired) executor keeps that
+// classification; an online executor is typed from the most recent transport
+// error recorded by the run.
+func TestOnlineExecutorExpiredLeaseNotLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	run.Summary.LastError = "executor_timeout: executor request timed out while creating the browser context"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("status = %s, want pending", stored.Status)
+	}
+	if stored.FailureClass == execution.FailureClassExecutorLost {
+		t.Fatal("online executor lease expiry was misread as executor_lost")
+	}
+	if stored.Summary.VerdictReason != "" {
+		t.Fatalf("non-terminal retry wrote verdict_reason %q", stored.Summary.VerdictReason)
+	}
+	if stored.Summary.RetryReason != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("retry reason = %q, want executor_timeout", stored.Summary.RetryReason)
+	}
+	if stored.LeaseUntil != nil {
+		t.Fatalf("retry kept a lease until %v", stored.LeaseUntil)
+	}
+}
+
+func TestOfflineExecutorExpiredLeaseLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	f.runs.byID[500] = run
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorOffline,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("status = %s, want pending", stored.Status)
+	}
+	if stored.Summary.RetryReason != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("retry reason = %q, want executor_lost", stored.Summary.RetryReason)
+	}
+}
+
+func TestHeartbeatExpiredExecutorIsLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	f.runs.byID[500] = run
+	stale := f.clock.Now().Add(-2 * time.Minute)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &stale,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Summary.RetryReason != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("retry reason = %q, want executor_lost for an expired heartbeat", stored.Summary.RetryReason)
+	}
+}
+
+// A terminal online run keeps the timeout/environment classification and a
+// stable cause instead of the legacy raw executor_lost.
+func TestOnlineExecutorExhaustedLeaseKeepsTypedCause(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 3
+	run.Summary.LastError = "executor_timeout: executor request timed out while creating the browser context"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunFailed || stored.FailureClass != execution.FailureClassTimeout {
+		t.Fatalf("terminal run = %s/%s, want failed/timeout", stored.Status, stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("terminal cause = %q, want executor_timeout", stored.Summary.TerminalCause)
+	}
+	if stored.Summary.VerdictReason != execution.VerdictReasonAgentFailure {
+		t.Fatalf("verdict reason = %q, want agent_failure", stored.Summary.VerdictReason)
+	}
+}

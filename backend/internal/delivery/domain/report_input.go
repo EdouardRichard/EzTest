@@ -40,6 +40,14 @@ const (
 	// "application" and not "automation": the run is neither a product defect
 	// nor flaky automation noise; it needs a rerun to produce a conclusion.
 	FailureClassExpectedFailure = "expected_failure"
+	// FailureClassBlocked is the report-visible failure class of a run blocked
+	// by an executor capability limitation (v0.2.3 X-02). It stays blocked: the
+	// executor could not perform the action, so it is never a SUT defect.
+	FailureClassBlocked = "blocked"
+	// TerminalCauseExecutorCapability is the shared stable cause of a run blocked
+	// by an executor capability limitation. Execution, issue candidates and the
+	// report/triage vocabulary use the same code (no DB enum/migration).
+	TerminalCauseExecutorCapability = "executor_capability"
 	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
 	// run failed but the platform triage classified that failure as flaky. It
 	// is a flaky gap, not a product coverage failure.
@@ -250,6 +258,11 @@ type CaseRunSnapshot struct {
 	VersionSUTIDs []int64
 	Status        string
 	FailureClass  string
+	// TerminalCause is the execution-persisted stable cause of the run
+	// (case_run.summary.terminal_cause). The report/triage vocabulary shares it
+	// with execution: executor_capability marks a run blocked by an executor
+	// capability limitation, never a SUT defect (v0.2.3 X-02).
+	TerminalCause string
 	// TriageClassification is the latest finished platform triage
 	// classification of the issue that references this run (empty when none).
 	// A flaky classification overrides the report-visible classification; the
@@ -276,6 +289,11 @@ type CaseRunSnapshot struct {
 // budget/no-judgment, needs a rerun). Neither triage classification is a
 // product/application defect (Task 118, Task 122).
 func (row CaseRunSnapshot) EffectiveFailureClass() string {
+	if row.ExecutorCapabilityBlocked() {
+		// An executor capability block is not a product defect and no triage
+		// classification may turn it into one (X-02).
+		return FailureClassBlocked
+	}
 	switch row.TriageClassification {
 	case TriageClassificationFlaky:
 		return FailureClassAutomation
@@ -283,6 +301,13 @@ func (row CaseRunSnapshot) EffectiveFailureClass() string {
 		return FailureClassExpectedFailure
 	}
 	return row.FailureClass
+}
+
+// ExecutorCapabilityBlocked reports whether the run was blocked by an executor
+// capability limitation rather than a SUT defect. Execution and the issue
+// candidate gate share the same terminal cause vocabulary (v0.2.3 X-02).
+func (row CaseRunSnapshot) ExecutorCapabilityBlocked() bool {
+	return row.TerminalCause == TerminalCauseExecutorCapability
 }
 
 // ExpectedFailureTriage reports whether the latest finished issue triage

@@ -199,6 +199,10 @@ type assembledRun struct {
 	// product behavior (QA Q1) or a failed/blocked step observing a missing
 	// required control/feature (Task 110).
 	hasRequirementDeviation bool
+	// hasExecutorLimitation reports whether a failed/blocked step carries the
+	// structured executor capability limitation marker (v0.2.3 X-02). Such a
+	// run is a blocked executor condition, never a SUT issue candidate.
+	hasExecutorLimitation bool
 }
 
 // caseRunsOfVersion returns every case_run of a version ordered by ID, reached
@@ -351,9 +355,15 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	result.hasFailedAssertion = firstFailed != nil
 	var deviationStep *execution.StepResult
 	for index := range steps {
-		if execution.StepShowsApplicationDeviation(steps[index]) {
+		switch steps[index].Status {
+		case execution.StepFailed, execution.StepBlocked:
+			if _, limited := execution.StepExecutorLimitation(steps[index]); limited {
+				result.hasExecutorLimitation = true
+				continue
+			}
+		}
+		if deviationStep == nil && execution.StepShowsApplicationDeviation(steps[index]) {
 			deviationStep = &steps[index]
-			break
 		}
 	}
 	result.hasRequirementDeviation = deviationStep != nil
@@ -494,10 +504,11 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		RequirementID: info.requirementID, CaseTitle: info.title,
 		VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
-		Summary:         failureSummary,
-		StepCount:       stepCount,
-		StepFailedCount: stepFailedCount,
-		AssertionCount:  assertionCount, AssertionFailedCount: assertionFailedCount,
+		ExecutorCapability: result.hasExecutorLimitation,
+		Summary:            failureSummary,
+		StepCount:          stepCount,
+		StepFailedCount:    stepFailedCount,
+		AssertionCount:     assertionCount, AssertionFailedCount: assertionFailedCount,
 		FailedStepSeq: failedStepSeq, FailedAssertionSeq: failedAssertionSeq,
 		FailedStepResultID: failedStepResultID, FailedAssertionResultIDs: failedAssertionIDs,
 		FailedExpected: failedExpected, FailedActual: failedActual, FailedReason: failedReason,
@@ -509,6 +520,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		RequirementID: info.requirementID,
 		CaseTitle:     info.title, VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
+		TerminalCause:   run.Summary.TerminalCause,
 		Summary:         failureSummary,
 		StepCount:       stepCount,
 		StepFailedCount: stepFailedCount,
@@ -541,6 +553,11 @@ func (r *ExecutionReader) ListFailedApplicationCaseRuns(ctx context.Context, ver
 		assembled, err := r.model.buildCaseRun(ctx, versionID, run, index[run.CaseVersionID], true)
 		if err != nil {
 			return nil, err
+		}
+		// An executor capability limitation is a blocked executor condition, not
+		// a SUT defect: never a failed(application) issue candidate (X-02).
+		if assembled.hasExecutorLimitation {
+			continue
 		}
 		// P3 emits an issue candidate only for a failed(application) run with
 		// failed assertion evidence, or (QA Q1) with a failed step whose

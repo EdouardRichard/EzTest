@@ -599,6 +599,18 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	if strings.TrimSpace(in.Observed) != "" {
 		result.Observed["summary"] = truncateRunes(in.Observed, 4000)
 	}
+	// The executor action error carries a structured capability code when the
+	// executor cannot perform the action at all (for example
+	// file_chooser_unavailable). Persist it as a structured marker so the
+	// analysis reads it before the text heuristics (v0.2.3 X-02). Nothing is
+	// inferred from prose: only a code-shaped token qualifies.
+	if status != execution.StepPassed {
+		if code, ok := execution.ExecutorLimitationCodeFromError(in.Error); ok {
+			result.Observed[execution.ExecutorLimitationKey] = map[string]any{
+				execution.ExecutorLimitationCodeKey: code,
+			}
+		}
+	}
 	if status == execution.StepRunning {
 		result.StartedAt = &now
 	}
@@ -720,6 +732,10 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	// A structured executor capability limitation wins over the text heuristics
+	// and assertion evidence: the executor could not perform the action, so the
+	// run is blocked, never a SUT application defect (v0.2.3 X-02).
+	status, class, summary = applyExecutorCapabilityLimitation(status, class, summary, steps)
 	// Terminal-state discovery capture (R-EX-1): every active browser context is
 	// read before it is closed, at all four terminal states, and stored as
 	// DB-29 observations plus redacted network evidence. Best effort only.
@@ -812,28 +828,45 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 	}
 	usage := execution.NewCaseRunUsage(result.Turns, result.Usage)
 	if runErr != nil {
-		class, retryable := classifyFinalRunError(ctx, runErr)
-		if retryable && maxAttempts > 0 && attempt < maxAttempts {
+		classification := classifyFinalRunError(ctx, runErr)
+		if classification.Retryable && maxAttempts > 0 && attempt < maxAttempts {
+			// Release the lease immediately under the dispatch CAS fence: the
+			// scheduler redispatch runs in seconds instead of waiting for the
+			// 90s lease to expire (v0.2.3 X-01). The row is non-terminal, so it
+			// carries no terminal failure class/verdict reason.
 			now := s.now()
-			_, _ = s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
+			_, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
+				run.Status = execution.CaseRunPending
+				run.FailureClass = ""
+				run.Summary.VerdictReason = ""
 				run.Summary.LastError = truncateRunes(runErr.Error(), 2000)
+				run.Summary.RetryReason = classification.Cause
+				run.DispatchEpoch++
+				run.DispatchToken = ""
+				run.LeaseUntil = nil
+				run.OwnerExecutorID = nil
+				run.StartedAt = nil
 				run.UpdatedAt = now
 				return nil
 			})
+			if err != nil {
+				return mapExecutionError(err, "case_run")
+			}
+			// A lost fence means a newer dispatch owns the row and finalizes it.
 			return nil
 		}
 		candidate := execution.FinishCandidate{
 			Verdict:      execution.CaseRunFailed,
-			FailureClass: class,
+			FailureClass: classification.Class,
 		}
-		if class == execution.FailureClassBlocked {
+		if classification.Class == execution.FailureClassBlocked {
 			candidate.Verdict = execution.CaseRunBlocked
 		}
 		// A run that dies before recording any step/assertion result must not
 		// look like a silent zero-row failure: persist the concrete error as
 		// text evidence so the reason is visible in the report/UI.
 		s.recordRunFailureEvidence(ctx, caseRun, runErr)
-		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil, usage); err != nil {
+		if err := s.finalizeWithCandidate(ctx, caseRun, candidate, runErr, nil, usage, classification.Cause); err != nil {
 			return err
 		}
 		return nil
@@ -842,7 +875,7 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 	// budget was exhausted): aggregate whatever was recorded and explain the
 	// stop instead of writing a silent inconclusive(incomplete).
 	outcome := newIncompleteRunOutcome(result)
-	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome, usage); err != nil {
+	if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, nil, &outcome, usage, ""); err != nil {
 		return err
 	}
 	return nil
@@ -959,7 +992,7 @@ func visualSymptomReached(caseSnapshot execution.CaseSnapshot, steps []execution
 	return len(visualResults) > 0
 }
 
-func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage) error {
+func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage, terminalCause string) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
 		return err
@@ -980,6 +1013,7 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 		return platform.Invalid("verdict", err.Error())
 	}
 	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
+	status, class, summary = applyExecutorCapabilityLimitation(status, class, summary, steps)
 	if failure != nil {
 		// Persist the concrete failure reason (delivery reports and attribution
 		// read summary.last_error): a failed/blocked run must explain itself.
@@ -1008,6 +1042,12 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	// carry a stable cause and next action derived from the persisted terminal
 	// data, so no terminal row is left unexplained (QA Q2).
 	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
+	// The executor classification (executor_timeout / executor_context_create_failed
+	// / executor_lost) is a more specific stable cause than the generic
+	// failure-class derivation and wins for a terminal row (v0.2.3 X-01/X-07).
+	if terminalCause != "" && status != execution.CaseRunPassed && status != execution.CaseRunSkipped {
+		summary.TerminalCause = terminalCause
+	}
 	if usage != nil {
 		summary.Usage = usage
 	}
@@ -1238,11 +1278,30 @@ func IsRunLeaseLost(err error) bool {
 	return errors.As(err, &runErr) && runErr.Reason == "lease_lost"
 }
 
-// classifyFinalRunError maps an agent run failure to the P3 failure taxonomy and
-// its retry eligibility.
-func classifyFinalRunError(ctx context.Context, err error) (execution.FailureClass, bool) {
+// finalRunFailure is the typed classification of an agent run failure: the P3
+// failure class, whether the dispatch can be retried, and the stable terminal
+// cause persisted for the UI/analysis (v0.2.3 X-01/X-07). Cause is empty when
+// no more specific cause than the failure class exists.
+type finalRunFailure struct {
+	Class     execution.FailureClass
+	Retryable bool
+	Cause     string
+}
+
+// executorContextsPath is the executor endpoint that lazily creates the browser
+// context (the first browser action). A failure there is the pre-first-action
+// failure the UAT evidence pointed at.
+const executorContextsPath = "/v1/contexts"
+
+// classifyFinalRunError maps an agent run failure to the P3 failure taxonomy,
+// its retry eligibility and a stable terminal cause. Only a refused dial (the
+// executor cannot be reached), an offline executor row or an expired heartbeat
+// is executor_lost; a request timeout/cancellation is a timeout and a reachable
+// executor returning 5xx/protocol failures is an environment failure (v0.2.3
+// X-01).
+func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return execution.FailureClassTimeout, false
+		return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
 	}
 	var runErr *agentapp.RunError
 	if errors.As(err, &runErr) {
@@ -1251,28 +1310,85 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 			// The execution task provider rejected the case scope before the
 			// agent loop (unresolvable step target, stale case, missing binding):
 			// this is a blocked case, not an automation failure.
-			return execution.FailureClassBlocked, false
+			return finalRunFailure{Class: execution.FailureClassBlocked, Cause: execution.VerdictReasonBlocked}
 		case "budget", "model_error", "ai_unavailable", "invalid_payload", "profile_not_found":
-			return execution.FailureClassModel, runErr.Retryable
+			return finalRunFailure{Class: execution.FailureClassModel, Retryable: runErr.Retryable}
 		case "tool_failure":
 			var apiErr *platform.Error
-			if errors.As(err, &apiErr) && apiErr.Code == "executor_unavailable" {
-				// "executor" is its own failure class (executor_lost), never
-				// environment: the UI shows 执行器失联 and the run may be retried
-				// on a recovered executor.
-				return execution.FailureClassExecutorLost, runErr.Retryable
+			if errors.As(err, &apiErr) {
+				if class, cause, ok := classifyExecutorError(apiErr); ok {
+					return finalRunFailure{Class: class, Retryable: runErr.Retryable, Cause: cause}
+				}
 			}
-			return execution.FailureClassAutomation, runErr.Retryable
+			return finalRunFailure{Class: execution.FailureClassAutomation, Retryable: runErr.Retryable}
 		case "interrupted", "aborted":
-			return execution.FailureClassTimeout, false
+			return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
 		default:
-			return execution.FailureClassUnknown, runErr.Retryable
+			return finalRunFailure{Class: execution.FailureClassUnknown, Retryable: runErr.Retryable}
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return execution.FailureClassTimeout, false
+		return finalRunFailure{Class: execution.FailureClassTimeout, Cause: execution.TerminalCauseExecutorTimeout}
 	}
-	return execution.FailureClassUnknown, agentapp.IsRetryable(err)
+	return finalRunFailure{Class: execution.FailureClassUnknown, Retryable: agentapp.IsRetryable(err)}
+}
+
+// classifyExecutorError types one executor platform error. The executor client
+// reports the transport phase in Details.phase; only a dial failure (connection
+// refused/unreachable) keeps the executor_lost class.
+func classifyExecutorError(apiErr *platform.Error) (execution.FailureClass, string, bool) {
+	contextCreate := executorErrorField(apiErr, "path") == executorContextsPath
+	switch apiErr.Code {
+	case "executor_timeout":
+		cause := execution.TerminalCauseExecutorTimeout
+		if contextCreate {
+			cause = execution.TerminalCauseExecutorContextCreateFailed
+		}
+		return execution.FailureClassTimeout, cause, true
+	case "executor_unavailable":
+		if executorErrorField(apiErr, "phase") == "dial" {
+			return execution.FailureClassExecutorLost, string(execution.FailureClassExecutorLost), true
+		}
+		cause := execution.TerminalCauseExecutorUnavailable
+		if contextCreate {
+			cause = execution.TerminalCauseExecutorContextCreateFailed
+		}
+		return execution.FailureClassEnvironment, cause, true
+	default:
+		return "", "", false
+	}
+}
+
+func executorErrorField(apiErr *platform.Error, key string) string {
+	if apiErr == nil || apiErr.Details == nil {
+		return ""
+	}
+	value, _ := apiErr.Details[key].(string)
+	return value
+}
+
+// applyExecutorCapabilityLimitation turns a failed/blocked/inconclusive run
+// carrying the structured executor limitation marker into a blocked run with
+// terminal_cause=executor_capability. It never touches a passed/skipped run.
+func applyExecutorCapabilityLimitation(status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary, steps []execution.StepResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
+	switch status {
+	case execution.CaseRunFailed, execution.CaseRunBlocked, execution.CaseRunInconclusive:
+	default:
+		return status, class, summary
+	}
+	step, code, ok := execution.ExecutorLimitationStep(steps)
+	if !ok {
+		return status, class, summary
+	}
+	reason := "the executor could not perform the action"
+	if code != "" {
+		reason = "executor capability limitation " + code
+	}
+	summary.VerdictReason = execution.VerdictReasonBlocked
+	summary.TerminalCause = execution.TerminalCauseExecutorCapability
+	summary.NextAction = execution.NextActionResolveBlocker
+	summary.LastError = fmt.Sprintf("%s (step %d)", reason, step.Seq)
+	return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
 }
 
 // writeTerminal persists the terminal verdict when this owner still holds the

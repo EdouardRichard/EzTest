@@ -309,6 +309,11 @@ type CaseRunSummary struct {
 	VisualInconclusive int    `json:"visual_inconclusive"`
 	HumanRequestID     int64  `json:"human_request_id,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
+	// RetryReason is the stable cause of a retryable run error persisted by a
+	// Finalize/Recovery retry (v0.2.3 X-01). It is a retry reason, not a
+	// terminal failure class: a pending/running row never carries one as its
+	// verdict explanation.
+	RetryReason string `json:"retry_reason,omitempty"`
 	// TerminalCause/NextAction explain a terminal incomplete run: which budget
 	// (or agent stop) ended it and what the human should do next (QA Q2).
 	TerminalCause string `json:"terminal_cause,omitempty"`

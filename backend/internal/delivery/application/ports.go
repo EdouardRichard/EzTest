@@ -376,16 +376,20 @@ type Clock interface {
 // execution.failure_candidate dedupe_hint: candidate ingestion uses it only
 // when it is 32 lowercase hex chars and recomputes the key otherwise.
 type CaseRunSnapshot struct {
-	ID                       int64
-	VersionID                int64
-	WaveID                   int64
-	CaseVersionID            int64
-	RequirementID            int64
-	CaseTitle                string
-	VersionSUTID             *int64
-	VersionSUTIDs            []int64
-	Status                   string
-	FailureClass             string
+	ID            int64
+	VersionID     int64
+	WaveID        int64
+	CaseVersionID int64
+	RequirementID int64
+	CaseTitle     string
+	VersionSUTID  *int64
+	VersionSUTIDs []int64
+	Status        string
+	FailureClass  string
+	// ExecutorCapability marks a run blocked by an executor capability
+	// limitation (structured step marker, v0.2.3 X-02). It is never a SUT issue
+	// candidate even when an older classifier stored failed(application).
+	ExecutorCapability       bool
 	DedupeHint               string
 	Summary                  string
 	StepCount                int

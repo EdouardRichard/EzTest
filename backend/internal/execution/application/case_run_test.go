@@ -1408,14 +1408,16 @@ func queuedWorkItem(t *testing.T, queue *fakeDispatchQueue) agent.WorkItem {
 	return agent.WorkItem{ID: 9001, VersionID: queued.VersionID, Type: queued.Type, Payload: payload}
 }
 
-// TestFinalizeMapsExecutorUnavailableToExecutorLost: an unreachable executor is
-// an executor failure, not an environment failure; the frontend maps it to
-// “执行器失联”.
-func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
+// TestFinalizeMapsConnectionRefusedToExecutorLost: a refused dial is an
+// executor failure, not an environment failure; the frontend maps it to
+// “执行器失联”. A reachable-executor 5xx (no dial phase) is environment instead
+// (v0.2.3 X-01).
+func TestFinalizeMapsConnectionRefusedToExecutorLost(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	executorUnavailable := platform.NewError(503, "executor_unavailable", "executor is offline")
 	executorUnavailable.Retryable = true
+	executorUnavailable.Details = map[string]any{"phase": "dial"}
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: executorUnavailable}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 1, 1); err != nil {
 		t.Fatalf("Finalize: %v", err)
@@ -1426,6 +1428,9 @@ func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
 	}
 	if stored.FailureClass != execution.FailureClassExecutorLost {
 		t.Fatalf("failure class = %q, want executor_lost (not environment)", stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal cause = %q, want executor_lost", stored.Summary.TerminalCause)
 	}
 }
 

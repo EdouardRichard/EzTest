@@ -245,6 +245,22 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 		}
 	}
 
+	// v0.2.3 X-02: the structured executor capability limitation marker wins over
+	// every text heuristic and over failed-assertion evidence. The executor could
+	// not perform the action, so the run is blocked (never a SUT application
+	// defect) and carries the stable terminal cause for the report/UI.
+	if limitationStep, code, limited := execution.ExecutorLimitationStep(steps); limited {
+		summary.VerdictReason = execution.VerdictReasonBlocked
+		summary.TerminalCause = execution.TerminalCauseExecutorCapability
+		summary.NextAction = execution.NextActionResolveBlocker
+		reason := "the executor could not perform the action"
+		if code != "" {
+			reason = "executor capability limitation " + code
+		}
+		summary.LastError = fmt.Sprintf("%s (step %d)", reason, limitationStep.Seq)
+		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
+	}
+
 	// Recorded application evidence is authoritative over a blocked state (Task
 	// 107, PO trap E2E FR-113): the run observed a missing like control/count,
 	// missing like fields and a 404 like endpoint, recorded one failed ui
@@ -382,6 +398,11 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 	if failedAssertion == nil && evidenceStep == nil {
 		return nil
 	}
+	// A structured executor capability limitation is never a SUT defect: no
+	// issue candidate is emitted even if a failed assertion is present (X-02).
+	if _, _, limited := execution.ExecutorLimitationStep(steps); limited {
+		return nil
+	}
 	category := "ui"
 	stepSeq, assertionSeq := 0, 0
 	detail := ""
@@ -472,6 +493,22 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 	requested := execution.FailureClass(strings.TrimSpace(in.FailureClass))
 	if !requested.Valid() || requested == "" {
 		return nil, platform.Invalid("failure_class", "must be one of application, environment, session, model, automation, timeout, executor_lost, blocked, unknown")
+	}
+	if requested == execution.FailureClassApplication {
+		// v0.2.3 X-02: a run blocked by an executor capability limitation is an
+		// execution-environment condition, never a SUT application defect. The
+		// analyst cannot escalate it with assertion evidence.
+		steps, err := s.results.ListSteps(ctx, run.ID)
+		if err != nil {
+			return nil, mapExecutionError(err, "step result")
+		}
+		if _, code, limited := execution.ExecutorLimitationStep(steps); limited {
+			reason := "executor capability limitation"
+			if code != "" {
+				reason = "executor capability limitation " + code
+			}
+			return nil, platform.StateConflict(reason + " cannot be classified as an application defect")
+		}
 	}
 	if run.FailureClass != execution.FailureClassApplication && requested == execution.FailureClassApplication {
 		// QA Q1: a stored observed requirement deviation is evidence the
@@ -586,7 +623,9 @@ func summaryEqual(left, right execution.CaseRunSummary) bool {
 		left.StepTotal == right.StepTotal &&
 		left.StepFailed == right.StepFailed &&
 		left.VisualSkipped == right.VisualSkipped &&
-		left.LastError == right.LastError
+		left.LastError == right.LastError &&
+		left.TerminalCause == right.TerminalCause &&
+		left.NextAction == right.NextAction
 }
 
 func (s *AnalysisService) casePriority(ctx context.Context, versionID, caseVersionID int64) string {
