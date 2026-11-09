@@ -48,9 +48,9 @@ func TestVisionCaptionerCaptionsImage(t *testing.T) {
 	}
 	captioner := NewVisionCaptioner(gateway)
 
-	available, err := captioner.Available(context.Background())
-	if err != nil || !available {
-		t.Fatalf("Available = %v, %v", available, err)
+	availability, err := captioner.Available(context.Background())
+	if err != nil || !availability.Available {
+		t.Fatalf("Available = %#v, %v", availability, err)
 	}
 	caption, err := captioner.Caption(context.Background(), "image/png", []byte("png-bytes"))
 	if err != nil {
@@ -72,17 +72,154 @@ func TestVisionCaptionerCaptionsImage(t *testing.T) {
 	}
 }
 
-func TestVisionCaptionerReportsUnavailableWithoutVisionModel(t *testing.T) {
+// TestVisionCaptionerAvailableReportsTypedReasons pins the M-07 diagnosis
+// contract: the availability probe maps every deterministic LLM configuration
+// failure to a stable reason_code (with the config/model identity carried by
+// Task 7's resolve details) and classifies transport/unclassified failures as
+// retryable gateway_unreachable instead of collapsing everything into "no
+// vision model".
+func TestVisionCaptionerAvailableReportsTypedReasons(t *testing.T) {
+	tests := []struct {
+		name          string
+		resolveErr    error
+		wantReason    string
+		wantRetryable bool
+		wantCause     string
+		wantConfigID  string
+		wantConfig    string
+		wantModel     string
+		wantMissing   []string
+	}{
+		{
+			name: "no default config",
+			resolveErr: &platform.Error{
+				Status: http.StatusServiceUnavailable, Code: llmapp.CodeAIUnavailable,
+				Message: "no default llm config is configured", Retryable: true,
+			},
+			wantReason: versionapp.VisionReasonNoDefaultConfig,
+			wantCause:  llmapp.CodeAIUnavailable,
+		},
+		{
+			name: "default llm config disabled",
+			resolveErr: &platform.Error{
+				Status: http.StatusServiceUnavailable, Code: llmapp.CodeAIUnavailable,
+				Message: "default llm config is disabled", Retryable: true,
+			},
+			wantReason: versionapp.VisionReasonNoDefaultConfig,
+			wantCause:  llmapp.CodeAIUnavailable,
+		},
+		{
+			name: "default model missing",
+			resolveErr: &platform.Error{
+				Status: http.StatusBadRequest, Code: llmapp.CodeLLMConfigInvalid,
+				Message: "llm config has no default model; set default_model_id before running agents",
+				Details: map[string]any{
+					"field": "default_model_id", "config_id": "7", "config_name": "主配置", "default_model_id": "",
+				},
+			},
+			wantReason:   versionapp.VisionReasonDefaultModelMissing,
+			wantCause:    llmapp.CodeLLMConfigInvalid,
+			wantConfigID: "7",
+			wantConfig:   "主配置",
+		},
+		{
+			name: "default model deleted from catalog",
+			resolveErr: &platform.Error{
+				Status: http.StatusBadRequest, Code: llmapp.CodeLLMConfigInvalid,
+				Message: `default model 9 is not in the catalog of llm config "主配置"`,
+				Details: map[string]any{"config_id": "7", "config_name": "主配置", "default_model_id": "9"},
+			},
+			wantReason:   versionapp.VisionReasonDefaultModelMissing,
+			wantCause:    llmapp.CodeLLMConfigInvalid,
+			wantConfigID: "7",
+			wantConfig:   "主配置",
+		},
+		{
+			name: "default model disabled",
+			resolveErr: &platform.Error{
+				Status: http.StatusBadRequest, Code: llmapp.CodeLLMConfigInvalid,
+				Message: `default model "gpt-4" is deprecated or disabled; set default_model_id to an active model`,
+				Details: map[string]any{"config_id": "7", "config_name": "主配置", "default_model_id": "9"},
+			},
+			wantReason:   versionapp.VisionReasonDefaultModelDisabled,
+			wantCause:    llmapp.CodeLLMConfigInvalid,
+			wantConfigID: "7",
+			wantConfig:   "主配置",
+		},
+		{
+			name: "default model without vision",
+			resolveErr: &platform.Error{
+				Status: http.StatusBadRequest, Code: llmapp.CodeLLMCapabilityMismatch,
+				Message: `llm model "gpt-4" does not support vision required by this role`,
+				Details: map[string]any{
+					"model": "gpt-4", "missing_capabilities": []string{"vision"},
+					"config_id": "7", "config_name": "主配置", "default_model_id": "",
+				},
+			},
+			wantReason:   versionapp.VisionReasonDefaultModelNotVision,
+			wantCause:    llmapp.CodeLLMCapabilityMismatch,
+			wantConfigID: "7",
+			wantConfig:   "主配置",
+			wantModel:    "gpt-4",
+			wantMissing:  []string{"vision"},
+		},
+		{
+			name: "gateway transport failure",
+			resolveErr: &platform.Error{
+				Status: http.StatusServiceUnavailable, Code: llmapp.CodeAIUnavailable,
+				Message: "llm request failed: dial tcp: connection refused", Retryable: true,
+			},
+			wantReason:    versionapp.VisionReasonGatewayUnreachable,
+			wantRetryable: true,
+			wantCause:     llmapp.CodeAIUnavailable,
+		},
+		{
+			name:          "unclassified failure",
+			resolveErr:    errors.New("database is down"),
+			wantReason:    versionapp.VisionReasonGatewayUnreachable,
+			wantRetryable: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			captioner := NewVisionCaptioner(&fakeVisionGateway{resolveErr: tc.resolveErr})
+			availability, err := captioner.Available(context.Background())
+			if err != nil {
+				t.Fatalf("Available returned an error: %v", err)
+			}
+			if availability.Available {
+				t.Fatalf("availability = %#v, want unavailable", availability)
+			}
+			if availability.ReasonCode != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", availability.ReasonCode, tc.wantReason)
+			}
+			if availability.Retryable != tc.wantRetryable {
+				t.Fatalf("retryable = %v, want %v", availability.Retryable, tc.wantRetryable)
+			}
+			if availability.CauseCode != tc.wantCause {
+				t.Fatalf("cause code = %q, want %q", availability.CauseCode, tc.wantCause)
+			}
+			if availability.ConfigID != tc.wantConfigID || availability.ConfigName != tc.wantConfig {
+				t.Fatalf("config = %q/%q, want %q/%q",
+					availability.ConfigID, availability.ConfigName, tc.wantConfigID, tc.wantConfig)
+			}
+			if availability.ModelName != tc.wantModel {
+				t.Fatalf("model = %q, want %q", availability.ModelName, tc.wantModel)
+			}
+			if strings.Join(availability.Missing, ",") != strings.Join(tc.wantMissing, ",") {
+				t.Fatalf("missing = %#v, want %#v", availability.Missing, tc.wantMissing)
+			}
+		})
+	}
+}
+
+func TestVisionCaptionerCaptionRejectsMissingVisionModel(t *testing.T) {
 	gateway := &fakeVisionGateway{resolveErr: &platform.Error{
 		Status:  http.StatusBadRequest,
 		Code:    llmapp.CodeLLMConfigInvalid,
 		Message: "llm config has no default model",
 	}}
 	captioner := NewVisionCaptioner(gateway)
-	available, err := captioner.Available(context.Background())
-	if err != nil || available {
-		t.Fatalf("Available = %v, %v; want false, nil", available, err)
-	}
 	if _, err := captioner.Caption(context.Background(), "image/png", []byte("png")); !errors.Is(err, versionapp.ErrVisionUnavailable) {
 		t.Fatalf("Caption err = %v, want ErrVisionUnavailable", err)
 	}

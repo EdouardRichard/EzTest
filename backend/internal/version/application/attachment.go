@@ -117,15 +117,53 @@ type ImageCaption struct {
 // upstream failure.
 var ErrVisionUnavailable = errors.New("no vision-capable model is configured")
 
+// Stable vision availability reason codes (M-07). They are part of the error
+// details contract and are localized by the frontend, so they must not change
+// once released.
+const (
+	// VisionReasonNoDefaultConfig means there is no usable default LLM
+	// configuration at all (none configured or the default config is disabled).
+	VisionReasonNoDefaultConfig = "no_default_config"
+	// VisionReasonDefaultModelMissing means the default configuration has no
+	// default model configured, or that model is no longer in the catalog.
+	VisionReasonDefaultModelMissing = "default_model_missing"
+	// VisionReasonDefaultModelDisabled means the default model is deprecated or
+	// disabled and cannot be selected.
+	VisionReasonDefaultModelDisabled = "default_model_disabled"
+	// VisionReasonDefaultModelNotVision means the default model is selectable
+	// but does not support vision.
+	VisionReasonDefaultModelNotVision = "default_model_not_vision"
+	// VisionReasonGatewayUnreachable means the availability check could not
+	// reach a conclusion (transport/catalog failure); the caller retries.
+	VisionReasonGatewayUnreachable = "gateway_unreachable"
+)
+
+// ImageAvailability is the typed outcome of the vision model availability probe
+// (M-07). A deterministic configuration/capability failure carries the stable
+// reason code plus the configuration identity and the missing capabilities; a
+// transient failure carries Retryable instead of being reported as a missing
+// model. CauseCode keeps the underlying LLM/platform error code for logs.
+type ImageAvailability struct {
+	Available  bool
+	ReasonCode string
+	CauseCode  string
+	ConfigID   string
+	ConfigName string
+	ModelID    string
+	ModelName  string
+	Missing    []string
+	Retryable  bool
+}
+
 // VisionCaptioner is the version context's port for per-image analysis. The
 // production adapter lives in infrastructure and resolves the default LLM model
 // with a vision requirement, then sends the original bytes as llm.ChatImage;
 // the version application never imports the LLM context (Agent.md §6.2/§6.9.7).
-// Available reports whether a vision-capable default model exists; it is
-// checked before persistence so a no-vision deployment never pretends the
-// images were analyzed (R-E2-2).
+// Available reports whether a vision-capable default model exists and, when it
+// does not, why (M-07); it is checked before persistence so a no-vision
+// deployment never pretends the images were analyzed (R-E2-2).
 type VisionCaptioner interface {
-	Available(ctx context.Context) (bool, error)
+	Available(ctx context.Context) (ImageAvailability, error)
 	Caption(ctx context.Context, mime string, data []byte) (ImageCaption, error)
 }
 
@@ -173,16 +211,26 @@ func (e *VisionRequiredError) Unwrap() []error {
 	return []error{version.ErrVisionRequired, e.api}
 }
 
-func newVisionRequiredError(attachment version.Attachment, reason string) *VisionRequiredError {
-	message := "该文档包含图片，但当前没有可用的视觉模型；请先在 LLM 设置中配置支持视觉的默认模型，再发送或重试附件分析"
-	if strings.TrimSpace(reason) != "" {
-		message += "（" + reason + "）"
-	}
+func newVisionRequiredError(attachment version.Attachment, availability ImageAvailability) *VisionRequiredError {
+	message := visionUnavailableMessage(availability)
 	apiErr := platform.NewError(http.StatusBadRequest, version.AttachmentErrorVisionRequired, message)
+	model := availability.ModelName
+	if model == "" {
+		model = availability.ModelID
+	}
+	missing := availability.Missing
+	if missing == nil {
+		missing = []string{}
+	}
 	apiErr.Details = map[string]any{
-		"version_id":    platformid.Format(attachment.VersionID),
-		"attachment_id": platformid.Format(attachment.ID),
-		"next_action":   "configure a vision-capable default model and reanalyze the attachment",
+		"reason_code":          availability.ReasonCode,
+		"config_id":            availability.ConfigID,
+		"config_name":          availability.ConfigName,
+		"model":                model,
+		"missing_capabilities": missing,
+		"version_id":           platformid.Format(attachment.VersionID),
+		"attachment_id":        platformid.Format(attachment.ID),
+		"next_action":          visionNextAction(availability.ReasonCode),
 	}
 	return &VisionRequiredError{
 		VersionID: attachment.VersionID, AttachmentID: attachment.ID, api: apiErr,
@@ -762,13 +810,13 @@ func (s *AttachmentService) Reanalyze(ctx context.Context, attachmentID int64) (
 	if len(existing) == 0 {
 		return []AttachmentImageView{}, nil
 	}
-	available, reason, err := s.visionStatus(ctx)
+	availability, err := s.visionStatus(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !available {
-		s.publishVisionUnavailable(ctx, attachment, reason)
-		return nil, newVisionRequiredError(attachment, reason)
+	if !availability.Available {
+		s.publishVisionUnavailable(ctx, attachment, availability)
+		return nil, newVisionRequiredError(attachment, availability)
 	}
 	if _, err := s.repo.ResetImagesForReanalysis(ctx, attachmentID, s.clock.Now()); err != nil {
 		return nil, mapAttachmentRepositoryError(err)
@@ -840,13 +888,13 @@ func (s *AttachmentService) ensureVisionForImageBearingAttachment(ctx context.Co
 	if len(images) == 0 {
 		return nil
 	}
-	available, reason, err := s.visionStatus(ctx)
+	availability, err := s.visionStatus(ctx)
 	if err != nil {
 		return err
 	}
-	if !available {
-		s.publishVisionUnavailable(ctx, attachment, reason)
-		return newVisionRequiredError(attachment, reason)
+	if !availability.Available {
+		s.publishVisionUnavailable(ctx, attachment, availability)
+		return newVisionRequiredError(attachment, availability)
 	}
 	return nil
 }
@@ -876,6 +924,22 @@ func (s *AttachmentService) attachmentImageViews(ctx context.Context, attachment
 		})
 	}
 	return views, nil
+}
+
+// attachmentImageInfos projects the joined image views into the compact
+// reference/caption shape shared by GetAttachmentInfo, attachment.read_text and
+// attachment.image_ref (C-01). It always returns a non-nil slice so JSON callers
+// see an empty array instead of null.
+func attachmentImageInfos(views []AttachmentImageView) []AttachmentImageInfo {
+	infos := make([]AttachmentImageInfo, 0, len(views))
+	for _, image := range views {
+		infos = append(infos, AttachmentImageInfo{
+			ID: image.ID, Seq: image.Seq, SHA256: image.SHA256, MIME: image.MIME,
+			Width: image.Width, Height: image.Height, SourceKind: image.SourceKind,
+			Status: image.Status, Caption: image.Caption, Error: image.Error,
+		})
+	}
+	return infos
 }
 
 // Attachment read limits for the agent tools (character based).
@@ -940,6 +1004,10 @@ type AttachmentTextRead struct {
 	Truncated    bool
 	Error        string
 	Retryable    bool
+	// Images carries the persisted image rows with their platform-generated
+	// captions. It lets attachment.read_text expose the analysis even when the
+	// attachment text itself is empty (scanned/image-only documents).
+	Images []AttachmentImageInfo
 }
 
 // AttachmentMeta is the compact attachment list entry for agent tools.
@@ -956,13 +1024,16 @@ type AttachmentMeta struct {
 }
 
 // AttachmentImageRef identifies the original content object of an image
-// attachment so the runtime can pass an image_ref to the model.
+// attachment so the runtime can pass an image_ref to the model. Images mirrors
+// the persisted image rows (with captions) so the tool can return the same
+// analysis as attachment.read_text.
 type AttachmentImageRef struct {
 	AttachmentID int64
 	SHA256       string
 	Name         string
 	MIME         string
 	Size         int64
+	Images       []AttachmentImageInfo
 }
 
 // GetAttachmentInfo returns one attachment with its extracted text (when the
@@ -999,13 +1070,7 @@ func (s *AttachmentService) GetAttachmentInfo(ctx context.Context, versionID, at
 	if err != nil {
 		return AttachmentInfo{}, err
 	}
-	for _, image := range images {
-		info.Images = append(info.Images, AttachmentImageInfo{
-			ID: image.ID, Seq: image.Seq, SHA256: image.SHA256, MIME: image.MIME,
-			Width: image.Width, Height: image.Height, SourceKind: image.SourceKind,
-			Status: image.Status, Caption: image.Caption, Error: image.Error,
-		})
-	}
+	info.Images = attachmentImageInfos(images)
 	info.ImageTokens = len(info.Images) * version.AttachmentImageTokenBudget
 	return info, nil
 }
@@ -1097,6 +1162,11 @@ func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, c
 	default:
 		result.Error = "attachment text is not available yet"
 	}
+	images, err := s.attachmentImageViews(ctx, attachment.ID)
+	if err != nil {
+		return AttachmentTextRead{}, err
+	}
+	result.Images = attachmentImageInfos(images)
 	return result, nil
 }
 
@@ -1132,12 +1202,17 @@ func (s *AttachmentService) AttachmentImageRef(ctx context.Context, versionID, c
 	if err != nil {
 		return AttachmentImageRef{}, err
 	}
+	images, err := s.attachmentImageViews(ctx, attachment.ID)
+	if err != nil {
+		return AttachmentImageRef{}, err
+	}
 	return AttachmentImageRef{
 		AttachmentID: attachment.ID,
 		SHA256:       sha256,
 		Name:         attachment.Name,
 		MIME:         attachment.MIME,
 		Size:         attachment.Size,
+		Images:       attachmentImageInfos(images),
 	}, nil
 }
 
@@ -1216,7 +1291,7 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	// stay claimable (pending). The definitive no-vision answer is carried to
 	// the image-persistence step below and only affects documents that actually
 	// contain images.
-	visionAvailable, visionReason, err := s.visionStatus(ctx)
+	visionAvailability, err := s.visionStatus(ctx)
 	if err != nil {
 		return ExtractionResult{}, err
 	}
@@ -1303,9 +1378,9 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	// silent skip (R-E2-2/R-E3-3).
 	imageStatus := version.AttachmentImageExtracted
 	imageSkipReason := ""
-	if !visionAvailable {
+	if !visionAvailability.Available {
 		imageStatus = version.AttachmentImageSkipped
-		imageSkipReason = visionUnavailableMessage(visionReason)
+		imageSkipReason = visionUnavailableMessage(visionAvailability)
 	}
 	maxImages := s.visionMaxImages(ctx)
 	maxImageBytes := s.visionMaxImageBytes(ctx)
@@ -1315,9 +1390,9 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 		return ExtractionResult{}, err
 	}
 	if len(imageRows) > 0 {
-		if !visionAvailable {
-			message := "attachment contains embedded images, but " + visionUnavailableMessage(visionReason)
-			s.publishVisionUnavailable(ctx, attachment, visionReason)
+		if !visionAvailability.Available {
+			message := "attachment contains embedded images, but " + visionUnavailableMessage(visionAvailability)
+			s.publishVisionUnavailable(ctx, attachment, visionAvailability)
 			return s.failAttachment(ctx, attachment, version.AttachmentErrorVisionRequired, message, parsed.Images)
 		}
 		failures := 0
@@ -1409,44 +1484,115 @@ func (s *AttachmentService) failAttachment(ctx context.Context, attachment versi
 	}, nil
 }
 
-// visionStatus reports whether a vision-capable model is configured and, when
-// it is not, a human-readable reason. A nil captioner is a deployment without
-// the image-analysis feature: fail closed instead of degrading to a silent skip
-// (R-E2-2). A transient availability-check failure is returned as err so every
-// caller treats it as a retryable failure; only a definitive "no vision model"
-// answer becomes the typed vision_required outcome.
-func (s *AttachmentService) visionStatus(ctx context.Context) (bool, string, error) {
+// visionStatus resolves the typed vision availability (M-07). A nil captioner
+// is a deployment without the image-analysis feature: fail closed instead of
+// degrading to a silent skip (R-E2-2). A transient availability-check failure is
+// returned as a retryable 503 ai_unavailable so every caller neither persists a
+// skipped row nor tells the user to fix a configuration; only a definitive
+// configuration/capability answer becomes the typed vision_required outcome.
+func (s *AttachmentService) visionStatus(ctx context.Context) (ImageAvailability, error) {
 	if s.vision == nil {
-		return false, "vision image analysis is not configured", nil
+		return ImageAvailability{ReasonCode: VisionReasonNoDefaultConfig}, nil
 	}
-	available, err := s.vision.Available(ctx)
+	availability, err := s.vision.Available(ctx)
 	if err != nil {
-		return false, "", fmt.Errorf("check vision model availability: %w", err)
+		return ImageAvailability{ReasonCode: VisionReasonGatewayUnreachable, Retryable: true},
+			visionRetryableError(VisionReasonGatewayUnreachable)
 	}
-	if !available {
-		return false, "no vision-capable model is configured", nil
+	if !availability.Available && availability.Retryable {
+		return availability, visionRetryableError(availability.ReasonCode)
 	}
-	return true, "", nil
+	return availability, nil
 }
 
-func visionUnavailableMessage(reason string) string {
-	message := "no vision-capable model is configured; document images cannot be analyzed"
-	if trimmed := strings.TrimSpace(reason); trimmed != "" {
-		message += ": " + trimmed
+// visionRetryableError builds the transient 503 the API returns when the vision
+// gateway cannot be reached or its availability cannot be determined. It is
+// deliberately distinct from the deterministic 400 vision_required.
+func visionRetryableError(reasonCode string) error {
+	if strings.TrimSpace(reasonCode) == "" {
+		reasonCode = VisionReasonGatewayUnreachable
 	}
-	return message
+	apiErr := platform.AIUnavailable("视觉模型暂时不可用，请稍后重试")
+	apiErr.Details = map[string]any{"reason_code": reasonCode, "retryable": true}
+	return apiErr
+}
+
+// visionUnavailableMessage renders the cause-specific Chinese message. Every
+// branch carries the stable reason code so logs and the UI envelope can explain
+// which setting is broken instead of collapsing into "no vision model".
+func visionUnavailableMessage(availability ImageAvailability) string {
+	message := ""
+	switch availability.ReasonCode {
+	case VisionReasonNoDefaultConfig:
+		message = "当前没有可用的默认 LLM 配置，文档中的图片无法分析；请在 LLM 设置中启用默认配置并选择支持视觉的默认模型"
+	case VisionReasonDefaultModelMissing:
+		message = "默认模型未设置或已不在模型目录中，文档中的图片无法分析；请在 LLM 设置中设置支持视觉的默认模型"
+	case VisionReasonDefaultModelDisabled:
+		message = "默认模型已下线或禁用，文档中的图片无法分析；请在 LLM 设置中改用已启用且支持视觉的默认模型"
+	case VisionReasonDefaultModelNotVision:
+		message = "默认模型不支持视觉能力，文档中的图片无法分析；请在 LLM 设置中改用支持视觉的模型"
+	case VisionReasonGatewayUnreachable:
+		message = "视觉模型网关暂时不可用，文档中的图片暂时无法分析；请稍后重试"
+	default:
+		message = "没有可用的视觉模型，文档中的图片无法分析；请检查 LLM 设置"
+	}
+	reasonCode := availability.ReasonCode
+	if strings.TrimSpace(reasonCode) == "" {
+		reasonCode = VisionReasonGatewayUnreachable
+	}
+	return message + "（原因：" + reasonCode + "）"
+}
+
+// visionNextAction returns the Chinese operator hint for one reason code; the
+// details.next_action contract is localized by the frontend.
+func visionNextAction(reasonCode string) string {
+	switch reasonCode {
+	case VisionReasonNoDefaultConfig:
+		return "请到 LLM 设置中启用默认配置，并选择支持视觉的默认模型后重试"
+	case VisionReasonDefaultModelMissing:
+		return "请到 LLM 设置中设置默认模型（不会自动使用 models[0]），并确认其支持视觉后重试"
+	case VisionReasonDefaultModelDisabled:
+		return "请到 LLM 设置中把默认模型改为已启用且未下线的模型后重试"
+	case VisionReasonDefaultModelNotVision:
+		return "请到 LLM 设置中把默认模型改为支持视觉（vision）的模型后重试"
+	case VisionReasonGatewayUnreachable:
+		return "请稍后重试；若持续失败，请检查 LLM 网关与模型配置"
+	default:
+		return "请检查 LLM 视觉模型配置后重试"
+	}
 }
 
 // publishVisionUnavailable emits model.vision.unavailable so the UI can tell
-// the user to configure a vision model instead of assuming the images were
-// understood. The payload carries the concrete reason plus the next action.
-func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attachment version.Attachment, reason string) {
-	s.publishAttachmentEvent(ctx, attachment.VersionID, "model.vision.unavailable", attachment, map[string]any{
+// the user which configuration is broken instead of assuming the images were
+// understood. The payload carries the typed reason, configuration identity and
+// missing capabilities plus the next action.
+func (s *AttachmentService) publishVisionUnavailable(ctx context.Context, attachment version.Attachment, availability ImageAvailability) {
+	reasonCode := availability.ReasonCode
+	if strings.TrimSpace(reasonCode) == "" {
+		reasonCode = VisionReasonGatewayUnreachable
+	}
+	payload := map[string]any{
 		"attachment_id": platformid.Format(attachment.ID),
-		"reason":        reason,
-		"message":       visionUnavailableMessage(reason),
-		"next_action":   "configure a vision-capable default model, then reanalyze the attachment",
-	})
+		"reason":        reasonCode,
+		"reason_code":   reasonCode,
+		"message":       visionUnavailableMessage(availability),
+		"next_action":   visionNextAction(reasonCode),
+	}
+	if availability.ConfigID != "" {
+		payload["config_id"] = availability.ConfigID
+	}
+	if availability.ConfigName != "" {
+		payload["config_name"] = availability.ConfigName
+	}
+	if availability.ModelName != "" {
+		payload["model"] = availability.ModelName
+	} else if availability.ModelID != "" {
+		payload["model"] = availability.ModelID
+	}
+	if len(availability.Missing) > 0 {
+		payload["missing_capabilities"] = availability.Missing
+	}
+	s.publishAttachmentEvent(ctx, attachment.VersionID, "model.vision.unavailable", attachment, payload)
 }
 
 // persistExtractedImages stores one attachment_image row per parsed image. The

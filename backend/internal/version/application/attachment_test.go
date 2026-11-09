@@ -749,6 +749,70 @@ func TestAttachmentImageRef(t *testing.T) {
 	}
 }
 
+// TestReadAttachmentTextReturnsImageCaptions pins C-01's primary exit: the
+// attachment-level read exposes the persisted image rows with their captions so
+// the Host can use the platform-generated analysis instead of a fact stream
+// that ranks captions last.
+func TestReadAttachmentTextReturnsImageCaptions(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("8", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	read, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	if len(read.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", read.Images)
+	}
+	image := read.Images[0]
+	if image.Seq != 1 || image.Status != version.AttachmentImageDone || image.Caption == "" {
+		t.Fatalf("image = %#v, want seq/status/caption", image)
+	}
+	if image.SHA256 == "" || image.MIME != "image/png" || image.Width != 8 || image.Height != 6 {
+		t.Fatalf("image metadata = %#v", image)
+	}
+}
+
+// TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit:
+// image_ref returns the same persisted image rows/captions as read_text instead
+// of only a bare content reference.
+func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("b", 64)
+	image := registerAttachment(t, env, sha, "shot.png", "image/png", []byte("png"))
+	stored := env.repo.attachments[image.ID]
+	env.repo.images[901] = version.AttachmentImageRecord{
+		ID: 901, AttachmentID: image.ID, Seq: 1, ContentRefID: stored.ContentRefID,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceStandalone,
+		Status: version.AttachmentImageDone, Caption: "登录界面截图：手机号与验证码输入框",
+	}
+
+	ref, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, image.ID)
+	if err != nil {
+		t.Fatalf("AttachmentImageRef: %v", err)
+	}
+	if len(ref.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted caption", ref.Images)
+	}
+	if ref.Images[0].Caption != "登录界面截图：手机号与验证码输入框" ||
+		ref.Images[0].Status != version.AttachmentImageDone || ref.Images[0].Seq != 1 {
+		t.Fatalf("image = %#v", ref.Images[0])
+	}
+	if ref.Images[0].SHA256 != sha {
+		t.Fatalf("image sha = %q, want %q", ref.Images[0].SHA256, sha)
+	}
+}
+
 func TestListPendingForIngestClampsLimit(t *testing.T) {
 	env := newAttachmentEnv(t)
 	env.repo.pendingForIngest = []version.PendingAttachment{{ID: 5, VersionID: 2, ConversationID: 3, MessageID: 4}}

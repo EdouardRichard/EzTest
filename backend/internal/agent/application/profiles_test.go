@@ -298,3 +298,21 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 		}
 	}
 }
+
+// TestHostPromptsExplainPlatformCaptions pins C-01's prompt half: both
+// conversation Hosts must know the platform generates image captions, read
+// images[].caption first, and never claim the platform has no vision when a
+// caption is empty/failed.
+func TestHostPromptsExplainPlatformCaptions(t *testing.T) {
+	for _, key := range []string{agentapp.ProfileKeyClarificationHost, agentapp.ProfileKeyDesignHost} {
+		profile, ok := agentapp.Profile(key)
+		if !ok {
+			t.Fatalf("missing profile %q", key)
+		}
+		for _, want := range []string{"images[].caption", "平台", "图片分析未完成", "不要声称"} {
+			if !strings.Contains(profile.SystemPrompt, want) {
+				t.Fatalf("profile %q prompt lacks %q: %s", key, want, profile.SystemPrompt)
+			}
+		}
+	}
+}

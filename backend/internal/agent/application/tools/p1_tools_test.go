@@ -494,6 +494,50 @@ func TestAttachmentReadTextReportsPendingStatus(t *testing.T) {
 	}
 }
 
+// TestAttachmentReadTextExposesImageCaptions pins C-01: the read result carries
+// the persisted image rows and their platform-generated captions so the Host
+// reads the analysis instead of claiming the platform has no vision. The bytes
+// never enter the tool output.
+func TestAttachmentReadTextExposesImageCaptions(t *testing.T) {
+	port := &fakeAttachmentPort{text: AttachmentText{
+		AttachmentID: 9003, Name: "with-image.docx", MIME: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		Status: "done", Text: "登录界面示意", TotalChars: 6,
+		Images: []AttachmentImageDetail{{
+			ID: 901, Seq: 1, SHA256: "abc123", MIME: "image/png", Width: 8, Height: 6,
+			Status: "done", Caption: "登录界面截图：手机号与验证码输入框",
+		}},
+	}}
+	registry := NewP1Registry(Deps{Attachment: port})
+	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9003"}`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	body := resultMap(t, result)
+	images, ok := body["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("images = %#v", body["images"])
+	}
+	image, ok := images[0].(map[string]any)
+	if !ok {
+		t.Fatalf("image = %#v", images[0])
+	}
+	if image["image_id"] != "901" || image["seq"] != float64(1) || image["status"] != "done" {
+		t.Fatalf("image = %#v", image)
+	}
+	if image["caption"] != "登录界面截图：手机号与验证码输入框" {
+		t.Fatalf("caption = %#v", image["caption"])
+	}
+	if image["sha256"] != "abc123" || image["mime"] != "image/png" ||
+		image["width"] != float64(8) || image["height"] != float64(6) {
+		t.Fatalf("image metadata = %#v", image)
+	}
+	for _, forbidden := range []string{"data", "data_ref", "base64"} {
+		if _, ok := image[forbidden]; ok {
+			t.Fatalf("image output leaked %q: %#v", forbidden, image)
+		}
+	}
+}
+
 func TestAttachmentDefaultMaxChars(t *testing.T) {
 	port := &fakeAttachmentPort{}
 	registry := NewP1Registry(Deps{Attachment: port})
@@ -506,7 +550,13 @@ func TestAttachmentDefaultMaxChars(t *testing.T) {
 }
 
 func TestAttachmentImageRefReturnsMetadata(t *testing.T) {
-	port := &fakeAttachmentPort{image: AttachmentImage{AttachmentID: 9002, SHA256: "abc", URL: "/api/content/abc", MIME: "image/png"}}
+	port := &fakeAttachmentPort{image: AttachmentImage{
+		AttachmentID: 9002, SHA256: "abc", URL: "/api/content/abc", MIME: "image/png",
+		Images: []AttachmentImageDetail{{
+			ID: 902, Seq: 1, SHA256: "abc", MIME: "image/png", Width: 8, Height: 6,
+			Status: "done", Caption: "登录界面截图",
+		}},
+	}}
 	registry := NewP1Registry(Deps{Attachment: port})
 	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{"attachment_id":"9002"}`)
 	if err != nil {
@@ -518,6 +568,28 @@ func TestAttachmentImageRefReturnsMetadata(t *testing.T) {
 	body := resultMap(t, result)
 	if body["sha256"] != "abc" || body["url"] != "/api/content/abc" || body["mime"] != "image/png" {
 		t.Fatalf("result = %#v", body)
+	}
+	images, ok := body["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("images = %#v", body["images"])
+	}
+	image := images[0].(map[string]any)
+	if image["caption"] != "登录界面截图" || image["status"] != "done" || image["seq"] != float64(1) {
+		t.Fatalf("image = %#v", image)
+	}
+
+	tool, ok := registry.Get(ToolAttachmentImageRef)
+	if !ok {
+		t.Fatalf("%s is not registered", ToolAttachmentImageRef)
+	}
+	description := tool.Description()
+	if strings.Contains(description, "P1 不做视觉理解") {
+		t.Fatalf("description still denies vision: %s", description)
+	}
+	for _, want := range []string{"caption", "不会重新运行视觉分析"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("description %q lacks %q", description, want)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
@@ -52,19 +53,28 @@ func NewVisionCaptioner(gateway VisionGateway) *VisionCaptioner {
 
 var _ versionapp.VisionCaptioner = (*VisionCaptioner)(nil)
 
-// Available reports whether a vision-capable default model is configured.
-func (c *VisionCaptioner) Available(ctx context.Context) (bool, error) {
+// Available reports whether a vision-capable default model is configured and,
+// when it is not, the typed reason (M-07). A deterministic configuration or
+// capability failure is returned as data (Retryable=false) so the attachment
+// layer can build the 400 vision_required diagnostics; a transport or
+// unclassified failure is gateway_unreachable with Retryable=true so the API
+// answers 503 ai_unavailable instead of blaming the configuration.
+func (c *VisionCaptioner) Available(ctx context.Context) (versionapp.ImageAvailability, error) {
 	if c == nil || c.gateway == nil {
-		return false, nil
+		return versionapp.ImageAvailability{ReasonCode: versionapp.VisionReasonNoDefaultConfig}, nil
 	}
-	_, err := c.gateway.ResolveModel(ctx, 0, "", llmapp.ModelRequirements{Vision: true})
+	model, err := c.gateway.ResolveModel(ctx, 0, "", llmapp.ModelRequirements{Vision: true})
 	if err == nil {
-		return true, nil
+		availability := versionapp.ImageAvailability{Available: true, ModelName: model.Model}
+		if model.ConfigID > 0 {
+			availability.ConfigID = strconv.FormatInt(model.ConfigID, 10)
+		}
+		if model.ModelID > 0 {
+			availability.ModelID = strconv.FormatInt(model.ModelID, 10)
+		}
+		return availability, nil
 	}
-	if visionModelUnavailable(err) {
-		return false, nil
-	}
-	return false, err
+	return classifyVisionResolveError(err), nil
 }
 
 // Caption analyzes one image and returns its caption. Empty captions are
@@ -111,5 +121,111 @@ func visionModelUnavailable(err error) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// classifyVisionResolveError maps a ResolveModel failure onto the stable
+// availability reason codes (M-07). Task 7 carries config_id/config_name/
+// default_model_id on config/capability errors, so the diagnosis can name the
+// broken configuration. The underlying LLM code is preserved in CauseCode.
+func classifyVisionResolveError(err error) versionapp.ImageAvailability {
+	availability := versionapp.ImageAvailability{
+		ReasonCode: versionapp.VisionReasonGatewayUnreachable,
+		Retryable:  true,
+	}
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		return availability
+	}
+	availability.CauseCode = apiErr.Code
+	availability.ConfigID = detailString(apiErr.Details, "config_id")
+	availability.ConfigName = detailString(apiErr.Details, "config_name")
+	availability.ModelID = detailString(apiErr.Details, "default_model_id")
+	availability.ModelName = detailString(apiErr.Details, "model")
+	availability.Missing = detailStrings(apiErr.Details, "missing_capabilities")
+
+	switch apiErr.Code {
+	case llmapp.CodeLLMConfigInvalid:
+		availability.Retryable = false
+		if strings.Contains(strings.ToLower(apiErr.Message), "deprecated or disabled") {
+			availability.ReasonCode = versionapp.VisionReasonDefaultModelDisabled
+		} else {
+			availability.ReasonCode = versionapp.VisionReasonDefaultModelMissing
+		}
+	case llmapp.CodeLLMCapabilityMismatch:
+		availability.Retryable = false
+		availability.ReasonCode = versionapp.VisionReasonDefaultModelNotVision
+		if len(availability.Missing) == 0 {
+			availability.Missing = []string{"vision"}
+		}
+		if availability.ModelName == "" {
+			availability.ModelName = availability.ModelID
+		}
+	case llmapp.CodeAIUnavailable:
+		// ai_unavailable is also the code for "no default config"/"default
+		// config disabled", which are deterministic configuration outcomes.
+		// Only those exact deployment messages are non-retryable; anything else
+		// stays gateway_unreachable and is retried.
+		if deterministicVisionConfigMessage(apiErr.Message) {
+			availability.ReasonCode = versionapp.VisionReasonNoDefaultConfig
+			availability.Retryable = false
+		}
+	}
+	return availability
+}
+
+// deterministicVisionConfigMessage identifies the ai_unavailable messages that
+// describe a configuration problem rather than a transient gateway failure.
+// They come from llm.Service.selectConfig/resolveChatTarget, so the wording is
+// stable.
+func deterministicVisionConfigMessage(message string) bool {
+	lower := strings.ToLower(message)
+	for _, fragment := range []string{
+		"no default llm config",
+		"default llm config is disabled",
+		"llm chat gateway is not configured",
+	} {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func detailString(details map[string]any, key string) string {
+	if details == nil {
+		return ""
+	}
+	switch value := details[key].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case int:
+		return strconv.Itoa(value)
+	case int64:
+		return strconv.FormatInt(value, 10)
+	case float64:
+		return strconv.FormatInt(int64(value), 10)
+	default:
+		return ""
+	}
+}
+
+func detailStrings(details map[string]any, key string) []string {
+	if details == nil {
+		return nil
+	}
+	switch value := details[key].(type) {
+	case []string:
+		return append([]string(nil), value...)
+	case []any:
+		values := make([]string, 0, len(value))
+		for _, item := range value {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				values = append(values, text)
+			}
+		}
+		return values
+	default:
+		return nil
 	}
 }

@@ -433,7 +433,9 @@ type AttachmentMeta struct {
 
 // AttachmentText is one page of extracted attachment text plus the structured
 // parse status. A non-done status is data, never a tool error: the model is
-// told "解析中，可重试" or the concrete parse failure reason (§8.5).
+// told "解析中，可重试" or the concrete parse failure reason (§8.5). Images
+// carries the persisted image rows and their platform-generated captions so the
+// Host can read the analysis through read_text (C-01).
 type AttachmentText struct {
 	AttachmentID int64
 	Name         string
@@ -445,14 +447,32 @@ type AttachmentText struct {
 	Truncated    bool
 	Error        string
 	Retryable    bool
+	Images       []AttachmentImageDetail
 }
 
-// AttachmentImage is image metadata; P1 performs no vision understanding.
+// AttachmentImageDetail is one persisted attachment_image row plus its
+// platform-generated caption. The image bytes stay in the content ledger; only
+// the SHA-256 reference is exposed.
+type AttachmentImageDetail struct {
+	ID      int64
+	Seq     int
+	SHA256  string
+	MIME    string
+	Width   int
+	Height  int
+	Status  string
+	Caption string
+	Error   string
+}
+
+// AttachmentImage is image metadata plus the persisted image rows/captions. The
+// platform generates captions; image_ref never re-runs the analysis.
 type AttachmentImage struct {
 	AttachmentID int64
 	SHA256       string
 	URL          string
 	MIME         string
+	Images       []AttachmentImageDetail
 }
 
 // AttachmentPort is the version context's attachment application surface.

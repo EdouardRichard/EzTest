@@ -5,6 +5,7 @@ import (
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // GetAttachment implements agentapp.AttachmentReader for attachment.ingest
@@ -108,7 +109,23 @@ func (a *Adapter) ReadAttachmentText(ctx context.Context, versionID, conversatio
 		Truncated:    read.Truncated,
 		Error:        read.Error,
 		Retryable:    read.Retryable,
+		Images:       attachmentImageDetails(read.Images),
 	}, nil
+}
+
+// attachmentImageDetails maps the version-side persisted image rows/captions to
+// the tool output shape shared by attachment.read_text and attachment.image_ref
+// (C-01).
+func attachmentImageDetails(images []versionapp.AttachmentImageInfo) []tools.AttachmentImageDetail {
+	details := make([]tools.AttachmentImageDetail, 0, len(images))
+	for _, image := range images {
+		details = append(details, tools.AttachmentImageDetail{
+			ID: image.ID, Seq: image.Seq, SHA256: image.SHA256, MIME: image.MIME,
+			Width: image.Width, Height: image.Height,
+			Status: image.Status, Caption: image.Caption, Error: image.Error,
+		})
+	}
+	return details
 }
 
 // LoadImage implements agentapp.ImageLoader for vision runs: it resolves the
@@ -127,8 +144,8 @@ func (a *Adapter) LoadImage(ctx context.Context, dataRef string) (agentapp.Image
 }
 
 // AttachmentImageRef implements tools.AttachmentPort for attachment.image_ref.
-// P1 does not perform vision understanding; the SHA-256 is the content-ledger
-// reference the UI can resolve.
+// The platform already generated the captions; the adapter returns the same
+// persisted image rows as attachment.read_text and never re-runs vision.
 func (a *Adapter) AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (tools.AttachmentImage, error) {
 	if a.attachments == nil {
 		return tools.AttachmentImage{}, a.missing("attachments")
@@ -142,6 +159,7 @@ func (a *Adapter) AttachmentImageRef(ctx context.Context, versionID, conversatio
 		SHA256:       reference.SHA256,
 		URL:          "/api/content/" + reference.SHA256,
 		MIME:         reference.MIME,
+		Images:       attachmentImageDetails(reference.Images),
 	}, nil
 }
 

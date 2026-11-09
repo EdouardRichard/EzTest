@@ -75,7 +75,7 @@ type attachmentReadText struct{ deps Deps }
 func (t *attachmentReadText) Name() string { return ToolAttachmentReadText }
 
 func (t *attachmentReadText) Description() string {
-	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000，超出按 20000 截断）。响应返回 returned_chars 与 next_offset；必须按 next_offset 前进，禁止按请求的 max_chars 跳过内容。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。"
+	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000，超出按 20000 截断）。响应返回 returned_chars 与 next_offset；必须按 next_offset 前进，禁止按请求的 max_chars 跳过内容。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。若附件含图片，响应还返回 images[]（image_id/seq/sha256/mime/width/height/status/caption/error）；caption 由平台视觉分析生成，优先阅读 images[].caption；caption 为空或 status=failed 时说明图片分析未完成。"
 }
 
 func (t *attachmentReadText) Parameters() json.RawMessage {
@@ -142,7 +142,28 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 		"truncated":      page.Truncated,
 		"error":          page.Error,
 		"retryable":      page.Retryable,
+		"images":         attachmentImagesPayload(page.Images),
 	}, nil
+}
+
+// attachmentImagesPayload renders the persisted image rows for the tool JSON.
+// The bytes never enter the tool output: SHA-256 is the content reference.
+func attachmentImagesPayload(images []AttachmentImageDetail) []map[string]any {
+	result := make([]map[string]any, 0, len(images))
+	for _, image := range images {
+		result = append(result, map[string]any{
+			"image_id": idString(image.ID),
+			"seq":      image.Seq,
+			"sha256":   image.SHA256,
+			"mime":     image.MIME,
+			"width":    image.Width,
+			"height":   image.Height,
+			"status":   image.Status,
+			"caption":  image.Caption,
+			"error":    image.Error,
+		})
+	}
+	return result
 }
 
 type attachmentImageRefParams struct {
@@ -154,7 +175,7 @@ type attachmentImageRef struct{ deps Deps }
 func (t *attachmentImageRef) Name() string { return ToolAttachmentImageRef }
 
 func (t *attachmentImageRef) Description() string {
-	return "返回图片附件的引用元数据（sha256/url/mime）。P1 不做视觉理解，只登记引用。"
+	return "返回图片附件的引用元数据（sha256/url/mime）与已生成的 images[]（含平台生成的 caption）；不会重新运行视觉分析。caption 为空或 status=failed 时说明图片分析未完成。"
 }
 
 func (t *attachmentImageRef) Parameters() json.RawMessage {
@@ -187,5 +208,6 @@ func (t *attachmentImageRef) Execute(ctx context.Context, scope Scope, raw json.
 		"sha256":        image.SHA256,
 		"url":           image.URL,
 		"mime":          image.MIME,
+		"images":        attachmentImagesPayload(image.Images),
 	}, nil
 }

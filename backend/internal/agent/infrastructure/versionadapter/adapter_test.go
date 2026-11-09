@@ -619,10 +619,20 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 			return versionapp.AttachmentTextRead{
 				AttachmentID: attachmentID, Name: "spec.md", MIME: "text/markdown", Status: "done",
 				Offset: offset, Text: "page", TotalChars: 10, Truncated: true,
+				Images: []versionapp.AttachmentImageInfo{{
+					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
+					Status: "done", Caption: "登录界面截图",
+				}},
 			}, nil
 		},
 		imageRefFn: func(_ context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
-			return versionapp.AttachmentImageRef{AttachmentID: 9, SHA256: sha, Name: "login.png", MIME: "image/png", Size: 5}, nil
+			return versionapp.AttachmentImageRef{
+				AttachmentID: 9, SHA256: sha, Name: "login.png", MIME: "image/png", Size: 5,
+				Images: []versionapp.AttachmentImageInfo{{
+					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
+					Status: "done", Caption: "登录界面截图",
+				}},
+			}, nil
 		},
 		readImageFn: func(_ context.Context, dataRef string) (string, []byte, error) {
 			if dataRef != sha {
@@ -651,6 +661,13 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	if text.Text != "page" || text.TotalChars != 10 || !text.Truncated || text.Name != "spec.md" {
 		t.Fatalf("text = %#v", text)
 	}
+	if len(text.Images) != 1 {
+		t.Fatalf("text images = %#v, want the persisted caption", text.Images)
+	}
+	if text.Images[0].Caption != "登录界面截图" || text.Images[0].Status != "done" ||
+		text.Images[0].SHA256 != sha || text.Images[0].Seq != 1 {
+		t.Fatalf("text image = %#v", text.Images[0])
+	}
 
 	image, err := adapter.AttachmentImageRef(ctx, 10, 20, 9)
 	if err != nil {
@@ -658,6 +675,9 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	}
 	if image.AttachmentID != 9 || image.SHA256 != sha || image.URL != "/api/content/"+sha || image.MIME != "image/png" {
 		t.Fatalf("image = %#v", image)
+	}
+	if len(image.Images) != 1 || image.Images[0].Caption != "登录界面截图" {
+		t.Fatalf("image ref images = %#v, want the persisted caption", image.Images)
 	}
 
 	loaded, err := adapter.LoadImage(ctx, sha)
