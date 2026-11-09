@@ -1473,9 +1473,16 @@ func (s *AttachmentService) AttachmentImageRef(ctx context.Context, versionID, c
 		return AttachmentImageRef{}, platform.Invalid("attachment_id",
 			"has no extracted images; image_ref is available for image attachments and documents with embedded images")
 	}
-	sha256, err := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
-	if err != nil {
-		return AttachmentImageRef{}, err
+	// A partial service (tests, degraded wiring) may carry no content store.
+	// The attachment metadata and the persisted image rows are still readable,
+	// so only the original SHA-256 is skipped (empty) instead of failing the
+	// whole view.
+	sha256 := ""
+	if s.storage != nil {
+		sha256, err = s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
+		if err != nil {
+			return AttachmentImageRef{}, err
+		}
 	}
 	reference := AttachmentImageRef{
 		AttachmentID: attachment.ID,
@@ -2143,6 +2150,9 @@ func (s *AttachmentService) publishImageEvent(ctx context.Context, attachment ve
 // originalObjectID resolves the attachment's content reference back to the
 // content object SHA-256 through the storage ledger port.
 func (s *AttachmentService) originalObjectID(ctx context.Context, attachmentID, contentRefID int64) (string, error) {
+	if s.storage == nil {
+		return "", errors.New("attachment service has no content store")
+	}
 	refs, err := s.storage.ListRefs(ctx, version.AttachmentOwnerKind, attachmentID)
 	if err != nil {
 		return "", err

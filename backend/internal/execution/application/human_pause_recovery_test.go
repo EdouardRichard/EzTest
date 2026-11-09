@@ -692,6 +692,42 @@ func TestOnlineExecutorLeaseExpiryFromDialRefusedIsLost(t *testing.T) {
 	}
 }
 
+// A recorded executor_lost transport cause on a reachable (online) executor is
+// still an executor_lost; the generic lease-expired environment default must not
+// swallow it when the run exhausts its dispatch budget.
+func TestOnlineExecutorRecordedLostCauseKeepsExecutorLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 3
+	run.Summary.RetryReason = string(execution.FailureClassExecutorLost) + ": executor transport failed"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunFailed || stored.FailureClass != execution.FailureClassExecutorLost {
+		t.Fatalf("terminal run = %s/%s, want failed/executor_lost", stored.Status, stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal cause = %q, want executor_lost", stored.Summary.TerminalCause)
+	}
+	if stored.Summary.VerdictReason != execution.VerdictReasonAgentFailure {
+		t.Fatalf("verdict reason = %q, want agent_failure", stored.Summary.VerdictReason)
+	}
+}
+
 // A terminal online run keeps the timeout/environment classification and a
 // stable cause instead of the legacy raw executor_lost.
 func TestOnlineExecutorExhaustedLeaseKeepsTypedCause(t *testing.T) {

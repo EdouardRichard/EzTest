@@ -925,6 +925,37 @@ func TestReadAttachmentTextToleratesNilStorage(t *testing.T) {
 	}
 }
 
+// TestAttachmentImageRefToleratesNilStorage mirrors the ReadAttachmentText
+// degradation for the docx-with-images path: without a content store the
+// original SHA cannot be resolved, but the attachment metadata and persisted
+// image captions still return instead of panicking on the refs lookup.
+func TestAttachmentImageRefToleratesNilStorage(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("6", 64)
+	view := registerAttachment(t, env, sha, "with-images.docx", docxMIME, []byte("docx"))
+	env.repo.images[9102] = version.AttachmentImageRecord{
+		ID: 9102, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面",
+	}
+
+	svc := versionapp.NewAttachmentService(
+		env.repo, nil, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	ref, err := svc.AttachmentImageRef(requestContext(), env.versionID, 8001, view.ID)
+	if err != nil {
+		t.Fatalf("AttachmentImageRef with nil storage: %v", err)
+	}
+	if ref.SHA256 != "" {
+		t.Fatalf("sha256 = %q, want empty without a content store", ref.SHA256)
+	}
+	if ref.Name != "with-images.docx" || ref.MIME != docxMIME {
+		t.Fatalf("metadata = %#v, want the attachment name/MIME preserved", ref)
+	}
+	if len(ref.Images) != 1 || ref.Images[0].Caption != "登录界面" || ref.Images[0].Seq != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", ref.Images)
+	}
+}
+
 // TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit on
 // the real UAT path: a docx attachment whose embedded images were extracted and
 // analyzed returns those persisted rows/captions. The previous version of this

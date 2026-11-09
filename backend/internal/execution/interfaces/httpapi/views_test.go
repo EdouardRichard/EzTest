@@ -375,6 +375,22 @@ func TestCaseRunViewBlanksLegacyRawVerdictReason(t *testing.T) {
 	}
 }
 
+// TestCaseRunViewKeepsBlockedVerdictReason: "blocked" is both a failure class
+// and a legitimate verdict reason, so the legacy raw-enum filter must not blank
+// a settled blocked row's verdict_reason.
+func TestCaseRunViewKeepsBlockedVerdictReason(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3005, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunBlocked, FailureClass: execution.FailureClassBlocked,
+		Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonBlocked},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["verdict_reason"] != execution.VerdictReasonBlocked {
+		t.Fatalf("blocked verdict_reason = %v, want %q", summary["verdict_reason"], execution.VerdictReasonBlocked)
+	}
+}
+
 // TestCaseRunViewInterruptedIsNonTerminal: interrupted runs can be redispatched
 // (Finished() true, Terminal() false); the view must not expose terminal
 // verdict/class/cause for them.

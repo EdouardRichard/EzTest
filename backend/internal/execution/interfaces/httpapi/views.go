@@ -428,9 +428,27 @@ func toCaseRunDispatchView(dispatch *execution.CaseRunDispatchDiagnostic) *CaseR
 }
 
 // isRawFailureClass reports whether value is a bare persisted failure class
-// (executor_lost, environment, ...) rather than a human verdict reason.
+// (executor_lost, environment, ...) rather than a human verdict reason. Some
+// verdict reasons are also valid failure-class strings ("blocked"), so a value
+// that names a known verdict reason is never treated as a raw legacy enum.
 func isRawFailureClass(value string) bool {
-	return value != "" && execution.FailureClass(value).Valid()
+	return value != "" && execution.FailureClass(value).Valid() && !isKnownVerdictReason(value)
+}
+
+// isKnownVerdictReason reports whether value is a stable verdict_reason code
+// written by the verdict aggregation or a human pause decision.
+func isKnownVerdictReason(value string) bool {
+	switch value {
+	case execution.VerdictReasonPassed, execution.VerdictReasonAssertionFailed,
+		execution.VerdictReasonStepFailed, execution.VerdictReasonIncomplete,
+		execution.VerdictReasonEmptyCase, execution.VerdictReasonNoAssertions,
+		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure,
+		execution.VerdictReasonVisualAssertionNotRun,
+		execution.VerdictReasonHumanTimeout, execution.VerdictReasonHumanCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 // isRawCaseRunCause reports whether value is a bare persisted enum (a failure

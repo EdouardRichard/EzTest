@@ -92,9 +92,9 @@ func TestLegacySeedPromptDigestsCoverEveryUpgradableKey(t *testing.T) {
 func TestLegacySeedPromptDigestNormalizesLineEndings(t *testing.T) {
 	for key, body := range legacyPromptBodiesV022 {
 		t.Run(key, func(t *testing.T) {
-			lf := strings.ReplaceAll(strings.ReplaceAll(body, "\\r\\n", "\\n"), "\\r", "\\n")
-			crlf := strings.ReplaceAll(lf, "\\n", "\\r\\n")
-			cr := strings.ReplaceAll(lf, "\\n", "\\r")
+			lf := strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
+			crlf := strings.ReplaceAll(lf, "\n", "\r\n")
+			cr := strings.ReplaceAll(lf, "\n", "\r")
 			want := seedPromptDigest(lf)
 			if got := seedPromptDigest(crlf); got != want {
 				t.Fatalf("CRLF digest = %s, want %s", got, want)

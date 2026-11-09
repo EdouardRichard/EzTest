@@ -273,6 +273,8 @@ func (s *Recovery) classifyInterruptedRun(ctx context.Context, run execution.Cas
 	switch cause {
 	case execution.TerminalCauseExecutorContextCreateFailed, execution.TerminalCauseExecutorTimeout:
 		return execution.FailureClassTimeout, cause
+	case string(execution.FailureClassExecutorLost):
+		return execution.FailureClassExecutorLost, cause
 	case execution.TerminalCauseExecutorUnavailable:
 		return execution.FailureClassEnvironment, cause
 	case execution.TerminalCauseExecutorCapability:
