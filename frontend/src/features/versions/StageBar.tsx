@@ -11,7 +11,6 @@ import { formatDateTime } from "@/lib/format"
 import {
   parseStageBlocker,
   pauseVersion,
-  requestStage,
   resumeVersion,
   type StageBlocker,
   stageGateDetails,
@@ -30,13 +29,6 @@ const WORKFLOW_STAGES: readonly VersionStage[] = [
   "reporting",
   "completed",
 ]
-
-/** `nextWorkflowStage` returns the forward edge used by the advance button. */
-function nextWorkflowStage(stage: VersionStage): VersionStage | null {
-  const index = WORKFLOW_STAGES.indexOf(stage)
-  if (index < 0 || index >= WORKFLOW_STAGES.length - 1) return null
-  return WORKFLOW_STAGES[index + 1] ?? null
-}
 
 export type StageBarProps = {
   /** Version scope of the stage write transport. Without it the controls are disabled. */
@@ -65,7 +57,9 @@ export type StageBarProps = {
  * Version stage bar (v0.22 R-B4-6/FE-6). It renders the deterministic workflow,
  * highlights the current stage, disables future stages, shows `stage_entered_at`,
  * exposes the blocked/paused overlay with its reason and sends typed
- * `stage/request`, `stage/pause` and `stage/resume` writes. A 409 gate response is
+ * `stage/pause` and `stage/resume` writes. Stage advancement is driven by the
+ * workflow itself (CTAs, gates and reconcilers), so the bar has no manual
+ * advance control. A 409 gate response is
  * rendered inline with its structured `gate/reason/action/next` details; the bar
  * never infers a stage locally after a failed write.
  */
@@ -98,7 +92,6 @@ export function StageBar({
 
   const blocked = activeStage === "blocked"
   const paused = activeStage === "paused"
-  const nextStage = blocked || paused ? null : nextWorkflowStage(activeStage)
   const canPause = !blocked && !paused && activeStage !== "completed"
   const currentIndex = WORKFLOW_STAGES.indexOf(activeStage)
   const writesDisabled = disabled || submitting || versionId === undefined || versionId === ""
@@ -124,12 +117,6 @@ export function StageBar({
     } finally {
       setSubmitting(false)
     }
-  }
-
-  function advance(): void {
-    if (nextStage === null || versionId === undefined || versionId === "") return
-    const target = nextStage
-    void run(() => requestStage(versionId, target))
   }
 
   function pause(): void {
@@ -228,7 +215,7 @@ export function StageBar({
               ? `：${activeBlocker.reason}`
               : ""}
           </p>
-          <p className="text-[11px] text-muted-foreground">请先解除阻塞后再推进阶段。</p>
+          <p className="text-[11px] text-muted-foreground">请先解除阻塞后再继续。</p>
         </div>
       ) : null}
 
@@ -245,11 +232,6 @@ export function StageBar({
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        {nextStage !== null ? (
-          <Button size="sm" disabled={writesDisabled} onClick={advance}>
-            {submitting ? "请求中…" : `推进到「${stageLabel(nextStage)}」`}
-          </Button>
-        ) : null}
         {canPause ? (
           <Button
             size="sm"

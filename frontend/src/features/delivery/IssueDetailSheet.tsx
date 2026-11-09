@@ -12,6 +12,10 @@ import { Field } from "@/components/ui/Field"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
 import { AnchorPanel } from "@/features/anchors/AnchorPanel"
+import {
+  closedRequirementId,
+  requirementClosedMessage,
+} from "@/features/execution/closed-requirement"
 import { formatDateTime } from "@/lib/format"
 
 import {
@@ -46,6 +50,12 @@ export type IssueDetailSheetProps = {
   onMerge: () => void
   /** Starts a retest; omitted in the read-only global workspace. */
   onRetest?: () => Promise<void>
+  /**
+   * Opens the requirements tab on the closed requirement a retest was rejected
+   * for, so the user can reopen it and retry. Omitted in the read-only global
+   * workspace (no transitions/merge there either).
+   */
+  onOpenRequirement?: (requirementId: string) => void
 }
 
 const STATUS_TONE: Record<IssueStatus, BadgeTone> = {
@@ -478,6 +488,7 @@ export function IssueDetailSheet({
   onTransition,
   onMerge,
   onRetest,
+  onOpenRequirement,
 }: IssueDetailSheetProps) {
   const [transition, setTransition] = useState<IssueTransitionAction | null>(null)
   const [retesting, setRetesting] = useState(false)
@@ -499,6 +510,7 @@ export function IssueDetailSheet({
   const mergedChain = issue?.merged_chain ?? []
   const mergedIntoId = issue?.merged_into_id ?? null
   const retestStatus: IssueRetestStatus = issue?.retest_status ?? "not_retested"
+  const closedRetestRequirement = closedRequirementId(retestError)
 
   /** Runs the retest and keeps API errors inside the sheet (dialog stays open). */
   async function submitRetest(): Promise<void> {
@@ -685,7 +697,27 @@ export function IssueDetailSheet({
                       </Button>
                     ) : null}
                   </div>
-                  {retestError !== null ? <InlineError error={retestError} /> : null}
+                  {retestError !== null ? (
+                    <div className="space-y-1">
+                      <InlineError
+                        error={retestError}
+                        message={
+                          closedRetestRequirement !== null
+                            ? requirementClosedMessage("retest")
+                            : undefined
+                        }
+                      />
+                      {closedRetestRequirement !== null && onOpenRequirement !== undefined ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => onOpenRequirement(closedRetestRequirement)}
+                        >
+                          前往重新打开需求
+                        </Button>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               )}
 

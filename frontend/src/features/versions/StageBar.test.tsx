@@ -68,35 +68,21 @@ describe("StageBar", () => {
     expect(transition).toHaveTextContent("host")
   })
 
-  it("requests the next stage and adopts the server projection", async () => {
-    const updated = stageView()
-    fetchMock.mockResolvedValueOnce(jsonResponse({ data: updated }))
-    const onStageChanged = vi.fn()
+  it("offers no manual stage advance control in any workflow stage", () => {
+    const { rerender } = render(
+      <StageBar versionId="2001" stage="clarifying" stageEnteredAt="2026-11-01T06:00:00Z" />,
+    )
 
-    render(
+    expect(screen.queryByRole("button", { name: /推进/ })).not.toBeInTheDocument()
+
+    rerender(
       <StageBar
         versionId="2001"
-        stage="clarifying"
-        stageEnteredAt="2026-11-01T06:00:00Z"
-        onStageChanged={onStageChanged}
+        stage="requirement_review"
+        stageEnteredAt="2026-11-01T07:00:00Z"
       />,
     )
-
-    fireEvent.click(screen.getByRole("button", { name: "推进到「需求待确认」" }))
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    const [url, init] = fetchMock.mock.calls[0]
-    expect(String(url)).toBe("http://localhost:13333/api/versions/2001/stage/request")
-    expect(init?.method).toBe("POST")
-    expect(JSON.parse(String(init?.body))).toEqual({ to: "requirement_review" })
-    await waitFor(() => expect(onStageChanged).toHaveBeenCalledWith(updated))
-    await waitFor(() =>
-      expect(screen.getByTestId("stage-item-requirement_review")).toHaveAttribute(
-        "aria-current",
-        "step",
-      ),
-    )
-    expect(screen.getByRole("button", { name: "推进到「设计中」" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /推进/ })).not.toBeInTheDocument()
   })
 
   it("shows typed 409 gate details inline and keeps the current stage", async () => {
@@ -117,7 +103,7 @@ describe("StageBar", () => {
       />,
     )
 
-    fireEvent.click(screen.getByRole("button", { name: "推进到「设计中」" }))
+    fireEvent.click(screen.getByRole("button", { name: "暂停版本" }))
 
     const gateError = await screen.findByTestId("stage-gate-error")
     expect(gateError).toHaveTextContent("阶段门禁未通过")

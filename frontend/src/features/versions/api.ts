@@ -155,7 +155,11 @@ function versionPath(versionId: string): string {
   return `/api/versions/${encodeURIComponent(versionId)}`
 }
 
-/** `POST /api/versions/{id}/stage/request`: user/Host asks the stage machine to advance. */
+/**
+ * `POST /api/versions/{id}/stage/request`: user/Host asks the stage machine to
+ * advance. `x-api-only` (FE-5/R-B4-6): the v0.2.3 UI has no manual advance
+ * control; forward edges are driven by the workflow CTAs and reconcilers.
+ */
 export function requestStage(versionId: string, to: VersionStage): Promise<StageView> {
   return apiPost<StageView>(`${versionPath(versionId)}/stage/request`, { to })
 }
@@ -508,6 +512,8 @@ export function rejectStage(versionId: string, input: RejectStageInput): Promise
 /**
  * `POST /api/versions/{id}/stage/advance`: advances to the next forward
  * workflow stage without naming it; the stage machine stays single-writer.
+ * `x-api-only` (FE-5/R-B4-6): no v0.2.3 UI renders this control, but the
+ * wrapper stays for API consumers and contract tests.
  */
 export function advanceStage(versionId: string): Promise<StageView> {
   return apiPost<StageView>(`${versionPath(versionId)}/stage/advance`)
