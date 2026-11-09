@@ -48,9 +48,28 @@ export const DEFAULT_CREATE_FAILURE_THRESHOLD = 3
 // instead of staying degraded (and undispatched) until a restart.
 export const CREATE_FAILURE_COOLDOWN_MS = 30_000
 const MAX_CONTEXT_CREATE_ERROR_CHARS = 500
+// Credential-bearing fragments of a create-failure message. /healthz is
+// reachable without a bearer token, so URL userinfo, common secret query
+// parameters and bearer tokens are redacted before the text leaves the process.
+const URL_CREDENTIALS = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/@\s]+)@/g
+const SECRET_QUERY_PARAM =
+  /([?&](?:access_token|token|password|passwd|secret|api_key|apikey|auth|authorization)=)[^&\s]*/gi
+const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
 
 function scrub(text, secrets) {
   return stripSecretValues(text, [...secrets])
+}
+
+/**
+ * Removes credential-bearing fragments from a diagnostic string before it is
+ * exposed (unauthenticated /healthz) or logged. Safe for any input; never
+ * throws.
+ */
+export function sanitizeDiagnosticText(text) {
+  return String(text ?? "")
+    .replace(URL_CREDENTIALS, "$1***@")
+    .replace(SECRET_QUERY_PARAM, "$1***")
+    .replace(BEARER_TOKEN, "Bearer ***")
 }
 
 // Bounds and normalizes the diagnostic exposed on /healthz. The message is
@@ -58,7 +77,7 @@ function scrub(text, secrets) {
 function formatContextCreateError(error) {
   const code = error instanceof ExecutorError ? error.code : error?.code
   const message = error instanceof Error ? error.message : String(error)
-  const detail = code ? `${code}: ${message}` : message
+  const detail = sanitizeDiagnosticText(code ? `${code}: ${message}` : message)
   return detail.length > MAX_CONTEXT_CREATE_ERROR_CHARS
     ? detail.slice(0, MAX_CONTEXT_CREATE_ERROR_CHARS)
     : detail
@@ -649,6 +668,10 @@ export class ContextManager {
   #consecutiveCreateFailures = 0
   #lastContextCreateError = null
   #lastCreateFailureAt = 0
+  // Injectable clock/cooldown so the degraded -> ok -> success recovery can be
+  // exercised deterministically instead of sleeping through the wall clock.
+  #now
+  #createCooldown = CREATE_FAILURE_COOLDOWN_MS
   #allowDataPages
   #readiness = null
   // Bound on page.close/newPage during canceled-action recovery. It is an
@@ -668,6 +691,8 @@ export class ContextManager {
     recoveryTimeoutMs = RECOVERY_TIMEOUT_MS,
     contextCreateTimeoutMs = DEFAULT_CONTEXT_CREATE_TIMEOUT_MS,
     createFailureThreshold = DEFAULT_CREATE_FAILURE_THRESHOLD,
+    createFailureCooldownMs = CREATE_FAILURE_COOLDOWN_MS,
+    now = () => Date.now(),
   } = {}) {
     const parsed = Number(maxContexts)
     this.#maxContexts = Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CONTEXTS
@@ -687,6 +712,10 @@ export class ContextManager {
       Number.isInteger(failureThreshold) && failureThreshold > 0
         ? failureThreshold
         : DEFAULT_CREATE_FAILURE_THRESHOLD
+    const cooldown = Number(createFailureCooldownMs)
+    this.#createCooldown =
+      Number.isFinite(cooldown) && cooldown >= 0 ? Math.floor(cooldown) : CREATE_FAILURE_COOLDOWN_MS
+    this.#now = typeof now === "function" ? now : () => Date.now()
     this.#allowedHosts = normalizeAllowedHosts(
       Array.isArray(allowedHosts) && allowedHosts.length > 0 ? allowedHosts : [...DEFAULT_ALLOWED_HOSTS],
     )
@@ -769,7 +798,7 @@ export class ContextManager {
     }
     if (
       this.#consecutiveCreateFailures >= this.#createFailureThreshold &&
-      Date.now() - this.#lastCreateFailureAt < CREATE_FAILURE_COOLDOWN_MS
+      this.#now() - this.#lastCreateFailureAt < this.#createCooldown
     ) {
       return {
         status: "degraded",
@@ -778,7 +807,7 @@ export class ContextManager {
         lastContextCreateError,
       }
     }
-    if (this.#readiness && Date.now() - this.#readiness.at < READINESS_TTL_MS) {
+    if (this.#readiness && this.#now() - this.#readiness.at < READINESS_TTL_MS) {
       const cached = this.#readiness.result
       const browserUsable = this.#browser !== null && this.#browser.isConnected?.() === true
       if (cached.status !== "ok" || browserUsable) {
@@ -791,14 +820,14 @@ export class ContextManager {
         throw new Error("browser is not connected")
       }
       const result = { status: "ok", browserVersion: browser.version() }
-      this.#readiness = { at: Date.now(), result }
+      this.#readiness = { at: this.#now(), result }
       return { ...result, creating, lastContextCreateError }
     } catch (error) {
       const result = {
         status: "degraded",
         error: error instanceof Error ? error.message : String(error),
       }
-      this.#readiness = { at: Date.now(), result }
+      this.#readiness = { at: this.#now(), result }
       return { ...result, creating, lastContextCreateError }
     }
   }
@@ -862,7 +891,7 @@ export class ContextManager {
       return created
     } catch (error) {
       this.#consecutiveCreateFailures += 1
-      this.#lastCreateFailureAt = Date.now()
+      this.#lastCreateFailureAt = this.#now()
       this.#lastContextCreateError = formatContextCreateError(error)
       if (error instanceof ExecutorError && error.code === "executor_timeout") {
         creation.then(

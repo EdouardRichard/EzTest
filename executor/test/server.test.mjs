@@ -432,21 +432,30 @@ async function startProtocolServer(manager, logger = null) {
 // caller's x-ezt-test-request-id, so an API-side timeout can be matched to the
 // executor's own log line.
 test("request start and finish logs carry the x-ezt-test-request-id", async () => {
+  const requestId = "req_0123456789abcdef"
   const lines = []
-  const logger = {
-    info: (line) => lines.push(String(line)),
-    warn: (line) => lines.push(String(line)),
-    error: (line) => lines.push(String(line)),
+  let resolveFinish
+  const finished = new Promise((resolve) => {
+    resolveFinish = resolve
+  })
+  const record = (line) => {
+    const text = String(line)
+    lines.push(text)
+    if (text.includes("request finish") && text.includes(requestId)) {
+      resolveFinish()
+    }
   }
+  const logger = { info: record, warn: record, error: record }
   const protocol = await startProtocolServer(fakeManager(), logger)
   try {
-    const requestId = "req_0123456789abcdef"
     const response = await protocol.request("/healthz", {
       token: undefined,
       headers: { "x-ezt-test-request-id": requestId },
     })
     assert.equal(response.status, 200, response.text)
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    // The finish line is emitted when the response is fully flushed; awaiting
+    // it removes the previous sleep without racing the logger.
+    await finished
     assert.ok(
       lines.some((line) => line.includes("request start") && line.includes(requestId)),
       `missing start log with the request id:\n${lines.join("\n")}`,
@@ -475,6 +484,30 @@ test("healthz exposes creating and lastContextCreateError", async () => {
     assert.equal(response.status, 200, response.text)
     assert.equal(response.json.creating, 1)
     assert.equal(response.json.lastContextCreateError, lastContextCreateError)
+  } finally {
+    await protocol.close()
+  }
+})
+
+// /healthz is reachable without a bearer token, so a create-failure diagnostic
+// must never expose URL credentials, bearer tokens or secret query parameters.
+test("healthz scrubs credentials from lastContextCreateError", async () => {
+  const raw =
+    "context create failed: https://alice:s3cret@example.test/app?token=tok_live_123&inert=1 with Bearer abc.def.ghi"
+  const protocol = await startProtocolServer(
+    fakeManager({
+      async health() {
+        return { status: "ok", creating: 0, lastContextCreateError: raw }
+      },
+    }),
+  )
+  try {
+    const response = await protocol.request("/healthz", { token: undefined })
+    assert.equal(response.status, 200, response.text)
+    const exposed = String(response.json.lastContextCreateError ?? "")
+    assert.doesNotMatch(exposed, /s3cret|tok_live_123|abc\.def\.ghi|alice:/)
+    assert.match(exposed, /https:\/\/\*\*\*@example\.test/)
+    assert.match(exposed, /inert=1/)
   } finally {
     await protocol.close()
   }

@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -82,6 +83,64 @@ func TestBrowserAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
 	}
 	if got, _ := details["attempt"].(int); got != 2 {
 		t.Fatalf("details.attempt = %#v, want 2", details["attempt"])
+	}
+}
+
+// TestInt64FromMetadataNormalizesNumericIDs pins the diagnostic id validation:
+// only positive integral values are accepted, so a fractional or negative
+// metadata value cannot be truncated into a misleading correlation id.
+func TestInt64FromMetadataNormalizesNumericIDs(t *testing.T) {
+	cases := []struct {
+		name  string
+		value any
+		want  int64
+	}{
+		{"json number", json.Number("42"), 42},
+		{"numeric string", "42", 42},
+		{"int64", int64(42), 42},
+		{"int", 42, 42},
+		{"integral float", float64(42), 42},
+		{"integral float64 literal", 42.0, 42},
+		{"fractional float", 42.5, 0},
+		{"fractional json number", json.Number("42.5"), 0},
+		{"negative float", float64(-3), 0},
+		{"negative int64", int64(-3), 0},
+		{"negative int", -3, 0},
+		{"negative string", "-3", 0},
+		{"non-numeric string", "abc", 0},
+		{"nil value", nil, 0},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := map[string]any{"case_run_id": tc.value}
+			if got := int64FromMetadata(metadata, "case_run_id"); got != tc.want {
+				t.Fatalf("int64FromMetadata(%#v) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
+	}
+	if got := int64FromMetadata(nil, "case_run_id"); got != 0 {
+		t.Fatalf("int64FromMetadata(nil) = %d, want 0", got)
+	}
+}
+
+// TestExecutorProbeMapsContextCreateDiagnostics proves the application port
+// carries the new /healthz creating/lastContextCreateError fields.
+func TestExecutorProbeMapsContextCreateDiagnostics(t *testing.T) {
+	const lastError = "executor_timeout: context creation exceeded its hard deadline"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"status":"degraded","contexts":0,"maxContexts":2,"creating":1,"lastContextCreateError":"`+lastError+`"}`)
+	}))
+	defer server.Close()
+	probe := NewExecutorProbe(executorinfra.NewClient(server.URL, "test", time.Second))
+
+	health, err := probe.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health.Creating != 1 || health.LastContextCreateError != lastError {
+		t.Fatalf("ExecutorHealth = %+v, want creating=1 lastContextCreateError=%q", health, lastError)
 	}
 }
 

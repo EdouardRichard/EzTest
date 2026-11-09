@@ -286,8 +286,10 @@ type CaseRunDispatchDiagnostic struct {
 	ExecutorStatus  string `json:"executor_status,omitempty"`
 	LastHeartbeat   string `json:"last_heartbeat,omitempty"`
 	ExecutorVersion string `json:"version,omitempty"`
-	// RegistryHit is false when the call had to fall back to the configured
-	// primary endpoint instead of a registered owner.
+	// RegistryHit is the selection-time flag: true when the scheduler picked a
+	// registered executor row (owner id > 0), not a dial-time claim. The
+	// dial-route truth is the router-level registry_hit in the client error
+	// details (false there means primary-endpoint fallback).
 	RegistryHit bool   `json:"registry_hit"`
 	DispatchAt  string `json:"dispatch_at,omitempty"`
 	Attempt     int    `json:"attempt,omitempty"`

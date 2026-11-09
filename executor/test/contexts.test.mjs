@@ -231,7 +231,8 @@ test("createContext times out with executor_timeout and reports creating", { tim
         (value) => ({ value }),
         (error) => ({ error }),
       )
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    // `creating` is incremented synchronously before the first await, so the
+    // health probe observes the in-flight creation without a sleep.
     const during = await manager.health()
     assert.equal(during.creating, 1, "health must expose the in-flight context creation")
     const { error } = await outcome
@@ -246,9 +247,18 @@ test("createContext times out with executor_timeout and reports creating", { tim
 })
 
 // A browser.newContext that resolves after the deadline must not leak an
-// unguarded, untracked browser context: the late result is closed.
+// unguarded, untracked browser context: the late result is closed. The launch
+// promise and the close signal are test-controlled, so the test never races a
+// sleep against the deadline.
 test("createContext closes a context that appears after the deadline", { timeout: 5_000 }, async () => {
-  let closed = false
+  let resolveLaunch
+  const launched = new Promise((resolve) => {
+    resolveLaunch = resolve
+  })
+  let resolveClosed
+  const closed = new Promise((resolve) => {
+    resolveClosed = resolve
+  })
   const page = { on() {}, once() {}, async close() {} }
   const context = {
     async addInitScript() {},
@@ -262,16 +272,13 @@ test("createContext closes a context that appears after the deadline", { timeout
       return { async send() {}, on() {}, async detach() {} }
     },
     async close() {
-      closed = true
+      resolveClosed()
     },
   }
   const browser = {
     version: () => "fake-1.0.0",
     isConnected: () => true,
-    async newContext() {
-      await new Promise((resolve) => setTimeout(resolve, 80))
-      return context
-    },
+    newContext: () => launched,
     async close() {},
   }
   const manager = new ContextManager({
@@ -285,8 +292,9 @@ test("createContext closes a context that appears after the deadline", { timeout
       () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
       (error) => error && error.code === "executor_timeout",
     )
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    assert.equal(closed, true, "the half-created context must be closed after the timeout")
+    // The browser context appears only after the hard deadline.
+    resolveLaunch(context)
+    await closed
     assert.equal(manager.size, 0)
   } finally {
     await manager.close()
@@ -319,6 +327,86 @@ test("repeated context create failures degrade health", async () => {
     const health = await manager.health()
     assert.equal(health.status, "degraded")
     assert.match(String(health.lastContextCreateError ?? ""), /context launch exploded/)
+  } finally {
+    await manager.close()
+  }
+})
+
+// The degraded marker must expire after its cooldown so a recovered browser can
+// be retried, and a successful create must reset the failure streak. The clock
+// and the cooldown are injected so this is deterministic.
+test("degraded create health recovers after the cooldown and a success", async () => {
+  let now = 1_000
+  let remainingFailures = 3
+  const browser = fakeBrowser([])
+  const realNewContext = browser.newContext.bind(browser)
+  browser.newContext = async (options) => {
+    if (remainingFailures > 0) {
+      remainingFailures -= 1
+      throw new Error("context launch exploded")
+    }
+    return realNewContext(options)
+  }
+  const manager = new ContextManager({
+    maxContexts: 1,
+    createFailureThreshold: 3,
+    createFailureCooldownMs: 1_000,
+    now: () => now,
+    launch: async () => browser,
+    logger: null,
+  })
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await assert.rejects(
+        () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
+        /context launch exploded/,
+      )
+    }
+    assert.equal((await manager.health()).status, "degraded")
+
+    // One tick before the cooldown expires the executor stays degraded.
+    now += 999
+    assert.equal((await manager.health()).status, "degraded")
+
+    // After the cooldown the readiness probe may retry and recover.
+    now += 1
+    assert.equal((await manager.health()).status, "ok")
+
+    const created = await manager.createContext({ allowedHosts: ["127.0.0.1"] })
+    assert.match(created.contextId, /^ctx_/)
+    const recovered = await manager.health()
+    assert.equal(recovered.status, "ok")
+    assert.equal(recovered.lastContextCreateError, null, "a successful create clears the diagnostic")
+  } finally {
+    await manager.close()
+  }
+})
+
+// The unauthenticated /healthz must not leak credentials embedded in the
+// create-failure text (URL userinfo, bearer tokens, secret query parameters).
+test("lastContextCreateError scrubs URL credentials and secrets", async () => {
+  const manager = new ContextManager({
+    maxContexts: 1,
+    launch: async () => ({
+      version: () => "fake-1.0.0",
+      isConnected: () => true,
+      async newContext() {
+        throw new Error(
+          "launch failed for https://alice:s3cret@example.test/app?token=tok_live_123&inert=1 with Bearer abc.def.ghi",
+        )
+      },
+      async close() {},
+    }),
+    logger: null,
+  })
+  try {
+    await assert.rejects(
+      () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
+      /launch failed/,
+    )
+    const text = String((await manager.health()).lastContextCreateError ?? "")
+    assert.doesNotMatch(text, /s3cret|tok_live_123|abc\.def\.ghi|alice:/)
+    assert.match(text, /https:\/\/\*\*\*@example\.test/)
   } finally {
     await manager.close()
   }

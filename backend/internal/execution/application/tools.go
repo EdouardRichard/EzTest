@@ -144,6 +144,7 @@ func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution
 		ExecutorID:   caseRunExecutorID(caseRun),
 		Metadata: map[string]any{
 			"case_run_id":    platformid.Format(caseRun.ID),
+			"attempt":        caseRun.Attempts,
 			"version_sut_id": platformid.Format(binding.VersionSUTID),
 			"account_role":   role,
 			"dispatch_epoch": platformid.Format(caseRun.DispatchEpoch),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
@@ -92,7 +93,10 @@ func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.Br
 	return info.ID, nil
 }
 
-// Action runs one executor action and maps its envelope.
+// Action runs one executor action and maps its envelope. Only context_id (plus
+// the route provenance) is attached here: case_run_id/attempt are stamped on
+// the create metadata, so an Action (or Cancel/Close) transport failure carries
+// context_id but no attempt until a caller plumbs it.
 func (a *BrowserAdapter) Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
@@ -197,12 +201,14 @@ func (a *ExecutorProbeAdapter) Health(ctx context.Context) (executionapp.Executo
 		return executionapp.ExecutorHealth{}, err
 	}
 	return executionapp.ExecutorHealth{
-		Status:         health.Status,
-		Version:        health.Version,
-		Contexts:       health.Contexts,
-		MaxContexts:    health.MaxContexts,
-		BrowserVersion: health.BrowserVersion,
-		Error:          health.Error,
+		Status:                 health.Status,
+		Version:                health.Version,
+		Contexts:               health.Contexts,
+		MaxContexts:            health.MaxContexts,
+		BrowserVersion:         health.BrowserVersion,
+		Error:                  health.Error,
+		Creating:               health.Creating,
+		LastContextCreateError: health.LastContextCreateError,
 	}, nil
 }
 
@@ -353,11 +359,19 @@ func int64FromMetadata(metadata map[string]any, key string) int64 {
 			return parsed
 		}
 	case int64:
-		return value
+		if value > 0 {
+			return value
+		}
 	case int:
-		return int64(value)
+		if value > 0 {
+			return int64(value)
+		}
 	case float64:
-		return int64(value)
+		// Only a positive integral value is a valid id: truncating 42.9 or a
+		// negative/non-finite number would invent a misleading correlation.
+		if value > 0 && value <= math.MaxInt64 && value == math.Trunc(value) {
+			return int64(value)
+		}
 	}
 	return 0
 }

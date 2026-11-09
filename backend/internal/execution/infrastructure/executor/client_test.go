@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -528,6 +529,124 @@ func TestClientDoesNotFollowRedirects(t *testing.T) {
 	}
 	if atomic.LoadInt32(&leaked) != 0 {
 		t.Fatalf("client followed the redirect, which would leak the bearer token")
+	}
+}
+
+// TestSlowBodyReadTimeoutIsTypedExecutorTimeout pins the review finding that
+// http.Client.Timeout also bounds reading the response body (up to 32 MiB for
+// artifacts): a body-read timeout must surface as executor_timeout with the
+// body phase instead of a generic executor_unavailable. Locally detected
+// timeouts use the same 504 status as the executor's own envelope.
+func TestSlowBodyReadTimeoutIsTypedExecutorTimeout(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		// Send the headers and a partial body, then stall well past the client
+		// timeout so io.ReadAll fails while reading the body.
+		_, _ = w.Write([]byte(`{"contextId":"ctx_slow"`))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	client := executor.NewClientWithHTTPClient(server.URL, testToken, &http.Client{Timeout: 80 * time.Millisecond})
+
+	_, err := client.CreateContext(context.Background(), executor.CreateContextInput{
+		AllowedHosts: []string{"127.0.0.1"},
+	})
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_timeout" || !perr.Retryable {
+		t.Fatalf("error = %+v, want retryable executor_timeout for a slow body read", perr)
+	}
+	if perr.Status != http.StatusGatewayTimeout {
+		t.Fatalf("error status = %d, want 504 (executor_timeout is always 504)", perr.Status)
+	}
+	requireDiagnosticDetails(t, perr, server.URL, http.MethodPost, "/v1/contexts")
+	if phase, _ := perr.Details["phase"].(string); phase != "body" {
+		t.Fatalf("details.phase = %q, want body", phase)
+	}
+	if got := detailInt64(t, perr.Details, "timeout_ms"); got != 80 {
+		t.Fatalf("details.timeout_ms = %d, want 80", got)
+	}
+	if status := detailInt64(t, perr.Details, "status_code"); status != http.StatusOK {
+		t.Fatalf("details.status_code = %d, want 200 (the headers were received)", status)
+	}
+}
+
+// Test5xxTypedEnvelopeStaysExecutorUnavailable pins the documented contract: a
+// 5xx maps to executor_unavailable unless it is an explicit executor_timeout,
+// so an arbitrary executor code cannot leak into the API's failure taxonomy
+// (Task 11 classifies executor_unavailable as an environment failure).
+func Test5xxTypedEnvelopeStaysExecutorUnavailable(t *testing.T) {
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+	} {
+		status := status
+		for _, code := range []string{"canceled", "page_not_found", "internal", ""} {
+			code := code
+			t.Run(fmt.Sprintf("status_%d_code_%q", status, code), func(t *testing.T) {
+				client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"` + code + `","message":"boom"}}`))
+				})
+				_, err := client.ListContexts(context.Background())
+				perr := asPlatformError(t, err)
+				if perr.Code != "executor_unavailable" || !perr.Retryable {
+					t.Fatalf("error = %+v, want retryable executor_unavailable for a %d %q envelope", perr, status, code)
+				}
+				if code != "" && perr.Code == code {
+					t.Fatalf("executor code %q leaked into the platform error", code)
+				}
+				if got := detailInt64(t, perr.Details, "status_code"); got != int64(status) {
+					t.Fatalf("details.status_code = %d, want %d", got, status)
+				}
+			})
+		}
+	}
+}
+
+// TestAction5xxTypedEnvelopeStaysExecutorUnavailable covers the action endpoint:
+// its 5xx path must apply the same taxonomy instead of forwarding the envelope
+// code.
+func TestAction5xxTypedEnvelopeStaysExecutorUnavailable(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"canceled","message":"boom"}}`))
+	})
+	_, err := client.Action(context.Background(), "ctx_1", "goto", nil)
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_unavailable" || !perr.Retryable {
+		t.Fatalf("error = %+v, want retryable executor_unavailable", perr)
+	}
+	if phase, _ := perr.Details["phase"].(string); phase != "response" {
+		t.Fatalf("details.phase = %q, want response", phase)
+	}
+}
+
+// TestHealthParsesCreatingAndLastContextCreateError pins the new /healthz
+// diagnostic fields the executor exposes (X-01).
+func TestHealthParsesCreatingAndLastContextCreateError(t *testing.T) {
+	const lastError = "executor_timeout: context creation exceeded its hard deadline"
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"degraded","contexts":0,"maxContexts":4,"creating":2,"lastContextCreateError":"` + lastError + `"}`))
+	})
+	health, err := client.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health.Creating != 2 {
+		t.Fatalf("health.creating = %d, want 2", health.Creating)
+	}
+	if health.LastContextCreateError != lastError {
+		t.Fatalf("health.lastContextCreateError = %q, want %q", health.LastContextCreateError, lastError)
 	}
 }
 

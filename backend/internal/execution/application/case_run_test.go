@@ -19,6 +19,7 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	executorexec "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/executor"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
 type caseRunnerFixture struct {
@@ -669,6 +670,14 @@ func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
 	}
 	if fixture.browser.lastSpec.ExecutorID != 7 {
 		t.Fatalf("context spec executor = %d, want 7", fixture.browser.lastSpec.ExecutorID)
+	}
+	// X-01 review: the create metadata is the only producer that correlates a
+	// browser context with its dispatch attempt, so it must stamp both ids.
+	if got, _ := fixture.browser.lastSpec.Metadata["case_run_id"].(string); got != platformid.Format(caseRow.ID) {
+		t.Fatalf("context metadata case_run_id = %v, want %s", fixture.browser.lastSpec.Metadata["case_run_id"], platformid.Format(caseRow.ID))
+	}
+	if got, ok := fixture.browser.lastSpec.Metadata["attempt"].(int); !ok || got != caseRow.Attempts {
+		t.Fatalf("context metadata attempt = %v, want %d", fixture.browser.lastSpec.Metadata["attempt"], caseRow.Attempts)
 	}
 	row, ok := fixture.sutContext.row(7, "admin")
 	if !ok || row.Status != execution.SUTContextActive || row.BrowserContextID != "ctx_1" {

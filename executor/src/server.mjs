@@ -12,7 +12,7 @@ import http from "node:http"
 import { pathToFileURL } from "node:url"
 
 import { createExploreRuntime } from "./actions/explore.mjs"
-import { ContextManager, DEFAULT_CONTEXT_CREATE_TIMEOUT_MS } from "./contexts.mjs"
+import { ContextManager, DEFAULT_CONTEXT_CREATE_TIMEOUT_MS, sanitizeDiagnosticText } from "./contexts.mjs"
 import { parseAllowedHosts } from "./limits.mjs"
 import { startPushFromEnv } from "./push.mjs"
 import {
@@ -229,7 +229,12 @@ export function createExecutorServer({
         typeof executor.health === "function" ? await executor.health() : { status: "ok" }
       const ready = health.status === "ok"
       const creating = Number.isInteger(health.creating) ? health.creating : 0
-      const lastContextCreateError = health.lastContextCreateError ?? null
+      // Defense in depth: /healthz is unauthenticated, so even an injected
+      // manager's diagnostic is scrubbed of URL credentials/secrets here.
+      const lastContextCreateError =
+        health.lastContextCreateError == null
+          ? null
+          : sanitizeDiagnosticText(health.lastContextCreateError)
       return sendJson(res, ready ? 200 : 503, {
         status: health.status,
         version,

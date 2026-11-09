@@ -666,6 +666,9 @@ func isInfraFailure(class execution.FailureClass) bool {
 // dispatchDiagnostic snapshots the executor selected for one attempt. It is
 // persisted in case_run.summary["dispatch"] (no migration, X-01) so a later
 // timeout/lost-executor verdict can say which endpoint the run was sent to.
+// RegistryHit is selection-time only (executor.ID > 0): it records that the
+// scheduler found a registered owner row, not that the later dial used the
+// registry. The dial-route truth lives in the router/client error details.
 func dispatchDiagnostic(executor *execution.ExecutorInstance, at time.Time, attempt int) *execution.CaseRunDispatchDiagnostic {
 	diagnostic := &execution.CaseRunDispatchDiagnostic{
 		DispatchAt: at.UTC().Format(time.RFC3339Nano),

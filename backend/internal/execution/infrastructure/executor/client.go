@@ -54,7 +54,9 @@ const (
 // CallDiagnostics is the dispatch provenance attached to one executor call. The
 // router/adapter layers know the owner and context; every field is optional and
 // is copied into the structured error details/log line when known. It never
-// carries credentials.
+// carries credentials. CreateContext is the only call that receives
+// case_run_id/attempt (from the create metadata); Action/Cancel/Close attach
+// only context_id (plus owner/endpoint/registry_hit) for now.
 type CallDiagnostics struct {
 	OwnerExecutorID int64
 	CaseRunID       int64
@@ -502,6 +504,14 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, payload a
 	result.duration = time.Since(started)
 	result.status, result.body = response.StatusCode, raw
 	if readErr != nil {
+		// io.ReadAll can fail after the headers because http.Client.Timeout also
+		// bounds the body (artifacts travel up to 32 MiB). A timeout or
+		// cancellation there is the same transport failure as one before the
+		// headers, so it keeps the executor_timeout taxonomy instead of being
+		// flattened into executor_unavailable.
+		if transportTimedOutOrCanceled(ctx, readErr) {
+			return nil, result.failure("body", transportError(ctx, readErr))
+		}
 		return nil, result.failure("body", unavailable("executor response could not be read"))
 	}
 	return result, nil
@@ -522,15 +532,14 @@ func (c *HTTPClient) effectiveTimeout(ctx context.Context) time.Duration {
 
 // transportError maps a failed exchange onto the typed transport taxonomy.
 func transportError(ctx context.Context, err error) *platform.Error {
-	timedOut := errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(ctx.Err(), context.DeadlineExceeded) ||
-		isTimeoutError(err)
-	canceled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
-	if !timedOut && !canceled {
+	if !transportTimedOutOrCanceled(ctx, err) {
 		return unavailable("executor request failed: " + sanitizeTransportError(err))
 	}
+	canceled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 	apiErr := &platform.Error{
-		Status:    http.StatusServiceUnavailable,
+		// Every executor_timeout uses the same 504 status as the executor's own
+		// typed envelope, whether the deadline was detected locally or remotely.
+		Status:    http.StatusGatewayTimeout,
 		Code:      CodeExecutorTimeout,
 		Retryable: !canceled,
 	}
@@ -540,6 +549,17 @@ func transportError(ctx context.Context, err error) *platform.Error {
 		apiErr.Message = "executor request timed out: " + sanitizeTransportError(err)
 	}
 	return apiErr
+}
+
+// transportTimedOutOrCanceled reports whether err (or the caller's context) is a
+// deadline or cancellation, including a response-body read that was interrupted
+// by http.Client.Timeout.
+func transportTimedOutOrCanceled(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+		isTimeoutError(err) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(ctx.Err(), context.Canceled)
 }
 
 func isTimeoutError(err error) bool {
@@ -583,9 +603,10 @@ func ensureOK(result *httpResult) error {
 	return result.failure("response", executorError(result))
 }
 
-// executorError converts an executor error envelope into a *platform.Error. An
-// untyped 5xx response stays the retryable executor_unavailable code, while a
-// typed executor_timeout reply keeps its own code.
+// executorError converts an executor error envelope into a *platform.Error.
+// Every 5xx is the retryable executor_unavailable environment failure, except
+// an explicit executor_timeout reply. Forwarding an arbitrary executor code
+// would leak it into the API failure taxonomy (Task 11 classifies these).
 func executorError(result *httpResult) *platform.Error {
 	var envelope struct {
 		Error struct {
@@ -596,25 +617,15 @@ func executorError(result *httpResult) *platform.Error {
 	_ = json.Unmarshal(result.body, &envelope)
 	code := envelope.Error.Code
 	if result.status >= http.StatusInternalServerError {
-		switch code {
-		case "", "internal":
-			return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
-		case CodeExecutorTimeout:
+		if code == CodeExecutorTimeout {
 			return &platform.Error{
-				Status:    result.status,
+				Status:    http.StatusGatewayTimeout,
 				Code:      CodeExecutorTimeout,
 				Message:   envelope.Error.Message,
 				Retryable: true,
 			}
-		default:
-			// A typed 5xx is still a temporary environment failure.
-			return &platform.Error{
-				Status:    result.status,
-				Code:      code,
-				Message:   envelope.Error.Message,
-				Retryable: true,
-			}
 		}
+		return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
 	}
 	if code == "" {
 		return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
