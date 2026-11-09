@@ -468,27 +468,55 @@ func TestLoginReturnsOpaqueTokenAndAudits(t *testing.T) {
 
 func TestLoginFailuresAreRejectedAndAudited(t *testing.T) {
 	cases := []struct {
-		name     string
-		username string
-		password string
-		prepare  func(t *testing.T, env *testEnv)
+		name       string
+		username   string
+		password   string
+		wantStatus int
+		wantCode   string
+		wantReason string
+		prepare    func(t *testing.T, env *testEnv)
 	}{
 		{
-			name:     "unknown user",
-			username: "nobody",
-			password: "whatever-1",
-			prepare:  func(*testing.T, *testEnv) {},
+			name:       "unknown user",
+			username:   "nobody",
+			password:   "whatever-1",
+			wantStatus: 401,
+			wantCode:   "unauthenticated",
+			wantReason: "unknown_user",
+			prepare:    func(*testing.T, *testEnv) {},
 		},
 		{
-			name:     "wrong password",
-			username: "admin",
-			password: "wrong-password",
-			prepare:  func(t *testing.T, env *testEnv) { env.seedAdmin(t) },
+			name:       "wrong password",
+			username:   "admin",
+			password:   "wrong-password",
+			wantStatus: 401,
+			wantCode:   "unauthenticated",
+			wantReason: "invalid_password",
+			prepare:    func(t *testing.T, env *testEnv) { env.seedAdmin(t) },
 		},
 		{
-			name:     "disabled user",
-			username: "qa01",
-			password: "qa-password",
+			// A disabled account is only distinguished after the password
+			// verified, so the operator gets an actionable code without
+			// turning the endpoint into a user-enumeration oracle.
+			name:       "disabled user with the correct password",
+			username:   "qa01",
+			password:   "qa-password",
+			wantStatus: 403,
+			wantCode:   "account_disabled",
+			wantReason: "disabled",
+			prepare: func(t *testing.T, env *testEnv) {
+				user := env.seedUser(t, "qa01", "qa-password")
+				user.Status = identity.StatusDisabled
+				env.repo.users[user.ID] = user
+			},
+		},
+		{
+			name:       "disabled user with a wrong password",
+			username:   "qa01",
+			password:   "wrong-password",
+			wantStatus: 401,
+			wantCode:   "unauthenticated",
+			wantReason: "invalid_password",
 			prepare: func(t *testing.T, env *testEnv) {
 				user := env.seedUser(t, "qa01", "qa-password")
 				user.Status = identity.StatusDisabled
@@ -502,7 +530,10 @@ func TestLoginFailuresAreRejectedAndAudited(t *testing.T) {
 			tc.prepare(t, env)
 
 			_, err := env.svc.Login(context.Background(), tc.username, tc.password, testRequestID, "192.0.2.5", "ua")
-			assertAPIError(t, err, 401, "unauthenticated")
+			apiErr := assertAPIError(t, err, tc.wantStatus, tc.wantCode)
+			if apiErr.Message == "" {
+				t.Fatal("API error carries no English message")
+			}
 			if len(env.repo.tokens) != 0 {
 				t.Fatalf("failed login stored %d tokens", len(env.repo.tokens))
 			}
@@ -515,6 +546,9 @@ func TestLoginFailuresAreRejectedAndAudited(t *testing.T) {
 			}
 			if event.Metadata["username"] != tc.username {
 				t.Fatalf("audit metadata = %#v", event.Metadata)
+			}
+			if event.Metadata["reason"] != tc.wantReason {
+				t.Fatalf("audit reason = %#v, want %q", event.Metadata["reason"], tc.wantReason)
 			}
 			if _, ok := event.Metadata["password"]; ok {
 				t.Fatal("audit metadata contains a password")

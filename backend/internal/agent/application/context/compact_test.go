@@ -665,8 +665,8 @@ func getContextPacket(t *testing.T, handler http.Handler, path string, headers m
 }
 
 // TestContextPacketReadAPI serves GET /api/versions/{id}/context-packets/latest
-// and pins authentication, ID validation, not-found mapping and the frozen
-// packet projection.
+// and pins authentication, ID validation, the empty-read mapping (200 with a
+// null data body when no packet exists) and the frozen packet projection.
 func TestContextPacketReadAPI(t *testing.T) {
 	assembler := agentcontext.NewAssembler()
 	request := baseRequest()
@@ -798,11 +798,20 @@ func TestContextPacketReadAPI(t *testing.T) {
 		}
 	}
 
-	// No packet for the version maps to 404.
+	// No packet for the version is an empty read, not an error: the browser
+	// network layer must not record a 404 for a version that simply has no
+	// cached packet yet (G-09 contract: 200 {"data":null}).
 	notFound := newContextPacketServer(t, &fakeContextPacketReader{err: agentcontext.ErrContextPacketNotFound})
 	missing := getContextPacket(t, notFound, "/api/versions/9/context-packets/latest", nil)
-	if missing.Code != http.StatusNotFound {
+	if missing.Code != http.StatusOK {
 		t.Fatalf("missing packet status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+	var missingPayload map[string]json.RawMessage
+	if err := json.Unmarshal(missing.Body.Bytes(), &missingPayload); err != nil {
+		t.Fatalf("decode missing packet body %q: %v", missing.Body.String(), err)
+	}
+	if raw, ok := missingPayload["data"]; !ok || string(raw) != "null" {
+		t.Fatalf("missing packet data = %s, want null", string(raw))
 	}
 
 	// An unwired reader is unavailable rather than a panic.
