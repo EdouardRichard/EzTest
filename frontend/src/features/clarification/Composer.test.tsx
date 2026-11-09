@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { useRef, useState } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
@@ -458,6 +458,42 @@ describe("Composer", () => {
     expect(onSend.mock.calls[1][0]).toEqual([{ type: "text", text: "请读附件" }])
     expect(await screen.findByTestId("composer-sent-note")).toHaveTextContent("已发送")
     expect(textarea).toHaveValue("等待期间写的新消息")
+  })
+
+  it("keeps text typed while the queued retry timer is pending", async () => {
+    vi.useFakeTimers()
+    // Production path: the backend's `isAttachmentPending` only emits
+    // pending/processing stages, so the retry runs from the timer scheduled by
+    // the `error` effect, never from the (unreachable) `done` branch.
+    const onSend = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    const queued = attachmentPending({ stage: "queued", retry_after_seconds: 2 })
+
+    render(<AutoRetryHarness onSend={onSend} errors={[queued]} />)
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId("composer-retry-progress")).toHaveTextContent("2 秒后自动重试")
+
+    // The textarea stays editable while the retry timer waits; this render must
+    // not reschedule the timer (the effect only depends on `error`).
+    fireEvent.change(textarea, { target: { value: "等待期间写的新消息" } })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+
+    expect(onSend).toHaveBeenCalledTimes(2)
+    // The retry still posts the chain snapshot captured at chain creation.
+    expect(onSend.mock.calls[1][0]).toEqual([{ type: "text", text: "请读附件" }])
+    // The timer callback runs from the render that scheduled it; the comparison
+    // must use the live draft, not that stale closure, or this text is wiped.
+    expect(textarea).toHaveValue("等待期间写的新消息")
+    expect(screen.getByTestId("composer-sent-note")).toHaveTextContent("已发送")
   })
 
   it("stops auto-retry on a failed parse and shows the reason", async () => {

@@ -126,6 +126,12 @@ export function Composer({
   const chainRef = useRef<RetryChain | null>(null)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // The latest rendered draft, kept in a ref because a retry timer scheduled by
+  // an earlier render captures `finishChain`/`buildParts` from that render. The
+  // `error`-only effect never reschedules on a draft edit, so a delayed success
+  // must compare the chain snapshot against this live value — otherwise a stale
+  // closure sees equality and `clearDraft` wipes text typed during the wait.
+  const livePartsRef = useRef<NewMessagePart[]>([])
 
   const value = text ?? internalValue
   const hasContent = value.trim().length > 0 || attachments.length > 0 || caseReferences.length > 0
@@ -185,6 +191,9 @@ export function Composer({
     return parts
   }
 
+  // Refresh on every render so an async completion reads the draft as it is now.
+  livePartsRef.current = buildParts()
+
   function clearDraft(): void {
     updateValue("")
     setAttachments([])
@@ -209,7 +218,7 @@ export function Composer({
    * parse wait are kept and a `已发送` note explains why.
    */
   function finishChain(chain: RetryChain): void {
-    const draftUnchanged = sameParts(buildParts(), chain.parts)
+    const draftUnchanged = sameParts(livePartsRef.current, chain.parts)
     chainRef.current = null
     clearRetryTimers()
     setProgress(null)

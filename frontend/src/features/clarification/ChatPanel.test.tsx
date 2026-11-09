@@ -48,6 +48,9 @@ describe("ChatPanel", () => {
     api.rollbackRequirement.mockReset()
     api.uploadContent.mockReset()
     api.getAttachmentPendingDetails.mockReset()
+    // Matches the real helper's "not a typed 409" result so a non-retry test
+    // never makes a decision on an accidental `undefined`.
+    api.getAttachmentPendingDetails.mockReturnValue(null)
     api.listMessages.mockResolvedValue([messageFixture, userMessageFixture])
   })
 
