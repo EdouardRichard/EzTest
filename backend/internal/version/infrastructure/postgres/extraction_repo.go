@@ -931,6 +931,9 @@ func normalizeReconciliationReport(report versionapp.ReconciliationReport) versi
 	if report.MissingIDs == nil {
 		report.MissingIDs = []string{}
 	}
+	if report.SkippedIDs == nil {
+		report.SkippedIDs = []string{}
+	}
 	if report.PlannedIDs == nil {
 		report.PlannedIDs = []string{}
 	}
@@ -977,6 +980,43 @@ func (r *ExtractionRepository) ListExtractedExternalIDs(ctx context.Context, ver
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list extracted external ids: %w", err)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// ListSkippedExternalIDs returns the unique external ids of non-draft
+// extraction requirements of the version, sorted for deterministic
+// reconciliation. UpsertExtractedRequirements refuses to overwrite them (C-03
+// product decision), so the report must list them as skipped instead of
+// missing.
+func (r *ExtractionRepository) ListSkippedExternalIDs(ctx context.Context, versionID int64) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT external_id FROM requirement
+		WHERE version_id = $1
+		  AND source_key LIKE 'extraction:%'
+		  AND status <> 'draft'
+		  AND external_id <> ''
+	`, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("list skipped external ids: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{})
+	ids := make([]string, 0)
+	for rows.Next() {
+		var externalID string
+		if err := rows.Scan(&externalID); err != nil {
+			return nil, fmt.Errorf("list skipped external ids: scan: %w", err)
+		}
+		if _, duplicate := seen[externalID]; duplicate {
+			continue
+		}
+		seen[externalID] = struct{}{}
+		ids = append(ids, externalID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list skipped external ids: %w", err)
 	}
 	sort.Strings(ids)
 	return ids, nil

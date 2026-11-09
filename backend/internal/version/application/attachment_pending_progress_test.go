@@ -92,3 +92,40 @@ func TestAttachmentPendingProgressStages(t *testing.T) {
 		t.Fatalf("done stage = %#v", done["stage"])
 	}
 }
+
+// TestAttachmentPendingETADecaysFromHeartbeat pins the polling behavior: the
+// ETA is the remaining analysis estimate minus the elapsed time since the last
+// parent heartbeat, so repeated 409 polls see it shrink instead of staying
+// frozen (floored at 1 second). percent counts terminal rows including
+// failed/skipped because those images are no longer pending work.
+func TestAttachmentPendingETADecaysFromHeartbeat(t *testing.T) {
+	now := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	images := []version.AttachmentImageRecord{
+		{ID: 1, AttachmentID: 1, Seq: 1, Status: version.AttachmentImageDone,
+			CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-5 * time.Minute)},
+		{ID: 2, AttachmentID: 1, Seq: 2, Status: version.AttachmentImageDone,
+			CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-5 * time.Minute)},
+		{ID: 3, AttachmentID: 1, Seq: 3, Status: version.AttachmentImageExtracted,
+			CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute)},
+		{ID: 4, AttachmentID: 1, Seq: 4, Status: version.AttachmentImageExtracted,
+			CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute)},
+	}
+	details := attachmentPendingDetails(version.Attachment{
+		ID: 1, ExtractionStatus: version.AttachmentProcessing,
+		UpdatedAt: now.Add(-2 * time.Minute),
+	}, images, now)
+	if details["percent"] != 50 {
+		t.Fatalf("percent = %#v, want 50 for 2/4 terminal images", details["percent"])
+	}
+	// 2 remaining x 5m average - 2m elapsed = 8m.
+	if eta := details["eta_seconds"]; eta != 480 {
+		t.Fatalf("eta_seconds = %#v, want 480 after the heartbeat decay", eta)
+	}
+	staleHeartbeat := attachmentPendingDetails(version.Attachment{
+		ID: 1, ExtractionStatus: version.AttachmentProcessing,
+		UpdatedAt: now.Add(-time.Hour),
+	}, images, now)
+	if eta := staleHeartbeat["eta_seconds"]; eta != 1 {
+		t.Fatalf("eta_seconds = %#v, want the 1 second floor", eta)
+	}
+}

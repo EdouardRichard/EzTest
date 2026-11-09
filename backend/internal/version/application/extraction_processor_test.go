@@ -324,3 +324,74 @@ func TestDeterministicProcessorBodyMissingAC(t *testing.T) {
 		t.Fatalf("constraints = %#v, want needs_review + reason", constraints)
 	}
 }
+
+// TestDeterministicProcessorTableTitleCapped pins the guardrail against an
+// unbounded catalog title: a long 需求名称 cell is truncated to 200 runes so one
+// row cannot blow the requirement title/validation limits.
+func TestDeterministicProcessorTableTitleCapped(t *testing.T) {
+	longTitle := strings.Repeat("长", 260)
+	document := "# 6.4 延展功能需求清单\n\n" +
+		"| 需求编号 | 需求名称 | 所属功能 | 优先级 | 验收场景数 | 当前系统状态 |\n" +
+		"| --- | --- | --- | --- | --- | --- |\n" +
+		"| FR-331 | " + longTitle + " | 内容管理 | P2 | 2 | 不存在 |\n"
+	requirements := processDeterministicDocument(t, document)
+	if len(requirements) != 1 {
+		t.Fatalf("requirements = %#v, want FR-331", requirements)
+	}
+	if runes := []rune(requirements[0].Title); len(runes) != 200 {
+		t.Fatalf("title runes = %d, want capped 200", len(runes))
+	}
+}
+
+// TestDeterministicProcessorTableFallbackReasons pins the two low-confidence
+// title fallbacks apart: an unmappable header and an empty title cell must each
+// keep needs_review but explain the actual reason.
+func TestDeterministicProcessorTableFallbackReasons(t *testing.T) {
+	unmapped := `# 6.4 延展功能需求清单
+
+| 甲列 | 乙列 | 丙列 |
+| --- | --- | --- |
+| FR-341 | 备用标题 | 内容管理 |
+`
+	requirements := processDeterministicDocument(t, unmapped)
+	if len(requirements) != 1 {
+		t.Fatalf("unmapped-header requirements = %#v", requirements)
+	}
+	requirement := requirements[0]
+	if requirement.Title != "备用标题" {
+		t.Fatalf("unmapped-header title = %q, want the second column", requirement.Title)
+	}
+	var constraints map[string]any
+	if err := json.Unmarshal(requirement.ConstraintsJSON, &constraints); err != nil {
+		t.Fatalf("constraints_json = %q: %v", requirement.ConstraintsJSON, err)
+	}
+	reason := fmt.Sprint(constraints["reason"])
+	if constraints["needs_review"] != true || !strings.Contains(reason, "header could not be mapped") {
+		t.Fatalf("unmapped-header constraints = %#v, want a header reason", constraints)
+	}
+	if requirement.Confidence >= 0.6 {
+		t.Fatalf("unmapped-header confidence = %v, want low confidence", requirement.Confidence)
+	}
+
+	emptyTitle := `# 6.1 需求清单总表
+
+| 需求编号 | 需求名称 | 所属功能 |
+| --- | --- | --- |
+| FR-342 |  | 内容管理 |
+`
+	requirements = processDeterministicDocument(t, emptyTitle)
+	if len(requirements) != 1 {
+		t.Fatalf("empty-title requirements = %#v", requirements)
+	}
+	requirement = requirements[0]
+	if requirement.Title != "内容管理" {
+		t.Fatalf("empty-title fallback = %q, want the first usable cell", requirement.Title)
+	}
+	if err := json.Unmarshal(requirement.ConstraintsJSON, &constraints); err != nil {
+		t.Fatalf("constraints_json = %q: %v", requirement.ConstraintsJSON, err)
+	}
+	reason = fmt.Sprint(constraints["reason"])
+	if constraints["needs_review"] != true || !strings.Contains(reason, "title column is empty") {
+		t.Fatalf("empty-title constraints = %#v, want a title-column reason", constraints)
+	}
+}

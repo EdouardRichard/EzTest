@@ -790,6 +790,13 @@ func (r *fakeExtractionRepo) ListExtractedExternalIDs(_ context.Context, version
 	return ids, nil
 }
 
+// ListSkippedExternalIDs is the fake equivalent of the non-draft requirement
+// query. The fake has no requirement status, so the PostgreSQL integration test
+// owns that path; the pure ReconcileDocument test owns the exclusion logic.
+func (r *fakeExtractionRepo) ListSkippedExternalIDs(_ context.Context, versionID int64) ([]string, error) {
+	return nil, nil
+}
+
 func (r *fakeExtractionRepo) UpsertExtractedRequirements(_ context.Context, source versionapp.ExtractionSource, requirements []versionapp.ExtractionRequirement, _ time.Time) (versionapp.ExtractionEmitCounts, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1118,6 +1125,27 @@ func TestReconciliationCounts(t *testing.T) {
 				t.Fatalf("planned id %s reported missing", missing)
 			}
 		}
+	}
+}
+
+// TestReconciliationExcludesSkippedNonDraft pins spec D: a declared requirement
+// the sink skipped because it is already non-draft must be reported as skipped,
+// not missing. The three partitions stay consistent: expected = extracted +
+// missing + skipped.
+func TestReconciliationExcludesSkippedNonDraft(t *testing.T) {
+	document := "FR-001 登录\nFR-002 下单\nFR-003 退出\n"
+	report := versionapp.ReconcileDocument(document, versionapp.ReconciliationInput{
+		ExtractedIDs: []string{"FR-001"},
+		SkippedIDs:   []string{"FR-002", "FR-999"},
+	})
+	if report.Expected != 3 || report.Extracted != 1 || report.Skipped != 1 || report.Missing != 1 {
+		t.Fatalf("report = %+v, want expected=3 extracted=1 skipped=1 missing=1", report)
+	}
+	if len(report.SkippedIDs) != 1 || report.SkippedIDs[0] != "FR-002" {
+		t.Fatalf("skipped_ids = %#v, want [FR-002]", report.SkippedIDs)
+	}
+	if len(report.MissingIDs) != 1 || report.MissingIDs[0] != "FR-003" {
+		t.Fatalf("missing_ids = %#v, want [FR-003]", report.MissingIDs)
 	}
 }
 

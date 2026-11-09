@@ -766,7 +766,7 @@ func TestDOCXExtractionLayoutTablesAndFRBody(t *testing.T) {
 			t.Fatalf("body text %q missing:\n%s", want, result.Text)
 		}
 	}
-	listHeader := []string{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "当前系统状态", "所属功能"}
+	listHeader := []string{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "需求状态", "所属功能"}
 	listRow := []string{"FR-001", "账号密码登录", "用户使用账号密码登录", "P1", "功能需求", "已实现", "账号"}
 	if !findTableRow(result.Elements, "6.1 需求清单总表", listHeader) {
 		t.Fatalf("6.1 header row missing/wrong: %+v", result.Elements)

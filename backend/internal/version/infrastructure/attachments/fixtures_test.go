@@ -94,7 +94,9 @@ func docxEscape(value string) string {
 // docxExtractionLayoutFixture reproduces the C-03 UAT layout in memory: an FR
 // Heading3 body with 需求描述 + 验收标准/场景 BDD text, then the 7-column 6.1
 // requirement list and the 6-column 6.4 catalog that previously overwrote the
-// body row.
+// body row. The 6.1 header uses the researched alias names
+// (docs/v0.2.3/research/extraction.md): 需求编号/需求名称/需求描述/优先级/
+// 需求类型/需求状态/所属功能; 当前系统状态 is only the 6.4 column.
 func docxExtractionLayoutFixture() []byte {
 	return docxBlockFixture([]docxBlock{
 		{Style: "Heading3", Text: "FR-101 账号密码登录"},
@@ -107,7 +109,7 @@ func docxExtractionLayoutFixture() []byte {
 		{Text: "Given 已注册用户 When 输入错误密码 Then 提示密码错误"},
 		{Style: "Heading3", Text: "6.1 需求清单总表"},
 		{Table: [][]string{
-			{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "当前系统状态", "所属功能"},
+			{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "需求状态", "所属功能"},
 			{"FR-001", "账号密码登录", "用户使用账号密码登录", "P1", "功能需求", "已实现", "账号"},
 		}},
 		{Style: "Heading3", Text: "6.4 延展功能需求清单"},

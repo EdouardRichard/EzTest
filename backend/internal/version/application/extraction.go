@@ -596,6 +596,13 @@ func extractionImageRef(image ExtractionImage) string {
 // kind=table blocks (spec R-A7-2). Row groups repeat the Markdown header; a
 // group that still cannot fit (a single row or header wider than the maximum)
 // is split again at a text boundary so no segment ever exceeds the maximum.
+//
+// This path only runs for structured elements (DOCX/PPTX/XLSX table_row /
+// sheet_row): plain-text and Markdown input carries no structured rows, so an
+// oversized Markdown table there is split by the generic text splitter and its
+// continuation pieces do not repeat the header. That is a documented limitation
+// of the text path; the deterministic processor still recognizes the header
+// piece, and the DOCX path (the UAT document) is safe.
 func expandOversizedTables(blocks []segmentBlock, maxChars int) []segmentBlock {
 	expanded := make([]segmentBlock, 0, len(blocks))
 	for _, block := range blocks {
@@ -883,19 +890,27 @@ type ReconciliationInput struct {
 	// SkippedImages is the parser coverage count of human-visible images that
 	// were not analyzed (A §7.9: v0.22 keeps the reference and marks skipped).
 	SkippedImages int
+	// SkippedIDs are the declared ids the sink declined to overwrite because
+	// the requirement is already non-draft (spec D). They are reported as
+	// skipped, never as missing, and excluded from MissingIDs.
+	SkippedIDs []string
 }
 
 // ReconciliationReport is the R-A7-8 audit report. Expected/Extracted/Missing
 // and MissingIDs cover the V1 current requirements only. The V2 planned
 // requirements are a separate partition (PlannedCount/PlannedIDs) and are never
 // reported missing: the live document declares 58 current + 32 planned ids, so
-// summing them would over-count the A-9 58/58 target. The whole report is
-// persisted as requirement_extraction_run.report for the progress UI/API.
+// summing them would over-count the A-9 58/58 target. Skipped/SkippedIDs list
+// the current ids the sink skipped as already non-draft (spec D), so expected =
+// extracted + missing + skipped. The whole report is persisted as
+// requirement_extraction_run.report for the progress UI/API.
 type ReconciliationReport struct {
 	Expected      int      `json:"expected"`
 	Extracted     int      `json:"extracted"`
 	Missing       int      `json:"missing"`
 	MissingIDs    []string `json:"missing_ids"`
+	Skipped       int      `json:"skipped"`
+	SkippedIDs    []string `json:"skipped_ids"`
 	LowConfidence int      `json:"low_confidence"`
 	SkippedImages int      `json:"skipped_images"`
 	PlannedCount  int      `json:"planned_count"`
@@ -936,7 +951,9 @@ var (
 // are never lost. Headings marking V2/规划 split the declared ids into
 // PlannedIDs; V1/当前 sections fill CurrentIDs. Expected/Extracted/Missing and
 // MissingIDs are computed over the V1 current partition only; planned ids are
-// counted separately and are never missing. The report never invents an id and
+// counted separately and are never missing. An id the sink skipped because the
+// requirement is already non-draft (input.SkippedIDs) is reported in
+// SkippedIDs/Skipped and is never missing. The report never invents an id and
 // never rewrites extracted ids: missing_ids is the set difference, in document
 // order.
 func ReconcileDocument(documentText string, input ReconciliationInput) ReconciliationReport {
@@ -944,6 +961,7 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 		LowConfidence: input.LowConfidence,
 		SkippedImages: input.SkippedImages,
 		MissingIDs:    []string{},
+		SkippedIDs:    []string{},
 		CurrentIDs:    []string{},
 		PlannedIDs:    []string{},
 	}
@@ -1016,6 +1034,14 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 		}
 		extracted[trimmed] = struct{}{}
 	}
+	skipped := make(map[string]struct{}, len(input.SkippedIDs))
+	for _, id := range input.SkippedIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		skipped[trimmed] = struct{}{}
+	}
 	for _, id := range declared {
 		if planned[id] {
 			report.PlannedIDs = append(report.PlannedIDs, id)
@@ -1026,10 +1052,15 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 			report.Extracted++
 			continue
 		}
+		if _, ok := skipped[id]; ok {
+			report.SkippedIDs = append(report.SkippedIDs, id)
+			continue
+		}
 		report.MissingIDs = append(report.MissingIDs, id)
 	}
 	report.Expected = len(report.CurrentIDs)
 	report.PlannedCount = len(report.PlannedIDs)
 	report.Missing = len(report.MissingIDs)
+	report.Skipped = len(report.SkippedIDs)
 	return report
 }

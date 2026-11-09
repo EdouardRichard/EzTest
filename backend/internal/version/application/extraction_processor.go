@@ -729,7 +729,7 @@ func deterministicTableRequirement(headers, cells []string, line string) (Extrac
 	if externalID == "" {
 		return ExtractionRequirement{}, false
 	}
-	title, titleFallback := deterministicTableTitle(columns, cells, externalID)
+	title, titleFallbackReason := deterministicTableTitle(columns, cells, externalID)
 	if title == "" {
 		return ExtractionRequirement{}, false
 	}
@@ -790,17 +790,17 @@ func deterministicTableRequirement(headers, cells []string, line string) (Extrac
 		}
 	}
 	confidence := 0.8
-	if titleFallback {
+	if titleFallbackReason != "" {
 		confidence = 0.55
 		constraints["needs_review"] = true
-		constraints["reason"] = "table header could not be mapped; used the second column as the title"
+		constraints["reason"] = titleFallbackReason
 	}
 	if description == "" {
 		description = title
 	}
 	return ExtractionRequirement{
 		ExternalID:         externalID,
-		Title:              sanitizeExtractionField(title),
+		Title:              truncateExtractionText(sanitizeExtractionField(title), 200),
 		Description:        sanitizeExtractionField(truncateExtractionText(description, 2000)),
 		AcceptanceCriteria: criteria,
 		Priority:           priority,
@@ -834,11 +834,15 @@ func deterministicTableID(columns extractionTableColumns, cells []string) (strin
 }
 
 // deterministicTableTitle returns the 需求名称 cell, or the second column with
-// a low-confidence fallback. The title is never the raw Markdown row.
-func deterministicTableTitle(columns extractionTableColumns, cells []string, externalID string) (string, bool) {
-	if columns.title >= 0 && columns.title < len(cells) {
+// a low-confidence fallback. The second return value is the accurate fallback
+// reason ("" when the mapped title column was used): an unmappable header and an
+// empty title cell are different document defects and must not share one text.
+// The title is never the raw Markdown row.
+func deterministicTableTitle(columns extractionTableColumns, cells []string, externalID string) (string, string) {
+	titleColumnMapped := columns.title >= 0 && columns.title < len(cells)
+	if titleColumnMapped {
 		if title := sanitizeExtractionField(cells[columns.title]); title != "" && title != externalID {
-			return title, false
+			return title, ""
 		}
 	}
 	fallbackIndex := 1
@@ -847,7 +851,14 @@ func deterministicTableTitle(columns extractionTableColumns, cells []string, ext
 	}
 	if fallbackIndex < len(cells) {
 		if title := sanitizeExtractionField(cells[fallbackIndex]); title != "" && title != externalID {
-			return title, true
+			switch {
+			case !titleColumnMapped:
+				return title, "table header could not be mapped; used the second column as the title"
+			case fallbackIndex == columns.title:
+				return title, "title column has no usable value; used the first non-empty cell as the title"
+			default:
+				return title, "title column is empty; used the second column as the title"
+			}
 		}
 	}
 	for index, cell := range cells {
@@ -855,10 +866,13 @@ func deterministicTableTitle(columns extractionTableColumns, cells []string, ext
 			continue
 		}
 		if title := sanitizeExtractionField(cell); title != "" && title != externalID && !isPureNumeric(title) {
-			return title, true
+			if !titleColumnMapped {
+				return title, "table header could not be mapped; used the first non-empty cell as the title"
+			}
+			return title, "title column is empty; used the first non-empty cell as the title"
 		}
 	}
-	return "", false
+	return "", ""
 }
 
 // deterministicTableDescription returns the 需求描述 cell when present, and a

@@ -412,9 +412,10 @@ func TestAttachmentRepositoryConversationScopesPreRegisteredDrafts(t *testing.T)
 
 // TestAttachmentStaleProcessingRecovery pins the C-04 worker-crash recovery:
 // the leader-gated ListPendingForIngest sweep returns an abandoned processing
-// row to pending, keeps a freshly touched slow parse untouched, and image
-// transitions touch the parent attachment so a legitimate slow parse is not
-// reset.
+// row to pending, keeps a freshly touched slow parse untouched, resets the
+// abandoned image analysis (analyzing -> extracted) so a later parse can
+// re-analyze it, and image transitions touch the parent attachment so a
+// legitimate slow parse is not reset.
 func TestAttachmentStaleProcessingRecovery(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
@@ -445,6 +446,24 @@ func TestAttachmentStaleProcessingRecovery(t *testing.T) {
 		}
 	}
 
+	// Both attachments crashed mid-image-analysis. Only the stale image row is
+	// reset; the fresh worker's analyzing row must survive the sweep.
+	staleImage := version.AttachmentImageRecord{
+		ID: ids.Next(), AttachmentID: stale.ID, Seq: 1, ContentRefID: 76,
+		MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageAnalyzing, CreatedAt: now.Add(-20 * time.Minute), UpdatedAt: now.Add(-20 * time.Minute),
+	}
+	freshImage := version.AttachmentImageRecord{
+		ID: ids.Next(), AttachmentID: fresh.ID, Seq: 1, ContentRefID: 77,
+		MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageAnalyzing, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}
+	for _, image := range []version.AttachmentImageRecord{staleImage, freshImage} {
+		if err := repo.CreateImage(ctx, image); err != nil {
+			t.Fatalf("CreateImage: %v", err)
+		}
+	}
+
 	pending, err := repo.ListPendingForIngest(ctx, 10)
 	if err != nil {
 		t.Fatalf("ListPendingForIngest: %v", err)
@@ -467,17 +486,41 @@ func TestAttachmentStaleProcessingRecovery(t *testing.T) {
 		t.Fatalf("fresh slow parse was reset: %q", storedFresh.ExtractionStatus)
 	}
 
+	staleImages, err := repo.ListImages(ctx, stale.ID)
+	if err != nil {
+		t.Fatalf("ListImages stale: %v", err)
+	}
+	if len(staleImages) != 1 || staleImages[0].Status != version.AttachmentImageExtracted {
+		t.Fatalf("stale analyzing image was not reset to extracted: %+v", staleImages)
+	}
+	freshImages, err := repo.ListImages(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("ListImages fresh: %v", err)
+	}
+	if len(freshImages) != 1 || freshImages[0].Status != version.AttachmentImageAnalyzing {
+		t.Fatalf("fresh analyzing image was reset: %+v", freshImages)
+	}
+
+	// Crash-mid-image recovery: the recovered row is re-analyzable and its
+	// terminal transition still heartbeats the parent attachment.
+	if changed, err := repo.MarkImageAnalyzing(ctx, staleImage.ID, now); err != nil || !changed {
+		t.Fatalf("re-analyze recovered image: changed=%v err=%v", changed, err)
+	}
+	if err := repo.MarkImageDone(ctx, staleImage.ID, "恢复后的 caption", now); err != nil {
+		t.Fatalf("MarkImageDone recovered image: %v", err)
+	}
+	recovered, err := repo.ListImages(ctx, stale.ID)
+	if err != nil {
+		t.Fatalf("ListImages recovered: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0].Status != version.AttachmentImageDone ||
+		recovered[0].Caption != "恢复后的 caption" {
+		t.Fatalf("recovered image = %+v, want done with caption", recovered)
+	}
+
 	// Image transitions are the heartbeat that keeps the fresh row alive.
-	image := version.AttachmentImageRecord{
-		ID: ids.Next(), AttachmentID: fresh.ID, Seq: 1, ContentRefID: 77,
-		MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
-		Status: version.AttachmentImageExtracted, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
-	}
-	if err := repo.CreateImage(ctx, image); err != nil {
-		t.Fatalf("CreateImage: %v", err)
-	}
-	if changed, err := repo.MarkImageAnalyzing(ctx, image.ID, now); err != nil || !changed {
-		t.Fatalf("MarkImageAnalyzing=%v err=%v", changed, err)
+	if err := repo.MarkImageDone(ctx, freshImage.ID, "慢解析仍在进行", now); err != nil {
+		t.Fatalf("MarkImageDone fresh: %v", err)
 	}
 	touched, err := repo.Get(ctx, fresh.ID)
 	if err != nil {

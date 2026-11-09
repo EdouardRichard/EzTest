@@ -454,10 +454,14 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 // same rules:
 //   - fill_empty: only empty title/description/AC/source_quote are filled;
 //   - replace: non-empty values replace, but empty values never clear a
-//     non-empty title/description/AC/source_quote;
+//     non-empty title/description/AC/source_quote. Acceptance criteria are
+//     taken verbatim from the incoming row (never unioned), so a re-upload can
+//     drop a removed scenario; the current criteria are kept only when the
+//     incoming list is empty;
 //   - a valid priority may replace in either mode;
 //   - constraints are merged as JSON objects (incoming wins on a key conflict);
-//   - confidence: fill_empty takes the max, replace takes the incoming score.
+//   - confidence: fill_empty takes the max, replace takes a supplied incoming
+//     score and otherwise keeps the current one (0/omitted never overwrites).
 func MergeExtractionRequirement(current, incoming ExtractionRequirement) ExtractionRequirement {
 	merged := current
 	fillEmpty := incoming.MergeMode == ExtractionMergeFillEmpty
@@ -485,13 +489,22 @@ func MergeExtractionRequirement(current, incoming ExtractionRequirement) Extract
 			merged.Description = incoming.Description
 		}
 		if len(incoming.AcceptanceCriteria) > 0 {
-			merged.AcceptanceCriteria = appendUniqueExtractionStrings(
-				append([]string(nil), merged.AcceptanceCriteria...), incoming.AcceptanceCriteria...)
+			// Replace, never append: the persisted acceptance criteria are
+			// newline-joined and re-split on the next upsert, so a union would
+			// duplicate every multi-line criterion on each re-upload and could
+			// never drop a removed scenario.
+			merged.AcceptanceCriteria = append([]string(nil), incoming.AcceptanceCriteria...)
 		}
 		if strings.TrimSpace(incoming.SourceQuote) != "" {
 			merged.SourceQuote = incoming.SourceQuote
 		}
-		merged.Confidence = incoming.Confidence
+		if incoming.Confidence > 0 {
+			merged.Confidence = incoming.Confidence
+		} else if merged.Confidence < 0 {
+			// -1 is the PostgreSQL NULL sentinel; an omitted model confidence
+			// must not be persisted as a negative number.
+			merged.Confidence = 0
+		}
 	}
 	if IsExtractionPriority(incoming.Priority) {
 		merged.Priority = incoming.Priority
@@ -572,16 +585,4 @@ func containsExactString(values []string, value string) bool {
 		}
 	}
 	return false
-}
-
-// appendUniqueExtractionStrings appends non-empty additions that are not already
-// present, preserving order (acceptance-criteria union on duplicate external_id).
-func appendUniqueExtractionStrings(values []string, additions ...string) []string {
-	for _, addition := range additions {
-		if addition == "" || containsExactString(values, addition) {
-			continue
-		}
-		values = append(values, addition)
-	}
-	return values
 }

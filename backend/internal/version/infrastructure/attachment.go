@@ -262,14 +262,28 @@ const staleProcessingTimeout = 15 * time.Minute
 //
 // The call is leader-gated by the worker loop, so it also runs the C-04 stale
 // processing sweep: a row abandoned by a crashed worker (>15 minutes without a
-// heartbeat touch) returns to pending. Per-image transitions touch the parent
-// attachment, so a legitimate slow parse/analysis is never reset.
+// heartbeat touch) returns to pending, and its in-flight attachment_image rows
+// are reset from analyzing to extracted so the retried parse re-analyzes them
+// instead of reusing a caption-less row. Per-image transitions touch the parent
+// attachment, so a legitimate slow parse/analysis is never reset. The threshold
+// is evaluated by the database clock (now() - make_interval), so application
+// clock skew can never reset a live row.
 func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit int) ([]version.PendingAttachment, error) {
 	if _, err := r.pool.Exec(ctx, `
+		WITH stale AS (
+			SELECT id FROM requirement_attachment
+			WHERE extraction_status = 'processing'
+			  AND updated_at < now() - make_interval(secs => $1::double precision)
+		), reset_images AS (
+			UPDATE attachment_image
+			SET status = 'extracted', caption = '', error = '', updated_at = now()
+			WHERE attachment_id IN (SELECT id FROM stale)
+			  AND status = 'analyzing'
+		)
 		UPDATE requirement_attachment
 		SET extraction_status = 'pending', extraction_error = NULL, updated_at = now()
-		WHERE extraction_status = 'processing' AND updated_at < $1
-	`, time.Now().UTC().Add(-staleProcessingTimeout)); err != nil {
+		WHERE id IN (SELECT id FROM stale)
+	`, int64(staleProcessingTimeout.Seconds())); err != nil {
 		return nil, fmt.Errorf("reset stale processing attachments: %w", err)
 	}
 	rows, err := r.pool.Query(ctx, `

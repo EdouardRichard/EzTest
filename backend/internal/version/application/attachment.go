@@ -754,9 +754,14 @@ const AttachmentPendingRetryAfterSeconds = 2
 // attachmentPendingDetails computes the C-04 409 details from the attachment
 // row and its image rows. It is a pure function so every stage (queued,
 // parsing, analyzing_images, done, failed) is directly testable:
-//   - percent only exists while images are being analyzed;
-//   - eta_seconds is measured from completed images and is absent until at
-//     least one image finished (never invented);
+//   - percent only exists while images are being analyzed and counts terminal
+//     rows (done + failed + skipped) as completed work, because failed/skipped
+//     images are no longer pending;
+//   - eta_seconds is measured from completed images (their queue wait is
+//     included, so it is an upper bound) and decays by the time elapsed since
+//     the parent attachment's last heartbeat, so repeated polls see it shrink;
+//     it is absent until at least one image finished (never invented) and
+//     floored at one second;
 //   - error carries the stored failure reason for a failed row.
 func attachmentPendingDetails(attachment version.Attachment, images []version.AttachmentImageRecord, now time.Time) map[string]any {
 	stage := "queued"
@@ -804,11 +809,19 @@ func attachmentPendingDetails(attachment version.Attachment, images []version.At
 			average := completedDuration / time.Duration(done)
 			if average > 0 {
 				remaining := len(images) - terminal
-				eta := int(time.Duration(remaining) * average / time.Second)
-				if eta < 1 {
-					eta = 1
+				eta := time.Duration(remaining) * average
+				// Decay the static estimate by the elapsed time since the
+				// parent row was last touched (every image transition
+				// heartbeats it), so polling shows a countdown instead of a
+				// frozen number.
+				if !attachment.UpdatedAt.IsZero() && now.After(attachment.UpdatedAt) {
+					eta -= now.Sub(attachment.UpdatedAt)
 				}
-				details["eta_seconds"] = eta
+				seconds := int(eta / time.Second)
+				if seconds < 1 {
+					seconds = 1
+				}
+				details["eta_seconds"] = seconds
 			}
 		}
 	}
