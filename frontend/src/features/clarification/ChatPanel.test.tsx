@@ -19,6 +19,7 @@ const api = vi.hoisted(() => ({
   postMessage: vi.fn(),
   rollbackRequirement: vi.fn(),
   uploadContent: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("./api", () => api)
 

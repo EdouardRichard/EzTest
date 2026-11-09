@@ -5,6 +5,7 @@ import "@testing-library/jest-dom/vitest"
 const clarificationApi = vi.hoisted(() => ({
   updateRequirement: vi.fn(),
   confirmRequirement: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("./api", () => clarificationApi)
 

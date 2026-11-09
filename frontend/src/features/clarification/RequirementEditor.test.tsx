@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
   confirmRequirement: vi.fn(),
   reopenRequirement: vi.fn(),
   rollbackRequirement: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
