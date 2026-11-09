@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
   updateRequirement: vi.fn(),
   confirmRequirement: vi.fn(),
   reopenRequirement: vi.fn(),
+  rollbackRequirement: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
@@ -61,6 +62,7 @@ describe("RequirementEditor", () => {
     api.updateRequirement.mockReset()
     api.confirmRequirement.mockReset()
     api.reopenRequirement.mockReset()
+    api.rollbackRequirement.mockReset()
     api.updateRequirement.mockResolvedValue(updatedDetail)
     api.confirmRequirement.mockResolvedValue({
       confirmed: true,
@@ -137,7 +139,7 @@ describe("RequirementEditor", () => {
     expect(await screen.findByRole("status")).toHaveTextContent("已确认")
   })
 
-  it("shows the rollback hint for a clarified requirement and hides confirm", () => {
+  it("makes a clarified requirement read-only and offers rollback instead of save", () => {
     renderEditor({
       requirement: {
         ...requirementDetailFixture,
@@ -147,10 +149,86 @@ describe("RequirementEditor", () => {
     })
 
     expect(screen.getByTestId("editor-rollback-hint")).toHaveTextContent(
-      "该需求已澄清；如需修改，请先确认回退为草案。",
+      "该需求已澄清；编辑前需先回退为草案（会生成新 revision 并重新确认）。",
     )
+    // C-06: a clarified requirement can only change through the audited
+    // rollback path, so every field is disabled and there is no save action.
+    expect(screen.getByTestId("editor-title")).toBeDisabled()
+    expect(screen.getByTestId("editor-description")).toBeDisabled()
+    expect(screen.getByTestId("editor-acceptance")).toBeDisabled()
+    expect(screen.getByTestId("editor-priority")).toBeDisabled()
+    expect(screen.getByTestId("editor-target-sut-1002")).toBeDisabled()
+    expect(screen.queryByTestId("editor-save")).not.toBeInTheDocument()
     expect(screen.queryByTestId("editor-confirm")).not.toBeInTheDocument()
-    expect(screen.getByTestId("editor-save")).toBeInTheDocument()
+    expect(screen.getByTestId("editor-rollback")).toBeInTheDocument()
+  })
+
+  it("rolls a clarified requirement back to draft with a required reason", async () => {
+    const onUpdated = vi.fn()
+    const clarifiedDetail: RequirementDetail = {
+      ...requirementDetailFixture,
+      status: "clarified",
+      confirmed_at: "2026-10-31T10:00:00Z",
+    }
+    const rolledBack: RequirementDetail = {
+      ...clarifiedDetail,
+      status: "draft",
+      revision: 2,
+      current_version_id: "6102",
+      current_version: {
+        ...requirementVersionFixture,
+        id: "6102",
+        revision: 2,
+      },
+      history: [requirementVersionFixture],
+      confirmed_at: null,
+    }
+    api.rollbackRequirement.mockResolvedValue(rolledBack)
+    renderEditor({ requirement: clarifiedDetail, onUpdated })
+
+    fireEvent.click(screen.getByTestId("editor-rollback"))
+    const dialog = await screen.findByRole("dialog", { name: "回退为草案" })
+    const submit = within(dialog).getByRole("button", { name: "回退为草案" })
+    // The reason is mandatory: no request before it is typed.
+    expect(submit).toBeDisabled()
+    expect(api.rollbackRequirement).not.toHaveBeenCalled()
+
+    fireEvent.change(within(dialog).getByLabelText("回退原因"), {
+      target: { value: "验收口径变更，需要重新澄清" },
+    })
+    fireEvent.click(submit)
+
+    await waitFor(() =>
+      expect(api.rollbackRequirement).toHaveBeenCalledWith("2001", "6001", {
+        reason: "验收口径变更，需要重新澄清",
+      }),
+    )
+    expect(api.updateRequirement).not.toHaveBeenCalled()
+    expect(onUpdated).toHaveBeenCalledWith(rolledBack)
+    expect(await screen.findByRole("status")).toHaveTextContent("已回退为草案 v2")
+  })
+
+  it("shows rollback API errors inline in the dialog", async () => {
+    api.rollbackRequirement.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "需求状态已变化，请刷新",
+      }),
+    )
+    renderEditor({
+      requirement: { ...requirementDetailFixture, status: "clarified" },
+    })
+
+    fireEvent.click(screen.getByTestId("editor-rollback"))
+    const dialog = await screen.findByRole("dialog", { name: "回退为草案" })
+    fireEvent.change(within(dialog).getByLabelText("回退原因"), {
+      target: { value: "重新澄清" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "回退为草案" }))
+
+    expect(await screen.findByText("需求状态已变化，请刷新")).toBeInTheDocument()
+    expect(api.rollbackRequirement).toHaveBeenCalledTimes(1)
   })
 
   it("reopens a closed requirement with an explicit reason dialog", async () => {

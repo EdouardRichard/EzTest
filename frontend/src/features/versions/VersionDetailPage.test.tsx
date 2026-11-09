@@ -9,18 +9,18 @@ import type { Version } from "./types"
 const api = vi.hoisted(() => ({
   listVersions: vi.fn(),
   getVersion: vi.fn(),
+  getVersionStage: vi.fn(),
   createVersion: vi.fn(),
   getResourceCatalog: vi.fn(),
   reopenVersion: vi.fn(),
 }))
-// Partial mock: the W1-4A panels import other helpers from this module, but they
-// stay unmounted without a stage projection. The stage read rejects so the page
-// keeps exercising the pre-existing stage-less overview path.
+// Partial mock: the W1-4A panels import other helpers from this module. The
+// stage read rejects by default so the page keeps exercising the pre-existing
+// stage-less overview path; the G-04 grid test opts into a real stage.
 vi.mock(import("./api"), async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>()
   return {
     ...actual,
-    getVersionStage: () => Promise.reject(new Error("stage projection unavailable")),
     ...api,
   }
 })
@@ -189,6 +189,8 @@ describe("VersionDetailPage", () => {
   beforeEach(() => {
     api.getVersion.mockReset()
     api.getVersion.mockResolvedValue(versionFixture)
+    api.getVersionStage.mockReset()
+    api.getVersionStage.mockRejectedValue(new Error("stage projection unavailable"))
     api.reopenVersion.mockReset()
     deliveryApi.listIssues.mockReset()
     deliveryApi.listIssues.mockResolvedValue([])
@@ -230,6 +232,20 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("2 个测试账号")
     expect(overview).toHaveTextContent("order-center-web")
     expect(overview).toHaveTextContent("未绑定代码仓")
+  })
+
+  it("lays out the version data grid with items-start (G-04)", async () => {
+    api.getVersionStage.mockResolvedValue({
+      version_id: "2001",
+      stage: "clarifying",
+      stage_entered_at: "2026-11-05T01:00:00Z",
+      blocker: null,
+    })
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    const grid = await screen.findByTestId("version-data-grid")
+    expect(grid).toHaveClass("items-start")
   })
 
   it("guides the user to resources when the version has no bound pages", async () => {

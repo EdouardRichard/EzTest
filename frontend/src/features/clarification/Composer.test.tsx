@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { useState } from "react"
+import { useRef, useState } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -8,15 +8,34 @@ import { ApiError } from "@/lib/api-client"
 import type { NewMessagePart } from "./types"
 
 const api = vi.hoisted(() => ({ uploadContent: vi.fn() }))
-vi.mock("./api", () => api)
+vi.mock("./api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>()
+  return { ...actual, ...api }
+})
 
-import { Composer } from "./Composer"
+import { AUTO_RETRY_MAX_MS, autoRetryExpired, Composer } from "./Composer"
 
 const CONTENT = {
   sha256: "a".repeat(64),
   size: 12,
   mime: "text/plain",
   url: `/api/content/${"a".repeat(64)}`,
+}
+
+/** A C-04 typed 409 with the progress details Task 10 sends. */
+function attachmentPending(details: Record<string, unknown> = {}): ApiError {
+  return new ApiError({
+    status: 409,
+    code: "attachment_pending",
+    message: "附件解析中，可重试",
+    retryable: true,
+    details: {
+      attachment_id: "55",
+      name: "spec.md",
+      retry_after_seconds: 2,
+      ...details,
+    },
+  })
 }
 
 function ErrorHarness(props: {
@@ -43,6 +62,35 @@ function PendingRetryHarness(props: {
   )
 }
 
+/**
+ * Simulates the page transport: each failed send publishes the next typed 409,
+ * and a successful send clears the error, exactly like `useConversation.send`
+ * + `ChatPanel` do in production.
+ */
+function AutoRetryHarness(props: {
+  onSend: (parts: NewMessagePart[], options?: { clientMessageId?: string }) => Promise<boolean>
+  errors: ApiError[]
+}) {
+  const [error, setError] = useState<unknown>(undefined)
+  const index = useRef(0)
+  return (
+    <Composer
+      error={error}
+      onSend={async (parts, options) => {
+        const sent = await props.onSend(parts, options)
+        if (sent) {
+          setError(undefined)
+        } else {
+          const next = props.errors[Math.min(index.current, props.errors.length - 1)]
+          index.current += 1
+          setError(next)
+        }
+        return sent
+      }}
+    />
+  )
+}
+
 describe("Composer", () => {
   beforeEach(() => {
     api.uploadContent.mockReset()
@@ -59,7 +107,10 @@ describe("Composer", () => {
     fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false })
 
     await waitFor(() =>
-      expect(onSend).toHaveBeenCalledWith([{ type: "text", text: "退款 T+1 到账" }]),
+      expect(onSend).toHaveBeenCalledWith(
+        [{ type: "text", text: "退款 T+1 到账" }],
+        expect.objectContaining({ clientMessageId: expect.any(String) }),
+      ),
     )
     await waitFor(() => expect(textarea).toHaveValue(""))
   })
@@ -312,7 +363,105 @@ describe("Composer", () => {
     fireEvent.click(screen.getByRole("button", { name: "重试发送" }))
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
     expect(onSend.mock.calls[1][0]).toEqual(onSend.mock.calls[0][0])
+    // C-04: the manual retry reuses the message id of the rejected attempt.
+    expect(onSend.mock.calls[1][1]).toEqual(onSend.mock.calls[0][1])
     await waitFor(() => expect(textarea).toHaveValue(""))
     await waitFor(() => expect(screen.queryByText("spec.md")).not.toBeInTheDocument())
+  })
+
+  it("shows the parse progress of a 409 attachment_pending and a retry countdown", async () => {
+    const onSend = vi.fn().mockResolvedValue(false)
+    const pending = attachmentPending({
+      stage: "analyzing_images",
+      images_total: 12,
+      images_done: 3,
+      images_failed: 0,
+      images_skipped: 0,
+      percent: 25,
+      eta_seconds: 60,
+      retry_after_seconds: 30,
+    })
+
+    render(<AutoRetryHarness onSend={onSend} errors={[pending]} />)
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const progress = await screen.findByTestId("composer-retry-progress")
+    expect(progress).toHaveTextContent("图片 3/12")
+    expect(progress).toHaveTextContent("25%")
+    expect(progress).toHaveTextContent("预计剩余 60 秒")
+    expect(progress).toHaveTextContent("30 秒后自动重试")
+    expect(screen.getByRole("button", { name: "取消自动重试" })).toBeInTheDocument()
+    // The draft is preserved while the attachment finishes parsing.
+    expect(textarea).toHaveValue("请读附件")
+  })
+
+  it("auto-sends exactly once with a stable client_message_id when parsing is done", async () => {
+    const onSend = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    const pending = attachmentPending({ stage: "done", images_total: 0 })
+
+    render(<AutoRetryHarness onSend={onSend} errors={[pending]} />)
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][0]).toEqual(onSend.mock.calls[0][0])
+    // Stable idempotency id: the retried POST can never create a second message.
+    expect(onSend.mock.calls[1][1]?.clientMessageId).toBe(onSend.mock.calls[0][1]?.clientMessageId)
+    await waitFor(() => expect(textarea).toHaveValue(""))
+
+    // No third automatic send after the success cleared the error.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(onSend).toHaveBeenCalledTimes(2)
+  })
+
+  it("stops auto-retry on a failed parse and shows the reason", async () => {
+    const onSend = vi.fn().mockResolvedValue(false)
+    const failed = attachmentPending({
+      stage: "failed",
+      images_total: 12,
+      images_done: 4,
+      images_failed: 1,
+      error: "图片分析失败",
+    })
+
+    render(<AutoRetryHarness onSend={onSend} errors={[failed]} />)
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    const progress = await screen.findByTestId("composer-retry-progress")
+    expect(progress).toHaveTextContent("解析失败")
+    expect(progress).toHaveTextContent("图片分析失败")
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole("button", { name: "重试发送" })).toBeInTheDocument()
+  })
+
+  it("cancels the automatic retry and falls back to the manual retry", async () => {
+    const onSend = vi.fn().mockResolvedValue(false)
+    const queued = attachmentPending({ stage: "queued", retry_after_seconds: 1 })
+
+    render(<AutoRetryHarness onSend={onSend} errors={[queued]} />)
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.change(textarea, { target: { value: "请读附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+
+    await screen.findByTestId("composer-retry-progress")
+    fireEvent.click(screen.getByRole("button", { name: "取消自动重试" }))
+    expect(screen.queryByRole("button", { name: "取消自动重试" })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "重试发送" })).toBeInTheDocument()
+
+    // The cancelled timer never fires another send.
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
+  it("caps the automatic retry window at five minutes", () => {
+    expect(autoRetryExpired(0, AUTO_RETRY_MAX_MS - 1)).toBe(false)
+    expect(autoRetryExpired(0, AUTO_RETRY_MAX_MS)).toBe(true)
   })
 })

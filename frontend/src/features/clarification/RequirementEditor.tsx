@@ -13,7 +13,12 @@ import { Select } from "@/components/ui/Select"
 import { Textarea } from "@/components/ui/Textarea"
 import { AnchorPanel } from "@/features/anchors/AnchorPanel"
 
-import { confirmRequirement, reopenRequirement, updateRequirement } from "./api"
+import {
+  confirmRequirement,
+  reopenRequirement,
+  rollbackRequirement,
+  updateRequirement,
+} from "./api"
 import { REQUIREMENT_STATUS_LABEL, REQUIREMENT_STATUS_TONE } from "./labels"
 import type { RequirementDetail, RequirementPriority, TargetOptions } from "./types"
 
@@ -84,6 +89,10 @@ export function RequirementEditor({
   const [reopenReason, setReopenReason] = useState("")
   const [reopening, setReopening] = useState(false)
   const [reopenError, setReopenError] = useState<unknown>(null)
+  const [rollbackOpen, setRollbackOpen] = useState(false)
+  const [rollbackReason, setRollbackReason] = useState("")
+  const [rollingBack, setRollingBack] = useState(false)
+  const [rollbackError, setRollbackError] = useState<unknown>(null)
 
   useEffect(() => {
     setTitle(current.title)
@@ -101,8 +110,30 @@ export function RequirementEditor({
   const clarified = requirement.status === "clarified"
   const closed = requirement.status === "closed"
   const obsolete = requirement.status === "obsolete"
-  const readOnly = closed || obsolete
+  // C-06: a clarified requirement is read-only here. Changing it must go
+  // through the audited rollback route (new draft revision + event + audit),
+  // never a plain PATCH that silently turns it back into a draft.
+  const readOnly = closed || obsolete || clarified
   const reopenSubmitDisabled = reopening || reopenReason.trim().length === 0
+  const rollbackSubmitDisabled = rollingBack || rollbackReason.trim().length === 0
+
+  async function rollback(): Promise<void> {
+    const reason = rollbackReason.trim()
+    if (reason.length === 0) return
+    setRollbackError(null)
+    setRollingBack(true)
+    try {
+      const updated = await rollbackRequirement(versionId, requirement.id, { reason })
+      onUpdated(updated)
+      setNotice(`已回退为草案 v${updated.revision}`)
+      setRollbackOpen(false)
+      setRollbackReason("")
+    } catch (cause) {
+      setRollbackError(cause)
+    } finally {
+      setRollingBack(false)
+    }
+  }
 
   async function reopen(): Promise<void> {
     const reason = reopenReason.trim()
@@ -179,7 +210,9 @@ export function RequirementEditor({
 
       {clarified ? (
         <div data-testid="editor-rollback-hint" className="mt-2">
-          <Alert tone="warning">该需求已澄清；如需修改，请先确认回退为草案。</Alert>
+          <Alert tone="warning">
+            该需求已澄清；编辑前需先回退为草案（会生成新 revision 并重新确认）。
+          </Alert>
         </div>
       ) : null}
 
@@ -286,7 +319,19 @@ export function RequirementEditor({
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        {readOnly ? (
+        {clarified ? (
+          <Button
+            size="sm"
+            data-testid="editor-rollback"
+            onClick={() => {
+              setRollbackError(null)
+              setRollbackReason("")
+              setRollbackOpen(true)
+            }}
+          >
+            回退为草案
+          </Button>
+        ) : readOnly ? (
           closed ? (
             <Button
               size="sm"
@@ -385,6 +430,55 @@ export function RequirementEditor({
             />
           </Field>
           {reopenError !== null ? <InlineError error={reopenError} /> : null}
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={rollbackOpen}
+        onClose={() => {
+          if (!rollingBack) setRollbackOpen(false)
+        }}
+        title="回退为草案"
+        description="需求从已澄清回到新的草案 revision；当前版本与确认历史保留，回退原因会写入审计与 requirement.rolled_back 事件。回退后需重新确认。"
+        footer={
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={rollingBack}
+              onClick={() => setRollbackOpen(false)}
+            >
+              取消
+            </Button>
+            <Button
+              size="sm"
+              disabled={rollbackSubmitDisabled}
+              onClick={() => {
+                void rollback()
+              }}
+            >
+              {rollingBack ? "提交中…" : "回退为草案"}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <Field
+            id="requirement-rollback-reason"
+            label="回退原因"
+            required
+            hint="必填（1–2000 字）；会生成新的草案 revision 并写入审计。"
+          >
+            <Textarea
+              id="requirement-rollback-reason"
+              value={rollbackReason}
+              maxLength={2000}
+              disabled={rollingBack}
+              placeholder="例如：验收口径变更，需要重新澄清"
+              onChange={(event) => setRollbackReason(event.target.value)}
+            />
+          </Field>
+          {rollbackError !== null ? <InlineError error={rollbackError} /> : null}
         </div>
       </Dialog>
 

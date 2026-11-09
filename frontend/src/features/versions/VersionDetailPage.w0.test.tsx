@@ -4,6 +4,7 @@ import "@testing-library/jest-dom/vitest"
 
 import type { QuestionBatch } from "@/features/clarification/api"
 import { ApiError } from "@/lib/api-client"
+import { formatDateTime } from "@/lib/format"
 
 const versionApi = vi.hoisted(() => ({
   getVersion: vi.fn(),
@@ -35,7 +36,10 @@ vi.mock("@/features/conversation/api", async (importOriginal) => {
   return { ...actual, ...conversationApi }
 })
 
-const clarificationApi = vi.hoisted(() => ({ listQuestions: vi.fn() }))
+const clarificationApi = vi.hoisted(() => ({
+  listQuestions: vi.fn(),
+  listVersionAttachments: vi.fn(),
+}))
 vi.mock("@/features/clarification/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/features/clarification/api")>()
   return { ...actual, ...clarificationApi }
@@ -244,6 +248,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
         new ApiError({ status: 403, code: "forbidden", message: "上下文包仅管理员可读" }),
       )
     clarificationApi.listQuestions.mockReset().mockResolvedValue([questionBatch])
+    clarificationApi.listVersionAttachments.mockReset().mockResolvedValue([])
     deliveryApi.listIssues.mockReset().mockResolvedValue([])
     deliveryApi.listReports.mockReset().mockResolvedValue([])
     executionApi.listHumanRequests.mockReset().mockResolvedValue([])
@@ -593,5 +598,193 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
 
     unmount()
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:attachment-original")
+  })
+
+  it("lists the version attachments and opens the image panel from a row link", async () => {
+    clarificationApi.listVersionAttachments.mockResolvedValue([
+      {
+        id: "55",
+        name: "需求文档.docx",
+        mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        size: 2048,
+        extraction_status: "done",
+        error_code: "",
+        error_text: "",
+        image_count: 3,
+      },
+      {
+        id: "56",
+        name: "损坏文档.pdf",
+        mime: "application/pdf",
+        size: 1024,
+        extraction_status: "failed",
+        error_code: "extraction_failed",
+        error_text: "解析器崩溃",
+        image_count: 0,
+      },
+    ])
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/attachments/55/images")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<VersionDetailPage versionId="2001" initialTab="overview" />)
+
+    const section = await screen.findByTestId("version-attachments")
+    const doneRow = await screen.findByTestId("version-attachment-55")
+    expect(section).toHaveTextContent("附件")
+    expect(doneRow).toHaveTextContent("需求文档.docx")
+    expect(doneRow).toHaveTextContent("已解析")
+    expect(doneRow).toHaveTextContent("3 张图片")
+    expect(screen.getByTestId("version-attachment-56")).toHaveTextContent("解析失败")
+    expect(screen.getByTestId("version-attachment-56")).toHaveTextContent("解析器崩溃")
+
+    const link = within(doneRow).getByRole("link")
+    expect(link).toHaveAttribute("href", "/versions/2001?tab=overview&attachment=55")
+    fireEvent.click(link)
+
+    expect(await screen.findByTestId("attachment-images")).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalled()
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=overview&attachment=55")
+  })
+
+  it("shows an empty state when the version has no attachments", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="overview" />)
+
+    expect(await screen.findByTestId("version-attachments-empty")).toHaveTextContent(
+      "该版本暂无附件",
+    )
+  })
+
+  it("reports reanalyze counts, per-row update times and distinct failure/skip reasons", async () => {
+    search.params = new URLSearchParams("tab=overview&attachment=55")
+    const before = [
+      {
+        id: "77",
+        attachment_id: "55",
+        seq: 1,
+        sha256: "",
+        mime: "image/png",
+        status: "failed",
+        caption: "",
+        error: "模型超时",
+        updated_at: "2026-11-10T01:00:00Z",
+      },
+      {
+        id: "78",
+        attachment_id: "55",
+        seq: 2,
+        sha256: "",
+        mime: "image/png",
+        status: "skipped",
+        caption: "",
+        error: "",
+        updated_at: "2026-11-10T01:00:00Z",
+      },
+    ]
+    const after = [
+      {
+        id: "77",
+        attachment_id: "55",
+        seq: 1,
+        sha256: "",
+        mime: "image/png",
+        status: "done",
+        caption: "登录页面",
+        error: "",
+        updated_at: "2026-11-10T02:00:00Z",
+      },
+      {
+        id: "78",
+        attachment_id: "55",
+        seq: 2,
+        sha256: "",
+        mime: "image/png",
+        status: "failed",
+        caption: "",
+        error: "模型超时",
+        updated_at: "2026-11-10T02:01:00Z",
+      },
+      {
+        id: "79",
+        attachment_id: "55",
+        seq: 3,
+        sha256: "",
+        mime: "image/png",
+        status: "skipped",
+        caption: "",
+        error: "无文字图片",
+        updated_at: "2026-11-10T02:02:00Z",
+      },
+    ]
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/reanalyze")) {
+        return new Response(JSON.stringify({ data: after }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      if (url.includes("/attachments/55/images")) {
+        return new Response(JSON.stringify({ data: before }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      throw new Error(`unexpected fetch: ${url} ${init?.method ?? "GET"}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<VersionDetailPage versionId="2001" initialTab="overview" />)
+    await screen.findByTestId("attachment-images")
+    await waitFor(() => expect(screen.getByTestId("attachment-image-77")).toHaveTextContent("失败"))
+
+    fireEvent.click(screen.getByRole("button", { name: "重新分析图片" }))
+
+    const notice = await screen.findByTestId("attachment-reanalyze-notice")
+    expect(notice).toHaveTextContent("已重新分析：1 成功 / 1 失败 / 1 跳过")
+    expect(notice).toHaveTextContent(`最近更新 ${formatDateTime("2026-11-10T02:02:00Z")}`)
+    expect(await screen.findByTestId("attachment-image-77")).toHaveTextContent("更新于")
+    expect(screen.getByTestId("attachment-image-78")).toHaveTextContent("失败")
+    expect(screen.getByTestId("attachment-image-79")).toHaveTextContent("跳过")
+    expect(screen.getByTestId("attachment-image-78")).toHaveTextContent("模型超时")
+    expect(screen.getByTestId("attachment-image-79")).toHaveTextContent("无文字图片")
+  })
+
+  it("shows an inline error and no success notice when reanalyze fails", async () => {
+    search.params = new URLSearchParams("tab=overview&attachment=55")
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/reanalyze")) {
+        return new Response(
+          JSON.stringify({
+            error: { code: "internal", message: "重新分析失败，请稍后重试" },
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        )
+      }
+      if (url.includes("/attachments/55/images")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      throw new Error(`unexpected fetch: ${url} ${init?.method ?? "GET"}`)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<VersionDetailPage versionId="2001" initialTab="overview" />)
+    await screen.findByTestId("attachment-images")
+    fireEvent.click(screen.getByRole("button", { name: "重新分析图片" }))
+
+    expect(await screen.findByText("重新分析失败，请稍后重试")).toBeInTheDocument()
+    expect(screen.queryByTestId("attachment-reanalyze-notice")).not.toBeInTheDocument()
   })
 })
