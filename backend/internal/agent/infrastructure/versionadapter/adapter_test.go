@@ -623,6 +623,7 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
 					Status: "done", Caption: "登录界面截图",
 				}},
+				ImageCount: 2, ImagesTruncated: true,
 			}, nil
 		},
 		imageRefFn: func(_ context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
@@ -632,6 +633,7 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
 					Status: "done", Caption: "登录界面截图",
 				}},
+				Note: "独立图片附件没有平台生成的 caption 行",
 			}, nil
 		},
 		readImageFn: func(_ context.Context, dataRef string) (string, []byte, error) {
@@ -668,6 +670,9 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 		text.Images[0].SHA256 != sha || text.Images[0].Seq != 1 {
 		t.Fatalf("text image = %#v", text.Images[0])
 	}
+	if text.ImageCount != 2 || !text.ImagesTruncated {
+		t.Fatalf("text image budget = %d/%v, want 2/true", text.ImageCount, text.ImagesTruncated)
+	}
 
 	image, err := adapter.AttachmentImageRef(ctx, 10, 20, 9)
 	if err != nil {
@@ -678,6 +683,9 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	}
 	if len(image.Images) != 1 || image.Images[0].Caption != "登录界面截图" {
 		t.Fatalf("image ref images = %#v, want the persisted caption", image.Images)
+	}
+	if image.Note != "独立图片附件没有平台生成的 caption 行" {
+		t.Fatalf("image ref note = %q", image.Note)
 	}
 
 	loaded, err := adapter.LoadImage(ctx, sha)

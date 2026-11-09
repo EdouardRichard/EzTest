@@ -801,33 +801,42 @@ func (r *fakeExtractionRepo) UpsertExtractedRequirements(_ context.Context, sour
 		key := fakeRequirementKey(source.VersionID, requirement.ExternalID)
 		existing, ok := r.requirements[key]
 		if ok {
+			current := versionapp.ExtractionRequirement{
+				ExternalID: existing.ExternalID, Title: existing.Title, Description: existing.Description,
+				AcceptanceCriteria: append([]string(nil), existing.Criteria...), Priority: existing.Priority,
+				Category: existing.Category, SourceQuote: existing.SourceQuote, Confidence: existing.Confidence,
+				ConstraintsJSON: existing.Constraints,
+			}
+			merged := versionapp.MergeExtractionRequirement(current, requirement)
 			existing.VersionID = source.VersionID
-			existing.ExternalID = requirement.ExternalID
-			existing.Title = requirement.Title
-			existing.Description = requirement.Description
-			existing.Criteria = append([]string(nil), requirement.AcceptanceCriteria...)
-			existing.Priority = requirement.Priority
-			existing.Category = requirement.Category
-			existing.SourceQuote = requirement.SourceQuote
-			existing.Confidence = requirement.Confidence
+			existing.ExternalID = merged.ExternalID
+			existing.Title = merged.Title
+			existing.Description = merged.Description
+			existing.Criteria = append([]string(nil), merged.AcceptanceCriteria...)
+			existing.Priority = merged.Priority
+			existing.Category = merged.Category
+			existing.SourceQuote = merged.SourceQuote
+			existing.Confidence = merged.Confidence
 			existing.ConfidenceSet = true
-			existing.Constraints = requirement.ConstraintsJSON
+			existing.Constraints = merged.ConstraintsJSON
 			existing.RunID = source.RunID
 			counts.Updated++
 			continue
 		}
+		storedValue := versionapp.MergeExtractionRequirement(
+			versionapp.ExtractionRequirement{ExternalID: requirement.ExternalID}, requirement)
 		stored := &fakeRequirement{
 			VersionID:     source.VersionID,
-			ExternalID:    requirement.ExternalID,
-			Title:         requirement.Title,
-			Description:   requirement.Description,
-			Criteria:      append([]string(nil), requirement.AcceptanceCriteria...),
-			Priority:      requirement.Priority,
-			Category:      requirement.Category,
-			SourceQuote:   requirement.SourceQuote,
-			Confidence:    requirement.Confidence,
+			ExternalID:    storedValue.ExternalID,
+			Title:         storedValue.Title,
+			Description:   storedValue.Description,
+			Criteria:      append([]string(nil), storedValue.AcceptanceCriteria...),
+			Priority:      storedValue.Priority,
+			Category:      storedValue.Category,
+			SourceQuote:   storedValue.SourceQuote,
+			Confidence:    storedValue.Confidence,
 			ConfidenceSet: true,
-			Constraints:   requirement.ConstraintsJSON,
+			Constraints:   storedValue.ConstraintsJSON,
 			RunID:         source.RunID,
 		}
 		r.requirements[key] = stored
@@ -1141,6 +1150,27 @@ func reconciliation58Plus32Doc() string {
 		fmt.Fprintf(&builder, "FR-%03d 规划需求 %d：后续版本能力。\n", index, index)
 	}
 	return builder.String()
+}
+
+// TestReconciliationIgnoresAliasedFRIDs is the C-03 reconciliation regression:
+// NFR ids and AC-FR sub-items must not inflate the declared count, so a
+// document with no real FR declaration reports expected=0.
+func TestReconciliationIgnoresAliasedFRIDs(t *testing.T) {
+	document := `# 非功能需求
+
+NFR-001 性能要求
+NFR-002 安全要求
+AC-FR-001-01 场景
+`
+	report := versionapp.ReconcileDocument(document, versionapp.ReconciliationInput{})
+	if report.Expected != 0 || len(report.CurrentIDs) != 0 || len(report.PlannedIDs) != 0 {
+		t.Fatalf("aliased ids counted as declared requirements: %+v", report)
+	}
+	// A real declaration still counts.
+	realReport := versionapp.ReconcileDocument(document+"\nFR-001 真正的需求\n", versionapp.ReconciliationInput{})
+	if realReport.Expected != 1 || realReport.CurrentIDs[0] != "FR-001" {
+		t.Fatalf("real declaration lost: %+v", realReport)
+	}
 }
 
 // TestReconciliationCurrent58Planned32 is the A-9 acceptance shape: the live
@@ -1483,6 +1513,64 @@ func TestDuplicateExternalIDUpsert(t *testing.T) {
 	}
 	if stored.Title != "手机号登录" || stored.SourceQuote != "FR-001 登录（手机号）" || stored.Confidence != 0.7 || stored.RunID != run.ID {
 		t.Fatalf("stored requirement=%+v", stored)
+	}
+}
+
+// TestMergeExtractedRequirementFillEmpty is the C-03 no-downgrade regression:
+// the FR body is emitted with replace, the appendix catalog row with
+// fill_empty. The catalog row must not overwrite the body title/description/AC;
+// a valid catalog priority may replace, confidence takes the max, and the
+// constraints of both rows are merged.
+func TestMergeExtractedRequirementFillEmpty(t *testing.T) {
+	env := newExtractionEnv(t)
+	ctx := context.Background()
+	run := env.start(t, 7, 3, testSHA("merge"), "", "需求段落")
+	source := versionapp.ExtractionSource{VersionID: 7, AttachmentID: 3, RunID: run.ID, SegmentSeq: 1}
+
+	body := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "内容排期与工作量看板", Description: "正文描述的完整需求",
+		AcceptanceCriteria: []string{"场景 1：Given 已登录 When 打开看板 Then 展示排期"},
+		Priority:           "P2", Category: "functional", SourceQuote: "FR-131 内容排期与工作量看板",
+		Confidence:      0.9,
+		ConstraintsJSON: json.RawMessage(`{"module":"内容管理"}`),
+		MergeMode:       versionapp.ExtractionMergeReplace,
+	}
+	if _, err := env.svc.EmitExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{body}); err != nil {
+		t.Fatalf("Emit body: %v", err)
+	}
+	catalog := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "目录里的短标题", Description: "目录摘要",
+		AcceptanceCriteria: nil, Priority: "P1", Category: "planned",
+		SourceQuote: "| FR-131 | 目录里的短标题 |", Confidence: 0.6,
+		ConstraintsJSON: json.RawMessage(`{"ac_count":2}`),
+		MergeMode:       versionapp.ExtractionMergeFillEmpty,
+	}
+	if _, err := env.svc.EmitExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{catalog}); err != nil {
+		t.Fatalf("Emit catalog: %v", err)
+	}
+
+	stored, ok := env.repo.Requirement(7, "FR-131")
+	if !ok {
+		t.Fatal("FR-131 not stored")
+	}
+	if stored.Title != body.Title || stored.Description != body.Description {
+		t.Fatalf("catalog row downgraded body title/description: %#v", stored)
+	}
+	if len(stored.Criteria) != 1 || stored.Criteria[0] != body.AcceptanceCriteria[0] {
+		t.Fatalf("catalog row downgraded body AC: %#v", stored.Criteria)
+	}
+	if stored.Priority != "P1" {
+		t.Fatalf("priority = %q, want the valid catalog P1 to replace", stored.Priority)
+	}
+	if stored.Confidence != 0.9 {
+		t.Fatalf("confidence = %v, want max(0.9, 0.6)", stored.Confidence)
+	}
+	var constraints map[string]any
+	if err := json.Unmarshal(stored.Constraints, &constraints); err != nil {
+		t.Fatalf("constraints = %q: %v", stored.Constraints, err)
+	}
+	if constraints["module"] != "内容管理" || constraints["ac_count"] != float64(2) {
+		t.Fatalf("constraints were not merged: %#v", constraints)
 	}
 }
 

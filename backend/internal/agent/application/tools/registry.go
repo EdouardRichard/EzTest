@@ -435,19 +435,23 @@ type AttachmentMeta struct {
 // parse status. A non-done status is data, never a tool error: the model is
 // told "解析中，可重试" or the concrete parse failure reason (§8.5). Images
 // carries the persisted image rows and their platform-generated captions so the
-// Host can read the analysis through read_text (C-01).
+// Host can read the analysis through read_text (C-01); it is only populated on
+// the first page (offset 0). ImageCount/ImagesTruncated report the total rows
+// and whether the first-page payload hit its cap.
 type AttachmentText struct {
-	AttachmentID int64
-	Name         string
-	MIME         string
-	Status       string
-	Offset       int
-	Text         string
-	TotalChars   int
-	Truncated    bool
-	Error        string
-	Retryable    bool
-	Images       []AttachmentImageDetail
+	AttachmentID    int64
+	Name            string
+	MIME            string
+	Status          string
+	Offset          int
+	Text            string
+	TotalChars      int
+	Truncated       bool
+	Error           string
+	Retryable       bool
+	Images          []AttachmentImageDetail
+	ImageCount      int
+	ImagesTruncated bool
 }
 
 // AttachmentImageDetail is one persisted attachment_image row plus its
@@ -465,14 +469,17 @@ type AttachmentImageDetail struct {
 	Error   string
 }
 
-// AttachmentImage is image metadata plus the persisted image rows/captions. The
-// platform generates captions; image_ref never re-runs the analysis.
+// AttachmentImage is image/document metadata plus the persisted image
+// rows/captions. The platform generates captions; image_ref never re-runs the
+// analysis. Note explains an intentionally empty Images payload (a standalone
+// image upload has no persisted analysis row).
 type AttachmentImage struct {
 	AttachmentID int64
 	SHA256       string
 	URL          string
 	MIME         string
 	Images       []AttachmentImageDetail
+	Note         string
 }
 
 // AttachmentPort is the version context's attachment application surface.

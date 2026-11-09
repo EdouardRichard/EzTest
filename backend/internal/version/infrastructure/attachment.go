@@ -250,12 +250,28 @@ func (r *AttachmentRepository) ConversationExists(ctx context.Context, versionID
 	return exists, nil
 }
 
+// staleProcessingTimeout is the C-04 worker-crash threshold: a processing row
+// whose updated_at was not touched for this long is returned to pending.
+const staleProcessingTimeout = 15 * time.Minute
+
 // ListPendingForIngest returns the oldest pending attachments together with
 // their conversation/message linkage (zero when a message is not stored yet).
 // An unbound pre-registered row carries its owning conversation in
 // conversation_id, so the reconciler keeps the conversation scope even before
 // the message binding exists.
+//
+// The call is leader-gated by the worker loop, so it also runs the C-04 stale
+// processing sweep: a row abandoned by a crashed worker (>15 minutes without a
+// heartbeat touch) returns to pending. Per-image transitions touch the parent
+// attachment, so a legitimate slow parse/analysis is never reset.
 func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit int) ([]version.PendingAttachment, error) {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE requirement_attachment
+		SET extraction_status = 'pending', extraction_error = NULL, updated_at = now()
+		WHERE extraction_status = 'processing' AND updated_at < $1
+	`, time.Now().UTC().Add(-staleProcessingTimeout)); err != nil {
+		return nil, fmt.Errorf("reset stale processing attachments: %w", err)
+	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT a.id, a.version_id,
 			COALESCE(m.conversation_id, a.conversation_id, 0),
@@ -391,7 +407,7 @@ func (r *AttachmentRepository) MarkImageAnalyzing(ctx context.Context, imageID i
 		return false, fmt.Errorf("mark attachment image analyzing: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
-		return true, nil
+		return true, r.touchImageAttachment(ctx, imageID, updatedAt)
 	}
 	return false, r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image analyzing")
 }
@@ -407,7 +423,7 @@ func (r *AttachmentRepository) MarkImageDone(ctx context.Context, imageID int64,
 		return fmt.Errorf("mark attachment image done: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
-		return nil
+		return r.touchImageAttachment(ctx, imageID, updatedAt)
 	}
 	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image done")
 }
@@ -425,7 +441,7 @@ func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int6
 		return fmt.Errorf("mark attachment image failed: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
-		return nil
+		return r.touchImageAttachment(ctx, imageID, updatedAt)
 	}
 	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image failed")
 }
@@ -444,7 +460,7 @@ func (r *AttachmentRepository) MarkImageSkipped(ctx context.Context, imageID int
 		return fmt.Errorf("mark attachment image skipped: %w", err)
 	}
 	if tag.RowsAffected() > 0 {
-		return nil
+		return r.touchImageAttachment(ctx, imageID, updatedAt)
 	}
 	return r.ensureAttachmentImageExists(ctx, imageID, "mark attachment image skipped")
 }
@@ -471,6 +487,20 @@ func (r *AttachmentRepository) ensureAttachmentImageExists(ctx context.Context, 
 	}
 	if !exists {
 		return version.ErrAttachmentNotFound
+	}
+	return nil
+}
+
+// touchImageAttachment heartbeats the parent requirement_attachment row: every
+// image transition proves the worker is alive, so the stale-processing sweep
+// (ListPendingForIngest) does not reset a legitimate slow analysis.
+func (r *AttachmentRepository) touchImageAttachment(ctx context.Context, imageID int64, updatedAt time.Time) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE requirement_attachment
+		SET updated_at = $2
+		WHERE id = (SELECT attachment_id FROM attachment_image WHERE id = $1)
+	`, imageID, updatedAt); err != nil {
+		return fmt.Errorf("touch attachment heartbeat: %w", err)
 	}
 	return nil
 }

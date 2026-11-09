@@ -907,7 +907,9 @@ type ReconciliationReport struct {
 
 var (
 	// extractionFRIDPattern is the declared-requirement id syntax (R-A7-8).
-	extractionFRIDPattern = regexp.MustCompile(`FR-\d{3,}`)
+	// It is word anchored and excludes the AC-FR-… prefix so NFR-001 and
+	// AC-FR-001-01 never alias FR-001 (v0.2.3 C-03).
+	extractionFRIDPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_-])(FR-\d{3,})\b`)
 	// extractionRHeadingIDPattern is the second declared-requirement id scheme
 	// (FA-5 typical input): a Markdown heading whose text starts with R<2
 	// digits> ("## R01 账号密码登录"). It is applied to heading text only, so
@@ -982,8 +984,10 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 				add(matches[1])
 			}
 		}
-		for _, id := range extractionFRIDPattern.FindAllString(line, -1) {
-			add(id)
+		for _, match := range extractionFRIDPattern.FindAllStringSubmatch(line, -1) {
+			if len(match) == 2 {
+				add(match[1])
+			}
 		}
 	}
 
@@ -996,8 +1000,10 @@ func ReconcileDocument(documentText string, input ReconciliationInput) Reconcili
 			if section > index && headings[section] {
 				break
 			}
-			for _, id := range extractionFRIDPattern.FindAllString(lines[section], -1) {
-				add(id)
+			for _, match := range extractionFRIDPattern.FindAllStringSubmatch(lines[section], -1) {
+				if len(match) == 2 {
+					add(match[1])
+				}
 			}
 		}
 	}

@@ -75,7 +75,7 @@ type attachmentReadText struct{ deps Deps }
 func (t *attachmentReadText) Name() string { return ToolAttachmentReadText }
 
 func (t *attachmentReadText) Description() string {
-	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000，超出按 20000 截断）。响应返回 returned_chars 与 next_offset；必须按 next_offset 前进，禁止按请求的 max_chars 跳过内容。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。若附件含图片，响应还返回 images[]（image_id/seq/sha256/mime/width/height/status/caption/error）；caption 由平台视觉分析生成，优先阅读 images[].caption；caption 为空或 status=failed 时说明图片分析未完成。"
+	return "分页读取已提取的附件纯文本（offset 从 0 开始，max_chars 默认 8000，最多 20000，超出按 20000 截断）。响应返回 returned_chars 与 next_offset；必须按 next_offset 前进，禁止按请求的 max_chars 跳过内容。返回 status/error/retryable；pending/processing 时明确提示“解析中，可重试”，failed 时返回具体失败原因，不抛状态冲突错误。若附件含图片，仅第一页（offset=0）返回 images[]（image_id/seq/sha256/mime/width/height/status/caption/error），最多 20 张且 caption 合计不超过 4000 字符，超出时 images_truncated=true；后续页只返回 image_count。caption 由平台视觉分析生成，优先阅读 images[].caption；caption 为空或 status=failed 时说明图片分析未完成。"
 }
 
 func (t *attachmentReadText) Parameters() json.RawMessage {
@@ -129,7 +129,7 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 	if page.TotalChars > 0 && nextOffset > page.TotalChars {
 		nextOffset = page.TotalChars
 	}
-	return map[string]any{
+	output := map[string]any{
 		"attachment_id":  idString(attachmentID),
 		"name":           page.Name,
 		"mime":           page.MIME,
@@ -142,8 +142,16 @@ func (t *attachmentReadText) Execute(ctx context.Context, scope Scope, raw json.
 		"truncated":      page.Truncated,
 		"error":          page.Error,
 		"retryable":      page.Retryable,
-		"images":         attachmentImagesPayload(page.Images),
-	}, nil
+		"image_count":    page.ImageCount,
+	}
+	// Images are a first-page-only payload (the application layer only fills
+	// them for offset 0); repeating them on every page would grow the Host
+	// context without adding information. image_count still reports the rows.
+	if page.Offset == 0 {
+		output["images"] = attachmentImagesPayload(page.Images)
+		output["images_truncated"] = page.ImagesTruncated
+	}
+	return output, nil
 }
 
 // attachmentImagesPayload renders the persisted image rows for the tool JSON.
@@ -175,7 +183,7 @@ type attachmentImageRef struct{ deps Deps }
 func (t *attachmentImageRef) Name() string { return ToolAttachmentImageRef }
 
 func (t *attachmentImageRef) Description() string {
-	return "返回图片附件的引用元数据（sha256/url/mime）与已生成的 images[]（含平台生成的 caption）；不会重新运行视觉分析。caption 为空或 status=failed 时说明图片分析未完成。"
+	return "返回图片附件或含内嵌图片的文档（如 docx）的引用元数据（sha256/url/mime）与已生成的 images[]（含平台生成的 caption）；不会重新运行视觉分析。独立图片附件没有持久化 caption 时返回空 images[] 并在 note 中说明；caption 为空或 status=failed 时说明图片分析未完成。"
 }
 
 func (t *attachmentImageRef) Parameters() json.RawMessage {
@@ -209,5 +217,6 @@ func (t *attachmentImageRef) Execute(ctx context.Context, scope Scope, raw json.
 		"url":           image.URL,
 		"mime":          image.MIME,
 		"images":        attachmentImagesPayload(image.Images),
+		"note":          image.Note,
 	}, nil
 }

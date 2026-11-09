@@ -183,6 +183,26 @@ type ExtractionSource = tools.ExtractionSource
 // ExtractionRequirement is one validated fixed-core-schema requirement.
 type ExtractionRequirement = tools.ExtractionRequirement
 
+// ExtractionMergeMode is the in-process no-downgrade merge policy (C-03): FR
+// body declarations replace, catalog table rows fill_empty. It is never
+// persisted and never model supplied.
+type ExtractionMergeMode = tools.ExtractionMergeMode
+
+const (
+	// ExtractionMergeReplace overwrites non-empty fields but never clears them
+	// with an empty value.
+	ExtractionMergeReplace = tools.ExtractionMergeReplace
+	// ExtractionMergeFillEmpty only fills fields that are still empty.
+	ExtractionMergeFillEmpty = tools.ExtractionMergeFillEmpty
+)
+
+// MergeExtractionRequirement applies the incoming row to the current one under
+// the incoming merge policy. It is shared by the in-batch duplicate merge, the
+// deterministic processor and the PostgreSQL upsert.
+func MergeExtractionRequirement(current, incoming ExtractionRequirement) ExtractionRequirement {
+	return tools.MergeExtractionRequirement(current, incoming)
+}
+
 // ExtractionEmitCounts is the created/updated result of one sink call.
 type ExtractionEmitCounts = tools.ExtractionEmitCounts
 

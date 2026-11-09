@@ -99,17 +99,19 @@ func (a *Adapter) ReadAttachmentText(ctx context.Context, versionID, conversatio
 		return tools.AttachmentText{}, err
 	}
 	return tools.AttachmentText{
-		AttachmentID: read.AttachmentID,
-		Name:         read.Name,
-		MIME:         read.MIME,
-		Status:       read.Status,
-		Offset:       read.Offset,
-		Text:         read.Text,
-		TotalChars:   read.TotalChars,
-		Truncated:    read.Truncated,
-		Error:        read.Error,
-		Retryable:    read.Retryable,
-		Images:       attachmentImageDetails(read.Images),
+		AttachmentID:    read.AttachmentID,
+		Name:            read.Name,
+		MIME:            read.MIME,
+		Status:          read.Status,
+		Offset:          read.Offset,
+		Text:            read.Text,
+		TotalChars:      read.TotalChars,
+		Truncated:       read.Truncated,
+		Error:           read.Error,
+		Retryable:       read.Retryable,
+		Images:          attachmentImageDetails(read.Images),
+		ImageCount:      read.ImageCount,
+		ImagesTruncated: read.ImagesTruncated,
 	}, nil
 }
 
@@ -160,6 +162,7 @@ func (a *Adapter) AttachmentImageRef(ctx context.Context, versionID, conversatio
 		URL:          "/api/content/" + reference.SHA256,
 		MIME:         reference.MIME,
 		Images:       attachmentImageDetails(reference.Images),
+		Note:         reference.Note,
 	}, nil
 }
 

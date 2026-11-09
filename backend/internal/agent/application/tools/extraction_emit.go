@@ -78,10 +78,26 @@ type ExtractionSource struct {
 	SegmentSeq   int
 }
 
+// ExtractionMergeMode is the in-process no-downgrade merge policy of one
+// emitted requirement. It is never persisted and never model supplied: the
+// deterministic processor marks FR body declarations replace and catalog table
+// rows fill_empty so a later appendix row cannot overwrite the body.
+type ExtractionMergeMode string
+
+const (
+	// ExtractionMergeReplace overwrites non-empty fields (but never clears a
+	// non-empty title/description/AC with an empty value).
+	ExtractionMergeReplace ExtractionMergeMode = "replace"
+	// ExtractionMergeFillEmpty only fills fields that are still empty in the
+	// current row.
+	ExtractionMergeFillEmpty ExtractionMergeMode = "fill_empty"
+)
+
 // ExtractionRequirement is one validated, normalized requirement of the fixed
 // core schema. SourceQuote is kept byte-for-byte (it passed the verbatim
 // substring check); ConstraintsJSON is the optional open JSON object.
-// Confidence is 0 when the model omitted the optional field.
+// Confidence is 0 when the model omitted the optional field. MergeMode is the
+// in-process merge policy (zero value = replace) and is not persisted.
 type ExtractionRequirement struct {
 	ExternalID         string
 	Title              string
@@ -92,12 +108,15 @@ type ExtractionRequirement struct {
 	SourceQuote        string
 	Confidence         float64
 	ConstraintsJSON    json.RawMessage
+	MergeMode          ExtractionMergeMode
 }
 
 // ExtractionEmitCounts is the sink's created/updated result for one batch.
+// Skipped counts non-draft requirements the sink declined to overwrite.
 type ExtractionEmitCounts struct {
 	Created int
 	Updated int
+	Skipped int
 }
 
 // ExtractionSink is the requirement draft write / upsert port (Task 17/18 owns
@@ -262,6 +281,8 @@ func (t *ExtractionEmitTool) Emit(ctx context.Context, scope Scope, segmentText 
 			// confidence must not zero the duplicate's earlier 0.9, etc.
 			if item.Confidence != nil {
 				merged.Confidence = requirement.Confidence
+			} else {
+				merged.Confidence = normalized[at].Confidence
 			}
 			normalized[at] = merged
 			continue
@@ -296,6 +317,7 @@ func extractionEmitResult(total int, counts ExtractionEmitCounts) map[string]any
 		"requirements": total,
 		"created":      counts.Created,
 		"updated":      counts.Updated,
+		"skipped":      counts.Skipped,
 	}
 }
 
@@ -320,6 +342,12 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 		return ExtractionRequirement{}, extractionFieldError(field("title"),
 			fmt.Sprintf("must be at most %d characters", maxExtractionTitleChars), nil)
 	}
+	if strings.ContainsRune(title, '|') {
+		// A Markdown table row is never a valid title (C-03 guardrail): the
+		// column-aware parser must write the cell, not the raw line.
+		return ExtractionRequirement{}, extractionFieldError(field("title"),
+			"must not contain a Markdown table pipe (|); extract the cell value", nil)
+	}
 	if params.Description == nil {
 		return ExtractionRequirement{}, extractionFieldError(field("description"),
 			"is required; use an empty string when the source has no description", nil)
@@ -328,6 +356,10 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 	if utf8.RuneCountInString(description) > maxExtractionDescriptionChars {
 		return ExtractionRequirement{}, extractionFieldError(field("description"),
 			fmt.Sprintf("must be at most %d characters", maxExtractionDescriptionChars), nil)
+	}
+	if strings.ContainsRune(description, '|') {
+		return ExtractionRequirement{}, extractionFieldError(field("description"),
+			"must not contain a Markdown table pipe (|); extract the cell value", nil)
 	}
 	if params.AcceptanceCriteria == nil {
 		return ExtractionRequirement{}, extractionFieldError(field("acceptance_criteria"),
@@ -416,32 +448,110 @@ func validateExtractionRequirement(index int, params extractionEmitRequirementPa
 	}, nil
 }
 
+// MergeExtractionRequirement applies the incoming row to the current one under
+// the incoming merge policy (C-03 no-downgrade merge). It is shared by the
+// in-batch duplicate merge and the PostgreSQL upsert so both paths enforce the
+// same rules:
+//   - fill_empty: only empty title/description/AC/source_quote are filled;
+//   - replace: non-empty values replace, but empty values never clear a
+//     non-empty title/description/AC/source_quote;
+//   - a valid priority may replace in either mode;
+//   - constraints are merged as JSON objects (incoming wins on a key conflict);
+//   - confidence: fill_empty takes the max, replace takes the incoming score.
+func MergeExtractionRequirement(current, incoming ExtractionRequirement) ExtractionRequirement {
+	merged := current
+	fillEmpty := incoming.MergeMode == ExtractionMergeFillEmpty
+	if fillEmpty {
+		if merged.Title == "" {
+			merged.Title = incoming.Title
+		}
+		if merged.Description == "" {
+			merged.Description = incoming.Description
+		}
+		if len(merged.AcceptanceCriteria) == 0 {
+			merged.AcceptanceCriteria = append([]string(nil), incoming.AcceptanceCriteria...)
+		}
+		if strings.TrimSpace(merged.SourceQuote) == "" {
+			merged.SourceQuote = incoming.SourceQuote
+		}
+		if merged.Confidence < incoming.Confidence {
+			merged.Confidence = incoming.Confidence
+		}
+	} else {
+		if incoming.Title != "" {
+			merged.Title = incoming.Title
+		}
+		if incoming.Description != "" {
+			merged.Description = incoming.Description
+		}
+		if len(incoming.AcceptanceCriteria) > 0 {
+			merged.AcceptanceCriteria = appendUniqueExtractionStrings(
+				append([]string(nil), merged.AcceptanceCriteria...), incoming.AcceptanceCriteria...)
+		}
+		if strings.TrimSpace(incoming.SourceQuote) != "" {
+			merged.SourceQuote = incoming.SourceQuote
+		}
+		merged.Confidence = incoming.Confidence
+	}
+	if IsExtractionPriority(incoming.Priority) {
+		merged.Priority = incoming.Priority
+	}
+	if incoming.Category != "" {
+		merged.Category = incoming.Category
+	}
+	merged.ConstraintsJSON = mergeExtractionConstraints(current.ConstraintsJSON, incoming.ConstraintsJSON)
+	merged.ExternalID = current.ExternalID
+	if merged.ExternalID == "" {
+		merged.ExternalID = incoming.ExternalID
+	}
+	return merged
+}
+
+// IsExtractionPriority reports whether the value is a valid P0-P3 priority.
+func IsExtractionPriority(value string) bool {
+	return containsExactString(extractionPriorities, strings.ToUpper(strings.TrimSpace(value)))
+}
+
+// mergeExtractionConstraints merges two JSON objects. The incoming object wins
+// on a key conflict; an empty side is treated as an empty object.
+func mergeExtractionConstraints(current, incoming json.RawMessage) json.RawMessage {
+	currentObject := decodeExtractionConstraints(current)
+	incomingObject := decodeExtractionConstraints(incoming)
+	if len(currentObject) == 0 && len(incomingObject) == 0 {
+		return current
+	}
+	for key, value := range incomingObject {
+		currentObject[key] = value
+	}
+	merged, err := json.Marshal(currentObject)
+	if err != nil {
+		if len(incoming) > 0 {
+			return incoming
+		}
+		return current
+	}
+	return merged
+}
+
+// decodeExtractionConstraints decodes a constraints JSON object; malformed or
+// empty input becomes an empty object so a merge never fails.
+func decodeExtractionConstraints(raw json.RawMessage) map[string]json.RawMessage {
+	object := map[string]json.RawMessage{}
+	if len(raw) == 0 {
+		return object
+	}
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return map[string]json.RawMessage{}
+	}
+	return object
+}
+
 // mergeExtractionRequirement merges a duplicate external_id into the first
-// occurrence: later scalar values update the base, acceptance criteria are
-// unioned in order (R-A7-5 "duplicate → update/merge, not duplicate").
-// Confidence is applied by Emit only when the duplicate supplied it, so an
-// absent confidence never resets the earlier value to zero.
+// occurrence using the same no-downgrade policy as the sink. Confidence is
+// applied by Emit only when the duplicate supplied it, so an absent confidence
+// never resets the earlier value to zero.
 func mergeExtractionRequirement(base, update ExtractionRequirement) ExtractionRequirement {
-	if update.Title != "" {
-		base.Title = update.Title
-	}
-	if update.Description != "" {
-		base.Description = update.Description
-	}
-	base.AcceptanceCriteria = appendUniqueExtractionStrings(base.AcceptanceCriteria, update.AcceptanceCriteria...)
-	if update.Priority != "" {
-		base.Priority = update.Priority
-	}
-	if update.Category != "" {
-		base.Category = update.Category
-	}
-	if update.SourceQuote != "" {
-		base.SourceQuote = update.SourceQuote
-	}
-	if len(update.ConstraintsJSON) > 0 {
-		base.ConstraintsJSON = update.ConstraintsJSON
-	}
-	return base
+	return MergeExtractionRequirement(base, update)
 }
 
 // extractionFieldError builds the retryable invalid_argument with the offending

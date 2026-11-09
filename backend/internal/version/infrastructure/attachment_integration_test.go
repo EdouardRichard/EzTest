@@ -409,3 +409,81 @@ func TestAttachmentRepositoryConversationScopesPreRegisteredDrafts(t *testing.T)
 		t.Fatalf("conversation A list after bind = %#v, want the backfilled legacy row", listAAfterBind)
 	}
 }
+
+// TestAttachmentStaleProcessingRecovery pins the C-04 worker-crash recovery:
+// the leader-gated ListPendingForIngest sweep returns an abandoned processing
+// row to pending, keeps a freshly touched slow parse untouched, and image
+// transitions touch the parent attachment so a legitimate slow parse is not
+// reset.
+func TestAttachmentStaleProcessingRecovery(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewAttachmentRepository(pool)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	stale := sampleAttachment(ids, 9001)
+	fresh := sampleAttachment(ids, 9001)
+	for _, attachment := range []version.Attachment{stale, fresh} {
+		if err := repo.Create(ctx, attachment); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	for _, row := range []struct {
+		id      int64
+		updated time.Time
+	}{
+		{stale.ID, now.Add(-20 * time.Minute)},
+		{fresh.ID, now.Add(-time.Minute)},
+	} {
+		if _, err := pool.Exec(ctx, `
+			UPDATE requirement_attachment
+			SET extraction_status = 'processing', updated_at = $2
+			WHERE id = $1
+		`, row.id, row.updated); err != nil {
+			t.Fatalf("age processing attachment: %v", err)
+		}
+	}
+
+	pending, err := repo.ListPendingForIngest(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListPendingForIngest: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != stale.ID {
+		t.Fatalf("pending=%+v, want only the stale row reset", pending)
+	}
+	storedStale, err := repo.Get(ctx, stale.ID)
+	if err != nil {
+		t.Fatalf("Get stale: %v", err)
+	}
+	storedFresh, err := repo.Get(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("Get fresh: %v", err)
+	}
+	if storedStale.ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("stale status = %q, want pending", storedStale.ExtractionStatus)
+	}
+	if storedFresh.ExtractionStatus != version.AttachmentProcessing {
+		t.Fatalf("fresh slow parse was reset: %q", storedFresh.ExtractionStatus)
+	}
+
+	// Image transitions are the heartbeat that keeps the fresh row alive.
+	image := version.AttachmentImageRecord{
+		ID: ids.Next(), AttachmentID: fresh.ID, Seq: 1, ContentRefID: 77,
+		MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageExtracted, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}
+	if err := repo.CreateImage(ctx, image); err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+	if changed, err := repo.MarkImageAnalyzing(ctx, image.ID, now); err != nil || !changed {
+		t.Fatalf("MarkImageAnalyzing=%v err=%v", changed, err)
+	}
+	touched, err := repo.Get(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("Get touched: %v", err)
+	}
+	if !touched.UpdatedAt.After(now.Add(-time.Second)) {
+		t.Fatalf("image transition did not touch the parent attachment: %v", touched.UpdatedAt)
+	}
+}

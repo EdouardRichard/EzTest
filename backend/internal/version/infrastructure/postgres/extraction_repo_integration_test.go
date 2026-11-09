@@ -11,6 +11,7 @@ package versionpg_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -250,6 +251,117 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 	// Missing run is a typed not-found.
 	if _, err := repo.GetRun(ctx, ids.Next()); !errors.Is(err, versionapp.ErrExtractionRunNotFound) {
 		t.Fatalf("GetRun missing err=%v, want ErrExtractionRunNotFound", err)
+	}
+}
+
+// TestExtractionUpsertNoDowngradeIntegration pins the C-03 SQL upsert: a
+// fill_empty catalog row only fills empty fields, a valid priority may replace,
+// confidence takes the max, constraints merge and a non-draft requirement is
+// skipped (reported through the counts) instead of being overwritten.
+func TestExtractionUpsertNoDowngradeIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	run := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("9", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	created, err := repo.CreateRun(ctx, run, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	source := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: created.ID, SegmentSeq: 1,
+	}
+	body := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "内容排期与工作量看板", Description: "正文描述",
+		AcceptanceCriteria: []string{"场景 1", "场景 2"}, Priority: "P2",
+		Category: "functional", SourceQuote: "FR-131 内容排期与工作量看板", Confidence: 0.9,
+		ConstraintsJSON: []byte(`{"module":"内容管理"}`),
+		MergeMode:       versionapp.ExtractionMergeReplace,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{body}, now); err != nil {
+		t.Fatalf("Upsert body: %v", err)
+	}
+	catalog := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "目录标题", Description: "目录摘要",
+		Priority: "P1", Category: "planned", SourceQuote: "| FR-131 | 目录标题 |",
+		Confidence: 0.6, ConstraintsJSON: []byte(`{"ac_count":2}`),
+		MergeMode: versionapp.ExtractionMergeFillEmpty,
+	}
+	counts, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{catalog}, now)
+	if err != nil {
+		t.Fatalf("Upsert catalog: %v", err)
+	}
+	if counts.Updated != 1 {
+		t.Fatalf("catalog upsert counts=%+v, want one update", counts)
+	}
+	var title, description, acceptance, priority, constraintsJSON string
+	var confidence float64
+	if err := pool.QueryRow(ctx, `
+		SELECT v.title, v.description, v.acceptance_criteria, v.priority,
+		       v.constraints::text, r.confidence
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-131'
+	`, versionID).Scan(&title, &description, &acceptance, &priority, &constraintsJSON, &confidence); err != nil {
+		t.Fatalf("read merged requirement: %v", err)
+	}
+	if title != body.Title || description != body.Description {
+		t.Fatalf("catalog row downgraded title/description: %q / %q", title, description)
+	}
+	if acceptance != "场景 1\n场景 2" {
+		t.Fatalf("catalog row downgraded AC: %q", acceptance)
+	}
+	if priority != "P1" {
+		t.Fatalf("priority = %q, want P1", priority)
+	}
+	if confidence != 0.9 {
+		t.Fatalf("confidence = %v, want max(0.9, 0.6)", confidence)
+	}
+	var constraints map[string]any
+	if err := json.Unmarshal([]byte(constraintsJSON), &constraints); err != nil {
+		t.Fatalf("constraints = %q: %v", constraintsJSON, err)
+	}
+	if constraints["module"] != "内容管理" || constraints["ac_count"] != float64(2) {
+		t.Fatalf("constraints were not merged: %#v", constraints)
+	}
+
+	// A clarified requirement is not an extraction draft anymore: the default
+	// policy skips it and reports the skip instead of overwriting user work.
+	if _, err := pool.Exec(ctx, `
+		UPDATE requirement SET status = 'clarified' WHERE version_id = $1 AND external_id = 'FR-131'
+	`, versionID); err != nil {
+		t.Fatalf("clarify requirement: %v", err)
+	}
+	overwrite := body
+	overwrite.Title = "抽取覆盖已澄清需求"
+	overwrite.MergeMode = versionapp.ExtractionMergeReplace
+	counts, err = repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{overwrite}, now)
+	if err != nil {
+		t.Fatalf("Upsert non-draft: %v", err)
+	}
+	if counts.Skipped != 1 || counts.Updated != 0 {
+		t.Fatalf("non-draft counts=%+v, want one skipped", counts)
+	}
+	var storedTitle string
+	if err := pool.QueryRow(ctx, `
+		SELECT v.title
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-131'
+	`, versionID).Scan(&storedTitle); err != nil {
+		t.Fatalf("read clarified requirement: %v", err)
+	}
+	if storedTitle == overwrite.Title {
+		t.Fatalf("non-draft requirement was overwritten: %q", storedTitle)
 	}
 }
 

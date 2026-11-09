@@ -304,7 +304,7 @@ func TestVisionRequiredErrorCarriesTypedDiagnosis(t *testing.T) {
 	view := failedSkippedImageAttachment(t, env)
 	env.vision.availability = versionapp.ImageAvailability{
 		ReasonCode: versionapp.VisionReasonDefaultModelNotVision,
-		ConfigID:   "7", ConfigName: "主配置", ModelName: "gpt-4",
+		ConfigID:   "7", ConfigName: "主配置", ModelID: "9", ModelName: "gpt-4",
 		Missing: []string{"vision"},
 	}
 
@@ -323,7 +323,7 @@ func TestVisionRequiredErrorCarriesTypedDiagnosis(t *testing.T) {
 		t.Fatalf("config details = %#v", apiErr.Details)
 	}
 	if apiErr.Details["model"] != "gpt-4" {
-		t.Fatalf("model = %#v", apiErr.Details["model"])
+		t.Fatalf("model = %#v, want the catalog name over the numeric id", apiErr.Details["model"])
 	}
 	missing, _ := apiErr.Details["missing_capabilities"].([]string)
 	if len(missing) != 1 || missing[0] != "vision" {
@@ -341,6 +341,64 @@ func TestVisionRequiredErrorCarriesTypedDiagnosis(t *testing.T) {
 	}
 }
 
+// TestVisionRequiredErrorNormalizesEmptyReasonAndCarriesCause pins the review
+// minors: an empty reason_code never reaches the 400 details, the real LLM cause
+// is surfaced, and a non-vision capability gap gets a cause-specific next action
+// instead of the vision hint.
+func TestVisionRequiredErrorNormalizesEmptyReasonAndCarriesCause(t *testing.T) {
+	t.Run("empty reason", func(t *testing.T) {
+		env := newAttachmentEnv(t)
+		view := failedSkippedImageAttachment(t, env)
+		env.vision.availability = versionapp.ImageAvailability{
+			ModelID:      "9",
+			CauseCode:    "llm_config_invalid",
+			CauseMessage: `thinking_type=disabled cannot be combined with reasoning_effort="high"`,
+		}
+		env.vision.availabilitySet = true
+
+		_, err := env.svc.Reanalyze(requestContext(), view.ID)
+		apiErr := apiError(t, err)
+		if apiErr.Details["reason_code"] != versionapp.VisionReasonDefaultModelInvalid {
+			t.Fatalf("reason_code = %#v, want the normalized generic code", apiErr.Details["reason_code"])
+		}
+		if apiErr.Details["cause_code"] != "llm_config_invalid" {
+			t.Fatalf("cause_code = %#v", apiErr.Details["cause_code"])
+		}
+		causeMessage, _ := apiErr.Details["cause_message"].(string)
+		if !strings.Contains(causeMessage, "thinking_type=disabled") {
+			t.Fatalf("cause_message = %q, want the real LLM message", causeMessage)
+		}
+		if apiErr.Details["model"] != "9" {
+			t.Fatalf("model = %#v, want the numeric-id fallback", apiErr.Details["model"])
+		}
+	})
+
+	t.Run("non-vision capability gap", func(t *testing.T) {
+		env := newAttachmentEnv(t)
+		view := failedSkippedImageAttachment(t, env)
+		env.vision.availability = versionapp.ImageAvailability{
+			ReasonCode: versionapp.VisionReasonDefaultModelInvalid,
+			ModelName:  "gpt-4", Missing: []string{"reasoning"},
+		}
+
+		_, err := env.svc.Reanalyze(requestContext(), view.ID)
+		apiErr := apiError(t, err)
+		if apiErr.Details["reason_code"] != versionapp.VisionReasonDefaultModelInvalid {
+			t.Fatalf("reason_code = %#v", apiErr.Details["reason_code"])
+		}
+		nextAction, _ := apiErr.Details["next_action"].(string)
+		if !strings.Contains(nextAction, "reasoning") {
+			t.Fatalf("next_action = %q, want the missing capability named", nextAction)
+		}
+		if strings.Contains(nextAction, "视觉（vision）的模型") {
+			t.Fatalf("next_action = %q, want no vision-only hint", nextAction)
+		}
+		if !strings.Contains(apiErr.Message, "reasoning") {
+			t.Fatalf("message = %q, want the missing capability named", apiErr.Message)
+		}
+	})
+}
+
 // TestVisionAvailabilityTransientReturns503 pins the other half of the M-07
 // split: a transient gateway problem must stay a retryable 503 ai_unavailable,
 // never a 400 vision_required that tells the user to fix a configuration.
@@ -349,6 +407,7 @@ func TestVisionAvailabilityTransientReturns503(t *testing.T) {
 	view := failedSkippedImageAttachment(t, env)
 	env.vision.availability = versionapp.ImageAvailability{
 		ReasonCode: versionapp.VisionReasonGatewayUnreachable, Retryable: true,
+		CauseCode: "ai_unavailable",
 	}
 
 	_, err := env.svc.Reanalyze(requestContext(), view.ID)
@@ -365,12 +424,37 @@ func TestVisionAvailabilityTransientReturns503(t *testing.T) {
 	if apiErr.Details["reason_code"] != versionapp.VisionReasonGatewayUnreachable {
 		t.Fatalf("reason_code = %#v", apiErr.Details["reason_code"])
 	}
+	if apiErr.Details["cause_code"] != "ai_unavailable" {
+		t.Fatalf("cause_code = %#v, want the underlying LLM code", apiErr.Details["cause_code"])
+	}
 	rows, listErr := env.svc.ListImages(requestContext(), view.ID)
 	if listErr != nil {
 		t.Fatalf("ListImages: %v", listErr)
 	}
 	if len(rows) != 1 || rows[0].Status != version.AttachmentImageSkipped {
 		t.Fatalf("transient error reset the rows: %#v", rows)
+	}
+}
+
+// TestVisionAvailabilityProbeErrorCarriesCause covers the advisor's dead-branch
+// note: if an adapter returns an error instead of data, the 503 must keep the
+// underlying cause code so the failure is diagnosable.
+func TestVisionAvailabilityProbeErrorCarriesCause(t *testing.T) {
+	env := newAttachmentEnv(t)
+	view := failedSkippedImageAttachment(t, env)
+	env.vision.availableErr = &platform.Error{
+		Status: http.StatusServiceUnavailable, Code: "ai_unavailable",
+		Message: "vision catalog lookup failed", Retryable: true,
+	}
+
+	_, err := env.svc.Reanalyze(requestContext(), view.ID)
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusServiceUnavailable || apiErr.Code != "ai_unavailable" || !apiErr.Retryable {
+		t.Fatalf("error = %#v, want retryable 503 ai_unavailable", apiErr)
+	}
+	if apiErr.Details["reason_code"] != versionapp.VisionReasonGatewayUnreachable ||
+		apiErr.Details["cause_code"] != "ai_unavailable" {
+		t.Fatalf("details = %#v, want reason + cause code", apiErr.Details)
 	}
 }
 

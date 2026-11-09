@@ -138,6 +138,7 @@ func classifyVisionResolveError(err error) versionapp.ImageAvailability {
 		return availability
 	}
 	availability.CauseCode = apiErr.Code
+	availability.CauseMessage = apiErr.Message
 	availability.ConfigID = detailString(apiErr.Details, "config_id")
 	availability.ConfigName = detailString(apiErr.Details, "config_name")
 	availability.ModelID = detailString(apiErr.Details, "default_model_id")
@@ -147,16 +148,38 @@ func classifyVisionResolveError(err error) versionapp.ImageAvailability {
 	switch apiErr.Code {
 	case llmapp.CodeLLMConfigInvalid:
 		availability.Retryable = false
-		if strings.Contains(strings.ToLower(apiErr.Message), "deprecated or disabled") {
+		message := strings.ToLower(apiErr.Message)
+		switch {
+		case strings.Contains(message, "deprecated or disabled"):
 			availability.ReasonCode = versionapp.VisionReasonDefaultModelDisabled
-		} else {
+		case strings.Contains(message, "has no default model"),
+			strings.Contains(message, "is not in the catalog"):
 			availability.ReasonCode = versionapp.VisionReasonDefaultModelMissing
+		default:
+			// Another deterministic configuration error (for example the
+			// thinking_type=disabled + reasoning_effort contradiction). Claiming
+			// the default model is missing would send the operator to fix the
+			// wrong setting, so keep the generic deterministic reason and carry
+			// the real cause in CauseCode/CauseMessage.
+			availability.ReasonCode = versionapp.VisionReasonDefaultModelInvalid
 		}
 	case llmapp.CodeLLMCapabilityMismatch:
 		availability.Retryable = false
-		availability.ReasonCode = versionapp.VisionReasonDefaultModelNotVision
-		if len(availability.Missing) == 0 {
-			availability.Missing = []string{"vision"}
+		if availability.Missing == nil {
+			availability.Missing = []string{}
+		}
+		if capabilityMissing(availability.Missing, "vision") ||
+			strings.Contains(strings.ToLower(apiErr.Message), "does not support vision") {
+			availability.ReasonCode = versionapp.VisionReasonDefaultModelNotVision
+			if !capabilityMissing(availability.Missing, "vision") {
+				availability.Missing = append(availability.Missing, "vision")
+			}
+		} else {
+			// A capability gap for a non-vision requirement (for example
+			// reasoning implied by the thinking settings) is not "not vision":
+			// name it in missing_capabilities and keep the cause-specific next
+			// action.
+			availability.ReasonCode = versionapp.VisionReasonDefaultModelInvalid
 		}
 		if availability.ModelName == "" {
 			availability.ModelName = availability.ModelID
@@ -172,6 +195,18 @@ func classifyVisionResolveError(err error) versionapp.ImageAvailability {
 		}
 	}
 	return availability
+}
+
+// capabilityMissing reports whether the resolved model rejected a specific
+// required capability. The comparison is case-insensitive because the LLM
+// application lowercases capability names while a future caller may not.
+func capabilityMissing(missing []string, capability string) bool {
+	for _, value := range missing {
+		if strings.EqualFold(strings.TrimSpace(value), capability) {
+			return true
+		}
+	}
+	return false
 }
 
 // deterministicVisionConfigMessage identifies the ai_unavailable messages that

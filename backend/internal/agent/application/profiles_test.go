@@ -309,7 +309,14 @@ func TestHostPromptsExplainPlatformCaptions(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing profile %q", key)
 		}
-		for _, want := range []string{"images[].caption", "平台", "图片分析未完成", "不要声称"} {
+		for _, want := range []string{
+			"caption 由平台视觉分析生成",
+			"用 attachment.read_text 读取附件",
+			"优先查看 images[].caption",
+			"caption 为空或 status=failed 时说明图片分析未完成",
+			"不要声称平台没有视觉能力",
+			"不要臆测图片内容",
+		} {
 			if !strings.Contains(profile.SystemPrompt, want) {
 				t.Fatalf("profile %q prompt lacks %q: %s", key, want, profile.SystemPrompt)
 			}

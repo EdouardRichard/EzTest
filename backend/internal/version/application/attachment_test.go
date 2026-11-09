@@ -766,9 +766,18 @@ func TestAttachmentImageRef(t *testing.T) {
 	if ref.SHA256 != strings.Repeat("b", 64) || ref.Name != "shot.png" || ref.MIME != "image/png" {
 		t.Fatalf("ref = %#v", ref)
 	}
+	// A standalone image upload is registered skipped and has no persisted
+	// attachment_image row (it is sent as an image part). That is metadata plus
+	// an explicit empty-payload note, not an error.
+	if len(ref.Images) != 0 {
+		t.Fatalf("standalone image images = %#v, want empty", ref.Images)
+	}
+	if strings.TrimSpace(ref.Note) == "" {
+		t.Fatalf("standalone image note = %q, want the explicit empty-caption note", ref.Note)
+	}
 	markdown := registerAttachment(t, env, strings.Repeat("a", 64), "spec.md", "text/markdown", []byte("# Spec"))
 	if _, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, markdown.ID); err == nil {
-		t.Fatal("image ref returned for a markdown attachment")
+		t.Fatal("image ref returned for a markdown attachment without persisted images")
 	}
 }
 
@@ -804,23 +813,106 @@ func TestReadAttachmentTextReturnsImageCaptions(t *testing.T) {
 	if image.SHA256 == "" || image.MIME != "image/png" || image.Width != 8 || image.Height != 6 {
 		t.Fatalf("image metadata = %#v", image)
 	}
+	if read.ImageCount != 1 || read.ImagesTruncated {
+		t.Fatalf("image count/truncated = %d/%v, want 1/false", read.ImageCount, read.ImagesTruncated)
+	}
 }
 
-// TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit:
-// image_ref returns the same persisted image rows/captions as read_text instead
-// of only a bare content reference.
-func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
-	env := newAttachmentEnv(t)
-	sha := strings.Repeat("b", 64)
-	image := registerAttachment(t, env, sha, "shot.png", "image/png", []byte("png"))
-	stored := env.repo.attachments[image.ID]
-	env.repo.images[901] = version.AttachmentImageRecord{
-		ID: 901, AttachmentID: image.ID, Seq: 1, ContentRefID: stored.ContentRefID,
-		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceStandalone,
-		Status: version.AttachmentImageDone, Caption: "登录界面截图：手机号与验证码输入框",
+// TestReadAttachmentTextPaginatesImages pins the C-01/M-07 paging contract: the
+// image payload is only attached to the first page. Later pages must not repeat
+// the captions, but still report image_count so the Host knows they exist.
+func TestReadAttachmentTextPaginatesImages(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("7", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
 	}
 
-	ref, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, image.ID)
+	first, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 2)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first.Images) != 1 || first.ImageCount != 1 {
+		t.Fatalf("first page images = %#v count = %d", first.Images, first.ImageCount)
+	}
+	if first.Text == "" || !first.Truncated {
+		t.Fatalf("first page = %#v, want a truncated text window", first)
+	}
+	second, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 2, 2)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second.Images) != 0 {
+		t.Fatalf("second page repeated images: %#v", second.Images)
+	}
+	if second.ImageCount != 1 {
+		t.Fatalf("second page image_count = %d, want 1", second.ImageCount)
+	}
+}
+
+// TestReadAttachmentTextBoundsImages pins the explicit image budget: at most
+// MaxAttachmentReadImages rows and MaxAttachmentReadImageCaptionChars caption
+// characters are returned on the first page, and the truncation is reported.
+func TestReadAttachmentTextBoundsImages(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("6", 64)
+	view := registerAttachment(t, env, sha, "many-images.docx", docxMIME, []byte("docx"))
+	for index := 1; index <= 25; index++ {
+		env.repo.images[int64(9000+index)] = version.AttachmentImageRecord{
+			ID: int64(9000 + index), AttachmentID: view.ID, Seq: index,
+			MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+			Status: version.AttachmentImageDone, Caption: strings.Repeat("图", 400),
+		}
+	}
+
+	read, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 8000)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	if read.ImageCount != 25 {
+		t.Fatalf("image_count = %d, want 25", read.ImageCount)
+	}
+	if !read.ImagesTruncated {
+		t.Fatalf("images_truncated = false, want the budget cap")
+	}
+	if len(read.Images) > versionapp.MaxAttachmentReadImages {
+		t.Fatalf("images = %d, want <= %d", len(read.Images), versionapp.MaxAttachmentReadImages)
+	}
+	captionChars := 0
+	for _, image := range read.Images {
+		captionChars += len([]rune(image.Caption))
+	}
+	if captionChars > versionapp.MaxAttachmentReadImageCaptionChars {
+		t.Fatalf("caption chars = %d, want <= %d", captionChars, versionapp.MaxAttachmentReadImageCaptionChars)
+	}
+}
+
+// TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit on
+// the real UAT path: a docx attachment whose embedded images were extracted and
+// analyzed returns those persisted rows/captions. The previous version of this
+// test fabricated a row on a standalone image, a state no upload can produce.
+func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("8", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	ref, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, view.ID)
 	if err != nil {
 		t.Fatalf("AttachmentImageRef: %v", err)
 	}
@@ -831,8 +923,14 @@ func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
 		ref.Images[0].Status != version.AttachmentImageDone || ref.Images[0].Seq != 1 {
 		t.Fatalf("image = %#v", ref.Images[0])
 	}
-	if ref.Images[0].SHA256 != sha {
-		t.Fatalf("image sha = %q, want %q", ref.Images[0].SHA256, sha)
+	if ref.Images[0].SHA256 == "" || ref.Images[0].MIME != "image/png" {
+		t.Fatalf("image metadata = %#v", ref.Images[0])
+	}
+	if ref.Name != "with-image.docx" || ref.MIME != docxMIME || ref.SHA256 != sha {
+		t.Fatalf("attachment metadata = %#v", ref)
+	}
+	if ref.Note != "" {
+		t.Fatalf("note = %q, want empty for a document with persisted captions", ref.Note)
 	}
 }
 
