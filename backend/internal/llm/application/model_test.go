@@ -726,3 +726,137 @@ func TestRefreshModelsCannotDowngradeDefaultVision(t *testing.T) {
 		t.Fatalf("rejected refresh changed the stored capability: %#v", stored)
 	}
 }
+
+// TestResolveModelErrorDetails pins the M-07 diagnostics contract: the two
+// non-retryable resolve errors carry the configuration identity and the
+// configured default model ID in details, so the vision layer and the admin UI
+// can explain which config/model is broken instead of collapsing every failure
+// into "no vision model".
+func TestResolveModelErrorDetails(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("capability mismatch carries config and default model", func(t *testing.T) {
+		svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+		seedDefaultConfig(repo, 11)
+		repo.models[11] = chatTestModel(11, 7, "plain-llm", 64000, 8192)
+
+		_, err := svc.ResolveModel(ctx, 0, "", ModelRequirements{Vision: true})
+		apiErr := apiError(t, err)
+		if apiErr.Code != CodeLLMCapabilityMismatch {
+			t.Fatalf("error = %#v", apiErr)
+		}
+		if apiErr.Details["config_id"] != "7" || apiErr.Details["config_name"] != "config-7" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+		if apiErr.Details["default_model_id"] != "11" || apiErr.Details["model"] != "plain-llm" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+		if missing, _ := apiErr.Details["missing_capabilities"].([]string); !containsString(missing, "vision") {
+			t.Fatalf("missing capabilities = %#v", apiErr.Details["missing_capabilities"])
+		}
+	})
+
+	t.Run("missing default carries empty default model id", func(t *testing.T) {
+		svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+		seedDefaultConfig(repo, 0)
+		repo.models[11] = chatTestModel(11, 7, "plain-llm", 64000, 8192)
+
+		_, err := svc.ResolveModel(ctx, 0, "")
+		apiErr := apiError(t, err)
+		if apiErr.Code != CodeLLMConfigInvalid {
+			t.Fatalf("error = %#v", apiErr)
+		}
+		if apiErr.Details["config_id"] != "7" || apiErr.Details["config_name"] != "config-7" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+		if apiErr.Details["default_model_id"] != "" {
+			t.Fatalf("default_model_id = %#v, want empty", apiErr.Details["default_model_id"])
+		}
+	})
+
+	t.Run("default outside catalog keeps the configured id", func(t *testing.T) {
+		svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+		seedDefaultConfig(repo, 99)
+
+		_, err := svc.ResolveModel(ctx, 0, "")
+		apiErr := apiError(t, err)
+		if apiErr.Code != CodeLLMConfigInvalid || apiErr.Details["default_model_id"] != "99" {
+			t.Fatalf("error = %#v", apiErr)
+		}
+		if apiErr.Details["config_id"] != "7" || apiErr.Details["config_name"] != "config-7" {
+			t.Fatalf("details = %#v", apiErr.Details)
+		}
+	})
+
+	t.Run("deprecated default carries config details", func(t *testing.T) {
+		svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+		seedDefaultConfig(repo, 11)
+		deprecated := chatTestModel(11, 7, "retired-llm", 64000, 8192)
+		deprecated.Deprecated = true
+		repo.models[11] = deprecated
+
+		_, err := svc.ResolveModel(ctx, 0, "")
+		apiErr := apiError(t, err)
+		if apiErr.Code != CodeLLMConfigInvalid ||
+			apiErr.Details["default_model_id"] != "11" ||
+			apiErr.Details["config_id"] != "7" ||
+			apiErr.Details["config_name"] != "config-7" {
+			t.Fatalf("error = %#v", apiErr)
+		}
+	})
+}
+
+// TestCapabilityProvenanceSources pins the capability-level provenance that
+// lets a catalog refresh preserve an administrator's manual corrections (S-02).
+// Each boolean capability carries its own catalog|manual marker; rows written
+// before the markers existed infer the source from the row's catalog/manual
+// origin so a legacy manual model keeps its administrator-provided values.
+func TestCapabilityProvenanceSources(t *testing.T) {
+	t.Run("legacy catalog row infers catalog", func(t *testing.T) {
+		model := llm.Model{
+			SupportsTools: true, SupportsVision: true,
+			Capabilities: llm.Capabilities{SupportsReasoning: true},
+			Source:       llm.SourceCatalog,
+		}
+		capabilities := model.EffectiveCapabilities()
+		if capabilities.SupportsToolsSource != llm.SourceCatalog ||
+			capabilities.SupportsVisionSource != llm.SourceCatalog ||
+			capabilities.SupportsReasoningSource != llm.SourceCatalog ||
+			capabilities.SupportsPromptCacheSource != llm.SourceCatalog {
+			t.Fatalf("legacy catalog sources = %#v", capabilities)
+		}
+	})
+
+	t.Run("legacy manual row infers manual", func(t *testing.T) {
+		model := llm.Model{Source: llm.SourceManual}
+		capabilities := model.EffectiveCapabilities()
+		if capabilities.SupportsToolsSource != llm.SourceManual ||
+			capabilities.SupportsVisionSource != llm.SourceManual ||
+			capabilities.SupportsReasoningSource != llm.SourceManual ||
+			capabilities.SupportsPromptCacheSource != llm.SourceManual {
+			t.Fatalf("legacy manual sources = %#v", capabilities)
+		}
+	})
+
+	t.Run("stored sources win over row origin", func(t *testing.T) {
+		model := llm.Model{
+			SupportsTools: true, SupportsVision: true,
+			Source: llm.SourceCatalog,
+			Capabilities: llm.Capabilities{
+				SupportsTools:             true,
+				SupportsVision:            true,
+				SupportsToolsSource:       llm.SourceManual,
+				SupportsVisionSource:      llm.SourceCatalog,
+				SupportsReasoningSource:   llm.SourceManual,
+				SupportsPromptCacheSource: llm.SourceCatalog,
+			},
+		}
+		capabilities := model.EffectiveCapabilities()
+		if capabilities.SupportsToolsSource != llm.SourceManual ||
+			capabilities.SupportsVisionSource != llm.SourceCatalog ||
+			capabilities.SupportsReasoningSource != llm.SourceManual ||
+			capabilities.SupportsPromptCacheSource != llm.SourceCatalog {
+			t.Fatalf("stored sources = %#v", capabilities)
+		}
+	})
+}

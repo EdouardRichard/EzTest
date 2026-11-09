@@ -183,7 +183,14 @@ func TestResolveModelReturnsCatalogMetadata(t *testing.T) {
 		ContextWindow: 128000,
 		MaxOutput:     16384,
 		SupportsTools: true,
-		Capabilities:  llm.Capabilities{SupportsTools: true, ContextWindow: 128000},
+		Capabilities: llm.Capabilities{
+			SupportsTools:             true,
+			SupportsToolsSource:       llm.SourceCatalog,
+			SupportsVisionSource:      llm.SourceCatalog,
+			SupportsReasoningSource:   llm.SourceCatalog,
+			SupportsPromptCacheSource: llm.SourceCatalog,
+			ContextWindow:             128000,
+		},
 	}
 	if info != want {
 		t.Fatalf("info = %#v, want %#v", info, want)

@@ -126,10 +126,11 @@ func (s *stubService) DeleteModel(_ context.Context, modelID int64, actorID int6
 	return s.err
 }
 
-func (s *stubService) ResetModelParams(_ context.Context, configID, modelID int64) (llm.Model, error) {
+func (s *stubService) ResetModelParams(_ context.Context, configID, modelID, actorID int64) (llm.Model, error) {
 	s.calls = append(s.calls, "reset_model_params")
 	s.lastID = configID
 	s.lastModel = modelID
+	s.lastActor = actorID
 	if s.err != nil {
 		return llm.Model{}, s.err
 	}
@@ -742,8 +743,8 @@ func TestResetModelParamsEndpoint(t *testing.T) {
 	if len(stub.calls) != 1 || stub.calls[0] != "reset_model_params" {
 		t.Fatalf("calls = %#v", stub.calls)
 	}
-	if stub.lastID != 101 || stub.lastModel != 201 {
-		t.Fatalf("ids = %d/%d, want 101/201", stub.lastID, stub.lastModel)
+	if stub.lastID != 101 || stub.lastModel != 201 || stub.lastActor != 7 {
+		t.Fatalf("ids/actor = %d/%d/%d, want 101/201/7", stub.lastID, stub.lastModel, stub.lastActor)
 	}
 	t.Logf("reset response: %s", recorder.Body.String())
 	for _, key := range []string{"catalog_context_window", "catalog_max_output"} {
@@ -774,6 +775,109 @@ func TestResetModelParamsEndpoint(t *testing.T) {
 	missing := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models/999/reset-params", "", adminActor())
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing status = %d, body = %s", missing.Code, missing.Body.String())
+	}
+}
+
+// TestConfigHealthDTO pins the M-07 configuration pre-check exposed on every
+// config response: the admin UI can warn about a missing/deleted/disabled
+// default model or a non-vision default without first attempting a run.
+func TestConfigHealthDTO(t *testing.T) {
+	healthy := sampleModel()
+	noVision := sampleModel()
+	noVision.SupportsVision = false
+	noVision.Capabilities = llm.Capabilities{SupportsVision: false}
+	disabled := sampleModel()
+	disabled.Status = llm.ModelStatusDisabled
+
+	cases := []struct {
+		name       string
+		defaultID  int64
+		models     []llm.Model
+		wantValid  bool
+		wantVision bool
+		wantReason string
+	}{
+		{"healthy vision default", 201, []llm.Model{healthy}, true, true, ""},
+		{"no default model", 0, []llm.Model{healthy}, false, false, "default_model_missing"},
+		{"default outside catalog", 999, []llm.Model{healthy}, false, false, "default_model_missing"},
+		{"default disabled", 201, []llm.Model{disabled}, false, false, "default_model_disabled"},
+		{"default without vision", 201, []llm.Model{noVision}, true, false, "default_model_not_vision"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, stub := newTestServer(t)
+			cfg := sampleConfig()
+			cfg.DefaultModelID = tc.defaultID
+			stub.configs = []llm.Config{cfg}
+			stub.models = tc.models
+
+			recorder := call(t, handler, http.MethodGet, "/api/admin/llm/configs", "", adminActor())
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			items := dataList(t, recorder)
+			if len(items) != 1 {
+				t.Fatalf("items = %#v", items)
+			}
+			item, _ := items[0].(map[string]any)
+			health, ok := item["health"].(map[string]any)
+			if !ok {
+				t.Fatalf("health = %#v", item["health"])
+			}
+			if health["default_model_valid"] != tc.wantValid || health["vision_ready"] != tc.wantVision {
+				t.Fatalf("health = %#v, want valid=%v vision=%v", health, tc.wantValid, tc.wantVision)
+			}
+			if health["reason"] != tc.wantReason {
+				t.Fatalf("health reason = %#v, want %q", health["reason"], tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestModelDTOCapabilitySources pins the S-02 HTTP surface: the per-capability
+// catalog|manual provenance is exposed both inside capabilities and as flat
+// fields so the admin UI can label manually corrected capabilities.
+func TestModelDTOCapabilitySources(t *testing.T) {
+	handler, stub := newTestServer(t)
+	model := sampleModel()
+	model.Capabilities = llm.Capabilities{
+		SupportsTools:             true,
+		SupportsVision:            true,
+		SupportsReasoning:         true,
+		SupportsPromptCache:       true,
+		SupportsToolsSource:       llm.SourceCatalog,
+		SupportsVisionSource:      llm.SourceManual,
+		SupportsReasoningSource:   llm.SourceCatalog,
+		SupportsPromptCacheSource: llm.SourceManual,
+		ContextWindow:             128000,
+	}
+	stub.models = []llm.Model{model}
+
+	recorder := call(t, handler, http.MethodGet, "/api/admin/llm/models", "", adminActor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	items := dataList(t, recorder)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	first, _ := items[0].(map[string]any)
+	want := map[string]string{
+		"supports_tools_source":        llm.SourceCatalog,
+		"supports_vision_source":       llm.SourceManual,
+		"supports_reasoning_source":    llm.SourceCatalog,
+		"supports_prompt_cache_source": llm.SourceManual,
+	}
+	for key, value := range want {
+		if first[key] != value {
+			t.Fatalf("%s = %#v, want %q", key, first[key], value)
+		}
+	}
+	capabilities, _ := first["capabilities"].(map[string]any)
+	for key, value := range want {
+		if capabilities[key] != value {
+			t.Fatalf("capabilities.%s = %#v, want %q", key, capabilities[key], value)
+		}
 	}
 }
 
