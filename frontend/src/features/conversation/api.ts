@@ -56,10 +56,11 @@ export type ContextPacketView = {
 /**
  * Reads the latest persisted context packet of the version. The payload contains
  * prompt content, so the backend only serves it to an admin (403 for a normal
- * user, 404 when no packet was recorded, 503 when the reader is not wired).
+ * user, 503 when the reader is not wired). A version with no recorded packet is
+ * an empty read (`200 {data:null}`) and resolves to `null`.
  */
-export function getLatestContextPacket(versionId: string): Promise<ContextPacketView> {
-  return apiGet<ContextPacketView>(
+export function getLatestContextPacket(versionId: string): Promise<ContextPacketView | null> {
+  return apiGet<ContextPacketView | null>(
     `/api/versions/${encodeURIComponent(versionId)}/context-packets/latest`,
   )
 }

@@ -5,10 +5,14 @@ import "@testing-library/jest-dom/vitest"
 const pathname = vi.hoisted(() => ({ current: "/resources" }))
 vi.mock("next/navigation", () => ({ usePathname: () => pathname.current }))
 
+const auth = vi.hoisted(() => ({ isAdmin: true }))
+vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin }))
+
 import { Sidebar } from "./Sidebar"
 
 describe("Sidebar", () => {
   beforeEach(() => {
+    auth.isAdmin = true
     pathname.current = "/resources"
   })
 
@@ -56,6 +60,37 @@ describe("Sidebar", () => {
 
     expect(screen.getByRole("link", { name: /^版本/ })).toHaveAttribute("aria-current", "page")
     expect(screen.getByRole("link", { name: /^资源/ })).not.toHaveAttribute("aria-current")
+  })
+
+  it("shows the admin-only platform entries to an administrator", () => {
+    render(<Sidebar />)
+
+    const nav = screen.getByRole("navigation", { name: "主导航" })
+    expect(within(nav).getAllByRole("link")).toHaveLength(8)
+    expect(screen.getByRole("link", { name: /^质量/ })).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: /^Agent 中心/ })).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: /^设置/ })).toBeInTheDocument()
+    expect(screen.getByText("平台")).toBeInTheDocument()
+  })
+
+  it("hides the admin-only platform entries from a normal user", () => {
+    auth.isAdmin = false
+    render(<Sidebar />)
+
+    const nav = screen.getByRole("navigation", { name: "主导航" })
+    const links = within(nav).getAllByRole("link")
+    expect(links).toHaveLength(5)
+    expect(links.map((link) => link.textContent?.trim())).toEqual([
+      "版本",
+      "问题",
+      "报告",
+      "知识",
+      "资源",
+    ])
+    expect(screen.queryByRole("link", { name: /^质量/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /^Agent 中心/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /^设置/ })).not.toBeInTheDocument()
+    expect(screen.queryByText("平台")).not.toBeInTheDocument()
   })
 
   it("shows the controlled-environment notice at the bottom", () => {

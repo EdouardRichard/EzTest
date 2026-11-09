@@ -1,5 +1,8 @@
 const TOKEN_KEY = "eztest.token"
 const USER_KEY = "eztest.user"
+const EXPIRES_AT_KEY = "eztest.token_expires_at"
+
+const AUTH_STORAGE_KEYS = new Set<string>([TOKEN_KEY, USER_KEY, EXPIRES_AT_KEY])
 
 /** Browser event dispatched whenever the local session is cleared. */
 export const AUTH_CLEARED_EVENT = "eztest:auth-cleared"
@@ -16,7 +19,16 @@ export type AuthUser = {
   status: AuthStatus
 }
 
-function getStorage(): Storage | null {
+function getLocalStorage(): Storage | null {
+  if (typeof window === "undefined") return null
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+function getSessionStorage(): Storage | null {
   if (typeof window === "undefined") return null
   try {
     return window.sessionStorage
@@ -25,9 +37,14 @@ function getStorage(): Storage | null {
   }
 }
 
+/** True for the keys the session uses; `null` (a full storage clear) counts too. */
+export function isAuthStorageKey(key: string | null): boolean {
+  return key === null || AUTH_STORAGE_KEYS.has(key)
+}
+
 function read(key: string): string | null {
   try {
-    return getStorage()?.getItem(key) ?? null
+    return getLocalStorage()?.getItem(key) ?? null
   } catch {
     return null
   }
@@ -35,19 +52,61 @@ function read(key: string): string | null {
 
 function write(key: string, value: string): void {
   try {
-    getStorage()?.setItem(key, value)
+    getLocalStorage()?.setItem(key, value)
   } catch {
     // Storage can be unavailable or full (private mode). The in-memory auth
     // state still works for the current page; the next reload signs the user out.
   }
 }
 
-function remove(key: string): void {
+function removeEverywhere(key: string): void {
   try {
-    getStorage()?.removeItem(key)
+    getLocalStorage()?.removeItem(key)
   } catch {
     // Ignore storage failures: there is nothing else to clean up.
   }
+  try {
+    getSessionStorage()?.removeItem(key)
+  } catch {
+    // Ignore storage failures: there is nothing else to clean up.
+  }
+}
+
+/**
+ * Copies a session written by an older build (sessionStorage) into
+ * localStorage exactly once. The legacy copy is always removed so a later tab
+ * cannot resurrect it over a newer localStorage session.
+ */
+function migrateLegacySession(): void {
+  if (typeof window === "undefined") return
+  let legacyToken: string | null = null
+  let legacyUser: string | null = null
+  try {
+    const legacy = getSessionStorage()
+    if (legacy === null) return
+    legacyToken = legacy.getItem(TOKEN_KEY)
+    legacyUser = legacy.getItem(USER_KEY)
+    if (legacyToken === null && legacyUser === null) return
+
+    // Only seed an empty localStorage; never overwrite a session created by
+    // this (or another) tab after the upgrade.
+    if (read(TOKEN_KEY) === null && read(USER_KEY) === null) {
+      if (legacyToken !== null) write(TOKEN_KEY, legacyToken)
+      if (legacyUser !== null) write(USER_KEY, legacyUser)
+    }
+    legacy.removeItem(TOKEN_KEY)
+    legacy.removeItem(USER_KEY)
+  } catch {
+    // A blocked/partial sessionStorage is equivalent to no legacy session.
+  }
+}
+
+function isSessionExpired(): boolean {
+  const expiresAt = read(EXPIRES_AT_KEY)
+  if (expiresAt === null) return false
+  const timestamp = Date.parse(expiresAt)
+  // Fail closed: an unparseable expiry must not keep a session alive.
+  return !Number.isFinite(timestamp) || timestamp <= Date.now()
 }
 
 function readId(value: unknown): string | null {
@@ -56,22 +115,31 @@ function readId(value: unknown): string | null {
   return null
 }
 
-/** Reads the bearer token from sessionStorage (never from a URL or log). */
+/** Reads the bearer token from localStorage (never from a URL or log). */
 export function getToken(): string | null {
-  return read(TOKEN_KEY)
+  migrateLegacySession()
+  const token = read(TOKEN_KEY)
+  if (token === null) return null
+  if (isSessionExpired()) {
+    clearSession()
+    return null
+  }
+  return token
 }
 
-/** Persists the bearer token for the current browser tab. */
+/** Persists the bearer token; the server owns the authoritative TTL. */
 export function setToken(token: string): void {
+  migrateLegacySession()
   write(TOKEN_KEY, token)
 }
 
 /**
- * Removes the bearer token and notifies listeners (for example AuthProvider)
- * so the protected layout can redirect to /login after a 401.
+ * Removes the bearer token and its expiry and notifies listeners (for example
+ * AuthProvider) so the protected layout can redirect to /login after a 401.
  */
 export function clearToken(): void {
-  remove(TOKEN_KEY)
+  removeEverywhere(TOKEN_KEY)
+  removeEverywhere(EXPIRES_AT_KEY)
   if (typeof window !== "undefined") {
     window.dispatchEvent(new Event(AUTH_CLEARED_EVENT))
   }
@@ -110,23 +178,32 @@ function parseUser(raw: string): AuthUser | null {
 }
 
 export function getStoredUser(): AuthUser | null {
+  migrateLegacySession()
+  if (isSessionExpired()) return null
   const raw = read(USER_KEY)
   if (!raw) return null
   return parseUser(raw)
 }
 
 export function setStoredUser(user: AuthUser): void {
+  migrateLegacySession()
   write(USER_KEY, JSON.stringify(user))
 }
 
-/** Stores a complete login session. */
-export function setSession(token: string, user: AuthUser): void {
-  setToken(token)
-  setStoredUser(user)
+/** Stores a complete login session, including the server-provided expiry. */
+export function setSession(token: string, user: AuthUser, expiresAt?: string | Date | null): void {
+  migrateLegacySession()
+  write(TOKEN_KEY, token)
+  write(USER_KEY, JSON.stringify(user))
+  if (expiresAt === undefined || expiresAt === null || expiresAt === "") {
+    removeEverywhere(EXPIRES_AT_KEY)
+    return
+  }
+  write(EXPIRES_AT_KEY, expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt)
 }
 
-/** Clears both the token and the cached user. */
+/** Clears the token, expiry and cached user from both storage areas. */
 export function clearSession(): void {
-  remove(USER_KEY)
+  removeEverywhere(USER_KEY)
   clearToken()
 }

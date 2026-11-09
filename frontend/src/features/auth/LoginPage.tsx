@@ -10,9 +10,9 @@ import { Button } from "@/components/ui/Button"
 import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
 import { Spinner } from "@/components/ui/Spinner"
-import { ApiError } from "@/lib/api-client"
 
-import { useAuth } from "./AuthProvider"
+import { safeNext, useAuth } from "./AuthProvider"
+import { loginErrorMessage } from "./login-errors"
 
 const HIGHLIGHTS = [
   { icon: Sparkles, text: "AI 驱动的需求澄清、用例设计与执行闭环" },
@@ -20,12 +20,17 @@ const HIGHLIGHTS = [
   { icon: ShieldCheck, text: "受控网络内的单团队测试工作区" },
 ]
 
+export type LoginPageProps = {
+  /** Raw `?next=` value from the login route; only same-origin paths are used. */
+  nextPath?: string
+}
+
 /**
- * Login screen for the single administrator account. There is intentionally no
- * bootstrap/initialise-admin form: the API seeds `admin` from
- * `EZTEST_INITIAL_ADMIN_PASSWORD` the first time the user table is empty.
+ * Login screen for platform accounts. Deployment variables and initial-password
+ * guidance intentionally live in the deployment docs, not on the public login
+ * screen (S-09).
  */
-export function LoginPage() {
+export function LoginPage({ nextPath }: LoginPageProps) {
   const { login, loading, token } = useAuth()
   const router = useRouter()
   const [username, setUsername] = useState("")
@@ -33,12 +38,13 @@ export function LoginPage() {
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
   const navigated = useRef(false)
+  const target = safeNext(nextPath)
 
   useEffect(() => {
     if (loading || token === null || navigated.current) return
     navigated.current = true
-    router.replace("/versions")
-  }, [loading, token, router])
+    router.replace(target)
+  }, [loading, token, router, target])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
@@ -52,10 +58,10 @@ export function LoginPage() {
     navigated.current = true
     try {
       await login(username.trim(), password)
-      router.push("/versions")
+      router.push(target)
     } catch (caught) {
       navigated.current = false
-      setError(caught instanceof ApiError ? caught.message : "登录失败，请稍后重试")
+      setError(loginErrorMessage(caught))
     } finally {
       setPending(false)
     }
@@ -104,8 +110,8 @@ export function LoginPage() {
             <p className="text-xs text-muted-foreground">使用平台账号进入工作区</p>
           </header>
 
-          <Alert tone="info" title="初始管理员密码">
-            由部署时的 EZTEST_INITIAL_ADMIN_PASSWORD 设置，首次登录后请修改密码。
+          <Alert tone="info" title="账号由管理员开通">
+            请使用平台账号登录；忘记密码或账号被禁用时，请联系管理员处理。
           </Alert>
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
@@ -138,10 +144,6 @@ export function LoginPage() {
               {pending ? "登录中…" : "登录"}
             </Button>
           </form>
-
-          <p className="text-[11px] leading-relaxed text-muted-foreground">
-            开发测试环境 · 受控网络。管理员凭据由部署配置提供，请登录后立即修改初始密码。
-          </p>
         </section>
       </div>
     </div>

@@ -114,7 +114,10 @@ export function FactsPanel({ versionId, initialFactId, refreshKey = 0 }: FactsPa
           description="探索/代码扫描产生的事实会写入这里，并参与计划与设计上下文。"
         />
       ) : (
-        <ul className="space-y-1.5">
+        <ul
+          data-testid="version-facts-list"
+          className="max-h-[36rem] space-y-1.5 overflow-y-auto pr-1"
+        >
           {facts.map((fact) => {
             const superseded = fact.superseded_by !== null
             const isSelected = fact.id === initialFactId

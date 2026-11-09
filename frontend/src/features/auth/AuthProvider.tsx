@@ -1,6 +1,6 @@
 "use client"
 
-import { useRouter } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import type { ReactNode } from "react"
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
@@ -10,7 +10,9 @@ import {
   AUTH_CLEARED_EVENT,
   type AuthUser,
   clearSession,
+  getStoredUser,
   getToken,
+  isAuthStorageKey,
   setSession,
   toAuthUser,
 } from "@/lib/auth-storage"
@@ -37,16 +39,40 @@ function readUserPayload(payload: unknown): User | null {
   return toAuthUser(payload)
 }
 
-function readSessionPayload(payload: unknown): { token: string; user: User } | null {
+function readSessionPayload(
+  payload: unknown,
+): { token: string; user: User; expiresAt: string | null } | null {
   if (!isRecord(payload)) return null
   const token = typeof payload.token === "string" ? payload.token : ""
   const user = readUserPayload(payload)
   if (token.length === 0 || user === null) return null
-  return { token, user }
+  const expiresAt =
+    typeof payload.expires_at === "string" && payload.expires_at.length > 0
+      ? payload.expires_at
+      : null
+  return { token, user, expiresAt }
 }
 
 function invalidResponse(message: string): ApiError {
   return new ApiError({ status: 200, code: "invalid_response", message, retryable: false })
+}
+
+/**
+ * Restricts a `next` redirect target to a same-origin path. Anything that could
+ * leave the app (absolute URL, protocol-relative `//`, backslash normalization)
+ * or loop back to /login falls back to the default landing page.
+ */
+export function safeNext(next: string | null | undefined): string {
+  const fallback = "/versions"
+  if (typeof next !== "string") return fallback
+  const candidate = next.trim()
+  if (candidate.length === 0) return fallback
+  if (!candidate.startsWith("/")) return fallback
+  if (candidate.startsWith("//")) return fallback
+  if (candidate.includes("\\")) return fallback
+  const path = candidate.split(/[?#]/, 1)[0] ?? ""
+  if (path === "/login" || path.startsWith("/login/")) return fallback
+  return candidate
 }
 
 /**
@@ -101,12 +127,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener(AUTH_CLEARED_EVENT, onCleared)
   }, [])
 
+  // localStorage is shared by every tab: adopt a login/logout performed in
+  // another tab instead of waiting for the next reload or API 401.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return
+      if (!isAuthStorageKey(event.key)) return
+      const nextToken = getToken()
+      setToken(nextToken)
+      if (nextToken === null) {
+        setUser(null)
+        setLoading(false)
+        return
+      }
+      setUser(getStoredUser())
+    }
+    window.addEventListener("storage", onStorage)
+    return () => window.removeEventListener("storage", onStorage)
+  }, [])
+
   const login = useCallback(async (username: string, password: string) => {
     const payload = await apiPost<unknown>("/api/auth/login", { username, password })
     const session = readSessionPayload(payload)
     if (session === null) throw invalidResponse("登录响应缺少令牌或用户信息")
 
-    setSession(session.token, session.user)
+    setSession(session.token, session.user, session.expiresAt)
     setToken(session.token)
     setUser(session.user)
   }, [])
@@ -148,10 +193,15 @@ export function useAuth(): AuthContextValue {
 export function RequireAuth({ children }: { children: ReactNode }) {
   const { loading, token } = useAuth()
   const router = useRouter()
+  const pathname = usePathname()
 
   useEffect(() => {
-    if (!loading && token === null) router.replace("/login")
-  }, [loading, token, router])
+    if (loading || token !== null) return
+    // Keep the deep link so login can return the visitor to where they were.
+    const search = typeof window === "undefined" ? "" : window.location.search
+    const target = `${pathname}${search}`
+    router.replace(`/login?next=${encodeURIComponent(target)}`)
+  }, [loading, token, router, pathname])
 
   if (loading) {
     return (

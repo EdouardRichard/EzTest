@@ -37,10 +37,15 @@ function jsonResponse(body: unknown, status = 200): Response {
   })
 }
 
-function renderLoginPage(): void {
+function clearStorage(): void {
+  window.localStorage.clear()
+  window.sessionStorage.clear()
+}
+
+function renderLoginPage(nextPath?: string): void {
   render(
     <AuthProvider>
-      <LoginPage />
+      <LoginPage nextPath={nextPath} />
     </AuthProvider>,
   )
 }
@@ -50,9 +55,14 @@ async function fillCredentials(): Promise<void> {
   fireEvent.change(screen.getByLabelText("密码"), { target: { value: "test-admin-pass" } })
 }
 
+async function submitLogin(): Promise<void> {
+  await fillCredentials()
+  fireEvent.click(screen.getByRole("button", { name: "登录" }))
+}
+
 describe("LoginPage", () => {
   beforeEach(() => {
-    window.sessionStorage.clear()
+    clearStorage()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
     nav.push.mockReset()
@@ -62,19 +72,17 @@ describe("LoginPage", () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
-    window.sessionStorage.clear()
+    clearStorage()
   })
 
-  it("shows env-based admin password guidance and no default credential hint", async () => {
+  it("does not expose deployment variables or initial-password guidance", async () => {
     renderLoginPage()
 
-    expect(
-      await screen.findByText(
-        "由部署时的 EZTEST_INITIAL_ADMIN_PASSWORD 设置，首次登录后请修改密码。",
-      ),
-    ).toBeInTheDocument()
-    expect(screen.queryByText(/admin123/i)).not.toBeInTheDocument()
-    expect(screen.queryByText(/首次启动默认|默认管理员账号/)).not.toBeInTheDocument()
+    expect(await screen.findByLabelText("用户名")).toBeInTheDocument()
+    expect(screen.getByText("使用平台账号进入工作区")).toBeInTheDocument()
+    expect(screen.queryByText(/EZTEST_INITIAL_ADMIN_PASSWORD/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/初始管理员密码/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/部署配置|部署时/)).not.toBeInTheDocument()
     expect(screen.getByLabelText("密码")).toHaveAttribute("type", "password")
   })
 
@@ -93,39 +101,90 @@ describe("LoginPage", () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it("surfaces the API login error", async () => {
+  it("maps a 401 to the Chinese credential error instead of the raw API message", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ error: { code: "unauthenticated", message: "用户名或密码错误" } }, 401),
+      jsonResponse({ error: { code: "unauthenticated", message: "invalid credentials" } }, 401),
     )
     renderLoginPage()
-    await fillCredentials()
-
-    fireEvent.click(screen.getByRole("button", { name: "登录" }))
+    await submitLogin()
 
     expect(await screen.findByRole("alert")).toHaveTextContent("用户名或密码错误")
     expect(getToken()).toBeNull()
     expect(nav.push).not.toHaveBeenCalled()
   })
 
-  it("persists the session and enters /versions on success", async () => {
+  it("maps a disabled account 403 to its own Chinese message", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "account_disabled", message: "account is disabled" } }, 403),
+    )
+    renderLoginPage()
+    await submitLogin()
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("账号已被禁用，请联系管理员")
+    expect(getToken()).toBeNull()
+  })
+
+  it("maps 429 to a Chinese rate-limit message", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: { code: "rate_limited", message: "too many requests" } }, 429),
+    )
+    renderLoginPage()
+    await submitLogin()
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("登录尝试过于频繁，请稍后再试")
+  })
+
+  it("maps a network failure to a Chinese connectivity message", async () => {
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    renderLoginPage()
+    await submitLogin()
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("网络连接失败，请检查网络后重试")
+    expect(getToken()).toBeNull()
+  })
+
+  it("persists the session with its expiry and enters /versions on success", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({
-        data: { token: "ezt_login", expires_at: "2026-11-07T00:00:00Z", user: admin },
+        data: { token: "ezt_login", expires_at: "2099-01-01T00:00:00Z", user: admin },
       }),
     )
     renderLoginPage()
-    await fillCredentials()
-
-    fireEvent.click(screen.getByRole("button", { name: "登录" }))
+    await submitLogin()
 
     await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/versions"))
     expect(getToken()).toBe("ezt_login")
+    expect(window.localStorage.getItem("eztest.token_expires_at")).toBe("2099-01-01T00:00:00Z")
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe("http://localhost:13333/api/auth/login")
     expect(JSON.parse(String(init?.body))).toEqual({
       username: "admin",
       password: "test-admin-pass",
     })
+  })
+
+  it("returns to the original target carried in next", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: { token: "ezt_login", expires_at: "2099-01-01T00:00:00Z", user: admin },
+      }),
+    )
+    renderLoginPage("/knowledge?tab=requirements")
+    await submitLogin()
+
+    await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/knowledge?tab=requirements"))
+  })
+
+  it("ignores an unsafe next target", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: { token: "ezt_login", expires_at: "2099-01-01T00:00:00Z", user: admin },
+      }),
+    )
+    renderLoginPage("//evil.example/login")
+    await submitLogin()
+
+    await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/versions"))
   })
 
   it("sends an already authenticated visitor to /versions", async () => {
@@ -135,5 +194,14 @@ describe("LoginPage", () => {
     renderLoginPage()
 
     await waitFor(() => expect(nav.replace).toHaveBeenCalledWith("/versions"))
+  })
+
+  it("sends an already authenticated visitor to next", async () => {
+    setSession("ezt_stored", admin)
+    fetchMock.mockResolvedValue(jsonResponse({ data: { user: admin } }))
+
+    renderLoginPage("/knowledge")
+
+    await waitFor(() => expect(nav.replace).toHaveBeenCalledWith("/knowledge"))
   })
 })

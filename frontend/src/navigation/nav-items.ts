@@ -18,6 +18,8 @@ export type NavItem = {
   placeholder?: boolean
   /** Phase that will provide the real page, shown on placeholder entries. */
   phase?: string
+  /** Admin-only pages are hidden from the sidebar for normal users (S-08). */
+  adminOnly?: boolean
 }
 
 export const NAV_SECTIONS: NavSection[] = [
@@ -56,6 +58,7 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/quality",
     icon: Gauge,
     section: "platform",
+    adminOnly: true,
   },
   {
     key: "agents",
@@ -63,8 +66,16 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/agents",
     icon: Bot,
     section: "platform",
+    adminOnly: true,
   },
-  { key: "settings", label: "设置", href: "/settings", icon: Settings, section: "platform" },
+  {
+    key: "settings",
+    label: "设置",
+    href: "/settings",
+    icon: Settings,
+    section: "platform",
+    adminOnly: true,
+  },
 ]
 
 /** A navigation entry owns its exact route and every nested route below it. */

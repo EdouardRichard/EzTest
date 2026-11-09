@@ -287,6 +287,31 @@ describe("QualityPage", () => {
     expect(navigation.replace).toHaveBeenCalledWith("/quality?version=2002")
   })
 
+  it("falls back to all versions for an unknown ?version= deep link", async () => {
+    auth.isAdmin = true
+    render(<QualityPage initialVersionId="9999" />)
+
+    expect(await screen.findByTestId("quality-version-fallback")).toHaveTextContent(
+      "版本 #9999 不存在，已按全部版本展示",
+    )
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith(undefined))
+    expect(qualityApi.getQualityOverview).not.toHaveBeenCalledWith("9999")
+    expect(qualityApi.getQualityTrends).not.toHaveBeenCalled()
+    expect(navigation.replace).toHaveBeenCalledWith("/quality")
+    expect(await screen.findByLabelText("版本")).toHaveValue("")
+    expect(screen.queryByRole("button", { name: "触发快照评测" })).not.toBeInTheDocument()
+  })
+
+  it("does not treat a failed version list as an unknown version", async () => {
+    versionsApi.listVersions.mockRejectedValue(new Error("版本列表不可用"))
+
+    render(<QualityPage initialVersionId="9999" />)
+
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("9999"))
+    expect(screen.queryByTestId("quality-version-fallback")).not.toBeInTheDocument()
+    expect(navigation.replace).not.toHaveBeenCalledWith("/quality")
+  })
+
   // W2-14 (R-W2-6): admin triggers one server-derived snapshot eval and the
   // quality board refreshes from the returned run.
   it("lets an admin trigger a snapshot eval for the selected version", async () => {

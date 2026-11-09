@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -9,7 +9,7 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { ApiError } from "@/lib/api-client"
 
-import { type ContextPacketView, getLatestContextPacket } from "./api"
+import { type ContextPacketSegment, type ContextPacketView, getLatestContextPacket } from "./api"
 
 export type ContextPacketCardProps = {
   versionId: string
@@ -41,6 +41,7 @@ function isApiError(error: unknown, status: number): boolean {
 export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCardProps) {
   const isAdmin = useIsAdmin()
   const [packet, setPacket] = useState<ContextPacketView | null>(null)
+  const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<unknown>(null)
 
   const load = useCallback(async () => {
@@ -48,11 +49,14 @@ export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCa
     // card for a normal user, and if they do it must not fire a guaranteed 403.
     if (!isAdmin) return
     setError(null)
+    setLoaded(false)
     try {
       setPacket(await getLatestContextPacket(versionId))
     } catch (cause) {
       setPacket(null)
       setError(cause)
+    } finally {
+      setLoaded(true)
     }
   }, [versionId, isAdmin])
 
@@ -63,6 +67,21 @@ export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCa
 
   const forbidden = !isAdmin || isApiError(error, 403)
   const missing = isApiError(error, 404)
+
+  // Identical history segments are legal (same role/name/tokens). Keep an
+  // occurrence suffix per segment so every rendered row has a unique key (G-05).
+  const segmentKeys = useMemo(() => {
+    const keys = new Map<ContextPacketSegment, string>()
+    if (packet === null) return keys
+    const seen = new Map<string, number>()
+    for (const segment of packet.segments) {
+      const base = `${segment.prefix ? "prefix" : "dynamic"}:${segment.role}:${segment.name}:${segment.tokens}`
+      const occurrence = seen.get(base) ?? 0
+      seen.set(base, occurrence + 1)
+      keys.set(segment, `${base}:${occurrence}`)
+    }
+    return keys
+  }, [packet])
 
   return (
     <section
@@ -91,8 +110,13 @@ export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCa
         />
       ) : error !== null ? (
         <ErrorState error={error} title="上下文包加载失败" onRetry={() => void load()} />
-      ) : packet === null ? (
+      ) : !loaded ? (
         <LoadingCard label="正在加载上下文包…" />
+      ) : packet === null ? (
+        <EmptyState
+          title="该版本暂无上下文包"
+          description="首次 agent run 记录上下文包后会在这里出现。"
+        />
       ) : (
         <div className="space-y-1.5 text-[11px]">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -116,10 +140,7 @@ export function ContextPacketCard({ versionId, refreshKey = 0 }: ContextPacketCa
             </summary>
             <ol className="mt-1.5 space-y-1">
               {packet.segments.map((segment) => (
-                <li
-                  key={`${segment.prefix ? "prefix" : "dynamic"}:${segment.role}:${segment.name}:${segment.tokens}`}
-                  className="rounded-md bg-muted/40 px-2 py-1"
-                >
+                <li key={segmentKeys.get(segment)} className="rounded-md bg-muted/40 px-2 py-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="font-medium text-foreground">{segment.name}</span>
                     <Badge tone="info">{segment.role}</Badge>
