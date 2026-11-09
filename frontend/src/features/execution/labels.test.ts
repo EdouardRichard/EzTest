@@ -16,8 +16,10 @@ import {
   HUMAN_REQUEST_KIND_LABEL,
   HUMAN_REQUEST_STATUS_LABEL,
   HUMAN_REQUEST_STATUS_TONE,
+  nextActionLabel,
   PAUSE_MODE_LABEL,
   STEP_STATUS_LABEL,
+  terminalCauseLabel,
   WAVE_STATUS_LABEL,
   WAVE_STATUS_TONE,
   WAVE_TRIGGER_LABEL,
@@ -110,6 +112,28 @@ describe("terminal cause labels (X-01/X-02/X-07)", () => {
     expect(causeTextLabel("登录后跳转超时")).toBe("登录后跳转超时")
     expect(causeTextLabel("")).toBeNull()
     expect(causeTextLabel(undefined)).toBeNull()
+  })
+
+  it("localizes a leading stable code and keeps the remaining detail", () => {
+    expect(causeTextLabel("executor_timeout: context creation exceeded its hard deadline")).toBe(
+      "执行器超时: context creation exceeded its hard deadline",
+    )
+    expect(causeTextLabel("executor_unavailable: dial tcp 127.0.0.1:13336: refused")).toBe(
+      "执行器不可用: dial tcp 127.0.0.1:13336: refused",
+    )
+    expect(causeTextLabel("executor_lost:")).toBe("执行器失联")
+    // Unknown codes and prose that merely contains a colon stay verbatim.
+    expect(causeTextLabel("token budget: used 1 of 2 tokens")).toBe(
+      "token budget: used 1 of 2 tokens",
+    )
+    expect(causeTextLabel("https://sut.test:8443 path")).toBe("https://sut.test:8443 path")
+  })
+
+  it("does not resolve inherited object properties as labels", () => {
+    expect(causeTextLabel("toString")).toBe("toString")
+    expect(failureClassLabel("constructor")).toBe("constructor")
+    expect(terminalCauseLabel("toString")).toBe("toString")
+    expect(nextActionLabel("hasOwnProperty")).toBe("hasOwnProperty")
   })
 })
 

@@ -31,6 +31,21 @@ const differentStepActual: Evidence = {
   filename: "other-step.png",
 }
 
+const differentRunActual: Evidence = {
+  ...laterActual,
+  id: "9405",
+  case_run_id: "9999",
+  filename: "other-run.png",
+  created_at: "2026-10-31T12:00:10Z",
+}
+
+const differentKindActual: Evidence = {
+  ...laterActual,
+  id: "9406",
+  kind: "screenshot",
+  filename: "screenshot-instead.png",
+}
+
 describe("EvidenceViewer visual kinds", () => {
   const createObjectURL = vi.fn<(blob: Blob) => string>()
   const revokeObjectURL = vi.fn<(url: string) => void>()
@@ -146,5 +161,28 @@ describe("EvidenceViewer visual kinds", () => {
 
     await screen.findByTestId("evidence-image")
     expect(screen.queryByTestId("evidence-compare")).not.toBeInTheDocument()
+  })
+
+  it("does not compare evidence from another case run or kind", async () => {
+    api.downloadEvidence.mockResolvedValue({
+      blob: new Blob(["png"], { type: "image/png" }),
+      filename: "actual.png",
+      contentType: "image/png",
+    })
+
+    render(
+      <EvidenceViewer
+        versionId="2001"
+        evidence={earlierActual}
+        candidates={[differentRunActual, differentKindActual]}
+        open
+        onClose={() => {}}
+      />,
+    )
+
+    await screen.findByTestId("evidence-image")
+    expect(screen.queryByTestId("evidence-compare")).not.toBeInTheDocument()
+    expect(api.downloadEvidence).not.toHaveBeenCalledWith("2001", "9405")
+    expect(api.downloadEvidence).not.toHaveBeenCalledWith("2001", "9406")
   })
 })

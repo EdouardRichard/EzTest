@@ -48,16 +48,19 @@ export function revokeSoon(url: string, delayMs: number = REVOKE_DELAY_MS): void
 
 /* ------------------------------ HTTP evidence ------------------------------ */
 
+export type HttpHeaderValue = string | string[]
+export type HttpHeaders = Record<string, HttpHeaderValue>
+
 export type HttpRequestRecord = {
   method: string
   url: string
-  headers: Record<string, string>
+  headers: HttpHeaders
   body: string
 }
 
 export type HttpResponseRecord = {
   status: number
-  headers: Record<string, string>
+  headers: HttpHeaders
   body: string
   body_truncated: boolean
 }
@@ -67,12 +70,29 @@ export type HttpEvidenceRecord = {
   response: HttpResponseRecord
 }
 
-function stringHeaders(value: unknown): Record<string, string> {
-  const headers: Record<string, string> = {}
+function stringHeaderValue(item: unknown): string | null {
+  if (typeof item === "string") return item
+  if (typeof item === "number" || typeof item === "boolean") return String(item)
+  return null
+}
+
+/**
+ * Normalizes persisted headers to `string | string[]`. The backend persists
+ * request headers as `map[string]string` but response headers as
+ * `map[string][]string` (`execution/application/tools.go`), so an array value
+ * is the normal production shape and must not be dropped.
+ */
+function stringHeaders(value: unknown): HttpHeaders {
+  const headers: HttpHeaders = {}
   if (value === null || typeof value !== "object" || Array.isArray(value)) return headers
   for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof item === "string") headers[name] = item
-    else if (typeof item === "number" || typeof item === "boolean") headers[name] = String(item)
+    if (Array.isArray(item)) {
+      const values = item.map(stringHeaderValue).filter((entry): entry is string => entry !== null)
+      if (values.length > 0) headers[name] = values
+    } else {
+      const single = stringHeaderValue(item)
+      if (single !== null) headers[name] = single
+    }
   }
   return headers
 }
@@ -127,15 +147,20 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`
 }
 
+/** Renders a header value; repeated (array) headers join with `, `. */
+function headerValueText(value: HttpHeaderValue): string {
+  return Array.isArray(value) ? value.join(", ") : value
+}
+
 /**
  * Builds an exact `curl` for the persisted request: method, URL, every header
  * in payload order and the verbatim body. Exported so the copy affordance can
  * be asserted without a clipboard.
  */
 export function buildCurl(request: HttpRequestRecord): string {
-  const parts = [`curl -X ${request.method} ${shellQuote(request.url)}`]
+  const parts = [`curl -X ${shellQuote(request.method)} ${shellQuote(request.url)}`]
   for (const [name, value] of Object.entries(request.headers)) {
-    parts.push(`-H ${shellQuote(`${name}: ${value}`)}`)
+    parts.push(`-H ${shellQuote(`${name}: ${headerValueText(value)}`)}`)
   }
   if (request.body.length > 0) {
     parts.push(`--data-raw ${shellQuote(request.body)}`)
@@ -403,7 +428,7 @@ export function EvidenceThumbnail({ versionId, evidence, onOpen }: EvidenceThumb
 
 /* ---------------------------------- viewer --------------------------------- */
 
-function HeaderList({ headers, testId }: { headers: Record<string, string>; testId: string }) {
+function HeaderList({ headers, testId }: { headers: HttpHeaders; testId: string }) {
   const entries = Object.entries(headers)
   if (entries.length === 0) {
     return (
@@ -417,7 +442,7 @@ function HeaderList({ headers, testId }: { headers: Record<string, string>; test
       {entries.map(([name, value]) => (
         <div key={name} className="break-all">
           <dt className="inline font-semibold text-foreground">{name}</dt>
-          <dd className="inline">: {value}</dd>
+          <dd className="inline">: {headerValueText(value)}</dd>
         </div>
       ))}
     </dl>

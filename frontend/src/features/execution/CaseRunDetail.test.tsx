@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -306,5 +306,56 @@ describe("CaseRunDetail cause labels (X-07)", () => {
     expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent(label)
     expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(label)
     expect(document.body.textContent).not.toContain(cause)
+  })
+
+  it("localizes a last_error that carries a stable code prefix", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_timeout",
+            last_error: "executor_timeout: context creation exceeded its hard deadline",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(
+      "执行器超时: context creation exceeded its hard deadline",
+    )
+    expect(document.body.textContent).not.toContain("executor_timeout")
+  })
+
+  it("prefills the manual issue summary with the localized last_error", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_timeout",
+            last_error: "executor_timeout: context creation exceeded its hard deadline",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "创建问题" }))
+
+    const summary = screen.getByLabelText("摘要") as HTMLTextAreaElement
+    expect(summary.value).toBe("执行器超时: context creation exceeded its hard deadline")
+    expect(document.body.textContent).not.toContain("executor_timeout")
   })
 })

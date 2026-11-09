@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
+import { REVOKE_DELAY_MS } from "@/features/execution/EvidenceViewer"
 import { ApiError } from "@/lib/api-client"
 
 import type { GlobalReportView } from "./global-api"
@@ -243,5 +244,39 @@ describe("GlobalReportsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "打开报告 HTML" }))
 
     expect(await screen.findByText("report html is not available")).toBeInTheDocument()
+  })
+
+  it("keeps the report HTML blob URL alive briefly after opening", async () => {
+    globalApi.listGlobalReports.mockResolvedValue(page([versionReport]))
+    const createObjectURL = vi.fn(() => "blob:global-report-html")
+    const revokeObjectURL = vi.fn()
+    Object.assign(URL, { createObjectURL, revokeObjectURL })
+    const open = vi.spyOn(window, "open").mockReturnValue({} as Window)
+    render(<GlobalReportsPage />)
+
+    fireEvent.click(await screen.findByTestId("global-report-8101"))
+    await screen.findByTestId("report-detail")
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "打开报告 HTML" }))
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      expect(api.downloadHTML).toHaveBeenCalledWith("2001", "8101", 2)
+      expect(open).toHaveBeenCalledWith("blob:global-report-html", "_blank", "noopener,noreferrer")
+      // X-05: revoking in the same tick races the new tab's navigation.
+      expect(revokeObjectURL).not.toHaveBeenCalled()
+
+      act(() => {
+        vi.advanceTimersByTime(REVOKE_DELAY_MS)
+      })
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:global-report-html")
+    } finally {
+      vi.useRealTimers()
+      open.mockRestore()
+    }
   })
 })

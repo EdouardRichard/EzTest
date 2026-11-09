@@ -79,7 +79,8 @@ export const FAILURE_CLASS_LABEL: Record<FailureClassKey, string> = {
 /** Renders the empty no-class value as a dash instead of an empty badge. */
 export function failureClassLabel(value: FailureClass | string): string {
   if (value === "") return "—"
-  if (value in FAILURE_CLASS_LABEL) return FAILURE_CLASS_LABEL[value as FailureClassKey]
+  if (Object.hasOwn(FAILURE_CLASS_LABEL, value))
+    return FAILURE_CLASS_LABEL[value as FailureClassKey]
   return value
 }
 
@@ -219,7 +220,21 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
 
 export function terminalCauseLabel(value: string | undefined): string | null {
   if (value === undefined || value === "") return null
-  return CASE_RUN_TERMINAL_CAUSE_LABEL[value] ?? value
+  if (Object.hasOwn(CASE_RUN_TERMINAL_CAUSE_LABEL, value)) {
+    return CASE_RUN_TERMINAL_CAUSE_LABEL[value]
+  }
+  return value
+}
+
+/** Resolves a stable cause or failure-class code to its Chinese label. */
+function stableCauseLabel(value: string): string | null {
+  if (Object.hasOwn(CASE_RUN_TERMINAL_CAUSE_LABEL, value)) {
+    return CASE_RUN_TERMINAL_CAUSE_LABEL[value]
+  }
+  if (Object.hasOwn(FAILURE_CLASS_LABEL, value)) {
+    return FAILURE_CLASS_LABEL[value as FailureClassKey]
+  }
+  return null
 }
 
 /**
@@ -227,18 +242,26 @@ export function terminalCauseLabel(value: string | undefined): string | null {
  *
  * `summary.verdict_reason` and `summary.last_error` normally carry a stable
  * code, but historical rows wrote the raw failure enum into either field. A
- * whole value that matches a known cause or failure class is localized; any
- * other value is treated as prose and passed through untouched. Empty values
- * render nothing.
+ * whole value that matches a known cause or failure class is localized; a
+ * leading `"code: detail"` prefix (the executor failure shape, e.g.
+ * `"executor_timeout: context creation exceeded its hard deadline"`) is
+ * localized while its detail is kept. Any other value is treated as prose and
+ * passed through untouched. Empty values render nothing.
  */
 export function causeTextLabel(value: string | undefined): string | null {
   const trimmed = value?.trim() ?? ""
   if (trimmed === "") return null
-  if (trimmed in CASE_RUN_TERMINAL_CAUSE_LABEL) {
-    return CASE_RUN_TERMINAL_CAUSE_LABEL[trimmed]
-  }
-  if (trimmed in FAILURE_CLASS_LABEL) {
-    return FAILURE_CLASS_LABEL[trimmed as FailureClassKey]
+  const whole = stableCauseLabel(trimmed)
+  if (whole !== null) return whole
+
+  const separator = trimmed.indexOf(":")
+  if (separator > 0) {
+    const code = trimmed.slice(0, separator).trim()
+    const label = stableCauseLabel(code)
+    if (label !== null) {
+      const detail = trimmed.slice(separator + 1).trim()
+      return detail === "" ? label : `${label}: ${detail}`
+    }
   }
   return trimmed
 }
@@ -256,7 +279,10 @@ export const CASE_RUN_NEXT_ACTION_LABEL: Record<string, string> = {
 
 export function nextActionLabel(value: string | undefined): string | null {
   if (value === undefined || value === "") return null
-  return CASE_RUN_NEXT_ACTION_LABEL[value] ?? value
+  if (Object.hasOwn(CASE_RUN_NEXT_ACTION_LABEL, value)) {
+    return CASE_RUN_NEXT_ACTION_LABEL[value]
+  }
+  return value
 }
 
 export const EXECUTOR_STATUS_LABEL: Record<ExecutorStatus, string> = {

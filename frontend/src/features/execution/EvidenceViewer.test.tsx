@@ -7,12 +7,9 @@ import { ApiError } from "@/lib/api-client"
 const api = vi.hoisted(() => ({ downloadEvidence: vi.fn() }))
 vi.mock("./api", () => api)
 
-import { EvidenceViewer } from "./EvidenceViewer"
+import { buildCurl, diffLines, EvidenceViewer, REVOKE_DELAY_MS } from "./EvidenceViewer"
 import { evidenceScreenshotFixture, evidenceTextFixture } from "./test-fixtures"
 import type { Evidence } from "./types"
-
-/** X-05: blob URLs are revoked after a short delay, not synchronously. */
-const REVOKE_DELAY_MS = 1000
 
 function download(blob: Blob, filename: string) {
   return {
@@ -165,7 +162,12 @@ describe("EvidenceViewer", () => {
       },
       response: {
         status: 200,
-        headers: { "Content-Type": "application/json" },
+        // The backend persists response headers as `map[string][]string`
+        // (`case_run.go`/`tools.go`), so every real value is an array.
+        headers: {
+          "Content-Type": ["application/json"],
+          "X-Trace-Id": ["trace-9f"],
+        },
         body: '{"total":2}',
         body_truncated: false,
       },
@@ -194,11 +196,16 @@ describe("EvidenceViewer", () => {
     const responsePane = screen.getByTestId("evidence-http-response")
     expect(responsePane).toHaveTextContent("200")
     expect(responsePane).toHaveTextContent('{"total":2}')
+    // A real backend payload carries response headers as string arrays; they
+    // must be rendered, not silently dropped.
+    expect(responsePane).toHaveTextContent("X-Trace-Id")
+    expect(responsePane).toHaveTextContent("trace-9f")
+    expect(responsePane).toHaveTextContent("application/json")
 
     fireEvent.click(screen.getByRole("button", { name: "复制 curl" }))
     await waitFor(() =>
       expect(writeText).toHaveBeenCalledWith(
-        "curl -X POST 'https://api.example.test/orders' -H 'Content-Type: application/json' -H 'Authorization: ***' --data-raw '{\"total\":1}'",
+        "curl -X 'POST' 'https://api.example.test/orders' -H 'Content-Type: application/json' -H 'Authorization: ***' --data-raw '{\"total\":1}'",
       ),
     )
 
@@ -207,6 +214,68 @@ describe("EvidenceViewer", () => {
     const diff = screen.getByTestId("evidence-http-diff")
     expect(diff.querySelector('[data-diff-type="remove"]')).toHaveTextContent('"total": 1')
     expect(diff.querySelector('[data-diff-type="add"]')).toHaveTextContent('"total": 2')
+  })
+
+  it("falls back to a plain text pane for malformed HTTP evidence", async () => {
+    const malformed = JSON.stringify({ request: { method: "POST" }, response: { status: 200 } })
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob([malformed], { type: "application/json" }), "http-request.json"),
+    )
+
+    render(
+      <EvidenceViewer versionId="2001" evidence={httpEvidenceFixture} open onClose={() => {}} />,
+    )
+
+    const text = await screen.findByTestId("evidence-text")
+    expect(text).toHaveTextContent('"request"')
+    expect(screen.queryByTestId("evidence-http-request")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("evidence-http-response")).not.toBeInTheDocument()
+  })
+
+  it("shell-quotes the curl method and special characters", () => {
+    const curl = buildCurl({
+      method: "POST|PUT",
+      url: "https://api.example.test/o'brien",
+      headers: { "X-Note": "`tick`" },
+      body: "it's",
+    })
+
+    expect(curl).toContain("-X 'POST|PUT'")
+    expect(curl).toContain("'https://api.example.test/o'\\''brien'")
+    expect(curl).toContain("-H 'X-Note: `tick`'")
+    expect(curl).toContain("--data-raw 'it'\\''s'")
+  })
+
+  it("diffs lines with LCS ordering and reconstructs both sides", () => {
+    const diff = diffLines("a\nb\nc", "a\nx\nc")
+
+    expect(diff).toEqual([
+      { type: "same", text: "a" },
+      { type: "remove", text: "b" },
+      { type: "add", text: "x" },
+      { type: "same", text: "c" },
+    ])
+    const before = diff
+      .filter((line) => line.type !== "add")
+      .map((line) => line.text)
+      .join("\n")
+    const after = diff
+      .filter((line) => line.type !== "remove")
+      .map((line) => line.text)
+      .join("\n")
+    expect(before).toBe("a\nb\nc")
+    expect(after).toBe("a\nx\nc")
+  })
+
+  it("falls back to a full remove/add block for oversized diffs", () => {
+    const before = Array.from({ length: 2000 }, (_, index) => `left-${index}`).join("\n")
+    const after = Array.from({ length: 2000 }, (_, index) => `right-${index}`).join("\n")
+
+    const diff = diffLines(before, after)
+
+    expect(diff).toHaveLength(4000)
+    expect(diff.slice(0, 2000).every((line) => line.type === "remove")).toBe(true)
+    expect(diff.slice(2000).every((line) => line.type === "add")).toBe(true)
   })
 
   it("shows a retryable error state when the evidence download fails", async () => {
@@ -236,6 +305,11 @@ describe("EvidenceViewer", () => {
     api.downloadEvidence.mockResolvedValue(
       download(new Blob(["png"], { type: "image/png" }), "step-3.png"),
     )
+    // Distinct URLs so the assertion proves the download blob (not the viewer
+    // preview blob) is the one kept alive.
+    createObjectURL
+      .mockReturnValueOnce("blob:evidence-preview")
+      .mockReturnValueOnce("blob:evidence-download")
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {})
 
     render(
@@ -247,7 +321,10 @@ describe("EvidenceViewer", () => {
       />,
     )
 
-    await screen.findByTestId("evidence-image")
+    expect(await screen.findByTestId("evidence-image")).toHaveAttribute(
+      "src",
+      "blob:evidence-preview",
+    )
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
     try {
       fireEvent.click(screen.getByRole("button", { name: "下载" }))
@@ -263,7 +340,8 @@ describe("EvidenceViewer", () => {
       act(() => {
         vi.advanceTimersByTime(REVOKE_DELAY_MS)
       })
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:evidence-9401")
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:evidence-download")
+      expect(revokeObjectURL).not.toHaveBeenCalledWith("blob:evidence-preview")
     } finally {
       vi.useRealTimers()
     }
