@@ -14,7 +14,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const fetchMock = vi.fn<typeof fetch>()
 
-const loginEntry: AuditLogEntry = {
+type AuditEntryResponse = AuditLogEntry & { actor_name?: string }
+
+const loginEntry: AuditEntryResponse = {
   id: "9100",
   actor_id: "1",
   action: "auth.login",
@@ -27,7 +29,7 @@ const loginEntry: AuditLogEntry = {
   created_at: "2026-10-31T08:00:00Z",
 }
 
-const settingEntry: AuditLogEntry = {
+const settingEntry: AuditEntryResponse = {
   ...loginEntry,
   id: "9099",
   action: "settings.updated",
@@ -43,7 +45,7 @@ function installFetch(handler: RouteHandler): void {
   fetchMock.mockImplementation(async (input) => handler(new URL(String(input))))
 }
 
-function auditPage(items: AuditLogEntry[], nextCursor = "", hasMore = false): Response {
+function auditPage(items: AuditEntryResponse[], nextCursor = "", hasMore = false): Response {
   return jsonResponse({ data: items, next_cursor: nextCursor, has_more: hasMore })
 }
 
@@ -69,7 +71,7 @@ describe("AuditPanel", () => {
 
     expect(await screen.findByText("auth.login")).toBeVisible()
     expect(screen.getByText("settings.updated")).toBeVisible()
-    expect(screen.getByText("execution.global_concurrency")).toBeVisible()
+    expect(screen.getByText("setting · execution.global_concurrency")).toBeVisible()
     expect(screen.getByText("req_audit000001")).toBeVisible()
 
     const url = new URL(String(fetchMock.mock.calls[0][0]))
@@ -133,6 +135,40 @@ describe("AuditPanel", () => {
     expect(await screen.findByText("auth.login")).toBeVisible()
     const third = new URL(String(fetchMock.mock.calls[2][0]))
     expect(third.searchParams.has("cursor")).toBe(false)
+  })
+
+  it("offers an action candidate datalist and separates target/actor fields", async () => {
+    installFetch(() =>
+      auditPage([
+        {
+          ...settingEntry,
+          actor_name: "admin",
+          target_kind: "setting",
+          target_id: "report.section_appendix",
+        },
+      ]),
+    )
+
+    render(<AuditPanel />)
+
+    expect(await screen.findByText("setting · report.section_appendix")).toBeVisible()
+    expect(screen.getByText("admin (#1)")).toBeVisible()
+    const combobox = screen.getByRole("combobox", { name: /操作/ })
+    expect(combobox).toHaveAttribute("list", "audit-action-candidates")
+    expect(document.querySelectorAll("#audit-action-candidates option").length).toBeGreaterThan(50)
+  })
+
+  it("distinguishes a filtered empty result from an empty audit log", async () => {
+    installFetch(() => auditPage([]))
+
+    render(<AuditPanel />)
+    expect(await screen.findByText("暂无审计日志")).toBeVisible()
+
+    fireEvent.change(screen.getByLabelText("操作"), { target: { value: "settings" } })
+    fireEvent.click(screen.getByRole("button", { name: "查询" }))
+
+    expect(await screen.findByText("无匹配记录")).toBeVisible()
+    expect(screen.queryByText("暂无审计日志")).toBeNull()
   })
 
   it("shows the error state when the audit request fails", async () => {

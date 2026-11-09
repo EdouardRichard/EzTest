@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
@@ -43,13 +44,24 @@ func New(repo audit.Repository, ids id.Generator, clk clock.Clock) *Service {
 	return &Service{repo: repo, ids: ids, clock: clk}
 }
 
-// Record appends one entry, filling the generated ID and timestamp. Recording
-// is best-effort for callers: business services ignore the returned error and
-// must not fail their operation because auditing failed.
+// Record appends one entry, filling the generated ID and timestamp. IP and
+// UserAgent fall back to the request metadata stored by the HTTP middleware
+// when the caller did not provide them. Recording is best-effort for callers:
+// business services ignore the returned error and must not fail their operation
+// because auditing failed.
 func (s *Service) Record(ctx context.Context, event Event) error {
 	metadata := event.Metadata
 	if metadata == nil {
 		metadata = map[string]any{}
+	}
+	ip, userAgent := event.IP, event.UserAgent
+	if meta, ok := platform.RequestMetaFrom(ctx); ok {
+		if ip == "" {
+			ip = meta.IP
+		}
+		if userAgent == "" {
+			userAgent = meta.UserAgent
+		}
 	}
 	return s.repo.Insert(ctx, audit.Entry{
 		ID:         s.ids.Next(),
@@ -58,11 +70,18 @@ func (s *Service) Record(ctx context.Context, event Event) error {
 		TargetKind: event.TargetKind,
 		TargetID:   event.TargetID,
 		RequestID:  event.RequestID,
-		IP:         event.IP,
-		UserAgent:  event.UserAgent,
+		IP:         ip,
+		UserAgent:  userAgent,
 		Metadata:   metadata,
 		CreatedAt:  s.clock.Now().UTC(),
 	})
+}
+
+// ActionCandidates returns the curated audit action catalog. The HTTP layer
+// exposes no candidate endpoint; the frontend keeps a static copy and this
+// helper exists for server-side callers/tests that need the same list.
+func ActionCandidates() []audit.Action {
+	return append([]audit.Action(nil), audit.Actions...)
 }
 
 // List returns one page of entries newest first and reports whether an older

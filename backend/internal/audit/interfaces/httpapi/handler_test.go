@@ -37,7 +37,7 @@ func newHandler() (*Handler, *fakeService) {
 	actor := int64(42)
 	svc := &fakeService{
 		entries: []audit.Entry{
-			{ID: 9002, ActorID: &actor, Action: "auth.login", TargetKind: "user", TargetID: "42", RequestID: "req_2", IP: "192.0.2.1", UserAgent: "ua", Metadata: map[string]any{"username": "admin"}, CreatedAt: now},
+			{ID: 9002, ActorID: &actor, ActorName: "admin", Action: "auth.login", TargetKind: "user", TargetID: "42", RequestID: "req_2", IP: "192.0.2.1", UserAgent: "ua", Metadata: map[string]any{"username": "admin"}, CreatedAt: now},
 			{ID: 9001, Action: "auth.login_failed", CreatedAt: now},
 		},
 		hasMore: true,
@@ -73,6 +73,9 @@ func TestListFiltersAndPaginates(t *testing.T) {
 	}
 	if items[0].ID != "9002" || items[0].ActorID != "42" || items[0].Action != "auth.login" {
 		t.Fatalf("first item = %#v", items[0])
+	}
+	if items[0].ActorName != "admin" {
+		t.Fatalf("actor_name = %q, want admin", items[0].ActorName)
 	}
 	if items[0].Metadata["username"] != "admin" {
 		t.Fatalf("metadata = %#v", items[0].Metadata)

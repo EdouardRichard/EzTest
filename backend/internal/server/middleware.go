@@ -21,7 +21,9 @@ type Authenticator interface {
 }
 
 // RequestID accepts a valid inbound X-Request-ID or creates a new one and
-// propagates it through the context and response header.
+// propagates it through the context and response header. It also seeds the
+// platform request metadata (RemoteAddr host and User-Agent) that audit
+// recording falls back to.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(requestid.Header)
@@ -29,7 +31,9 @@ func RequestID(next http.Handler) http.Handler {
 			id = requestid.New()
 		}
 		w.Header().Set(requestid.Header, id)
-		next.ServeHTTP(w, r.WithContext(requestid.With(r.Context(), id)))
+		ctx := requestid.With(r.Context(), id)
+		ctx = platform.WithRequestMeta(ctx, platform.RequestMetaFor(r))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

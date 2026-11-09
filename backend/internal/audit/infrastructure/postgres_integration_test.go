@@ -21,6 +21,12 @@ func TestRepositoryInsertAndList(t *testing.T) {
 	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	actor := int64(42)
 	other := int64(43)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_user (id, username, display_name, password_hash, role, status)
+		VALUES (42, 'admin', 'Administrator', 'x', 'admin', 'active')
+	`); err != nil {
+		t.Fatalf("insert app_user: %v", err)
+	}
 
 	fixtures := []audit.Entry{
 		{ID: 9001, Action: "auth.login_failed", RequestID: "req_a"},
@@ -49,6 +55,12 @@ func TestRepositoryInsertAndList(t *testing.T) {
 	if page[0].IP != "192.0.2.1" || page[0].UserAgent != "test-agent" {
 		t.Fatalf("request metadata = %#v", page[0])
 	}
+	if page[0].ActorName != "admin" {
+		t.Fatalf("actor name = %q, want admin", page[0].ActorName)
+	}
+	if page[1].ActorName != "" {
+		t.Fatalf("unknown actor name = %q, want empty", page[1].ActorName)
+	}
 
 	before := int64(9003)
 	older, err := repo.List(ctx, audit.Filter{}, 10, &before)
@@ -63,8 +75,18 @@ func TestRepositoryInsertAndList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List by action: %v", err)
 	}
-	if len(byAction) != 2 || byAction[0].ID != 9005 || byAction[1].ID != 9002 {
+	// The filter is a case-insensitive prefix, so auth.login also matches
+	// auth.login_failed (newest first).
+	if len(byAction) != 3 || byAction[0].ID != 9005 || byAction[1].ID != 9002 || byAction[2].ID != 9001 {
 		t.Fatalf("by action = %#v", byAction)
+	}
+
+	upper, err := repo.List(ctx, audit.Filter{Action: "AUTH.LOGIN"}, 10, nil)
+	if err != nil {
+		t.Fatalf("List by upper-case action: %v", err)
+	}
+	if len(upper) != 3 {
+		t.Fatalf("case-insensitive prefix matched %d entries, want 3", len(upper))
 	}
 
 	byActor, err := repo.List(ctx, audit.Filter{ActorID: &actor}, 10, nil)
@@ -113,6 +135,47 @@ func TestServiceRecordsAndListsThroughRepository(t *testing.T) {
 type ids struct{}
 
 func (ids) Next() int64 { return time.Now().UnixNano() }
+
+func TestRepositoryResolvesActionAlias(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := auditpg.New(pool)
+	ctx := context.Background()
+	actor := int64(42)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO app_user (id, username, display_name, password_hash, role, status)
+		VALUES (42, 'admin', 'Administrator', 'x', 'admin', 'active')
+	`); err != nil {
+		t.Fatalf("insert app_user: %v", err)
+	}
+	for _, entry := range []audit.Entry{
+		{ID: 9201, Action: "auth.login"},
+		{ID: 9202, ActorID: &actor, Action: "settings.updated", TargetKind: "setting", TargetID: "execution.global_concurrency"},
+		{ID: 9203, Action: "user.created"},
+	} {
+		if err := repo.Insert(ctx, entry); err != nil {
+			t.Fatalf("Insert(%d): %v", entry.ID, err)
+		}
+	}
+
+	aliased, err := repo.List(ctx, audit.Filter{Action: "setting.update"}, 10, nil)
+	if err != nil {
+		t.Fatalf("List by alias: %v", err)
+	}
+	if len(aliased) != 1 || aliased[0].ID != 9202 {
+		t.Fatalf("alias result = %#v", aliased)
+	}
+	if aliased[0].ActorName != "admin" {
+		t.Fatalf("actor name = %q, want admin", aliased[0].ActorName)
+	}
+
+	unknown, err := repo.List(ctx, audit.Filter{Action: "nope"}, 10, nil)
+	if err != nil {
+		t.Fatalf("List by unknown action: %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Fatalf("unknown action matched %#v", unknown)
+	}
+}
 
 func TestDeleteOlderThanRemovesOldAuditRows(t *testing.T) {
 	pool := testutil.NewDB(t)

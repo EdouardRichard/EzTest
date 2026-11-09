@@ -13,22 +13,31 @@ import type { ApiPage } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { type AuditLogEntry, listAuditLogs } from "./api"
+import { AUDIT_ACTIONS } from "./audit-actions"
 
 const PAGE_SIZE = 20
 
+// actor_name is joined by the backend but is not part of the shared
+// AuditLogEntry type yet; keep the read local instead of widening the API type.
+type AuditEntry = AuditLogEntry & { actor_name?: string }
+
 type Filters = { action: string; actor: string }
 
-function hasMetadata(entry: AuditLogEntry): boolean {
+function hasMetadata(entry: AuditEntry): boolean {
   return Object.keys(entry.metadata).length > 0
 }
 
-/** Admin audit log with exact-match filters and cursor pagination. */
+function hasActiveFilters(filters: Filters): boolean {
+  return filters.action.length > 0 || filters.actor.length > 0
+}
+
+/** Admin audit log with prefix/alias filters and cursor pagination. */
 export function AuditPanel() {
   const [draft, setDraft] = useState<Filters>({ action: "", actor: "" })
   const [filters, setFilters] = useState<Filters>({ action: "", actor: "" })
   const [cursor, setCursor] = useState("")
   const [history, setHistory] = useState<string[]>([])
-  const [page, setPage] = useState<ApiPage<AuditLogEntry> | null>(null)
+  const [page, setPage] = useState<ApiPage<AuditEntry> | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [filterError, setFilterError] = useState<string | null>(null)
@@ -97,7 +106,7 @@ export function AuditPanel() {
     setCursor(prior)
   }
 
-  const columns: TableColumn<AuditLogEntry>[] = [
+  const columns: TableColumn<AuditEntry>[] = [
     {
       key: "created_at",
       header: "时间",
@@ -119,7 +128,11 @@ export function AuditPanel() {
       header: "操作者",
       render: (entry) => (
         <span className="font-mono text-[11px] text-foreground">
-          {entry.actor_id ? `#${entry.actor_id}` : "系统"}
+          {entry.actor_id
+            ? entry.actor_name
+              ? `${entry.actor_name} (#${entry.actor_id})`
+              : `#${entry.actor_id}`
+            : "系统"}
         </span>
       ),
     },
@@ -128,9 +141,8 @@ export function AuditPanel() {
       header: "对象",
       render: (entry) => (
         <div className="max-w-56">
-          <span className="text-xs text-muted-foreground">{entry.target_kind}</span>
-          <span className="ml-1 break-all font-mono text-[11px] text-foreground">
-            {entry.target_id}
+          <span className="break-all font-mono text-[11px] text-foreground">
+            {entry.target_kind} · {entry.target_id}
           </span>
         </div>
       ),
@@ -179,16 +191,31 @@ export function AuditPanel() {
       </div>
 
       <form onSubmit={applyFilters} className="surface-card flex flex-wrap items-end gap-3 p-4">
-        <Field id="audit-action" label="操作" className="min-w-48 flex-1">
+        <Field
+          id="audit-action"
+          label="操作"
+          className="min-w-48 flex-1"
+          hint="大小写不敏感前缀匹配，如 settings；也可输入历史别名 setting.update"
+        >
           <Input
             id="audit-action"
-            placeholder="如 auth.login"
+            list="audit-action-candidates"
+            role="combobox"
+            aria-autocomplete="list"
+            placeholder="如 auth.login 或 settings"
             value={draft.action}
             onChange={(event) =>
               setDraft((current) => ({ ...current, action: event.target.value }))
             }
           />
         </Field>
+        <datalist id="audit-action-candidates">
+          {AUDIT_ACTIONS.map((action) => (
+            <option key={action.name} value={action.name}>
+              {action.label}
+            </option>
+          ))}
+        </datalist>
         <Field id="audit-actor" label="操作者 ID" className="w-36">
           <Input
             id="audit-actor"
@@ -231,7 +258,18 @@ export function AuditPanel() {
             columns={columns}
             rows={page.items}
             rowKey={(entry) => entry.id}
-            empty="暂无审计日志"
+            empty={
+              hasActiveFilters(filters) ? (
+                <span className="inline-flex flex-col items-center gap-1">
+                  <span>无匹配记录</span>
+                  <Button type="button" variant="ghost" size="sm" onClick={resetFilters}>
+                    清除筛选
+                  </Button>
+                </span>
+              ) : (
+                "暂无审计日志"
+              )
+            }
           />
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-[11px] text-muted-foreground">

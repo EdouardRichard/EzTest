@@ -481,6 +481,52 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 	}
 }
 
+func TestUpdateAuditRecordsOldAndNewValues(t *testing.T) {
+	repo := newFakeRepo()
+	svc, audit, _ := newTestService(t, repo)
+	ctx := context.Background()
+	if err := svc.SeedDefaults(ctx); err != nil {
+		t.Fatalf("SeedDefaults: %v", err)
+	}
+
+	if _, err := svc.Update(ctx, "execution.global_concurrency", 5, 42); err != nil {
+		t.Fatalf("first Update: %v", err)
+	}
+	if _, err := svc.Update(ctx, "execution.global_concurrency", 6, 42); err != nil {
+		t.Fatalf("second Update: %v", err)
+	}
+	if len(audit.events) != 2 {
+		t.Fatalf("audit events = %#v", audit.events)
+	}
+	metadata := audit.events[1].Metadata
+	if metadata["old_value"] != "5" || metadata["new_value"] != "6" {
+		t.Fatalf("metadata = %#v, want old_value=5 new_value=6", metadata)
+	}
+}
+
+func TestUpdateAuditOmitsSecretValues(t *testing.T) {
+	repo := newFakeRepo()
+	svc, audit, _ := newTestService(t, repo)
+	ctx := context.Background()
+	if err := svc.SeedDefaults(ctx); err != nil {
+		t.Fatalf("SeedDefaults: %v", err)
+	}
+
+	if _, err := svc.Update(ctx, "execution.executor_token", "rotated-token", 42); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("audit events = %#v", audit.events)
+	}
+	metadata := audit.events[0].Metadata
+	if _, ok := metadata["old_value"]; ok {
+		t.Fatalf("secret setting leaked old_value: %#v", metadata)
+	}
+	if _, ok := metadata["new_value"]; ok {
+		t.Fatalf("secret setting leaked new_value: %#v", metadata)
+	}
+}
+
 func isNotFound(err error) bool {
 	var apiErr *platform.Error
 	return errors.As(err, &apiErr) && apiErr.Status == 404
