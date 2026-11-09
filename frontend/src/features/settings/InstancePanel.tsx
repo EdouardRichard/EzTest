@@ -121,18 +121,26 @@ export function InstancePanel() {
     {
       key: "status",
       header: "状态",
-      render: (instance) => (
-        <div className="flex flex-col items-start gap-1">
-          <Badge tone={INSTANCE_STATUS_TONE[instance.status]}>
-            {INSTANCE_STATUS_LABELS[instance.status]}
-          </Badge>
-          {instance.last_error !== null && instance.last_error !== undefined ? (
-            <span className="max-w-48 truncate text-[10px] text-muted-foreground">
-              {instance.last_error}
-            </span>
-          ) : null}
-        </div>
-      ),
+      render: (instance) => {
+        const historical = instance.status === "offline" || instance.status === "stopped"
+        return (
+          <div className="flex flex-col items-start gap-1">
+            <Badge tone={INSTANCE_STATUS_TONE[instance.status]}>
+              {historical ? "历史实例（已失效）" : INSTANCE_STATUS_LABELS[instance.status]}
+            </Badge>
+            {historical ? (
+              <span className="text-[10px] text-muted-foreground">
+                {INSTANCE_STATUS_LABELS[instance.status]}，不再接收任务
+              </span>
+            ) : null}
+            {instance.last_error !== null && instance.last_error !== undefined ? (
+              <span className="max-w-48 truncate text-[10px] text-muted-foreground">
+                {instance.last_error}
+              </span>
+            ) : null}
+          </div>
+        )
+      },
     },
     {
       key: "inflight",
@@ -191,7 +199,7 @@ export function InstancePanel() {
             </Button>
           )
         }
-        if (instance.status === "draining" || instance.status === "offline") {
+        if (instance.status === "draining") {
           return (
             <Button
               size="sm"

@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/Button"
 import { Dialog } from "@/components/ui/Dialog"
 import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
-import { ApiError } from "@/lib/api-client"
+import { localizeApiError } from "@/lib/api-error-messages"
 
 import {
   type LLMModel,
@@ -17,14 +17,10 @@ import {
   type UpdateLLMModelInput,
   updateLLMModel,
 } from "./api"
-
-/** v0.22 K unit: 1K = 1000 tokens (A §4.1). Storage and API stay raw tokens. */
-const K = 1000
+import { formatTokensK, parseKInput, TOKENS_PER_K } from "./token-units"
 
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096
-const MAX_CONTEXT_WINDOW_TOKENS = 10_000_000
-const MAX_K_DECIMALS = 3
 
 export type CapabilityFlag =
   | "supports_tools"
@@ -77,38 +73,6 @@ export function modelMaxInput(model: LLMModel): number {
   return deriveMaxInput(modelContextWindow(model), model.max_output)
 }
 
-/** Renders raw tokens as K with at most 3 decimals (128000 → "128"). */
-export function formatTokensK(tokens: number): string {
-  return Number.parseFloat((tokens / K).toFixed(MAX_K_DECIMALS)).toString()
-}
-
-/** Row label: 0 means auto/unknown and is called out explicitly. */
-export function formatTokensKWithAuto(tokens: number): string {
-  return tokens === 0 ? "0K（自动）" : `${formatTokensK(tokens)}K`
-}
-
-type ParsedK = { ok: true; tokens: number } | { ok: false; error: string }
-
-/**
- * Parses a K input into raw tokens with an exact integer conversion. The
- * backend remains authoritative; this only keeps obvious mistakes from being
- * sent and matches the server's 0 ≤ W ≤ 10,000,000 / O ≤ W rules.
- */
-function parseKInput(text: string, label: string): ParsedK {
-  const trimmed = text.trim()
-  if (trimmed.length === 0 || !/^\d+(\.\d{1,3})?$/.test(trimmed)) {
-    return { ok: false, error: `${label}必须是 0 或更大的数字（最多 3 位小数）` }
-  }
-  const tokens = Math.round(Number(trimmed) * K)
-  if (!Number.isFinite(tokens) || tokens < 0) {
-    return { ok: false, error: `${label}必须是 0 或更大的数字（最多 3 位小数）` }
-  }
-  if (tokens > MAX_CONTEXT_WINDOW_TOKENS) {
-    return { ok: false, error: `${label}不能超过 ${MAX_CONTEXT_WINDOW_TOKENS / K}K` }
-  }
-  return { ok: true, tokens }
-}
-
 type ModelEditDialogProps = {
   model: LLMModel
   onClose: () => void
@@ -148,8 +112,8 @@ export function ModelEditDialog({ model, onClose, onModelChange }: ModelEditDial
 
   // Live read-only input budget. While the form is untouched the server value
   // is authoritative (it knows the effective window when the stored value is 0).
-  const typedWindow = Math.round(Number(windowK) * K)
-  const typedOutput = Math.round(Number(outputK) * K)
+  const typedWindow = Math.round(Number(windowK) * TOKENS_PER_K)
+  const typedOutput = Math.round(Number(outputK) * TOKENS_PER_K)
   const pristine =
     Number.isFinite(typedWindow) &&
     Number.isFinite(typedOutput) &&
@@ -220,7 +184,7 @@ export function ModelEditDialog({ model, onClose, onModelChange }: ModelEditDial
       onModelChange(saved)
       onClose()
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : "保存模型失败，请稍后重试")
+      setError(localizeApiError(caught).message)
     } finally {
       setPending(false)
     }
@@ -244,7 +208,7 @@ export function ModelEditDialog({ model, onClose, onModelChange }: ModelEditDial
       onModelChange(reset)
       setNotice("已恢复上游值")
     } catch (caught) {
-      setError(caught instanceof ApiError ? caught.message : "恢复上游值失败，请稍后重试")
+      setError(localizeApiError(caught).message)
     } finally {
       setPending(false)
     }

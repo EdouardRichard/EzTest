@@ -1,5 +1,6 @@
 "use client"
 
+import Link from "next/link"
 import type { FormEvent, ReactNode } from "react"
 import { useState } from "react"
 
@@ -11,6 +12,7 @@ import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
 import { Textarea } from "@/components/ui/Textarea"
 import { ApiError } from "@/lib/api-client"
+import { localizeApiError } from "@/lib/api-error-messages"
 
 import type {
   AccountFormValues,
@@ -46,18 +48,181 @@ import {
   validateSutForm,
 } from "./validation"
 
-/** Maps an API failure to an actionable inline message, including 409 guards. */
-export function requestErrorText(caught: unknown, fallback: string): string {
-  if (caught instanceof ApiError) {
-    if (caught.status === 409) {
-      return `操作冲突：${caught.message}。该资源可能已被版本绑定，或名称/键重复。`
-    }
-    if (caught.status === 403) return "当前账号没有权限执行此操作。"
-    if (caught.status === 404) return "资源不存在或已被删除，请刷新后重试。"
-    return caught.message.length > 0 ? caught.message : fallback
+export type ReferencingVersion = { id: string; title: string }
+
+export type ResourceRequestErrorView = {
+  message: string
+  nextAction?: string
+  versions: ReferencingVersion[]
+  /** Stable server code kept visible for support/troubleshooting. */
+  code?: string
+}
+
+const RESOURCE_KIND_LABELS: Record<string, string> = {
+  sut: "SUT",
+  environment: "环境",
+  page: "页面",
+  api: "API",
+  database: "目标库",
+  account: "测试账号",
+  repository: "代码仓",
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function readReferencingVersions(value: unknown): ReferencingVersion[] {
+  if (!Array.isArray(value)) return []
+  const versions: ReferencingVersion[] = []
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue
+    const record = item as Record<string, unknown>
+    const id = readString(record.id)
+    if (id === undefined) continue
+    versions.push({ id, title: readString(record.title) ?? `#${id}` })
   }
-  if (caught instanceof Error) return caught.message.length > 0 ? caught.message : fallback
-  return fallback
+  return versions
+}
+
+/**
+ * Chinese resolution copy per resource kind. The backend `details.resolution`
+ * stays English by contract, and the account hint is not accurate enough to
+ * render verbatim, so the UI owns the actionable copy.
+ */
+function resourceResolution(kind: string | undefined, hasVersions: boolean): string {
+  switch (kind) {
+    case "sut":
+      return "请先在引用版本中改用其他 SUT，或删除这些版本。"
+    case "environment":
+      return "请先在引用版本中改用其他环境，或删除这些版本。"
+    case "page":
+      return "请先在引用版本的页面范围中排除该页面，或调整版本的环境绑定。"
+    case "api":
+      return "请先在引用版本的 API 范围中排除该 API，或调整版本的环境绑定。"
+    case "database":
+      return "请先在引用版本中解除该目标库的绑定，或停用后再删除。"
+    case "account":
+      return hasVersions
+        ? "请从引用版本的账号绑定中移除该账号。"
+        : "请先在版本绑定中解除对该账号的引用后再删除。"
+    case "repository":
+      return "请先在版本绑定中移除该代码仓关联后再删除。"
+    default:
+      return "请先在版本绑定中解除对该资源的引用后再删除。"
+  }
+}
+
+/**
+ * Maps a resource API failure to Chinese copy plus the typed 409 details. A
+ * version reference (`resource_referenced`) and a URL collision
+ * (`page_url_exists`) are deliberately distinct: the old UI conflated both with
+ * "名称/键重复" and leaked the English backend message.
+ */
+export function describeResourceRequestError(
+  caught: unknown,
+  fallback: string,
+): ResourceRequestErrorView {
+  if (caught instanceof ApiError) {
+    const details = caught.details
+    const versions = readReferencingVersions(details.referencing_versions)
+    const kind = readString(details.kind)
+
+    if (caught.status === 409) {
+      if (caught.code === "page_url_exists") {
+        return {
+          code: caught.code,
+          message: "该页面 URL 在当前环境下已存在",
+          nextAction: "请修改页面 URL，或编辑已有页面后重试。",
+          versions: [],
+        }
+      }
+      if (caught.code === "resource_referenced" || versions.length > 0) {
+        const label = kind !== undefined ? (RESOURCE_KIND_LABELS[kind] ?? kind) : undefined
+        const message =
+          versions.length > 0
+            ? `该${label ?? "资源"}已被版本绑定引用，无法删除`
+            : `该${label ?? "资源"}被版本绑定引用，无法删除`
+        return {
+          code: caught.code,
+          message,
+          nextAction: resourceResolution(kind, versions.length > 0),
+          versions,
+        }
+      }
+      return {
+        code: caught.code,
+        message: "操作冲突：当前资源状态不允许此操作",
+        nextAction: "请刷新后重试；若仍失败，请联系管理员。",
+        versions,
+      }
+    }
+
+    if (caught.status === 403) {
+      return {
+        code: caught.code,
+        message: "当前账号没有权限执行此操作",
+        nextAction: "请联系管理员确认账号权限。",
+        versions: [],
+      }
+    }
+    if (caught.status === 404) {
+      return {
+        code: caught.code,
+        message: "资源不存在或已被删除",
+        nextAction: "请刷新后重试。",
+        versions: [],
+      }
+    }
+
+    const localized = localizeApiError(caught)
+    return {
+      code: caught.code,
+      message: localized.message,
+      nextAction: localized.nextAction,
+      versions: [],
+    }
+  }
+
+  if (caught instanceof Error && caught.message.length > 0) {
+    return { message: caught.message, versions: [] }
+  }
+  if (typeof caught === "string" && caught.length > 0) {
+    return { message: caught, versions: [] }
+  }
+  return { message: fallback, versions: [] }
+}
+
+/** Inline resource error with Chinese copy, version links and the stable code. */
+export function ResourceRequestError({ error, fallback }: { error: unknown; fallback: string }) {
+  const view = describeResourceRequestError(error, fallback)
+  return (
+    <Alert tone="danger">
+      <p>{view.message}</p>
+      {view.versions.length > 0 ? (
+        <p className="mt-1">
+          引用版本：
+          {view.versions.map((version, index) => (
+            <span key={version.id}>
+              {index > 0 ? "、" : ""}
+              <Link
+                className="underline"
+                href={`/versions/${encodeURIComponent(version.id)}?tab=overview`}
+              >
+                {version.title}
+              </Link>
+            </span>
+          ))}
+        </p>
+      ) : null}
+      {view.nextAction !== undefined ? (
+        <p className="mt-1 text-muted-foreground">处理建议：{view.nextAction}</p>
+      ) : null}
+      {view.code !== undefined ? (
+        <p className="mt-1 font-mono text-[10px] text-muted-foreground">错误码：{view.code}</p>
+      ) : null}
+    </Alert>
+  )
 }
 
 type DialogFormProps = {
@@ -68,7 +233,8 @@ type DialogFormProps = {
   submitLabel: string
   pendingLabel: string
   pending: boolean
-  error: string | null
+  error: unknown
+  errorFallback: string
   children: ReactNode
 }
 
@@ -82,13 +248,14 @@ function DialogForm({
   pendingLabel,
   pending,
   error,
+  errorFallback,
   children,
 }: DialogFormProps) {
   return (
     <Dialog open onClose={onClose} title={title} description={description}>
       <form onSubmit={onSubmit} className="flex flex-col gap-4" noValidate>
         {children}
-        {error ? <Alert tone="danger">{error}</Alert> : null}
+        {error ? <ResourceRequestError error={error} fallback={errorFallback} /> : null}
         <div className="flex items-center justify-end gap-2 pt-1">
           <Button variant="secondary" onClick={onClose} disabled={pending}>
             取消
@@ -120,7 +287,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
   const [environmentName, setEnvironmentName] = useState("")
   const [baseUrl, setBaseUrl] = useState("")
   const [errors, setErrors] = useState<FormErrors<SutFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -145,7 +312,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存 SUT 失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -165,6 +332,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存 SUT 失败，请稍后重试"
     >
       <Field id="sut-name" label="SUT 名称" required error={errors.name}>
         <Input
@@ -244,7 +412,7 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
   const [isDefault, setIsDefault] = useState(initial?.is_default ?? false)
   const [status, setStatus] = useState<ResourceStatus>(initial?.status ?? "active")
   const [errors, setErrors] = useState<FormErrors<EnvironmentFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -266,7 +434,7 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存环境失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -282,6 +450,7 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存环境失败，请稍后重试"
     >
       <Field id="env-name" label="环境名称" required error={errors.name}>
         <Input
@@ -344,7 +513,7 @@ export function PageDialog({ initial, onClose, onSubmit }: PageDialogProps) {
   const [authRole, setAuthRole] = useState(initial?.auth_role ?? "")
   const [module, setModule] = useState(initial?.module ?? "")
   const [errors, setErrors] = useState<FormErrors<PageFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -368,7 +537,7 @@ export function PageDialog({ initial, onClose, onSubmit }: PageDialogProps) {
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存页面失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -384,6 +553,7 @@ export function PageDialog({ initial, onClose, onSubmit }: PageDialogProps) {
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存页面失败，请稍后重试"
     >
       <Field id="page-name" label="页面名称" required error={errors.name}>
         <Input
@@ -459,7 +629,7 @@ export function ApiDialog({ initial, onClose, onSubmit }: ApiDialogProps) {
   const [authRole, setAuthRole] = useState(initial?.auth_role ?? "")
   const [schemaRef, setSchemaRef] = useState(initial?.schema_ref ?? "")
   const [errors, setErrors] = useState<FormErrors<ApiFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -482,7 +652,7 @@ export function ApiDialog({ initial, onClose, onSubmit }: ApiDialogProps) {
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存 API 失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -498,6 +668,7 @@ export function ApiDialog({ initial, onClose, onSubmit }: ApiDialogProps) {
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存 API 失败，请稍后重试"
     >
       <Field id="api-name" label="API 名称" required error={errors.name}>
         <Input
@@ -570,7 +741,7 @@ export function ImportDialog<T>({
   onSubmit,
 }: ImportDialogProps<T>) {
   const [text, setText] = useState("")
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
   const [result, setResult] = useState<{ created: number; skipped: number } | null>(null)
 
@@ -589,7 +760,7 @@ export function ImportDialog<T>({
     try {
       setResult(await onSubmit(parsed.items))
     } catch (caught) {
-      setError(requestErrorText(caught, `导入${itemLabel}失败，请稍后重试`))
+      setError(caught)
     } finally {
       setPending(false)
     }
@@ -616,7 +787,9 @@ export function ImportDialog<T>({
             onChange={(event) => setText(event.target.value)}
           />
         </Field>
-        {error ? <Alert tone="danger">{error}</Alert> : null}
+        {error ? (
+          <ResourceRequestError error={error} fallback={`导入${itemLabel}失败，请稍后重试`} />
+        ) : null}
         {result ? (
           <Alert tone="success">
             已创建 {result.created} 个{itemLabel}，跳过 {result.skipped} 个。
@@ -660,7 +833,7 @@ export function DatabaseDialog({ environmentId, initial, onClose, onSubmit }: Da
   const [readOnly, setReadOnly] = useState(initial?.read_only ?? true)
   const [clearPassword, setClearPassword] = useState(false)
   const [errors, setErrors] = useState<FormErrors<DatabaseFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -685,7 +858,7 @@ export function DatabaseDialog({ environmentId, initial, onClose, onSubmit }: Da
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存目标库失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -701,6 +874,7 @@ export function DatabaseDialog({ environmentId, initial, onClose, onSubmit }: Da
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存目标库失败，请稍后重试"
     >
       <Field id="db-name" label="库名称" required error={errors.name}>
         <Input
@@ -796,7 +970,7 @@ export function AccountDialog({ environmentId, initial, onClose, onSubmit }: Acc
   const [notes, setNotes] = useState(initial?.notes ?? "")
   const [clearPassword, setClearPassword] = useState(false)
   const [errors, setErrors] = useState<FormErrors<AccountFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -820,7 +994,7 @@ export function AccountDialog({ environmentId, initial, onClose, onSubmit }: Acc
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存测试账号失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -836,6 +1010,7 @@ export function AccountDialog({ environmentId, initial, onClose, onSubmit }: Acc
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存测试账号失败，请稍后重试"
     >
       <Field id="account-username" label="账号用户名" required error={errors.username}>
         <Input
@@ -919,7 +1094,7 @@ export function RepositoryDialog({ initial, onClose, onSubmit }: RepositoryDialo
   const [include, setInclude] = useState(initial?.include.join(", ") ?? "")
   const [exclude, setExclude] = useState(initial?.exclude.join(", ") ?? "")
   const [errors, setErrors] = useState<FormErrors<RepositoryFormValues>>({})
-  const [formError, setFormError] = useState<string | null>(null)
+  const [formError, setFormError] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -942,7 +1117,7 @@ export function RepositoryDialog({ initial, onClose, onSubmit }: RepositoryDialo
       await onSubmit(values)
       onClose()
     } catch (caught) {
-      setFormError(requestErrorText(caught, "保存代码仓失败，请稍后重试"))
+      setFormError(caught)
     } finally {
       setPending(false)
     }
@@ -958,6 +1133,7 @@ export function RepositoryDialog({ initial, onClose, onSubmit }: RepositoryDialo
       pendingLabel={editing ? "保存中…" : "创建中…"}
       pending={pending}
       error={formError}
+      errorFallback="保存代码仓失败，请稍后重试"
     >
       <Field id="repo-name" label="仓库名称" required error={errors.name}>
         <Input
@@ -1032,7 +1208,7 @@ export function ConfirmDialog({
   onConfirm,
 }: ConfirmDialogProps) {
   const [pending, setPending] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>(null)
 
   async function handleConfirm(): Promise<void> {
     setPending(true)
@@ -1041,7 +1217,7 @@ export function ConfirmDialog({
       await onConfirm()
       onClose()
     } catch (caught) {
-      setError(requestErrorText(caught, "操作失败，请稍后重试"))
+      setError(caught)
     } finally {
       setPending(false)
     }
@@ -1064,8 +1240,9 @@ export function ConfirmDialog({
         </>
       }
     >
-      {error ? <Alert tone="danger">{error}</Alert> : null}
-      {error ? null : (
+      {error ? (
+        <ResourceRequestError error={error} fallback="操作失败，请稍后重试" />
+      ) : (
         <p className="text-xs leading-relaxed text-muted-foreground">
           删除后不可恢复；如果该资源已被版本绑定引用，API 会返回 409 并拒绝删除。
         </p>

@@ -92,12 +92,17 @@ describe("CodeRepoPanel", () => {
     await waitFor(() => expect(api.listRepositories).toHaveBeenCalledTimes(2))
   })
 
-  it("surfaces a 409 when a repository is still bound to a version", async () => {
+  it("renders referenced-version links when a repository is still bound", async () => {
     vi.mocked(api.deleteRepository).mockRejectedValue(
       new ApiError({
         status: 409,
-        code: "conflict",
+        code: "resource_referenced",
         message: "repository is referenced by a version binding",
+        details: {
+          kind: "repository",
+          referencing_versions: [{ id: "2001", title: "订单中心 v1" }],
+          resolution: "Remove the version repository override.",
+        },
       }),
     )
     render(<CodeRepoPanel />)
@@ -106,10 +111,14 @@ describe("CodeRepoPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除代码仓 order-center-web" }))
     fireEvent.click(screen.getByRole("button", { name: "删除代码仓" }))
 
-    expect(
-      await screen.findByText(/repository is referenced by a version binding/),
-    ).toBeInTheDocument()
-    expect(screen.getByText(/操作冲突/)).toBeInTheDocument()
+    expect(await screen.findByText("该代码仓已被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByRole("link", { name: "订单中心 v1" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=overview",
+    )
+    expect(screen.getByText(/请先在版本绑定中移除该代码仓关联/)).toBeVisible()
+    expect(screen.queryByText(/repository is referenced by a version binding/)).toBeNull()
+    expect(screen.queryByText(/名称\/键重复/)).toBeNull()
     expect(api.deleteRepository).toHaveBeenCalledWith("1201")
     expect(api.listRepositories).toHaveBeenCalledTimes(1)
   })

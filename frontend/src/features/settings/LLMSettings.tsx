@@ -15,6 +15,7 @@ import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
 import { ApiError } from "@/lib/api-client"
+import { localizeApiError } from "@/lib/api-error-messages"
 import { formatDateTime } from "@/lib/format"
 
 import {
@@ -26,6 +27,7 @@ import {
   fetchLLMConfigs,
   fetchLLMModels,
   type LLMConfig,
+  type LLMConfigHealth,
   type LLMConfigInput,
   type LLMModel,
   type LLMProtocol,
@@ -38,12 +40,12 @@ import {
   updateLLMConfig,
 } from "./api"
 import {
-  formatTokensK,
-  formatTokensKWithAuto,
+  CAPABILITY_FIELDS,
   ModelEditDialog,
   modelCapabilities,
   modelMaxInput,
 } from "./ModelEditDialog"
+import { formatTokensK, formatTokensKWithAuto, parseKInput } from "./token-units"
 
 /** Canonical protocols offered to new/updated configurations. */
 const CANONICAL_PROTOCOLS: ReadonlyArray<{ value: LLMProtocol; label: string }> = [
@@ -86,7 +88,61 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function errorText(caught: unknown, fallback: string): string {
-  return caught instanceof ApiError ? caught.message : fallback
+  if (caught instanceof ApiError) return localizeApiError(caught).message
+  if (caught instanceof Error && caught.message.length > 0) return caught.message
+  return fallback
+}
+
+/** Reads one capability provenance from the flat DTO or the nested mirror. */
+function capabilitySource(model: LLMModel, key: string): string | undefined {
+  const flat = (model as unknown as Record<string, unknown>)[`${key}_source`]
+  if (flat === "manual" || flat === "catalog") return flat
+  const capabilities = model.capabilities as unknown as Record<string, unknown> | undefined
+  const nested = capabilities?.[`${key}_source`]
+  return nested === "manual" || nested === "catalog" ? nested : undefined
+}
+
+/** Distinct capability fields that the backend kept as manual after a refresh. */
+function manualCapabilityLabels(models: LLMModel[]): string[] {
+  const labels = new Set<string>()
+  for (const model of models) {
+    for (const field of CAPABILITY_FIELDS) {
+      if (capabilitySource(model, field.key) === "manual") labels.add(field.label)
+    }
+  }
+  return [...labels]
+}
+
+/** Chinese copy for the M-07 config pre-check (`configDTO.health`). */
+function healthWarning(
+  health: LLMConfigHealth | undefined,
+): { title: string; body: string } | null {
+  if (health === undefined) return null
+  if (health.reason === "default_model_missing") {
+    return {
+      title: "默认模型缺失",
+      body: "当前配置没有可用的默认模型，请在「编辑」中重新选择默认模型。",
+    }
+  }
+  if (health.reason === "default_model_disabled") {
+    return {
+      title: "默认模型不可用",
+      body: "默认模型已被禁用或下线，请启用该模型或改选其他可用模型。",
+    }
+  }
+  if (health.reason === "default_model_not_vision" || !health.vision_ready) {
+    if (!health.default_model_valid) {
+      return { title: "默认模型不可用", body: "当前默认模型不满足运行要求，请重新选择。" }
+    }
+    return {
+      title: "默认模型不支持视觉",
+      body: "包含图片的文档将无法分析，请在「编辑」中改选支持视觉的模型。",
+    }
+  }
+  if (!health.default_model_valid) {
+    return { title: "默认模型不可用", body: "当前默认模型不满足运行要求，请重新选择。" }
+  }
+  return null
 }
 
 type ConfigParseResult = { ok: true; input: LLMConfigInput } | { ok: false; error: string }
@@ -144,6 +200,7 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
   )
   const [defaultModelID, setDefaultModelID] = useState(config?.default_model_id ?? "")
   const [error, setError] = useState<string | null>(null)
+  const [defaultModelError, setDefaultModelError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
   const selectableModels = models.filter(
@@ -232,6 +289,7 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
     setError(null)
+    setDefaultModelError(null)
     const parsed = buildInput()
     if (!parsed.ok) {
       setError(parsed.error)
@@ -246,6 +304,15 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
         : await updateLLMConfig(config.id, parsed.input)
       onSaved(saved, created)
     } catch (caught) {
+      const localized = localizeApiError(caught)
+      if (localized.field === "default_model_id") {
+        // The vision gate is a field-level error: render it under the select and
+        // put the keyboard focus there instead of only showing a generic alert.
+        setDefaultModelError(localized.message)
+        const target = document.getElementById("llm-default-model")
+        if (target instanceof HTMLSelectElement) target.focus()
+        return
+      }
       setError(errorText(caught, "保存失败，请稍后重试"))
     } finally {
       setPending(false)
@@ -385,13 +452,18 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
             id="llm-default-model"
             label="默认模型"
             required={defaultModelRequired}
+            error={defaultModelError ?? undefined}
             hint={models.length === 0 ? "保存配置并刷新模型目录后可选" : "必须选择一个未下线的模型"}
           >
             <Select
               id="llm-default-model"
               value={defaultModelID}
               disabled={models.length === 0}
-              onChange={(event) => setDefaultModelID(event.target.value)}
+              aria-invalid={defaultModelError !== null}
+              onChange={(event) => {
+                setDefaultModelID(event.target.value)
+                setDefaultModelError(null)
+              }}
             >
               <option value="">请选择默认模型</option>
               {models.map((model) => (
@@ -454,8 +526,8 @@ type ModelDialogProps = {
 
 function ModelDialog({ config, onClose, onSaved }: ModelDialogProps) {
   const [modelName, setModelName] = useState("")
-  const [contextWindow, setContextWindow] = useState("0")
-  const [maxOutput, setMaxOutput] = useState("0")
+  const [contextWindowK, setContextWindowK] = useState("0")
+  const [maxOutputK, setMaxOutputK] = useState("0")
   const [supportsTools, setSupportsTools] = useState(false)
   const [supportsVision, setSupportsVision] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -470,21 +542,25 @@ function ModelDialog({ config, onClose, onSaved }: ModelDialogProps) {
       setError("请输入模型名称")
       return
     }
-    const context = Number(contextWindow.trim())
-    if (!Number.isInteger(context) || context < 0) {
-      setError("上下文窗口必须是 0 或更大的整数")
+    const context = parseKInput(contextWindowK, "上下文窗口")
+    if (!context.ok) {
+      setError(context.error)
       return
     }
-    const output = Number(maxOutput.trim())
-    if (!Number.isInteger(output) || output < 0) {
-      setError("最大输出必须是 0 或更大的整数")
+    const output = parseKInput(maxOutputK, "最大输出")
+    if (!output.ok) {
+      setError(output.error)
+      return
+    }
+    if (context.tokens > 0 && output.tokens > context.tokens) {
+      setError("最大输出不能大于上下文窗口")
       return
     }
 
     const input: AddLLMModelInput = {
       model: trimmed,
-      context_window: context,
-      max_output: output,
+      context_window: context.tokens,
+      max_output: output.tokens,
       supports_tools: supportsTools,
       supports_vision: supportsVision,
     }
@@ -504,7 +580,7 @@ function ModelDialog({ config, onClose, onSaved }: ModelDialogProps) {
       open
       onClose={onClose}
       title="新增模型"
-      description={`为「${config.name}」手工添加模型，来源标记为 manual。`}
+      description={`为「${config.name}」手工添加模型，来源标记为 manual；上下文窗口与最大输出按 K 输入（1K = 1000 tokens）。`}
     >
       <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
         <Field id="llm-model-name" label="模型名称" required>
@@ -516,22 +592,32 @@ function ModelDialog({ config, onClose, onSaved }: ModelDialogProps) {
           />
         </Field>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field id="llm-model-context" label="上下文窗口">
+          <Field
+            id="llm-model-context"
+            label="上下文窗口 (K)"
+            hint="单位：K tokens（1K = 1000）；0 = 自动。"
+          >
             <Input
               id="llm-model-context"
               type="number"
               min={0}
-              value={contextWindow}
-              onChange={(event) => setContextWindow(event.target.value)}
+              step="0.001"
+              value={contextWindowK}
+              onChange={(event) => setContextWindowK(event.target.value)}
             />
           </Field>
-          <Field id="llm-model-output" label="最大输出">
+          <Field
+            id="llm-model-output"
+            label="最大输出 (K)"
+            hint="单位：K tokens（1K = 1000）；0 = 自动（回退 4K）。"
+          >
             <Input
               id="llm-model-output"
               type="number"
               min={0}
-              value={maxOutput}
-              onChange={(event) => setMaxOutput(event.target.value)}
+              step="0.001"
+              value={maxOutputK}
+              onChange={(event) => setMaxOutputK(event.target.value)}
             />
           </Field>
         </div>
@@ -664,12 +750,20 @@ export function LLMSettings() {
     setBusyKey(`refresh:${config.id}`)
     clearActions(config.id)
     try {
+      const previousModels = models.filter((item) => item.config_id === config.id)
+      const preserved = manualCapabilityLabels(previousModels)
       const refreshed = await refreshLLMModels(config.id)
       setModels((current) => [
         ...current.filter((item) => item.config_id !== config.id),
         ...refreshed,
       ])
-      setNotice(config.id, `已刷新 ${refreshed.length} 个模型`)
+      const base = `已刷新 ${refreshed.length} 个模型`
+      setNotice(
+        config.id,
+        preserved.length > 0
+          ? `${base}；已保留 ${preserved.length} 项手工能力：${preserved.join("、")}`
+          : base,
+      )
     } catch (caught) {
       setError(config.id, caught)
     } finally {
@@ -784,6 +878,7 @@ export function LLMSettings() {
           const notice = notices[config.id]
           const expanded = expandedId === config.id
           const busy = busyKey !== null
+          const warning = healthWarning(config.health)
 
           return (
             <article
@@ -812,6 +907,14 @@ export function LLMSettings() {
                   <p>协议 {protocolLabel(config.protocol)}</p>
                 </div>
               </header>
+
+              {warning !== null ? (
+                <div className="mt-3">
+                  <Alert tone="warning" title={warning.title}>
+                    {warning.body}
+                  </Alert>
+                </div>
+              ) : null}
 
               <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
                 <div>
@@ -945,9 +1048,11 @@ export function LLMSettings() {
                                   {model.model}
                                 </code>
                                 <Badge tone={model.source === "manual" ? "info" : "neutral"}>
-                                  {model.source === "manual" ? "手工" : "目录"}
+                                  {model.source === "manual" ? "来源：手工" : "来源：上游目录"}
                                 </Badge>
-                                {manualParams ? <Badge tone="warning">[手工]</Badge> : null}
+                                <Badge tone={manualParams ? "warning" : "neutral"}>
+                                  {manualParams ? "参数：手工" : "参数：上游目录"}
+                                </Badge>
                                 {model.deprecated ? <Badge tone="danger">已下线</Badge> : null}
                                 {capabilities.supports_tools ? (
                                   <Badge tone="success">工具</Badge>
@@ -963,9 +1068,16 @@ export function LLMSettings() {
                                 ) : null}
                               </div>
                               <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                上下文 {formatTokensKWithAuto(model.context_window)} · 输出{" "}
-                                {formatTokensKWithAuto(model.max_output)} · 输入{" "}
-                                {formatTokensK(modelMaxInput(model))}K
+                                K 口径（1K = 1000）：上下文{" "}
+                                {formatTokensKWithAuto(model.context_window)}（
+                                {model.context_window} tokens） · 输出{" "}
+                                {formatTokensKWithAuto(model.max_output)}（{model.max_output}{" "}
+                                tokens） · 输入 {formatTokensK(modelMaxInput(model))}K
+                              </p>
+                              <p className="mt-0.5 text-[10px] text-muted-foreground">
+                                模型容量 ≠ 运行时预算：Agent 实际可用上下文由「设置 → 上下文」的
+                                context.window_tokens 决定（默认 128000
+                                tokens），超出部分运行时不会使用。
                               </p>
                             </div>
                             <div className="flex items-center gap-2">
