@@ -116,12 +116,19 @@ function manualCapabilityLabels(models: LLMModel[]): string[] {
 /** Chinese copy for the M-07 config pre-check (`configDTO.health`). */
 function healthWarning(
   health: LLMConfigHealth | undefined,
+  hasSelectableModels: boolean,
 ): { title: string; body: string } | null {
   if (health === undefined) return null
+  const missingModelBody = hasSelectableModels
+    ? "当前配置没有可用的默认模型，请在「编辑」中重新选择默认模型。"
+    : "当前配置没有可用的默认模型，请先刷新模型目录。"
+  const unavailableBody = hasSelectableModels
+    ? "当前默认模型不满足运行要求，请重新选择。"
+    : "当前配置没有可用的默认模型，请先刷新模型目录。"
   if (health.reason === "default_model_missing") {
     return {
       title: "默认模型缺失",
-      body: "当前配置没有可用的默认模型，请在「编辑」中重新选择默认模型。",
+      body: missingModelBody,
     }
   }
   if (health.reason === "default_model_disabled") {
@@ -132,7 +139,7 @@ function healthWarning(
   }
   if (health.reason === "default_model_not_vision" || !health.vision_ready) {
     if (!health.default_model_valid) {
-      return { title: "默认模型不可用", body: "当前默认模型不满足运行要求，请重新选择。" }
+      return { title: "默认模型不可用", body: unavailableBody }
     }
     return {
       title: "默认模型不支持视觉",
@@ -140,7 +147,7 @@ function healthWarning(
     }
   }
   if (!health.default_model_valid) {
-    return { title: "默认模型不可用", body: "当前默认模型不满足运行要求，请重新选择。" }
+    return { title: "默认模型不可用", body: unavailableBody }
   }
   return null
 }
@@ -733,6 +740,19 @@ export function LLMSettings() {
     })
   }
 
+  /**
+   * Model mutations can change the config's default-model health (S-12). The
+   * config list is authoritative for `health`, so refetch it instead of leaving
+   * a stale "默认模型缺失/不支持视觉" warning on the card.
+   */
+  async function reloadConfigs(): Promise<void> {
+    try {
+      setConfigs(await fetchLLMConfigs())
+    } catch {
+      // Best effort: keep the last known health rather than failing the action.
+    }
+  }
+
   async function handleTest(config: LLMConfig): Promise<void> {
     setBusyKey(`test:${config.id}`)
     clearActions(config.id)
@@ -750,13 +770,15 @@ export function LLMSettings() {
     setBusyKey(`refresh:${config.id}`)
     clearActions(config.id)
     try {
-      const previousModels = models.filter((item) => item.config_id === config.id)
-      const preserved = manualCapabilityLabels(previousModels)
       const refreshed = await refreshLLMModels(config.id)
       setModels((current) => [
         ...current.filter((item) => item.config_id !== config.id),
         ...refreshed,
       ])
+      // Compute preservation from the response: rows the refresh dropped (or
+      // that now carry catalog provenance) must not be claimed as preserved.
+      const preserved = manualCapabilityLabels(refreshed)
+      await reloadConfigs()
       const base = `已刷新 ${refreshed.length} 个模型`
       setNotice(
         config.id,
@@ -778,6 +800,7 @@ export function LLMSettings() {
       await deleteLLMModel(config.id, model.id)
       setModels((current) => current.filter((item) => item.id !== model.id))
       setNotice(config.id, `已删除模型 ${model.model}`)
+      void reloadConfigs()
     } catch (caught) {
       setError(config.id, caught)
     } finally {
@@ -821,11 +844,13 @@ export function LLMSettings() {
     setModels((current) => [...current, saved])
     setNotice(saved.config_id, `已添加模型 ${saved.model}`)
     setModelTarget(null)
+    void reloadConfigs()
   }
 
   function handleModelChanged(saved: LLMModel): void {
     setModels((current) => current.map((item) => (item.id === saved.id ? saved : item)))
     setNotice(saved.config_id, `已更新模型 ${saved.model}`)
+    void reloadConfigs()
   }
 
   if (loading && configs === null) return <LoadingCard label="正在加载 LLM 配置…" />
@@ -878,7 +903,15 @@ export function LLMSettings() {
           const notice = notices[config.id]
           const expanded = expandedId === config.id
           const busy = busyKey !== null
-          const warning = healthWarning(config.health)
+          // Only the default config drives the agent runtime, so a non-default
+          // config's health is informational noise; and "重新选择默认模型" is a
+          // dead end while the catalog has no selectable model at all.
+          const hasSelectableModels = configModels.some(
+            (item) => !item.deprecated && item.status !== "disabled",
+          )
+          const warning = config.is_default
+            ? healthWarning(config.health, hasSelectableModels)
+            : null
 
           return (
             <article

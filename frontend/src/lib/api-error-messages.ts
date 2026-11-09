@@ -63,6 +63,18 @@ const DEFAULT_MODEL_VISION_CAPABILITY: CatalogEntry = {
   nextAction: "请在「设置 → LLM 配置」中改选支持视觉的默认模型",
 }
 
+/** The capability editor cannot strip vision from the model already acting as default. */
+const DEFAULT_MODEL_VISION_DOWNGRADE: CatalogEntry = {
+  message: "默认模型必须支持视觉能力，不能关闭视觉支持",
+  nextAction: "请先把默认模型改为其他支持视觉的模型，再关闭该模型的视觉能力",
+}
+
+/** A config with selectable models must pin one as its default. */
+const DEFAULT_MODEL_REQUIRED: CatalogEntry = {
+  message: "该配置存在可选模型，必须选择默认模型",
+  nextAction: "请在「设置 → LLM 配置」中为该配置选择默认模型后再保存",
+}
+
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
@@ -119,12 +131,24 @@ export function localizeApiError(error: unknown, context: LocalizeContext = {}):
       if (visionEntry !== undefined) return fromCatalog(visionEntry)
     }
 
+    // The vision gate reaches the UI from two controls: config.default_model_id
+    // (pick a vision model) and model.supports_vision (a capability downgrade
+    // that would strip vision from the model already acting as default). The
+    // required-default error carries the same field but no missing capability.
     if (
       error.code === "invalid_argument" &&
-      field === "default_model_id" &&
-      hasCapability(details.missing_capabilities, "vision")
+      (field === "default_model_id" || field === "supports_vision")
     ) {
-      return fromCatalog(DEFAULT_MODEL_VISION_CAPABILITY)
+      if (hasCapability(details.missing_capabilities, "vision")) {
+        return fromCatalog(
+          field === "supports_vision"
+            ? DEFAULT_MODEL_VISION_DOWNGRADE
+            : DEFAULT_MODEL_VISION_CAPABILITY,
+        )
+      }
+      if (field === "default_model_id" && /required/i.test(error.message)) {
+        return fromCatalog(DEFAULT_MODEL_REQUIRED)
+      }
     }
 
     const genericMessage = GENERIC_MESSAGES[error.code]

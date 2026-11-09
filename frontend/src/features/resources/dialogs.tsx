@@ -50,6 +50,9 @@ import {
 
 export type ReferencingVersion = { id: string; title: string }
 
+/** The backend caps `details.referencing_versions`; a full page may hide more. */
+export const REFERENCING_VERSIONS_LIMIT = 20
+
 export type ResourceRequestErrorView = {
   message: string
   nextAction?: string
@@ -88,9 +91,16 @@ function readReferencingVersions(value: unknown): ReferencingVersion[] {
 /**
  * Chinese resolution copy per resource kind. The backend `details.resolution`
  * stays English by contract, and the account hint is not accurate enough to
- * render verbatim, so the UI owns the actionable copy.
+ * render verbatim, so the UI owns the actionable copy. Without a rendered
+ * version list (empty or capped-away rows) "这些版本" would point at nothing,
+ * so every kind falls back to the generic no-list copy instead.
  */
 function resourceResolution(kind: string | undefined, hasVersions: boolean): string {
+  if (!hasVersions) {
+    return kind === "account"
+      ? "请先在版本绑定中解除对该账号的引用后再删除。"
+      : "请先在版本绑定中解除对该资源的引用后再删除。"
+  }
   switch (kind) {
     case "sut":
       return "请先在引用版本中改用其他 SUT，或删除这些版本。"
@@ -103,9 +113,7 @@ function resourceResolution(kind: string | undefined, hasVersions: boolean): str
     case "database":
       return "请先在引用版本中解除该目标库的绑定，或停用后再删除。"
     case "account":
-      return hasVersions
-        ? "请从引用版本的账号绑定中移除该账号。"
-        : "请先在版本绑定中解除对该账号的引用后再删除。"
+      return "请从引用版本的账号绑定中移除该账号。"
     case "repository":
       return "请先在版本绑定中移除该代码仓关联后再删除。"
     default:
@@ -213,6 +221,11 @@ export function ResourceRequestError({ error, fallback }: { error: unknown; fall
               </Link>
             </span>
           ))}
+        </p>
+      ) : null}
+      {view.versions.length >= REFERENCING_VERSIONS_LIMIT ? (
+        <p className="mt-1 text-muted-foreground">
+          仅显示前 {REFERENCING_VERSIONS_LIMIT} 个，引用版本可能更多。
         </p>
       ) : null}
       {view.nextAction !== undefined ? (

@@ -122,4 +122,31 @@ describe("CodeRepoPanel", () => {
     expect(api.deleteRepository).toHaveBeenCalledWith("1201")
     expect(api.listRepositories).toHaveBeenCalledTimes(1)
   })
+
+  it("notes that a capped referencing list may omit more versions", async () => {
+    const versions = Array.from({ length: 20 }, (_, index) => ({
+      id: String(3001 + index),
+      title: `引用版本 ${index + 1}`,
+    }))
+    vi.mocked(api.deleteRepository).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "repository is referenced by a version binding",
+        details: {
+          kind: "repository",
+          referencing_versions: versions,
+          resolution: "Remove the version repository override.",
+        },
+      }),
+    )
+    render(<CodeRepoPanel />)
+    await screen.findByText("order-center-web")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除代码仓 order-center-web" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除代码仓" }))
+
+    expect(await screen.findByText(/仅显示前 20 个，引用版本可能更多/)).toBeVisible()
+    expect(screen.getAllByRole("link")).toHaveLength(20)
+  })
 })

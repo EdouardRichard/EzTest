@@ -162,6 +162,43 @@ describe("localizeApiError default-model capability errors", () => {
     expect(localized.message).toBe("the default model must support tools")
   })
 
+  it("maps a vision downgrade on the default model and keeps the offending field", () => {
+    const localized = localizeApiError(
+      apiError(
+        400,
+        "invalid_argument",
+        "the default model must have supports_vision=true; document images and image drafts require vision analysis",
+        {
+          field: "supports_vision",
+          model: "vision-llm",
+          missing_capabilities: ["vision"],
+          reason: "default_model_vision_downgrade",
+        },
+      ),
+    )
+
+    expect(localized.message).toContain("默认模型必须支持视觉")
+    expect(localized.message).not.toContain("supports_vision=true")
+    expect(localized.field).toBe("supports_vision")
+    expect(localized.nextAction).toBeTruthy()
+  })
+
+  it("maps the required-default error that carries no missing capabilities", () => {
+    const localized = localizeApiError(
+      apiError(
+        400,
+        "invalid_argument",
+        "default_model_id is required when the configuration has selectable models",
+        { field: "default_model_id" },
+      ),
+    )
+
+    expect(localized.message).toContain("默认模型")
+    expect(localized.message).not.toContain("is required")
+    expect(localized.field).toBe("default_model_id")
+    expect(localized.nextAction).toBeTruthy()
+  })
+
   it("leaves unrelated invalid_argument errors untouched", () => {
     const localized = localizeApiError(
       apiError(400, "invalid_argument", "title is required", { field: "title" }),

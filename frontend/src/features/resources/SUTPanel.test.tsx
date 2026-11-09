@@ -305,4 +305,28 @@ describe("SUTPanel", () => {
     expect(onRefresh).not.toHaveBeenCalled()
     expect(screen.getByRole("dialog")).toBeInTheDocument()
   })
+
+  it("uses the generic no-list copy when a referenced SUT has no version rows", async () => {
+    vi.mocked(api.deleteSut).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "sut is referenced by a version binding",
+        details: {
+          kind: "sut",
+          referencing_versions: [],
+          resolution: "Delete the referencing versions.",
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 SUT 订单中心" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除 SUT" }))
+
+    expect(await screen.findByText("该SUT被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByText(/请先在版本绑定中解除对该资源的引用后再删除/)).toBeVisible()
+    expect(screen.queryByText(/这些版本/)).toBeNull()
+    expect(screen.queryByRole("link")).toBeNull()
+  })
 })
