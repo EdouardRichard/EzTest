@@ -100,6 +100,17 @@ func TestHealthTransportFailureIsExecutorUnavailable(t *testing.T) {
 	if perr.Status != http.StatusServiceUnavailable || perr.Code != "executor_unavailable" || !perr.Retryable {
 		t.Fatalf("error = %+v", perr)
 	}
+	// A refused dial is not a timeout: it keeps executor_unavailable and reports
+	// the dial phase so the caller can tell it apart from executor_timeout.
+	if phase, _ := perr.Details["phase"].(string); phase != "dial" {
+		t.Fatalf("details.phase = %q, want dial (details: %#v)", phase, perr.Details)
+	}
+	if got, _ := perr.Details["endpoint"].(string); got != url {
+		t.Fatalf("details.endpoint = %q, want %q", got, url)
+	}
+	if requestID, _ := perr.Details["request_id"].(string); requestID == "" {
+		t.Fatalf("details.request_id is empty: %#v", perr.Details)
+	}
 }
 
 func TestCreateContextSendsAuthAndParsesInfo(t *testing.T) {
@@ -315,19 +326,185 @@ func TestCancelAndClose(t *testing.T) {
 	}
 }
 
-func TestClientTimeoutReturnsExecutorUnavailable(t *testing.T) {
+// detailInt64 reads a numeric diagnostic detail regardless of the concrete
+// integer width used when the map was built.
+func detailInt64(t *testing.T, details map[string]any, key string) int64 {
+	t.Helper()
+	switch value := details[key].(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	default:
+		t.Fatalf("details[%q] = %#v, want a number (details: %#v)", key, details[key], details)
+		return 0
+	}
+}
+
+func requireDiagnosticDetails(t *testing.T, perr *platform.Error, endpoint, method, path string) {
+	t.Helper()
+	if perr.Details == nil {
+		t.Fatalf("error has no details: %+v", perr)
+	}
+	details := perr.Details
+	if got, _ := details["endpoint"].(string); got != endpoint {
+		t.Fatalf("details.endpoint = %q, want %q (details: %#v)", got, endpoint, details)
+	}
+	if got, _ := details["method"].(string); got != method {
+		t.Fatalf("details.method = %q, want %q", got, method)
+	}
+	if got, _ := details["path"].(string); got != path {
+		t.Fatalf("details.path = %q, want %q", got, path)
+	}
+	if phase, _ := details["phase"].(string); phase == "" {
+		t.Fatalf("details.phase is empty: %#v", details)
+	}
+	if requestID, _ := details["request_id"].(string); requestID == "" {
+		t.Fatalf("details.request_id is empty: %#v", details)
+	}
+	if duration := detailInt64(t, details, "duration_ms"); duration < 0 {
+		t.Fatalf("details.duration_ms = %d, want >= 0", duration)
+	}
+	if detailInt64(t, details, "timeout_ms") <= 0 {
+		t.Fatalf("details.timeout_ms is missing: %#v", details)
+	}
+}
+
+// TestContextCreateTimeoutIsTypedExecutorTimeout pins v0.2.3 X-01: a transport
+// timeout is its own retryable executor_timeout code with structured diagnostics
+// (endpoint/phase/request id/timeout) instead of a generic executor_unavailable.
+func TestContextCreateTimeoutIsTypedExecutorTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		_, _ = w.Write([]byte(`{"contexts":[]}`))
+		time.Sleep(150 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"contextId":"ctx_1"}`))
 	}))
 	t.Cleanup(server.Close)
 	// Deliberately shorter than the handler's sleep.
-	client := executor.NewClient(server.URL, testToken, 20*time.Millisecond)
+	client := executor.NewClientWithHTTPClient(server.URL, testToken, &http.Client{Timeout: 50 * time.Millisecond})
 
+	_, err := client.CreateContext(context.Background(), executor.CreateContextInput{
+		AllowedHosts: []string{"127.0.0.1"},
+	})
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_timeout" || !perr.Retryable {
+		t.Fatalf("error = %+v, want retryable executor_timeout", perr)
+	}
+	requireDiagnosticDetails(t, perr, server.URL, http.MethodPost, "/v1/contexts")
+	if got := detailInt64(t, perr.Details, "timeout_ms"); got != 50 {
+		t.Fatalf("details.timeout_ms = %d, want 50", got)
+	}
+	if phase, _ := perr.Details["phase"].(string); phase != "response" {
+		t.Fatalf("details.phase = %q, want response for a header timeout", phase)
+	}
+	if strings.Contains(perr.Message, testToken) ||
+		strings.Contains(perr.Details["endpoint"].(string), testToken) {
+		t.Fatalf("diagnostics leak the token: %+v", perr)
+	}
+}
+
+// TestContextDeadlineExceededIsTypedExecutorTimeout covers a caller-supplied
+// deadline: it must be typed exactly like the per-client timeout.
+func TestContextDeadlineExceededIsTypedExecutorTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	client := executor.NewClient(server.URL, testToken, 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, err := client.ListContexts(ctx)
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_timeout" {
+		t.Fatalf("error = %+v, want executor_timeout", perr)
+	}
+	if phase, _ := perr.Details["phase"].(string); phase == "" {
+		t.Fatalf("details.phase is empty: %#v", perr.Details)
+	}
+}
+
+// TestCanceledRequestIsTypedExecutorTimeout keeps cancellations out of the
+// generic executor_unavailable bucket (task contract: transport timeouts and
+// cancellations share the executor_timeout code).
+func TestCanceledRequestIsTypedExecutorTimeout(t *testing.T) {
+	client := executor.NewClient("http://127.0.0.1:1", testToken, time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.ListContexts(ctx)
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_timeout" {
+		t.Fatalf("error = %+v, want executor_timeout", perr)
+	}
+}
+
+// TestExecutorRequestsCarryRequestIDHeader proves every executor call carries
+// the correlation header and that an HTTP failure reports the same id plus its
+// response phase in structured details.
+func TestExecutorRequestsCarryRequestIDHeader(t *testing.T) {
+	var healthHeader, listHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := r.Header.Get("X-EzTest-Request-Id")
+		if r.URL.Path == "/healthz" {
+			healthHeader = requestID
+			_, _ = w.Write([]byte(`{"status":"ok","version":"0.2.0-p3"}`))
+			return
+		}
+		listHeader = requestID
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"code":"internal","message":"boom"}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := executor.NewClient(server.URL, testToken, 5*time.Second)
+
+	if _, err := client.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
 	_, err := client.ListContexts(context.Background())
 	perr := asPlatformError(t, err)
-	if perr.Code != "executor_unavailable" || !perr.Retryable {
-		t.Fatalf("error = %+v", perr)
+	if perr.Code != "executor_unavailable" {
+		t.Fatalf("error = %+v, want executor_unavailable", perr)
+	}
+	if healthHeader == "" || listHeader == "" {
+		t.Fatalf("request ids were not sent: health=%q list=%q", healthHeader, listHeader)
+	}
+	if !strings.HasPrefix(listHeader, "req_") {
+		t.Fatalf("request id = %q, want a req_ id", listHeader)
+	}
+	requireDiagnosticDetails(t, perr, server.URL, http.MethodGet, "/v1/contexts")
+	if got := perr.Details["request_id"]; got != listHeader {
+		t.Fatalf("details.request_id = %v, want the sent header %q", got, listHeader)
+	}
+	if phase, _ := perr.Details["phase"].(string); phase != "response" {
+		t.Fatalf("details.phase = %q, want response", phase)
+	}
+	if status := detailInt64(t, perr.Details, "status_code"); status != http.StatusInternalServerError {
+		t.Fatalf("details.status_code = %d, want 500", status)
+	}
+}
+
+// TestExecutorTimeoutEnvelopeIsPreserved: a typed 504 executor_timeout reply is
+// not flattened into executor_unavailable.
+func TestExecutorTimeoutEnvelopeIsPreserved(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte(`{"error":{"code":"executor_timeout","message":"context creation exceeded its hard deadline"}}`))
+	})
+
+	_, err := client.CreateContext(context.Background(), executor.CreateContextInput{
+		AllowedHosts: []string{"127.0.0.1"},
+	})
+	perr := asPlatformError(t, err)
+	if perr.Code != "executor_timeout" || !perr.Retryable {
+		t.Fatalf("error = %+v, want retryable executor_timeout", perr)
+	}
+	if !strings.Contains(perr.Message, "hard deadline") {
+		t.Fatalf("message = %q, want the executor diagnostic", perr.Message)
+	}
+	if phase, _ := perr.Details["phase"].(string); phase != "response" {
+		t.Fatalf("details.phase = %q, want response", phase)
 	}
 }
 

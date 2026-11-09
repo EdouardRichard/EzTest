@@ -276,6 +276,23 @@ func NewCaseRunUsage(turns int, usage map[string]int) *CaseRunUsage {
 	}
 }
 
+// CaseRunDispatchDiagnostic is the dispatch-time executor snapshot persisted in
+// case_run.summary["dispatch"] (v0.2.3 X-01). It records which executor the
+// scheduler picked for one attempt (owner/endpoint/health/route) so a later
+// failure can be attributed without a new table or migration.
+type CaseRunDispatchDiagnostic struct {
+	OwnerExecutorID int64  `json:"owner_executor_id"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	ExecutorStatus  string `json:"executor_status,omitempty"`
+	LastHeartbeat   string `json:"last_heartbeat,omitempty"`
+	ExecutorVersion string `json:"version,omitempty"`
+	// RegistryHit is false when the call had to fall back to the configured
+	// primary endpoint instead of a registered owner.
+	RegistryHit bool   `json:"registry_hit"`
+	DispatchAt  string `json:"dispatch_at,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+}
+
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
 	VerdictReason      string `json:"verdict_reason,omitempty"`
@@ -296,6 +313,8 @@ type CaseRunSummary struct {
 	NextAction    string `json:"next_action,omitempty"`
 	// Usage is the observed agent-run usage of the terminal run (QA Q2).
 	Usage *CaseRunUsage `json:"usage,omitempty"`
+	// Dispatch is the latest dispatch-time executor snapshot (v0.2.3 X-01).
+	Dispatch *CaseRunDispatchDiagnostic `json:"dispatch,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.

@@ -7,16 +7,20 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
 // MaxActionDuration is the executor's per-action cap. The API-side case_run
@@ -37,17 +41,54 @@ const (
 	// A screenshot or download artifact is capped at 10MB by the executor and
 	// travels base64-encoded, so the response can exceed the request cap.
 	maxResponseBytes = 32 << 20
+
+	// RequestIDHeader correlates one API-side executor call with the executor's
+	// own request start/finish log lines (v0.2.3 X-01).
+	RequestIDHeader = "X-EzTest-Request-Id"
+
+	// CodeExecutorTimeout is the typed platform code for a transport timeout or
+	// cancellation. Non-timeout transport failures keep executor_unavailable.
+	CodeExecutorTimeout = "executor_timeout"
 )
 
+// CallDiagnostics is the dispatch provenance attached to one executor call. The
+// router/adapter layers know the owner and context; every field is optional and
+// is copied into the structured error details/log line when known. It never
+// carries credentials.
+type CallDiagnostics struct {
+	OwnerExecutorID int64
+	CaseRunID       int64
+	Attempt         int
+	ContextID       string
+	// RegistryHit reports whether the owner was resolved from the executor
+	// registry (false means primary-endpoint fallback).
+	RegistryHit *bool
+}
+
+type callDiagnosticsKey struct{}
+
+// WithCallDiagnostics attaches dispatch provenance to one executor call.
+func WithCallDiagnostics(ctx context.Context, diagnostics CallDiagnostics) context.Context {
+	return context.WithValue(ctx, callDiagnosticsKey{}, diagnostics)
+}
+
+func callDiagnosticsFrom(ctx context.Context) (CallDiagnostics, bool) {
+	diagnostics, ok := ctx.Value(callDiagnosticsKey{}).(CallDiagnostics)
+	return diagnostics, ok
+}
+
 // Health is the executor /healthz payload. A degraded executor still answers
-// (503) and keeps its bearer-protected routes available for cleanup.
+// (503) and keeps its bearer-protected routes available for cleanup. Creating
+// and LastContextCreateError expose an in-flight/hung context creation (X-01).
 type Health struct {
-	Status         string `json:"status"`
-	Version        string `json:"version"`
-	Contexts       int    `json:"contexts"`
-	MaxContexts    int    `json:"maxContexts"`
-	BrowserVersion string `json:"browserVersion,omitempty"`
-	Error          string `json:"error,omitempty"`
+	Status                 string `json:"status"`
+	Version                string `json:"version"`
+	Contexts               int    `json:"contexts"`
+	MaxContexts            int    `json:"maxContexts"`
+	BrowserVersion         string `json:"browserVersion,omitempty"`
+	Error                  string `json:"error,omitempty"`
+	Creating               int    `json:"creating"`
+	LastContextCreateError string `json:"lastContextCreateError,omitempty"`
 }
 
 // Viewport is the optional browser viewport of a new context.
@@ -161,16 +202,16 @@ func ContextKey(caseRunID, versionSUTID int64, role string) string {
 // Health probes GET /healthz. It does not send the bearer token; a 503 degraded
 // reply is a valid Health (the registry still records the heartbeat).
 func (c *HTTPClient) Health(ctx context.Context) (Health, error) {
-	status, body, err := c.request(ctx, http.MethodGet, healthPath, nil, false)
+	result, err := c.request(ctx, http.MethodGet, healthPath, nil, false)
 	if err != nil {
 		return Health{}, err
 	}
-	if status != http.StatusOK && status != http.StatusServiceUnavailable {
-		return Health{}, executorError(status, body)
+	if result.status != http.StatusOK && result.status != http.StatusServiceUnavailable {
+		return Health{}, result.failure("response", executorError(result))
 	}
 	var health Health
-	if err := json.Unmarshal(body, &health); err != nil {
-		return Health{}, protocolError("invalid executor health response")
+	if err := json.Unmarshal(result.body, &health); err != nil {
+		return Health{}, result.failure("body", protocolError("invalid executor health response"))
 	}
 	return health, nil
 }
@@ -192,19 +233,19 @@ func (c *HTTPClient) CreateContext(ctx context.Context, in CreateContextInput) (
 		Metadata:     in.Metadata,
 		Viewport:     in.Viewport,
 	}
-	status, body, err := c.request(ctx, http.MethodPost, contextsPath, payload, true)
+	result, err := c.request(ctx, http.MethodPost, contextsPath, payload, true)
 	if err != nil {
 		return ContextInfo{}, err
 	}
-	if err := ensureOK(status, body); err != nil {
+	if err := ensureOK(result); err != nil {
 		return ContextInfo{}, err
 	}
 	var created struct {
 		ContextID      string `json:"contextId"`
 		BrowserVersion string `json:"browserVersion"`
 	}
-	if err := json.Unmarshal(body, &created); err != nil || created.ContextID == "" {
-		return ContextInfo{}, protocolError("invalid executor create-context response")
+	if err := json.Unmarshal(result.body, &created); err != nil || created.ContextID == "" {
+		return ContextInfo{}, result.failure("body", protocolError("invalid executor create-context response"))
 	}
 	return ContextInfo{
 		ID:       created.ContextID,
@@ -215,11 +256,11 @@ func (c *HTTPClient) CreateContext(ctx context.Context, in CreateContextInput) (
 
 // ListContexts calls GET /v1/contexts (P3 extension).
 func (c *HTTPClient) ListContexts(ctx context.Context) ([]ContextInfo, error) {
-	status, body, err := c.request(ctx, http.MethodGet, contextsPath, nil, true)
+	result, err := c.request(ctx, http.MethodGet, contextsPath, nil, true)
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureOK(status, body); err != nil {
+	if err := ensureOK(result); err != nil {
 		return nil, err
 	}
 	var payload struct {
@@ -230,8 +271,8 @@ func (c *HTTPClient) ListContexts(ctx context.Context) ([]ContextInfo, error) {
 			CreatedAt string         `json:"createdAt"`
 		} `json:"contexts"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, protocolError("invalid executor list-contexts response")
+	if err := json.Unmarshal(result.body, &payload); err != nil {
+		return nil, result.failure("body", protocolError("invalid executor list-contexts response"))
 	}
 	contexts := make([]ContextInfo, 0, len(payload.Contexts))
 	for _, item := range payload.Contexts {
@@ -257,7 +298,7 @@ func (c *HTTPClient) Action(ctx context.Context, contextID, action string, args 
 		Args   json.RawMessage `json:"args"`
 	}{Action: action, Args: args}
 	path := contextsPath + "/" + url.PathEscape(contextID) + "/actions"
-	status, body, err := c.request(ctx, http.MethodPost, path, payload, true)
+	result, err := c.request(ctx, http.MethodPost, path, payload, true)
 	if err != nil {
 		return ActionResult{}, err
 	}
@@ -267,15 +308,15 @@ func (c *HTTPClient) Action(ctx context.Context, contextID, action string, args 
 		Artifacts []Artifact      `json:"artifacts"`
 		Error     *ActionError    `json:"error"`
 	}
-	decodeErr := json.Unmarshal(body, &envelope)
+	decodeErr := json.Unmarshal(result.body, &envelope)
 	if decodeErr != nil || (!envelope.OK && envelope.Error == nil) {
-		if status >= http.StatusInternalServerError || (status >= 200 && status < 300) {
-			return ActionResult{}, protocolError("invalid executor action response")
+		if result.status >= http.StatusInternalServerError || (result.status >= 200 && result.status < 300) {
+			return ActionResult{}, result.failure("body", protocolError("invalid executor action response"))
 		}
-		return ActionResult{}, executorError(status, body)
+		return ActionResult{}, result.failure("response", executorError(result))
 	}
-	if status >= http.StatusInternalServerError {
-		return ActionResult{}, executorError(status, body)
+	if result.status >= http.StatusInternalServerError {
+		return ActionResult{}, result.failure("response", executorError(result))
 	}
 	return ActionResult{
 		OK:        envelope.OK,
@@ -289,11 +330,11 @@ func (c *HTTPClient) Action(ctx context.Context, contextID, action string, args 
 // action was actually canceled.
 func (c *HTTPClient) Cancel(ctx context.Context, contextID string) (bool, error) {
 	path := contextsPath + "/" + url.PathEscape(contextID) + "/cancel"
-	status, body, err := c.request(ctx, http.MethodPost, path, nil, true)
+	result, err := c.request(ctx, http.MethodPost, path, nil, true)
 	if err != nil {
 		return false, err
 	}
-	if err := ensureOK(status, body); err != nil {
+	if err := ensureOK(result); err != nil {
 		return false, err
 	}
 	var payload struct {
@@ -302,8 +343,8 @@ func (c *HTTPClient) Cancel(ctx context.Context, contextID string) (bool, error)
 			Canceled bool `json:"canceled"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return false, protocolError("invalid executor cancel response")
+	if err := json.Unmarshal(result.body, &payload); err != nil {
+		return false, result.failure("body", protocolError("invalid executor cancel response"))
 	}
 	return payload.Result.Canceled, nil
 }
@@ -312,31 +353,126 @@ func (c *HTTPClient) Cancel(ctx context.Context, contextID string) (bool, error)
 // best-effort terminal cleanup.
 func (c *HTTPClient) Close(ctx context.Context, contextID string) error {
 	path := contextsPath + "/" + url.PathEscape(contextID)
-	status, body, err := c.request(ctx, http.MethodDelete, path, nil, true)
+	result, err := c.request(ctx, http.MethodDelete, path, nil, true)
 	if err != nil {
 		return err
 	}
-	return ensureOK(status, body)
+	return ensureOK(result)
 }
 
-// request performs one executor HTTP call. It returns the status and body; the
-// caller decides whether the status is an error (health/action envelopes differ
-// from the rest). Transport failures are mapped to executor_unavailable.
-func (c *HTTPClient) request(ctx context.Context, method, path string, payload any, auth bool) (int, []byte, error) {
+// httpResult is one completed executor HTTP exchange. It carries the
+// sanitized request identity so every failure path can attach the same
+// structured, request-scoped diagnostics.
+type httpResult struct {
+	ctx       context.Context
+	status    int
+	body      []byte
+	method    string
+	path      string
+	endpoint  string
+	requestID string
+	duration  time.Duration
+	timeout   time.Duration
+}
+
+// failure attaches structured details and logs one sanitized diagnostic line.
+// It returns the same error so callers can `return ..., result.failure(...)`.
+func (r *httpResult) failure(phase string, err *platform.Error) error {
+	err.Details = r.details(phase)
+	attrs := []any{
+		slog.String("executor.endpoint", r.endpoint),
+		slog.String("executor.method", r.method),
+		slog.String("executor.path", r.path),
+		slog.String("executor.phase", phase),
+		slog.String("executor.request_id", r.requestID),
+		slog.Int64("executor.duration_ms", r.duration.Milliseconds()),
+		slog.Int64("executor.timeout_ms", r.timeout.Milliseconds()),
+		slog.Int("executor.status_code", r.status),
+		slog.String("executor.code", err.Code),
+		slog.Bool("executor.retryable", err.Retryable),
+		slog.String("error", err.Message),
+	}
+	attrs = append(attrs, r.dispatchLogAttrs()...)
+	slog.Default().WarnContext(r.ctx, "executor request failed", attrs...)
+	return err
+}
+
+func (r *httpResult) dispatchLogAttrs() []any {
+	details := r.details("")
+	attrs := make([]any, 0, 8)
+	if value, ok := details["owner_executor_id"]; ok {
+		attrs = append(attrs, slog.Any("executor.owner_executor_id", value))
+	}
+	if value, ok := details["case_run_id"]; ok {
+		attrs = append(attrs, slog.Any("executor.case_run_id", value))
+	}
+	if value, ok := details["attempt"]; ok {
+		attrs = append(attrs, slog.Any("executor.attempt", value))
+	}
+	if value, ok := details["context_id"]; ok {
+		attrs = append(attrs, slog.Any("executor.context_id", value))
+	}
+	if value, ok := details["registry_hit"]; ok {
+		attrs = append(attrs, slog.Any("executor.registry_hit", value))
+	}
+	return attrs
+}
+
+// details builds the sanitized request-scoped diagnostics. It never includes
+// the bearer token, the request body or the raw (credential-bearing) URL.
+func (r *httpResult) details(phase string) map[string]any {
+	details := map[string]any{
+		"endpoint":   r.endpoint,
+		"method":     r.method,
+		"path":       r.path,
+		"request_id": r.requestID,
+	}
+	if phase != "" {
+		details["phase"] = phase
+	}
+	if r.status != 0 {
+		details["status_code"] = r.status
+	}
+	if r.timeout > 0 {
+		details["timeout_ms"] = r.timeout.Milliseconds()
+	}
+	details["duration_ms"] = r.duration.Milliseconds()
+	if diagnostics, ok := callDiagnosticsFrom(r.ctx); ok {
+		details["owner_executor_id"] = diagnostics.OwnerExecutorID
+		if diagnostics.CaseRunID > 0 {
+			details["case_run_id"] = diagnostics.CaseRunID
+		}
+		if diagnostics.Attempt > 0 {
+			details["attempt"] = diagnostics.Attempt
+		}
+		if diagnostics.ContextID != "" {
+			details["context_id"] = diagnostics.ContextID
+		}
+		if diagnostics.RegistryHit != nil {
+			details["registry_hit"] = *diagnostics.RegistryHit
+		}
+	}
+	return details
+}
+
+// request performs one executor HTTP call. Transport failures are typed as
+// executor_timeout (timeout/cancellation) or executor_unavailable (everything
+// else) and always carry the structured request diagnostics above.
+func (c *HTTPClient) request(ctx context.Context, method, path string, payload any, auth bool) (*httpResult, error) {
 	if c.endpoint == "" {
-		return 0, nil, protocolError("executor endpoint is not configured")
+		return nil, protocolError("executor endpoint is not configured")
 	}
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
-			return 0, nil, platform.Invalid("executor_request", "executor request could not be encoded")
+			return nil, platform.Invalid("executor_request", "executor request could not be encoded")
 		}
 		body = bytes.NewReader(encoded)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, body)
 	if err != nil {
-		return 0, nil, protocolError("executor endpoint is invalid")
+		return nil, protocolError("executor endpoint is invalid")
 	}
 	if payload != nil {
 		request.Header.Set("Content-Type", "application/json")
@@ -344,46 +480,148 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, payload a
 	if auth {
 		request.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	requestID := requestid.New()
+	request.Header.Set(RequestIDHeader, requestID)
+
+	result := &httpResult{
+		ctx:       ctx,
+		method:    method,
+		path:      path,
+		endpoint:  sanitizedEndpoint(c.endpoint),
+		requestID: requestID,
+		timeout:   c.effectiveTimeout(ctx),
+	}
+	started := time.Now()
 	response, err := c.http.Do(request)
+	result.duration = time.Since(started)
 	if err != nil {
-		if ctx.Err() != nil {
-			return 0, nil, platform.NewError(http.StatusServiceUnavailable, "executor_unavailable", "executor request was canceled")
-		}
-		return 0, nil, unavailable("executor request failed: " + sanitizeTransportError(err))
+		return nil, result.failure(transportPhase(err), transportError(ctx, err))
 	}
 	defer func() { _ = response.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
-	if err != nil {
-		return 0, nil, unavailable("executor response could not be read")
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+	result.duration = time.Since(started)
+	result.status, result.body = response.StatusCode, raw
+	if readErr != nil {
+		return nil, result.failure("body", unavailable("executor response could not be read"))
 	}
-	return response.StatusCode, raw, nil
+	return result, nil
+}
+
+// effectiveTimeout is the smaller of the HTTP client bound and the caller's
+// remaining context budget, used only for diagnostics.
+func (c *HTTPClient) effectiveTimeout(ctx context.Context) time.Duration {
+	timeout := c.http.Timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 && (timeout <= 0 || remaining < timeout) {
+			return remaining
+		}
+	}
+	return timeout
+}
+
+// transportError maps a failed exchange onto the typed transport taxonomy.
+func transportError(ctx context.Context, err error) *platform.Error {
+	timedOut := errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+		isTimeoutError(err)
+	canceled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+	if !timedOut && !canceled {
+		return unavailable("executor request failed: " + sanitizeTransportError(err))
+	}
+	apiErr := &platform.Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      CodeExecutorTimeout,
+		Retryable: !canceled,
+	}
+	if canceled {
+		apiErr.Message = "executor request was canceled"
+	} else {
+		apiErr.Message = "executor request timed out: " + sanitizeTransportError(err)
+	}
+	return apiErr
+}
+
+func isTimeoutError(err error) bool {
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+// transportPhase classifies where a transport failure happened: dial, tls,
+// request, response headers or body.
+func transportPhase(err error) string {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return "dial"
+	}
+	var certificateErr *tls.CertificateVerificationError
+	if errors.As(err, &certificateErr) {
+		return "tls"
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return "tls"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "tls:") || strings.Contains(message, "x509:"):
+		return "tls"
+	case strings.Contains(message, "awaiting headers"):
+		return "response"
+	case strings.Contains(message, "reading response body"):
+		return "body"
+	default:
+		return "request"
+	}
 }
 
 // ensureOK maps a non-2xx response to a typed error.
-func ensureOK(status int, body []byte) error {
-	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+func ensureOK(result *httpResult) error {
+	if result.status >= http.StatusOK && result.status < http.StatusMultipleChoices {
 		return nil
 	}
-	return executorError(status, body)
+	return result.failure("response", executorError(result))
 }
 
-// executorError converts an executor error envelope into a *platform.Error. 5xx
-// responses always become the retryable executor_unavailable code so callers
-// can classify them as environment failures.
-func executorError(status int, body []byte) error {
+// executorError converts an executor error envelope into a *platform.Error. An
+// untyped 5xx response stays the retryable executor_unavailable code, while a
+// typed executor_timeout reply keeps its own code.
+func executorError(result *httpResult) *platform.Error {
 	var envelope struct {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	_ = json.Unmarshal(body, &envelope)
-	if status >= http.StatusInternalServerError || envelope.Error.Code == "" {
-		return unavailable(fmt.Sprintf("executor returned HTTP %d", status))
+	_ = json.Unmarshal(result.body, &envelope)
+	code := envelope.Error.Code
+	if result.status >= http.StatusInternalServerError {
+		switch code {
+		case "", "internal":
+			return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
+		case CodeExecutorTimeout:
+			return &platform.Error{
+				Status:    result.status,
+				Code:      CodeExecutorTimeout,
+				Message:   envelope.Error.Message,
+				Retryable: true,
+			}
+		default:
+			// A typed 5xx is still a temporary environment failure.
+			return &platform.Error{
+				Status:    result.status,
+				Code:      code,
+				Message:   envelope.Error.Message,
+				Retryable: true,
+			}
+		}
+	}
+	if code == "" {
+		return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
 	}
 	return &platform.Error{
-		Status:  status,
-		Code:    envelope.Error.Code,
+		Status:  result.status,
+		Code:    code,
 		Message: envelope.Error.Message,
 	}
 }
@@ -403,6 +641,16 @@ func protocolError(message string) *platform.Error {
 		Code:    "executor_unavailable",
 		Message: message,
 	}
+}
+
+// sanitizedEndpoint drops userinfo, query and path so diagnostics never leak
+// credentials; executor endpoints are scheme://host[:port] by contract.
+func sanitizedEndpoint(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 // sanitizeTransportError keeps the useful part of a transport failure without

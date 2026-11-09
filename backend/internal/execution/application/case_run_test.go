@@ -52,8 +52,8 @@ type caseRunnerFixture struct {
 	// discovery records the terminal-state discovery observation batches. It is
 	// nil in the default fixture (the port is optional in W1-10).
 	discovery *fakeDiscoveryWriter
-	runCtx           context.Context
-	runCancel        context.CancelFunc
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 func int64ptr(value int64) *int64 { return &value }
@@ -1220,6 +1220,85 @@ func TestNoExecutorEmitsBlocked(t *testing.T) {
 	}
 	if got, _ := payloads[0]["case_run_id"].(string); got != "3001" {
 		t.Fatalf("blocked case_run_id = %q, want 3001", got)
+	}
+}
+
+// TestDispatchPersistsExecutorSnapshotInSummary pins v0.2.3 X-01: every dispatch
+// stamps the chosen executor (owner/endpoint/status/heartbeat/version/route) in
+// case_run.summary["dispatch"] so a later failure can be attributed without a
+// new table or migration.
+func TestDispatchPersistsExecutorSnapshotInSummary(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	heartbeat := fixture.clock.Now().Add(-2 * time.Second)
+	executor := &execution.ExecutorInstance{
+		ID: 7, Endpoint: "http://127.0.0.1:13336", Capacity: 8,
+		Status: execution.ExecutorActive, Version: "0.2.0-p3",
+		LastHeartbeat: &heartbeat,
+	}
+	scheduler, queue := newDispatchScheduler(fixture, executor)
+
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	row := fixture.caseRuns.get(t, 3001)
+	if row.Status != execution.CaseRunRunning {
+		t.Fatalf("run status = %q, want running", row.Status)
+	}
+	if queue.count() != 1 {
+		t.Fatalf("work items = %d, want 1", queue.count())
+	}
+	dispatch := row.Summary.Dispatch
+	if dispatch == nil {
+		t.Fatalf("case_run.summary.dispatch is nil: %+v", row.Summary)
+	}
+	if dispatch.OwnerExecutorID != 7 || dispatch.Endpoint != "http://127.0.0.1:13336" {
+		t.Fatalf("dispatch owner/endpoint = %+v", dispatch)
+	}
+	if dispatch.ExecutorStatus != string(execution.ExecutorActive) || dispatch.ExecutorVersion != "0.2.0-p3" {
+		t.Fatalf("dispatch executor status/version = %+v", dispatch)
+	}
+	if dispatch.LastHeartbeat != heartbeat.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("dispatch last_heartbeat = %q, want %q", dispatch.LastHeartbeat, heartbeat.UTC().Format(time.RFC3339Nano))
+	}
+	if !dispatch.RegistryHit {
+		t.Fatalf("dispatch registry_hit = false, want true for a selected row")
+	}
+	if dispatch.DispatchAt == "" {
+		t.Fatalf("dispatch_at is empty: %+v", dispatch)
+	}
+	if dispatch.Attempt != row.Attempts {
+		t.Fatalf("dispatch attempt = %d, want %d", dispatch.Attempt, row.Attempts)
+	}
+}
+
+// TestTerminalSummaryPreservesDispatchSnapshot proves the terminal verdict write
+// does not drop the dispatch snapshot assembled at dispatch time.
+func TestTerminalSummaryPreservesDispatchSnapshot(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	snapshot := &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 7,
+		Endpoint:        "http://127.0.0.1:13336",
+		ExecutorStatus:  string(execution.ExecutorActive),
+		RegistryHit:     true,
+		DispatchAt:      "2026-11-01T01:00:00Z",
+	}
+	run := fixture.caseRuns.rows[3001]
+	run.Summary.Dispatch = snapshot
+	fixture.caseRuns.rows[3001] = run
+	prepareCaseRun(t, fixture)
+	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+		Seq: 1, Status: "passed", Observed: "ok",
+	}); err != nil {
+		t.Fatalf("StepRecord: %v", err)
+	}
+	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+		Verdict: execution.CaseRunPassed,
+	}); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Summary.Dispatch == nil || stored.Summary.Dispatch.OwnerExecutorID != 7 {
+		t.Fatalf("terminal summary dropped the dispatch snapshot: %+v", stored.Summary)
 	}
 }
 

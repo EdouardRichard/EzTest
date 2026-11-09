@@ -12,7 +12,7 @@ import http from "node:http"
 import { pathToFileURL } from "node:url"
 
 import { createExploreRuntime } from "./actions/explore.mjs"
-import { ContextManager } from "./contexts.mjs"
+import { ContextManager, DEFAULT_CONTEXT_CREATE_TIMEOUT_MS } from "./contexts.mjs"
 import { parseAllowedHosts } from "./limits.mjs"
 import { startPushFromEnv } from "./push.mjs"
 import {
@@ -58,10 +58,16 @@ function statusForError(code) {
       return 409
     case "too_large":
       return 413
+    case "executor_timeout":
+      // The API maps this back to its typed executor_timeout code.
+      return 504
     default:
       return 500
   }
 }
+
+// Request-id header the API injects into every executor call (v0.2.3 X-01).
+const REQUEST_ID_HEADER = "x-ezt-test-request-id"
 
 const ACTION_ERROR_STATUS = {
   invalid_arguments: 400,
@@ -203,8 +209,16 @@ export function createExecutorServer({
     } catch {
       // Keep the default path; the request will 404 below.
     }
+    const requestId = String(req.headers[REQUEST_ID_HEADER] ?? "").trim()
+    // Start and finish are separate lines so a hung request is still visible in
+    // the executor log with the API-side correlation id (X-01).
+    logger?.info?.(
+      `[executor] request start ${req.method} ${pathname} request_id=${requestId || "-"}`,
+    )
     res.once("finish", () => {
-      logger?.info?.(`[executor] ${req.method} ${pathname} ${res.statusCode} ${Date.now() - startedAt}ms`)
+      logger?.info?.(
+        `[executor] request finish ${req.method} ${pathname} ${res.statusCode} ${Date.now() - startedAt}ms request_id=${requestId || "-"}`,
+      )
     })
 
     if (pathname === "/healthz") {
@@ -214,11 +228,15 @@ export function createExecutorServer({
       const health =
         typeof executor.health === "function" ? await executor.health() : { status: "ok" }
       const ready = health.status === "ok"
+      const creating = Number.isInteger(health.creating) ? health.creating : 0
+      const lastContextCreateError = health.lastContextCreateError ?? null
       return sendJson(res, ready ? 200 : 503, {
         status: health.status,
         version,
         contexts: executor.size ?? 0,
         maxContexts: executor.maxContexts ?? DEFAULT_MAX_CONTEXTS,
+        creating,
+        lastContextCreateError,
         ...(health.browserVersion ? { browserVersion: health.browserVersion } : {}),
         ...(health.error ? { error: health.error } : {}),
       })
@@ -346,6 +364,16 @@ export function parseMaxContexts(value) {
   return DEFAULT_MAX_CONTEXTS
 }
 
+// CTX-CREATE-TIMEOUT: the hard deadline browser.newContext/launch is allowed
+// before the executor reports a typed executor_timeout (default 30s, X-01).
+export function parseContextCreateTimeout(value) {
+  const numeric = Number(value)
+  if (Number.isInteger(numeric) && numeric > 0) {
+    return numeric
+  }
+  return DEFAULT_CONTEXT_CREATE_TIMEOUT_MS
+}
+
 export async function startFromEnv(
   env = process.env,
   { manager: injectedManager = null, explore: injectedExplore = null } = {},
@@ -361,9 +389,13 @@ export async function startFromEnv(
   // P8 hardening (design spec §10.5): the executor-wide WebSocket allow list.
   // It defaults to loopback; remote targets must be listed explicitly.
   const allowedHosts = parseAllowedHosts(env.EZTEST_EXEC_ALLOWED_HOSTS)
+  const contextCreateTimeoutMs = parseContextCreateTimeout(
+    env.EZTEST_EXECUTOR_CONTEXT_CREATE_TIMEOUT_MS,
+  )
   const logger = console
   const manager =
-    injectedManager ?? new ContextManager({ maxContexts, logger, allowedHosts })
+    injectedManager ??
+    new ContextManager({ maxContexts, logger, allowedHosts, contextCreateTimeoutMs })
   const exploreRuntime = injectedExplore ?? createExploreRuntime({ logger, allowedHosts })
   const version = env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION
   const server = createExecutorServer({

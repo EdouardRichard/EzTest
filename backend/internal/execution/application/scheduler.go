@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
@@ -371,6 +372,7 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		run.LeaseUntil = timePtr(now.Add(s.leaseTTL))
 		run.OwnerInstance = s.instance
 		run.OwnerExecutorID = int64PtrValue(executor.ID)
+		run.Summary.Dispatch = dispatchDiagnostic(executor, now, run.Attempts)
 		run.UpdatedAt = now
 		if _, err := s.caseRuns.Update(ctx, run); err != nil {
 			return mapExecutionError(err, "case run")
@@ -659,6 +661,38 @@ func isInfraFailure(class execution.FailureClass) bool {
 	default:
 		return false
 	}
+}
+
+// dispatchDiagnostic snapshots the executor selected for one attempt. It is
+// persisted in case_run.summary["dispatch"] (no migration, X-01) so a later
+// timeout/lost-executor verdict can say which endpoint the run was sent to.
+func dispatchDiagnostic(executor *execution.ExecutorInstance, at time.Time, attempt int) *execution.CaseRunDispatchDiagnostic {
+	diagnostic := &execution.CaseRunDispatchDiagnostic{
+		DispatchAt: at.UTC().Format(time.RFC3339Nano),
+		Attempt:    attempt,
+	}
+	if executor == nil {
+		return diagnostic
+	}
+	diagnostic.OwnerExecutorID = executor.ID
+	diagnostic.Endpoint = sanitizedExecutorEndpoint(executor.Endpoint)
+	diagnostic.ExecutorStatus = string(executor.Status)
+	diagnostic.ExecutorVersion = executor.Version
+	diagnostic.RegistryHit = executor.ID > 0
+	if executor.LastHeartbeat != nil {
+		diagnostic.LastHeartbeat = executor.LastHeartbeat.UTC().Format(time.RFC3339Nano)
+	}
+	return diagnostic
+}
+
+// sanitizedExecutorEndpoint drops userinfo/query/path so the summary never
+// persists a credential-bearing URL.
+func sanitizedExecutorEndpoint(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 // dispatchableExecutor reports whether a selected instance may start new

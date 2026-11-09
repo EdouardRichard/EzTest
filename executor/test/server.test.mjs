@@ -4,7 +4,12 @@ import { EventEmitter } from "node:events"
 import http from "node:http"
 
 import { ContextManager } from "../src/contexts.mjs"
-import { createExecutorServer, readBody, startFromEnv } from "../src/server.mjs"
+import {
+  createExecutorServer,
+  parseContextCreateTimeout,
+  readBody,
+  startFromEnv,
+} from "../src/server.mjs"
 import { ExecutorError, MAX_REQUEST_BYTES } from "../src/security.mjs"
 import { httpClient, startLocalPage } from "./helpers.mjs"
 
@@ -391,4 +396,116 @@ test("startFromEnv wires EZTEST_EXEC_ALLOWED_HOSTS into the context manager", as
     await new Promise((resolve) => started.server.close(resolve))
     await started.manager.close()
   }
+})
+
+// A fake manager keeps these protocol-level tests off a real browser.
+function fakeManager(overrides = {}) {
+  return {
+    size: 0,
+    maxContexts: 8,
+    list: () => [],
+    async health() {
+      return { status: "ok" }
+    },
+    async close() {},
+    ...overrides,
+  }
+}
+
+async function startProtocolServer(manager, logger = null) {
+  const protocolServer = createExecutorServer({
+    token: TOKEN,
+    manager,
+    logger,
+    version: "test",
+  })
+  protocolServer.listen(0, "127.0.0.1")
+  await new Promise((resolve) => protocolServer.once("listening", resolve))
+  const { port } = protocolServer.address()
+  return {
+    request: httpClient(`http://127.0.0.1:${port}`, TOKEN),
+    close: () => new Promise((resolve) => protocolServer.close(resolve)),
+  }
+}
+
+// v0.2.3 X-01: every executor request is logged at start and finish with the
+// caller's x-ezt-test-request-id, so an API-side timeout can be matched to the
+// executor's own log line.
+test("request start and finish logs carry the x-ezt-test-request-id", async () => {
+  const lines = []
+  const logger = {
+    info: (line) => lines.push(String(line)),
+    warn: (line) => lines.push(String(line)),
+    error: (line) => lines.push(String(line)),
+  }
+  const protocol = await startProtocolServer(fakeManager(), logger)
+  try {
+    const requestId = "req_0123456789abcdef"
+    const response = await protocol.request("/healthz", {
+      token: undefined,
+      headers: { "x-ezt-test-request-id": requestId },
+    })
+    assert.equal(response.status, 200, response.text)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.ok(
+      lines.some((line) => line.includes("request start") && line.includes(requestId)),
+      `missing start log with the request id:\n${lines.join("\n")}`,
+    )
+    assert.ok(
+      lines.some((line) => line.includes("request finish") && line.includes(requestId)),
+      `missing finish log with the request id:\n${lines.join("\n")}`,
+    )
+  } finally {
+    await protocol.close()
+  }
+})
+
+test("healthz exposes creating and lastContextCreateError", async () => {
+  const lastContextCreateError = "executor_timeout: context creation exceeded its hard deadline of 30000ms"
+  const protocol = await startProtocolServer(
+    fakeManager({
+      size: 1,
+      async health() {
+        return { status: "ok", browserVersion: "fake-2", creating: 1, lastContextCreateError }
+      },
+    }),
+  )
+  try {
+    const response = await protocol.request("/healthz", { token: undefined })
+    assert.equal(response.status, 200, response.text)
+    assert.equal(response.json.creating, 1)
+    assert.equal(response.json.lastContextCreateError, lastContextCreateError)
+  } finally {
+    await protocol.close()
+  }
+})
+
+test("POST /v1/contexts propagates a typed executor_timeout", async () => {
+  const protocol = await startProtocolServer(
+    fakeManager({
+      async createContext() {
+        throw new ExecutorError(
+          "executor_timeout",
+          "context creation exceeded its hard deadline of 30000ms",
+        )
+      },
+    }),
+  )
+  try {
+    const response = await protocol.request("/v1/contexts", {
+      method: "POST",
+      body: { allowedHosts: ["127.0.0.1"] },
+    })
+    assert.equal(response.status, 504, response.text)
+    assert.equal(response.json.error.code, "executor_timeout")
+  } finally {
+    await protocol.close()
+  }
+})
+
+test("parseContextCreateTimeout applies the 30s default", () => {
+  assert.equal(parseContextCreateTimeout(undefined), 30_000)
+  assert.equal(parseContextCreateTimeout("1500"), 1500)
+  assert.equal(parseContextCreateTimeout("nope"), 30_000)
+  assert.equal(parseContextCreateTimeout("-5"), 30_000)
 })

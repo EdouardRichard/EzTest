@@ -1281,6 +1281,9 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 // must not repeat one-time side effects such as the knowledge success hook.
 func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, bool, error) {
 	now := s.now()
+	// The aggregate rebuilds the verdict summary from scratch; keep the
+	// dispatch-time executor snapshot assembled by the scheduler (X-01).
+	summary.Dispatch = caseRun.Summary.Dispatch
 	ok, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
 		run.Status = status
 		run.FailureClass = class

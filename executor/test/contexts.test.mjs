@@ -208,3 +208,118 @@ test("createContext rejects an out-of-range deviceScaleFactor", async () => {
     await manager.close()
   }
 })
+
+// v0.2.3 X-01: a hung browser.newContext must never hang the API request. The
+// manager owns a hard create deadline (default 30s), reports it as a typed
+// executor_timeout and exposes `creating` on health while the launch is pending.
+test("createContext times out with executor_timeout and reports creating", { timeout: 5_000 }, async () => {
+  const manager = new ContextManager({
+    maxContexts: 1,
+    contextCreateTimeoutMs: 50,
+    launch: async () => ({
+      version: () => "fake-1.0.0",
+      isConnected: () => true,
+      newContext: () => new Promise(() => {}),
+      async close() {},
+    }),
+    logger: null,
+  })
+  try {
+    const outcome = manager
+      .createContext({ allowedHosts: ["127.0.0.1"] })
+      .then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      )
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const during = await manager.health()
+    assert.equal(during.creating, 1, "health must expose the in-flight context creation")
+    const { error } = await outcome
+    assert.ok(error, "createContext must reject when newContext never settles")
+    assert.equal(error.code, "executor_timeout")
+    const after = await manager.health()
+    assert.equal(after.creating, 0)
+    assert.match(String(after.lastContextCreateError ?? ""), /executor_timeout/)
+  } finally {
+    await manager.close()
+  }
+})
+
+// A browser.newContext that resolves after the deadline must not leak an
+// unguarded, untracked browser context: the late result is closed.
+test("createContext closes a context that appears after the deadline", { timeout: 5_000 }, async () => {
+  let closed = false
+  const page = { on() {}, once() {}, async close() {} }
+  const context = {
+    async addInitScript() {},
+    async route() {},
+    async routeWebSocket() {},
+    on() {},
+    async newPage() {
+      return page
+    },
+    async newCDPSession() {
+      return { async send() {}, on() {}, async detach() {} }
+    },
+    async close() {
+      closed = true
+    },
+  }
+  const browser = {
+    version: () => "fake-1.0.0",
+    isConnected: () => true,
+    async newContext() {
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      return context
+    },
+    async close() {},
+  }
+  const manager = new ContextManager({
+    maxContexts: 1,
+    contextCreateTimeoutMs: 20,
+    launch: async () => browser,
+    logger: null,
+  })
+  try {
+    await assert.rejects(
+      () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
+      (error) => error && error.code === "executor_timeout",
+    )
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(closed, true, "the half-created context must be closed after the timeout")
+    assert.equal(manager.size, 0)
+  } finally {
+    await manager.close()
+  }
+})
+
+// Consecutive create failures mean the environment cannot create browser
+// contexts: /healthz (and therefore the pushed heartbeat) must turn degraded.
+test("repeated context create failures degrade health", async () => {
+  const manager = new ContextManager({
+    maxContexts: 1,
+    createFailureThreshold: 3,
+    launch: async () => ({
+      version: () => "fake-1.0.0",
+      isConnected: () => true,
+      async newContext() {
+        throw new Error("context launch exploded")
+      },
+      async close() {},
+    }),
+    logger: null,
+  })
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await assert.rejects(
+        () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
+        /context launch exploded/,
+      )
+    }
+    const health = await manager.health()
+    assert.equal(health.status, "degraded")
+    assert.match(String(health.lastContextCreateError ?? ""), /context launch exploded/)
+  } finally {
+    await manager.close()
+  }
+})
