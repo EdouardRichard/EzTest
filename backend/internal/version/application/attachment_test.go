@@ -32,6 +32,10 @@ type fakeAttachmentRepo struct {
 	pendingForIngest     []version.PendingAttachment
 	lastPendingLimit     int
 	createErr            error
+	// existingVersions backs the version existence probe of the version
+	// attachment list. A nil map keeps the legacy fixtures permissive (every
+	// version exists) so unrelated tests do not have to seed the version table.
+	existingVersions map[int64]bool
 }
 
 func newFakeAttachmentRepo() *fakeAttachmentRepo {
@@ -117,6 +121,25 @@ func (f *fakeAttachmentRepo) ListByVersion(_ context.Context, versionID int64) (
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items, nil
+}
+
+func (f *fakeAttachmentRepo) VersionExists(_ context.Context, versionID int64) (bool, error) {
+	if f.existingVersions == nil {
+		return true, nil
+	}
+	return f.existingVersions[versionID], nil
+}
+
+func (f *fakeAttachmentRepo) CountImagesByVersion(_ context.Context, versionID int64) (map[int64]int, error) {
+	counts := make(map[int64]int)
+	for _, image := range f.images {
+		attachment, ok := f.attachments[image.AttachmentID]
+		if !ok || attachment.VersionID != versionID {
+			continue
+		}
+		counts[image.AttachmentID]++
+	}
+	return counts, nil
 }
 
 func (f *fakeAttachmentRepo) ListUnlinkedByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
@@ -1310,5 +1333,88 @@ func TestRetryBindsOnceWithoutLegacyIngestTask(t *testing.T) {
 	}
 	if tasks := h.ingestTasks(); len(tasks) != 0 {
 		t.Fatalf("idempotent retry enqueued a legacy ingest task: %#v", tasks)
+	}
+}
+
+// ---------- version attachment list (C-05) ----------
+
+// TestListVersionAttachments pins the version attachment panel read (C-05): the
+// rows are newest-first, carry the stable extraction error pair and the number
+// of extracted images, and attachments of another version are never listed.
+func TestListVersionAttachments(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.attachments[101] = version.Attachment{
+		ID: 101, VersionID: env.versionID, Name: "spec.pdf", MIME: "application/pdf", Size: 2048,
+		ExtractionStatus:    version.AttachmentFailed,
+		ExtractionErrorCode: version.AttachmentErrorExtraction,
+		ExtractionErrorText: "parser crashed",
+	}
+	env.repo.attachments[102] = version.Attachment{
+		ID: 102, VersionID: env.versionID, Name: "design.docx",
+		MIME: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		Size: 4096, ExtractionStatus: version.AttachmentDone,
+	}
+	// Another version's attachment must not leak into this version's panel.
+	env.repo.attachments[103] = version.Attachment{
+		ID: 103, VersionID: env.versionID + 1, Name: "foreign.txt", MIME: "text/plain",
+		Size: 64, ExtractionStatus: version.AttachmentDone,
+	}
+	for seq := 1; seq <= 2; seq++ {
+		env.repo.images[int64(200+seq)] = version.AttachmentImageRecord{
+			ID: int64(200 + seq), AttachmentID: 102, Seq: seq, ContentRefID: int64(300 + seq),
+			MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
+			Status: version.AttachmentImageDone, CreatedAt: testTime, UpdatedAt: testTime,
+		}
+	}
+
+	views, err := env.svc.ListVersionAttachments(requestContext(), env.versionID)
+	if err != nil {
+		t.Fatalf("ListVersionAttachments: %v", err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("views = %#v, want the two rows of this version", views)
+	}
+	if views[0].ID != 102 || views[1].ID != 101 {
+		t.Fatalf("order = %d,%d, want newest (ID desc)", views[0].ID, views[1].ID)
+	}
+	done := views[0]
+	if done.Name != "design.docx" || done.MIME != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+		done.Size != 4096 || done.ExtractionStatus != version.AttachmentDone ||
+		done.ErrorCode != "" || done.ErrorText != "" || done.ImageCount != 2 {
+		t.Fatalf("done view = %#v", done)
+	}
+	failed := views[1]
+	if failed.Name != "spec.pdf" || failed.MIME != "application/pdf" || failed.Size != 2048 ||
+		failed.ExtractionStatus != version.AttachmentFailed ||
+		failed.ErrorCode != version.AttachmentErrorExtraction || failed.ErrorText != "parser crashed" ||
+		failed.ImageCount != 0 {
+		t.Fatalf("failed view = %#v", failed)
+	}
+}
+
+// TestListVersionAttachmentsEmptyAndUnknownVersion covers the empty panel (a
+// non-nil empty slice so JSON is [] not null), an unknown/foreign version (404,
+// matching the image route semantics) and an invalid ID (400).
+func TestListVersionAttachmentsEmptyAndUnknownVersion(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.existingVersions = map[int64]bool{env.versionID: true}
+
+	views, err := env.svc.ListVersionAttachments(requestContext(), env.versionID)
+	if err != nil {
+		t.Fatalf("ListVersionAttachments empty: %v", err)
+	}
+	if views == nil || len(views) != 0 {
+		t.Fatalf("empty list = %#v, want a non-nil empty slice", views)
+	}
+
+	if _, err := env.svc.ListVersionAttachments(requestContext(), env.versionID+1); err == nil {
+		t.Fatal("unknown version was listed")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("unknown version status = %d, want 404", apiError(t, err).Status)
+	}
+	if _, err := env.svc.ListVersionAttachments(requestContext(), 0); err == nil {
+		t.Fatal("invalid version id was accepted")
+	} else if apiError(t, err).Status != http.StatusBadRequest {
+		t.Fatalf("invalid id status = %d, want 400", apiError(t, err).Status)
 	}
 }

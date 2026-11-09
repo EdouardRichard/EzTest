@@ -1023,6 +1023,22 @@ type AttachmentMeta struct {
 	ErrorText             string
 }
 
+// VersionAttachmentView is one read-only row of the version attachment panel
+// (C-05). It intentionally exposes only display/status fields: the panel links
+// to the existing version-scoped image routes by ID, so no content bytes or
+// internal ledger references are returned here. ImageCount is the number of
+// attachment_image rows extracted from the attachment (all analysis states).
+type VersionAttachmentView struct {
+	ID               int64
+	Name             string
+	MIME             string
+	Size             int64
+	ExtractionStatus string
+	ErrorCode        string
+	ErrorText        string
+	ImageCount       int
+}
+
 // AttachmentImageRef identifies the original content object of an image
 // attachment so the runtime can pass an image_ref to the model. Images mirrors
 // the persisted image rows (with captions) so the tool can return the same
@@ -1109,6 +1125,48 @@ func (s *AttachmentService) ListAttachments(ctx context.Context, versionID, conv
 		})
 	}
 	return metas, nil
+}
+
+// ListVersionAttachments is the read-only C-05 attachment panel list: every
+// attachment row of one version, newest first (ID descending), with its
+// extraction status/error pair and the number of extracted images. The version
+// is validated first so an unknown/foreign version is a 404 exactly like the
+// version-scoped image routes, not an empty 200. Ids are returned only as
+// identity; the panel reads image details through the existing scoped routes.
+func (s *AttachmentService) ListVersionAttachments(ctx context.Context, versionID int64) ([]VersionAttachmentView, error) {
+	if versionID <= 0 {
+		return nil, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	exists, err := s.repo.VersionExists(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, platform.NotFound("version")
+	}
+	attachments, err := s.repo.ListByVersion(ctx, versionID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	imageCounts, err := s.repo.CountImagesByVersion(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]VersionAttachmentView, 0, len(attachments))
+	for _, attachment := range attachments {
+		views = append(views, VersionAttachmentView{
+			ID:               attachment.ID,
+			Name:             attachment.Name,
+			MIME:             attachment.MIME,
+			Size:             attachment.Size,
+			ExtractionStatus: attachment.ExtractionStatus,
+			ErrorCode:        attachment.ExtractionErrorCode,
+			ErrorText:        attachment.ExtractionErrorText,
+			ImageCount:       imageCounts[attachment.ID],
+		})
+	}
+	sort.SliceStable(views, func(i, j int) bool { return views[i].ID > views[j].ID })
+	return views, nil
 }
 
 // ReadAttachmentText returns the structured status and a character window of

@@ -113,6 +113,49 @@ func (r *AttachmentRepository) ListByVersion(ctx context.Context, versionID int6
 	return attachments, nil
 }
 
+// VersionExists reports whether the version row exists, so the version
+// attachment list (C-05) can answer a foreign/unknown version with 404 instead
+// of an empty list, matching the version-scoped image routes.
+func (r *AttachmentRepository) VersionExists(ctx context.Context, versionID int64) (bool, error) {
+	var exists bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM version WHERE id = $1)
+	`, versionID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("attachment version check: %w", err)
+	}
+	return exists, nil
+}
+
+// CountImagesByVersion returns the attachment_image row count per attachment
+// for one version in a single grouped query. Attachments without images are
+// absent from the map. Counting all image rows (not only done ones) keeps the
+// panel honest while analysis is still running.
+func (r *AttachmentRepository) CountImagesByVersion(ctx context.Context, versionID int64) (map[int64]int, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT i.attachment_id, COUNT(*)
+		FROM attachment_image i
+		JOIN requirement_attachment a ON a.id = i.attachment_id
+		WHERE a.version_id = $1
+		GROUP BY i.attachment_id
+	`, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("count version attachment images: %w", err)
+	}
+	defer rows.Close()
+	counts := make(map[int64]int)
+	for rows.Next() {
+		var attachmentID, count int64
+		if err := rows.Scan(&attachmentID, &count); err != nil {
+			return nil, fmt.Errorf("scan version attachment image count: %w", err)
+		}
+		counts[attachmentID] = int(count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count version attachment images: %w", err)
+	}
+	return counts, nil
+}
+
 // ListByConversation returns the attachments visible to one conversation,
 // ordered by attachment ID: rows whose message belongs to the conversation,
 // plus pre-registered message attachments owned by this conversation whose
