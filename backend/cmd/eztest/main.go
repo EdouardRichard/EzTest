@@ -1871,6 +1871,9 @@ func main() {
 	if err := ensurePromptRevisions(ctx, runtimeRepo); err != nil {
 		log.Fatalf("eztest: seed agent prompt revisions: %v", err)
 	}
+	if err := agentapp.BackfillProfiles(ctx, runtimeRepo, auditSvc); err != nil {
+		log.Fatalf("eztest: backfill agent profiles: %v", err)
+	}
 	p6Agent, err := newP6AgentRuntime(pool, runtimeRepo, p6Read.VersionQuery, llmSvc, auditSvc)
 	if err != nil {
 		log.Fatalf("eztest: wire P6 agent centre: %v", err)

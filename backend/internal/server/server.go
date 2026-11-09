@@ -424,6 +424,7 @@ func registerLLMRoutes(mux *http.ServeMux, authenticated, admin func(http.Handle
 	mux.Handle("POST /api/admin/llm/configs/{id}/test", admin(http.HandlerFunc(h.TestConfig)))
 	mux.Handle("POST /api/admin/llm/configs/{id}/refresh-models", admin(http.HandlerFunc(h.RefreshModels)))
 	mux.Handle("POST /api/admin/llm/configs/{id}/models", admin(http.HandlerFunc(h.AddModel)))
+	mux.Handle("POST /api/admin/llm/configs/{id}/models/{modelId}/reset-params", admin(http.HandlerFunc(h.ResetModelParams)))
 	mux.Handle("PATCH /api/admin/llm/configs/{id}/models/{modelId}", admin(http.HandlerFunc(h.UpdateModel)))
 	mux.Handle("DELETE /api/admin/llm/configs/{id}/models/{modelId}", admin(http.HandlerFunc(h.DeleteModel)))
 	mux.Handle("GET /api/admin/llm/models", admin(http.HandlerFunc(h.ListModels)))
