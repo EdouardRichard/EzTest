@@ -5,23 +5,24 @@ import { usePathname } from "next/navigation"
 import { useEffect, useState } from "react"
 
 import { cn } from "@/components/ui/cn"
-import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { useAuth } from "@/features/auth/AuthProvider"
 import { isNavItemActive, NAV_ITEMS, NAV_SECTIONS } from "@/navigation/nav-items"
 
 /** Dark product sidebar: workspace/platform sections plus the environment note. */
 export function Sidebar() {
   const pathname = usePathname()
-  const roleIsAdmin = useIsAdmin()
-  // The cached role lives in localStorage, which is unavailable during SSR.
-  // Render the signed-out (normal user) menu first so hydration matches, then
-  // reveal the admin-only platform entries on the client (S-08).
+  const { user } = useAuth()
+  // The session is restored after mount, and localStorage is unavailable during
+  // SSR. Render the signed-out (normal user) menu first so hydration matches,
+  // then reveal the admin-only platform entries once the auth state settles
+  // (S-08).
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
     setMounted(true)
   }, [])
 
-  const isAdmin = mounted && roleIsAdmin
+  const isAdmin = mounted && user?.role === "admin"
   const items = NAV_ITEMS.filter((item) => isAdmin || item.adminOnly !== true)
   const sections = NAV_SECTIONS.filter((section) =>
     items.some((item) => item.section === section.id),

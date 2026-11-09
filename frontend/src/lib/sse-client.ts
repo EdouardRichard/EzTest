@@ -1,4 +1,4 @@
-import { clearToken, getToken } from "./auth-storage"
+import { clearSession, getToken } from "./auth-storage"
 
 /** Connection states surfaced to the UI status dot. */
 export type SSEStatus = "connecting" | "live" | "reconnecting" | "closed"
@@ -194,7 +194,9 @@ export function connectSSE(options: ConnectSSEOptions): () => void {
     if (finished) return
 
     if (response.status === 401) {
-      if (getToken() !== null) clearToken()
+      // A 401 invalidates the whole session, including the cached user used by
+      // the admin-only UI, not just the bearer token.
+      if (getToken() !== null) clearSession()
       finished = true
       controller = null
       options.onStatus("closed")

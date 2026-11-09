@@ -1,18 +1,34 @@
 import { cleanup, render, screen, within } from "@testing-library/react"
+import { renderToString } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 const pathname = vi.hoisted(() => ({ current: "/resources" }))
 vi.mock("next/navigation", () => ({ usePathname: () => pathname.current }))
 
-const auth = vi.hoisted(() => ({ isAdmin: true }))
-vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin }))
+const auth = vi.hoisted(() => ({ role: "admin" as "admin" | "user" }))
+vi.mock("@/features/auth/AuthProvider", () => ({
+  useAuth: () => ({
+    user: {
+      id: "9001",
+      username: "admin",
+      display_name: "管理员",
+      role: auth.role,
+      status: "active",
+    },
+    token: "ezt_token",
+    loading: false,
+    login: vi.fn(),
+    logout: vi.fn(),
+    changePassword: vi.fn(),
+  }),
+}))
 
 import { Sidebar } from "./Sidebar"
 
 describe("Sidebar", () => {
   beforeEach(() => {
-    auth.isAdmin = true
+    auth.role = "admin"
     pathname.current = "/resources"
   })
 
@@ -74,7 +90,7 @@ describe("Sidebar", () => {
   })
 
   it("hides the admin-only platform entries from a normal user", () => {
-    auth.isAdmin = false
+    auth.role = "user"
     render(<Sidebar />)
 
     const nav = screen.getByRole("navigation", { name: "主导航" })
@@ -91,6 +107,18 @@ describe("Sidebar", () => {
     expect(screen.queryByRole("link", { name: /^Agent 中心/ })).not.toBeInTheDocument()
     expect(screen.queryByRole("link", { name: /^设置/ })).not.toBeInTheDocument()
     expect(screen.queryByText("平台")).not.toBeInTheDocument()
+  })
+
+  it("renders the non-admin menu on the server render so hydration matches", () => {
+    // The admin entries are only revealed after mount (localStorage is not
+    // available during SSR); the initial render must never include them even
+    // though the authenticated user is an administrator.
+    const html = renderToString(<Sidebar />)
+
+    expect(html).toContain("资源")
+    expect(html).not.toContain("质量")
+    expect(html).not.toContain("Agent 中心")
+    expect(html).not.toContain("平台")
   })
 
   it("shows the controlled-environment notice at the bottom", () => {

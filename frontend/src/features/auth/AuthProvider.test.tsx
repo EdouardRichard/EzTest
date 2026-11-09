@@ -334,6 +334,17 @@ describe("safeNext", () => {
     expect(safeNext("/login?next=/knowledge")).toBe("/versions")
     expect(safeNext("/login/reset")).toBe("/versions")
   })
+
+  it("rejects encoded control characters (%0A / %09 / %0D) in the target", () => {
+    // `?next=/%0A//evil.example` decodes to "/\n//evil.example"; without this
+    // guard Next resolves it to https://evil.example/ (open redirect).
+    expect(safeNext("/\n//evil.example")).toBe("/versions")
+    expect(safeNext("/\t//evil.example")).toBe("/versions")
+    expect(safeNext("/\r//evil.example")).toBe("/versions")
+    expect(safeNext("/\u0000/evil.example")).toBe("/versions")
+    expect(safeNext("/\u007f/evil.example")).toBe("/versions")
+    expect(safeNext("/knowledge\n//evil.example")).toBe("/versions")
+  })
 })
 
 describe("RequireAuth", () => {

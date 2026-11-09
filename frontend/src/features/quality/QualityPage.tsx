@@ -11,9 +11,10 @@ import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
-import { listVersions } from "@/features/versions/api"
+import { getVersion, listVersions } from "@/features/versions/api"
 import type { VersionSummary } from "@/features/versions/types"
 import { QualityMetricsPanel } from "@/features/visual/QualityMetricsPanel"
+import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { getQualityOverview, getQualityTrends, listEvalRuns, triggerSnapshot } from "./api"
@@ -43,6 +44,13 @@ export type QualityPageProps = {
 const EVAL_LIST_LIMIT = 20
 
 /**
+ * Deep-link validation result. The first `limit=100` version page is not the
+ * whole workspace, so the specific id is resolved with `GET /api/versions/{id}`
+ * instead of being searched for in the list.
+ */
+type VersionCheck = "idle" | "pending" | "valid" | "invalid" | "unknown"
+
+/**
  * P6 quality centre (spec §5.5/P6-D-02).
  *
  * Every logged-in user sees the seven server-derived operational metrics and
@@ -56,8 +64,10 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
 
   const [versions, setVersions] = useState<VersionSummary[]>([])
   const [versionsError, setVersionsError] = useState<unknown>(null)
-  const [versionsLoaded, setVersionsLoaded] = useState(false)
   const [versionId, setVersionId] = useState(initialVersionId ?? "")
+  const [versionCheck, setVersionCheck] = useState<VersionCheck>(
+    initialVersionId !== undefined && initialVersionId !== "" ? "pending" : "idle",
+  )
 
   const [overview, setOverview] = useState<QualityOverview | null>(null)
   const [overviewLoading, setOverviewLoading] = useState(true)
@@ -79,16 +89,12 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   const [triggerError, setTriggerError] = useState<unknown>(null)
   const [triggerResult, setTriggerResult] = useState<EvalRun | null>(null)
 
-  // A deep-linked version must be checked against the version list before any
-  // version-scoped query starts. Until that list settles the scope is unknown,
-  // so no request is sent; an unknown id then falls back to the global scope
-  // (G-08) while a failed list read keeps the requested deep link.
-  const pendingVersionResolution = versionId !== "" && !versionsLoaded && versionsError === null
-  const invalidVersion =
-    versionsLoaded &&
-    versionsError === null &&
-    versionId !== "" &&
-    !versions.some((version) => version.id === versionId)
+  // A deep-linked version must be resolved before any version-scoped query
+  // starts. Until that read settles the scope is unknown, so no request is
+  // sent; a 404 then falls back to the global scope (G-08) while any other
+  // failure keeps the requested deep link.
+  const pendingVersionResolution = versionCheck === "pending"
+  const invalidVersion = versionCheck === "invalid"
   const effectiveVersionId = invalidVersion ? "" : versionId
   const canScopeVersion = !pendingVersionResolution && effectiveVersionId.length > 0
 
@@ -99,17 +105,32 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
       .then((items) => {
         if (cancelled) return
         setVersions(items)
-        setVersionsLoaded(true)
       })
       .catch((cause: unknown) => {
         if (cancelled) return
         setVersionsError(cause)
-        setVersionsLoaded(true)
       })
     return () => {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (initialVersionId === undefined || initialVersionId === "") return
+    let cancelled = false
+    setVersionCheck("pending")
+    void getVersion(initialVersionId)
+      .then(() => {
+        if (!cancelled) setVersionCheck("valid")
+      })
+      .catch((cause: unknown) => {
+        if (cancelled) return
+        setVersionCheck(cause instanceof ApiError && cause.status === 404 ? "invalid" : "unknown")
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [initialVersionId])
 
   useEffect(() => {
     if (invalidVersion) router.replace("/quality")
@@ -223,6 +244,9 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
 
   function changeVersion(next: string): void {
     setVersionId(next)
+    // A value picked from the resolved list is valid by construction and must
+    // clear any deep-link fallback.
+    setVersionCheck("valid")
     router.replace(next.length > 0 ? `/quality?version=${encodeURIComponent(next)}` : "/quality")
   }
 

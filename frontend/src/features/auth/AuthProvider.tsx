@@ -57,22 +57,46 @@ function invalidResponse(message: string): ApiError {
   return new ApiError({ status: 200, code: "invalid_response", message, retryable: false })
 }
 
+/** True for C0 controls, space and DEL, which URL parsers may strip/normalize. */
+function hasUnsafeControlChars(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x20 || code === 0x7f) return true
+  }
+  return false
+}
+
+const SAFE_NEXT_BASE = "http://internal.invalid"
+
 /**
  * Restricts a `next` redirect target to a same-origin path. Anything that could
- * leave the app (absolute URL, protocol-relative `//`, backslash normalization)
- * or loop back to /login falls back to the default landing page.
+ * leave the app (absolute URL, protocol-relative `//`, backslash normalization,
+ * embedded ASCII control characters such as an encoded `%0A`) or loop back to
+ * /login falls back to the default landing page.
  */
 export function safeNext(next: string | null | undefined): string {
   const fallback = "/versions"
   if (typeof next !== "string") return fallback
   const candidate = next.trim()
   if (candidate.length === 0) return fallback
+  // Decoded `%0A`/`%09`/`%0D` arrive as control characters; a URL parser would
+  // strip them and resolve the remainder (for example `//evil.example`).
+  if (hasUnsafeControlChars(candidate)) return fallback
   if (!candidate.startsWith("/")) return fallback
   if (candidate.startsWith("//")) return fallback
   if (candidate.includes("\\")) return fallback
-  const path = candidate.split(/[?#]/, 1)[0] ?? ""
-  if (path === "/login" || path.startsWith("/login/")) return fallback
-  return candidate
+
+  let resolved: URL
+  try {
+    resolved = new URL(candidate, SAFE_NEXT_BASE)
+  } catch {
+    return fallback
+  }
+  // Normalization (dot segments, backslashes, scheme-relative forms) must not
+  // move the target off the internal origin.
+  if (resolved.origin !== SAFE_NEXT_BASE) return fallback
+  if (resolved.pathname === "/login" || resolved.pathname.startsWith("/login/")) return fallback
+  return `${resolved.pathname}${resolved.search}${resolved.hash}`
 }
 
 /**

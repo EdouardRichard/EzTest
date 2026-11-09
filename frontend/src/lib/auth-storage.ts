@@ -140,9 +140,20 @@ export function setToken(token: string): void {
 export function clearToken(): void {
   removeEverywhere(TOKEN_KEY)
   removeEverywhere(EXPIRES_AT_KEY)
+  notifyCleared()
+}
+
+function notifyCleared(): void {
   if (typeof window !== "undefined") {
     window.dispatchEvent(new Event(AUTH_CLEARED_EVENT))
   }
+}
+
+/** Removes the whole stored session from localStorage and legacy sessionStorage. */
+function clearPersistedSession(): void {
+  removeEverywhere(TOKEN_KEY)
+  removeEverywhere(USER_KEY)
+  removeEverywhere(EXPIRES_AT_KEY)
 }
 
 /**
@@ -179,7 +190,13 @@ function parseUser(raw: string): AuthUser | null {
 
 export function getStoredUser(): AuthUser | null {
   migrateLegacySession()
-  if (isSessionExpired()) return null
+  if (isSessionExpired()) {
+    // Drop the expired session silently: callers include render-time role
+    // checks, and dispatching AUTH_CLEARED_EVENT mid-render would update the
+    // provider from another component's render. The token/expiry go too.
+    clearPersistedSession()
+    return null
+  }
   const raw = read(USER_KEY)
   if (!raw) return null
   return parseUser(raw)
@@ -204,6 +221,6 @@ export function setSession(token: string, user: AuthUser, expiresAt?: string | D
 
 /** Clears the token, expiry and cached user from both storage areas. */
 export function clearSession(): void {
-  removeEverywhere(USER_KEY)
-  clearToken()
+  clearPersistedSession()
+  notifyCleared()
 }
