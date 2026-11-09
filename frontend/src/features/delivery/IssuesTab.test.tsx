@@ -215,6 +215,7 @@ describe("IssuesTab", () => {
   beforeEach(() => {
     for (const fn of Object.values(api)) fn.mockReset()
     navigation.replace.mockReset()
+    navigation.push.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
     sse.calls = 0
@@ -596,6 +597,57 @@ describe("IssuesTab", () => {
 
     await waitFor(() => expect(api.retestIssue).toHaveBeenCalledWith("2001", "9101"))
     await waitFor(() => expect(api.listIssues).toHaveBeenCalledTimes(2))
+  })
+
+  it("localizes a closed-requirement retest 409 and deep-links the reopen entry", async () => {
+    api.retestIssue.mockRejectedValueOnce(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "the requirement is closed; reopen it before creating an execution intent",
+        requestId: "req_closed",
+        details: { reason: "requirement_closed", requirement_id: "6001" },
+      }),
+    )
+
+    render(<IssuesTab versionId="2001" />)
+    await screen.findByTestId("issue-9101")
+
+    fireEvent.click(within(rowOf("9101")).getByRole("button", { name: "复测" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("无法复测")
+    expect(alert).toHaveTextContent("该用例所属需求已闭环")
+    expect(alert).not.toHaveTextContent("the requirement is closed")
+    // One Chinese sentence is the primary copy; no English API message leaks.
+    expect(screen.getAllByText(/该用例所属需求已闭环/)).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "前往重新打开需求" }))
+    expect(navigation.push).toHaveBeenCalledWith("/versions/2001?tab=requirements&requirement=6001")
+  })
+
+  it("offers the reopen deep link for a closed-requirement retest in the sheet", async () => {
+    api.retestIssue.mockRejectedValueOnce(
+      new ApiError({
+        status: 409,
+        code: "state_conflict",
+        message: "the requirement is closed; reopen it before creating an execution intent",
+        requestId: "req_closed",
+        details: { reason: "requirement_closed", requirement_id: "6001" },
+      }),
+    )
+
+    render(<IssuesTab versionId="2001" />)
+    const sheet = await openDetail("9101")
+
+    fireEvent.click(within(sheet).getByRole("button", { name: "复测" }))
+
+    const alert = await within(sheet).findByRole("alert")
+    expect(alert).toHaveTextContent("无法复测")
+    expect(alert).not.toHaveTextContent("the requirement is closed")
+
+    fireEvent.click(within(sheet).getByRole("button", { name: "前往重新打开需求" }))
+    expect(navigation.push).toHaveBeenCalledWith("/versions/2001?tab=requirements&requirement=6001")
   })
 
   it("deep-links the response retest runs instead of the source runs", async () => {
