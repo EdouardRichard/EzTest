@@ -74,6 +74,35 @@ describe("CaseDetailPanel visual config and anchors", () => {
 
   afterEach(cleanup)
 
+  it("offers a request-AI empty state when the case has no visual assertion (D-08)", async () => {
+    designApi.getDesignCase.mockResolvedValue(designCaseDetailFixture)
+    const onRequestChange = vi.fn()
+
+    render(
+      <CaseDetailPanel
+        versionId="2001"
+        caseId="7001"
+        onConfirm={vi.fn()}
+        onRequestChange={onRequestChange}
+      />,
+    )
+
+    // The section stays discoverable instead of disappearing: the user learns
+    // why there is no editor and how to get a visual assertion generated.
+    expect(await screen.findByText("视觉断言配置")).toBeInTheDocument()
+    expect(screen.getByTestId("visual-assertions-empty")).toHaveTextContent(/该用例暂无视觉断言/)
+    expect(screen.getByTestId("visual-assertions-empty")).toHaveTextContent(/由设计生成/)
+    // Nothing to configure, so the visual config API is not called.
+    expect(visualApi.listVisualAssertions).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "请求 AI 添加视觉断言" }))
+
+    expect(onRequestChange).toHaveBeenCalledTimes(1)
+    const draft = onRequestChange.mock.calls[0][0] as string
+    expect(draft).toContain("退款 T+1 到账")
+    expect(draft).toContain("视觉基线断言")
+  })
+
   it("maps an existing config by step/assertion and saves it from the case detail", async () => {
     designApi.getDesignCase.mockResolvedValue(visualDetail())
 

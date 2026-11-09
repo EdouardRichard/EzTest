@@ -129,6 +129,28 @@ describe("MessageList stick-to-bottom scrolling", () => {
     expect(screen.getAllByTestId("message-user")).toHaveLength(2)
   })
 
+  it("keeps following when the content grows without an upward scroll (D-05)", async () => {
+    const first = message("1", "第一条消息")
+    const { rerender } = render(listElement([first]))
+    const list = scrolledList()
+
+    // A streamed increment, a rendered image or the activity bubble makes the
+    // content 600px taller while the reader has not moved. The browser may
+    // dispatch the scroll event only after that growth, so the distance from
+    // the bottom no longer reflects a real upward scroll: it must not pause the
+    // follow.
+    listScrollHeight = 1600
+    fireEvent.scroll(list)
+
+    expect(screen.queryByRole("button", { name: /回到最新/ })).not.toBeInTheDocument()
+
+    // The next appended message still anchors the viewport at the new bottom.
+    rerender(listElement([first, message("2", "第二条消息")]))
+
+    await waitFor(() => expect(list.scrollTop).toBe(listScrollHeight))
+    expect(screen.queryByRole("button", { name: /回到最新/ })).not.toBeInTheDocument()
+  })
+
   it("pauses after scrolling more than 80px up, counts unread and resumes from the button", async () => {
     const first = message("1", "第一条消息")
     const { rerender } = render(listElement([first]))

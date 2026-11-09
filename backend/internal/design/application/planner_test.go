@@ -4,11 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 )
+
+// assertNoDesignRoundTasks pins D-04: v0.22 removed the design.round runner
+// profile and makes it fail closed, so every design.round work item the planner
+// enqueues can only end as an invalid_work_type job card in the design thread.
+// The round state/projection is owned by the design_round row and the
+// design.round_started event, never by a work item.
+func assertNoDesignRoundTasks(t *testing.T, enqueuer *fakeEnqueuer) {
+	t.Helper()
+	if tasks := enqueuer.byType(TaskTypeDesignRound); len(tasks) != 0 {
+		t.Fatalf("planner enqueued %d design.round task(s) %v; the work type has no runner profile",
+			len(tasks), sortedTaskDedupeKeys(tasks))
+	}
+}
 
 func TestStartRoundActivatesAllPendingAndCreatesTasks(t *testing.T) {
 	planner, repo, enqueuer, teamRoom, _, versions, _ := newPlannerFixture()
@@ -38,9 +50,7 @@ func TestStartRoundActivatesAllPendingAndCreatesTasks(t *testing.T) {
 			t.Fatalf("scope status = %q", scope.Status)
 		}
 	}
-	if tasks := enqueuer.byType("design.round"); len(tasks) != 1 {
-		t.Fatalf("round tasks = %d", len(tasks))
-	}
+	assertNoDesignRoundTasks(t, enqueuer)
 	requirementTasks := enqueuer.byType("design.requirement")
 	if len(requirementTasks) != 2 {
 		t.Fatalf("requirement tasks = %d", len(requirementTasks))
@@ -225,24 +235,10 @@ func TestStartStageRoundEnsuresConversationAndTasks(t *testing.T) {
 			t.Fatalf("requirement task round association = %v", task.Payload)
 		}
 	}
-	if tasks := enqueuer.byType("design.round"); len(tasks) != 1 {
-		t.Fatalf("round tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
-	} else {
-		// Task 69: the round task carries the activated scope so the round turn
-		// can propose cases for every confirmed requirement.
-		requirementIDs := taskPayloadString(tasks[0], "requirement_ids")
-		requirementVersionIDs := taskPayloadString(tasks[0], "requirement_version_ids")
-		for _, want := range []string{"3001", "3005"} {
-			if !strings.Contains(requirementIDs, want) {
-				t.Fatalf("round task requirement_ids = %q, want %s", requirementIDs, want)
-			}
-		}
-		for _, want := range []string{"3002", "3006"} {
-			if !strings.Contains(requirementVersionIDs, want) {
-				t.Fatalf("round task requirement_version_ids = %q, want %s", requirementVersionIDs, want)
-			}
-		}
-	}
+	// D-04: the design.round work item was removed together with its v0.22
+	// runner profile. The stage entry must only enqueue the per-requirement
+	// authoring task; the round itself is carried by the round row/events.
+	assertNoDesignRoundTasks(t, enqueuer)
 	if len(versions.calls) != 1 || versions.calls[0] != 1001 {
 		t.Fatalf("version starter calls = %v", versions.calls)
 	}
@@ -263,6 +259,74 @@ func TestStartStageRoundEnsuresConversationAndTasks(t *testing.T) {
 	if len(enqueuer.tasks) != taskCount {
 		t.Fatalf("repeat duplicated tasks: %v", sortedTaskDedupeKeys(enqueuer.tasks))
 	}
+}
+
+// TestPlannerNeverEnqueuesDesignRound pins D-04 across every activation path.
+// The manual round, the design.cases stage entry, the D25 auto-start and the
+// reconciler's round repair each used to enqueue one design.round work item per
+// conversation; because v0.22 removed that runner profile the item failed with
+// invalid_work_type on every single round, leaving a dead job card in the
+// thread. Requirement-level authoring tasks are the only design work items.
+func TestPlannerNeverEnqueuesDesignRound(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("manual round", func(t *testing.T) {
+		planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
+		repo.clarified = []design.RequirementRef{plannerRequirement(3001, 3002)}
+
+		if _, err := planner.StartRound(ctx, 1001, 9001, 42); err != nil {
+			t.Fatalf("StartRound: %v", err)
+		}
+		if tasks := enqueuer.byType(TaskTypeDesignRequirement); len(tasks) != 1 {
+			t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+		}
+		assertNoDesignRoundTasks(t, enqueuer)
+	})
+
+	t.Run("stage entry round", func(t *testing.T) {
+		planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
+		repo.clarified = []design.RequirementRef{plannerRequirement(3001, 3002)}
+
+		if _, err := planner.StartStageRound(ctx, 1001, []int64{3001}); err != nil {
+			t.Fatalf("StartStageRound: %v", err)
+		}
+		if tasks := enqueuer.byType(TaskTypeDesignRequirement); len(tasks) != 1 {
+			t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+		}
+		assertNoDesignRoundTasks(t, enqueuer)
+	})
+
+	t.Run("auto-start round", func(t *testing.T) {
+		planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
+		repo.clarified = []design.RequirementRef{plannerRequirement(3001, 3002)}
+		repo.autoDesign = true
+
+		if err := planner.ScanVersion(ctx, 1001); err != nil {
+			t.Fatalf("ScanVersion: %v", err)
+		}
+		if tasks := enqueuer.byType(TaskTypeDesignRequirement); len(tasks) != 1 {
+			t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+		}
+		assertNoDesignRoundTasks(t, enqueuer)
+	})
+
+	t.Run("round repair", func(t *testing.T) {
+		planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
+		repo.hasConversation = true
+		repo.latestConversation = 9001
+		repo.clarified = []design.RequirementRef{plannerRequirement(3001, 3002)}
+
+		if err := planner.ScanVersion(ctx, 1001); err != nil {
+			t.Fatalf("ScanVersion: %v", err)
+		}
+		if len(repo.rounds) != 1 {
+			t.Fatalf("repaired rounds = %d, want the conversation's missing round", len(repo.rounds))
+		}
+		if tasks := enqueuer.byType(TaskTypeDesignRequirement); len(tasks) != 1 {
+			t.Fatalf("requirement tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+		}
+		assertNoDesignRoundTasks(t, enqueuer)
+	})
 }
 
 func TestPendingCountExcludesActiveScope(t *testing.T) {

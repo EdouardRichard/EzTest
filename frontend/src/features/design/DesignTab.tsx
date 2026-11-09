@@ -11,6 +11,7 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { activityText } from "@/features/clarification/activity"
 import { SSE_STATUS_LABEL } from "@/features/clarification/labels"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
@@ -85,12 +86,17 @@ export type DesignTabProps = {
 
 const EMPTY_REQUIREMENTS_COPY = "暂无已澄清需求，请先在需求与澄清中确认需求"
 
-function activityText(payload: Record<string, unknown>): string | null {
-  const status = typeof payload.status === "string" ? payload.status : ""
-  if (status === "finished" || status === "failed" || status === "done") return null
-  if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
-  if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
-  return "AI 正在处理…"
+/**
+ * One live activity of an agent run (D-06). Design can run several agents at
+ * the same time (round author, per-requirement author, critic), so the text is
+ * keyed by run instead of being a single string: a terminal event only removes
+ * its own run and a late frame cannot resurrect a finished one.
+ */
+type AgentActivity = {
+  runId: string
+  /** Empty when the frame carried no conversation; such a frame is unscoped. */
+  conversationId: string
+  text: string
 }
 
 /** `.app-content` bottom padding, reserved so the page itself never scrolls. */
@@ -209,7 +215,7 @@ export function DesignTab({
   const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
   const [handoffOpen, setHandoffOpen] = useState(false)
-  const [activity, setActivity] = useState<string | null>(null)
+  const [activities, setActivities] = useState<AgentActivity[]>([])
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
   /** Latest EV-12 discovery revision (auto-confirm or rollback replacement). */
@@ -245,6 +251,20 @@ export function DesignTab({
     }
     return results
   }, [graph])
+
+  /**
+   * The bubble shows the newest active run of the open conversation. Runs of
+   * another conversation stay in the map (their own terminal event still clears
+   * them) but never leak into this thread (D-06).
+   */
+  const activity = useMemo(() => {
+    const conversationId = activeConversationId ?? ""
+    for (let index = activities.length - 1; index >= 0; index -= 1) {
+      const entry = activities[index]
+      if (entry.conversationId === "" || entry.conversationId === conversationId) return entry.text
+    }
+    return null
+  }, [activities, activeConversationId])
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
@@ -328,13 +348,46 @@ export function DesignTab({
 
   const sseStatus = useVersionEvents(versionId, {
     onConversationMessage: (message) => {
-      setActivity(null)
+      // A completed message is the authoritative end of the turn: drop the
+      // activities of that conversation instead of waiting for a terminal run
+      // event that may be lost with a stream reconnect.
+      setActivities((current) =>
+        current.filter(
+          (entry) =>
+            entry.conversationId !== "" && entry.conversationId !== message.conversation_id,
+        ),
+      )
       setLiveMessages((current) => {
         if (current.some((existing) => existing.id === message.id)) return current
         return [...current, message].slice(-200)
       })
     },
-    onAgentActivity: (payload) => setActivity(activityText(payload)),
+    onAgentActivity: (payload) => {
+      const text = activityText(payload)
+      if (text === null) return
+      const runId = typeof payload.run_id === "string" ? payload.run_id : ""
+      const conversationId =
+        typeof payload.conversation_id === "string" ? payload.conversation_id : ""
+      // Keep the entries in arrival order so the last one is the newest active
+      // run; an update of the same run moves to the end.
+      setActivities((current) => [
+        ...current.filter((entry) => entry.runId !== runId),
+        { runId, conversationId, text },
+      ])
+    },
+    onAgentRunChanged: (event) => {
+      if (event.type !== "agent.run.finished" && event.type !== "agent.run.failed") return
+      const runId =
+        typeof event.payload.run_id === "string"
+          ? event.payload.run_id
+          : typeof event.scope.agent_run_id === "string"
+            ? event.scope.agent_run_id
+            : ""
+      if (runId === "") return
+      // Terminal event: the bubble must disappear even though the backend never
+      // publishes a terminal `agent.activity` frame (D-06).
+      setActivities((current) => current.filter((entry) => entry.runId !== runId))
+    },
     onTeamRoomChanged: () => setTeamRoomToken((token) => token + 1),
     onDesignGraphChanged: () => scheduleGraphRefresh(),
     onDesignCaseChanged: (event) => {
@@ -385,7 +438,6 @@ export function DesignTab({
     (conversationId: string) => {
       setActiveConversationId(conversationId)
       setStaleNotice(null)
-      setActivity(null)
       updateUrl(selectedCaseId, conversationId)
     },
     [updateUrl, selectedCaseId],
