@@ -1,7 +1,7 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Alert } from "@/components/ui/Alert"
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -68,6 +68,13 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   const [versionCheck, setVersionCheck] = useState<VersionCheck>(
     initialVersionId !== undefined && initialVersionId !== "" ? "pending" : "idle",
   )
+  // The `getVersion` result for a deep link outside the first list page, kept
+  // so the controlled select can still render a labelled option for it.
+  const [resolvedVersion, setResolvedVersion] = useState<{ id: string; title: string } | null>(null)
+  // The last id we know to be valid (deep-link validation result or a dropdown
+  // selection). Re-validating it after `router.replace` would tear down the
+  // version-scoped queries and flash "正在确认版本…" again.
+  const confirmedVersionRef = useRef<string | null>(null)
 
   const [overview, setOverview] = useState<QualityOverview | null>(null)
   const [overviewLoading, setOverviewLoading] = useState(true)
@@ -117,11 +124,22 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
 
   useEffect(() => {
     if (initialVersionId === undefined || initialVersionId === "") return
+    // A version picked from the resolved list — or one already validated — must
+    // not be resolved again. The server re-renders this page with the selected
+    // `?version=` after `router.replace`, and re-running the effect would clear
+    // the scope, unmount the panels and re-fetch everything.
+    if (confirmedVersionRef.current === initialVersionId) {
+      setVersionCheck("valid")
+      return
+    }
     let cancelled = false
     setVersionCheck("pending")
     void getVersion(initialVersionId)
-      .then(() => {
-        if (!cancelled) setVersionCheck("valid")
+      .then((version) => {
+        if (cancelled) return
+        confirmedVersionRef.current = version.id
+        setResolvedVersion({ id: version.id, title: version.title })
+        setVersionCheck("valid")
       })
       .catch((cause: unknown) => {
         if (cancelled) return
@@ -243,12 +261,26 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   }, [effectiveVersionId, triggering, refresh])
 
   function changeVersion(next: string): void {
+    // Remember the selection so the effect above skips re-validating the id the
+    // server will hand back after `router.replace`.
+    confirmedVersionRef.current = next.length > 0 ? next : null
     setVersionId(next)
     // A value picked from the resolved list is valid by construction and must
     // clear any deep-link fallback.
     setVersionCheck("valid")
     router.replace(next.length > 0 ? `/quality?version=${encodeURIComponent(next)}` : "/quality")
   }
+
+  // A valid deep link outside the first `limit=100` list has no matching option
+  // in `versions`; synthesize one from the `getVersion` result so the
+  // controlled select is not blank.
+  const deepLinkedOption =
+    versionCheck === "valid" &&
+    resolvedVersion !== null &&
+    effectiveVersionId === resolvedVersion.id &&
+    !versions.some((version) => version.id === resolvedVersion.id)
+      ? resolvedVersion
+      : null
 
   return (
     <div data-testid="quality-page" className="space-y-5">
@@ -281,6 +313,11 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                   #{version.id} · {version.title}
                 </option>
               ))}
+              {deepLinkedOption !== null ? (
+                <option value={deepLinkedOption.id}>
+                  #{deepLinkedOption.id} · {deepLinkedOption.title}
+                </option>
+              ) : null}
             </Select>
           </div>
           <Button variant="secondary" size="sm" onClick={refresh}>

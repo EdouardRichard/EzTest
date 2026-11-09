@@ -256,10 +256,36 @@ function createdMs(evidence: Evidence): number {
   return Number.isNaN(parsed) ? 0 : parsed
 }
 
+/** Numeric evidence id for tie-breaking; null for a non-numeric id. */
+function evidenceIDValue(id: string): bigint | null {
+  try {
+    return BigInt(id)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Recency order for before/after: the RFC3339 instant first, then the numeric
+ * evidence id (higher = newer) because two captures of one step can land in the
+ * same second. Returns -1 when `a` is older, 1 when it is newer, 0 when the two
+ * rows cannot be ordered.
+ */
+function compareRecency(a: Evidence, b: Evidence): number {
+  const aTime = createdMs(a)
+  const bTime = createdMs(b)
+  if (aTime !== bTime) return aTime < bTime ? -1 : 1
+  const aID = evidenceIDValue(a.id)
+  const bID = evidenceIDValue(b.id)
+  if (aID === null || bID === null || aID === bID) return 0
+  return aID < bID ? -1 : 1
+}
+
 /**
  * Pairs a screenshot with another evidence row from the same case run, step
  * and kind (X-03 "前后对比"). The nearest `created_at` wins; the older row is
- * the "before" side. Never pairs across case runs, steps or kinds.
+ * the "before" side (same-second captures tie-break by numeric id). Never pairs
+ * across case runs, steps or kinds.
  */
 export function findComparisonPair(
   evidence: Evidence,
@@ -278,13 +304,16 @@ export function findComparisonPair(
   const evidenceTime = createdMs(evidence)
   let nearest = matches[0]
   for (const candidate of matches.slice(1)) {
+    const candidateDistance = Math.abs(createdMs(candidate) - evidenceTime)
+    const nearestDistance = Math.abs(createdMs(nearest) - evidenceTime)
     if (
-      Math.abs(createdMs(candidate) - evidenceTime) < Math.abs(createdMs(nearest) - evidenceTime)
+      candidateDistance < nearestDistance ||
+      (candidateDistance === nearestDistance && compareRecency(candidate, nearest) > 0)
     ) {
       nearest = candidate
     }
   }
-  return createdMs(nearest) < evidenceTime
+  return compareRecency(nearest, evidence) < 0
     ? { before: nearest, after: evidence }
     : { before: evidence, after: nearest }
 }

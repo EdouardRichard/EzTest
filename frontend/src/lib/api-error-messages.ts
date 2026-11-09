@@ -23,7 +23,9 @@ type CatalogEntry = {
 const UNKNOWN_ERROR_MESSAGE = "发生未知错误，请稍后重试"
 
 const GENERIC_MESSAGES: Record<string, string> = {
-  unauthenticated: "用户名或密码错误",
+  // A 401 outside the login form means the session expired; the credential copy
+  // is login-specific and lives in `login-errors.ts`.
+  unauthenticated: "登录状态已失效，请重新登录",
   account_disabled: "账号已被禁用，请联系管理员",
   not_found: "资源不存在或已被删除",
   resource_not_found: "资源不存在或已被删除",
@@ -73,6 +75,18 @@ const DEFAULT_MODEL_VISION_DOWNGRADE: CatalogEntry = {
 const DEFAULT_MODEL_REQUIRED: CatalogEntry = {
   message: "该配置存在可选模型，必须选择默认模型",
   nextAction: "请在「设置 → LLM 配置」中为该配置选择默认模型后再保存",
+}
+
+/** The chosen default is not an active, non-deprecated model of the config. */
+const DEFAULT_MODEL_INACTIVE: CatalogEntry = {
+  message: "默认模型必须是当前配置中可用且未弃用的模型",
+  nextAction: "请在「设置 → LLM 配置」中改选一个可用且未弃用的模型作为默认模型",
+}
+
+/** The chosen default does not belong to the edited LLM configuration. */
+const DEFAULT_MODEL_FOREIGN: CatalogEntry = {
+  message: "默认模型必须属于当前 LLM 配置",
+  nextAction: "请在「设置 → LLM 配置」中从该配置的模型里选择默认模型",
 }
 
 function readString(value: unknown): string | undefined {
@@ -131,12 +145,12 @@ export function localizeApiError(error: unknown, context: LocalizeContext = {}):
       if (visionEntry !== undefined) return fromCatalog(visionEntry)
     }
 
-    // The vision gate reaches the UI from two controls: config.default_model_id
-    // (pick a vision model) and model.supports_vision (a capability downgrade
-    // that would strip vision from the model already acting as default). The
-    // required-default error carries the same field but no missing capability.
+    // The vision gate and the "must reference" default-model checks reach the
+    // UI as invalid_argument; the required-default check is llm_config_invalid
+    // (CodeLLMConfigInvalid in llm/application/chat.go). Both codes share the
+    // default_model_id/supports_vision fields.
     if (
-      error.code === "invalid_argument" &&
+      (error.code === "invalid_argument" || error.code === "llm_config_invalid") &&
       (field === "default_model_id" || field === "supports_vision")
     ) {
       if (hasCapability(details.missing_capabilities, "vision")) {
@@ -148,6 +162,11 @@ export function localizeApiError(error: unknown, context: LocalizeContext = {}):
       }
       if (field === "default_model_id" && /required/i.test(error.message)) {
         return fromCatalog(DEFAULT_MODEL_REQUIRED)
+      }
+      if (field === "default_model_id" && /must reference/i.test(error.message)) {
+        return fromCatalog(
+          /deprecated/i.test(error.message) ? DEFAULT_MODEL_INACTIVE : DEFAULT_MODEL_FOREIGN,
+        )
       }
     }
 

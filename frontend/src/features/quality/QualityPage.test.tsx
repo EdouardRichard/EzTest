@@ -291,6 +291,47 @@ describe("QualityPage", () => {
     expect(navigation.replace).toHaveBeenCalledWith("/quality?version=2002")
   })
 
+  it("does not re-validate a version picked from the list after a server re-render", async () => {
+    const { rerender } = render(<QualityPage initialVersionId="2001" />)
+
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
+    expect(versionsApi.getVersion).toHaveBeenCalledTimes(1)
+
+    const selector = await screen.findByLabelText("版本")
+    fireEvent.change(selector, { target: { value: "2002" } })
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenLastCalledWith("2002"))
+    await waitFor(() => expect(visualApi.getVisualMetrics).toHaveBeenLastCalledWith("2002"))
+    const overviewCalls = qualityApi.getQualityOverview.mock.calls.length
+
+    // `router.replace` re-renders the server component with the selected id.
+    rerender(<QualityPage initialVersionId="2002" />)
+
+    // The already-resolved id must not be validated again: re-running the
+    // effect would tear down the overview/trends/SSE and re-fetch them.
+    await waitFor(() => expect(versionsApi.getVersion).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText("正在确认版本…")).not.toBeInTheDocument()
+    expect(qualityApi.getQualityOverview).toHaveBeenCalledTimes(overviewCalls)
+    expect(visualApi.getVisualMetrics).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps a valid deep-linked version outside the first list page selectable", async () => {
+    const deepLinkedVersion = {
+      ...versionFixture,
+      id: "2003",
+      title: "订单中心 · 2026 Q1 归档",
+    }
+    versionsApi.listVersions.mockResolvedValue([versionSummaryFixture])
+    versionsApi.getVersion.mockResolvedValue(deepLinkedVersion)
+
+    render(<QualityPage initialVersionId="2003" />)
+
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
+    const selector = await screen.findByLabelText("版本")
+    await waitFor(() => expect(selector).toHaveValue("2003"))
+    expect(screen.getByRole("option", { name: "#2003 · 订单中心 · 2026 Q1 归档" })).toBeVisible()
+    expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("2003")
+  })
+
   it("falls back to all versions for an unknown ?version= deep link", async () => {
     auth.isAdmin = true
     versionsApi.getVersion.mockRejectedValue(

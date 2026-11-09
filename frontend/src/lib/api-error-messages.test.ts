@@ -14,10 +14,11 @@ function apiError(
 }
 
 describe("localizeApiError generic codes", () => {
-  it("maps unauthenticated to the Chinese credential copy", () => {
+  it("maps unauthenticated to the Chinese session-expiry copy, not the login credential copy", () => {
     const localized = localizeApiError(apiError(401, "unauthenticated", "authentication required"))
 
-    expect(localized.message).toBe("用户名或密码错误")
+    expect(localized.message).toBe("登录状态已失效，请重新登录")
+    expect(localized.message).not.toBe("用户名或密码错误")
   })
 
   it("maps disabled accounts to the admin-contact copy", () => {
@@ -184,10 +185,12 @@ describe("localizeApiError default-model capability errors", () => {
   })
 
   it("maps the required-default error that carries no missing capabilities", () => {
+    // The backend emits CodeLLMConfigInvalid (llm_config_invalid) for this
+    // branch, not invalid_argument (llm/application/service.go).
     const localized = localizeApiError(
       apiError(
         400,
-        "invalid_argument",
+        "llm_config_invalid",
         "default_model_id is required when the configuration has selectable models",
         { field: "default_model_id" },
       ),
@@ -195,6 +198,32 @@ describe("localizeApiError default-model capability errors", () => {
 
     expect(localized.message).toContain("默认模型")
     expect(localized.message).not.toContain("is required")
+    expect(localized.field).toBe("default_model_id")
+    expect(localized.nextAction).toBeTruthy()
+  })
+
+  it("localizes a default model that is not an active model of the config", () => {
+    const localized = localizeApiError(
+      apiError(400, "invalid_argument", "must reference an active model that is not deprecated", {
+        field: "default_model_id",
+      }),
+    )
+
+    expect(localized.message).toContain("默认模型")
+    expect(localized.message).not.toContain("must reference")
+    expect(localized.field).toBe("default_model_id")
+    expect(localized.nextAction).toBeTruthy()
+  })
+
+  it("localizes a default model that belongs to another LLM configuration", () => {
+    const localized = localizeApiError(
+      apiError(400, "invalid_argument", "must reference a model of this LLM configuration", {
+        field: "default_model_id",
+      }),
+    )
+
+    expect(localized.message).toContain("默认模型")
+    expect(localized.message).not.toContain("must reference")
     expect(localized.field).toBe("default_model_id")
     expect(localized.nextAction).toBeTruthy()
   })

@@ -7,7 +7,13 @@ import { ApiError } from "@/lib/api-client"
 const api = vi.hoisted(() => ({ downloadEvidence: vi.fn() }))
 vi.mock("./api", () => api)
 
-import { buildCurl, diffLines, EvidenceViewer, REVOKE_DELAY_MS } from "./EvidenceViewer"
+import {
+  buildCurl,
+  diffLines,
+  EvidenceViewer,
+  findComparisonPair,
+  REVOKE_DELAY_MS,
+} from "./EvidenceViewer"
 import { evidenceScreenshotFixture, evidenceTextFixture } from "./test-fixtures"
 import type { Evidence } from "./types"
 
@@ -26,6 +32,31 @@ const httpEvidenceFixture: Evidence = {
   mime: "application/json",
   filename: "http-request.json",
 }
+
+describe("findComparisonPair same-second captures", () => {
+  const sameSecond = "2026-10-31T12:00:00Z"
+  const capture = (id: string): Evidence => ({
+    ...evidenceScreenshotFixture,
+    id,
+    created_at: sameSecond,
+  })
+
+  it("tie-breaks equal timestamps by numeric evidence id, not array order", () => {
+    const older = capture("9402")
+    const newer = capture("9403")
+
+    expect(findComparisonPair(newer, [older])).toEqual({ before: older, after: newer })
+    expect(findComparisonPair(older, [newer])).toEqual({ before: older, after: newer })
+  })
+
+  it("compares numeric ids above Number.MAX_SAFE_INTEGER exactly", () => {
+    const older = capture("9007199254740992")
+    const newer = capture("9007199254740993")
+
+    expect(findComparisonPair(older, [newer])).toEqual({ before: older, after: newer })
+    expect(findComparisonPair(newer, [older])).toEqual({ before: older, after: newer })
+  })
+})
 
 describe("EvidenceViewer", () => {
   const createObjectURL = vi.fn<(blob: Blob) => string>()

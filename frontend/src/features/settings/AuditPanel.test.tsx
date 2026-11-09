@@ -153,8 +153,12 @@ describe("AuditPanel", () => {
 
     expect(await screen.findByText("setting · report.section_appendix")).toBeVisible()
     expect(screen.getByText("admin (#1)")).toBeVisible()
-    const combobox = screen.getByRole("combobox", { name: /操作/ })
-    expect(combobox).toHaveAttribute("list", "audit-action-candidates")
+    const actionField = screen.getByLabelText("操作")
+    expect(actionField).toHaveAttribute("list", "audit-action-candidates")
+    // A datalist input relies on its native role; a bare `role="combobox"`
+    // without aria-expanded/aria-controls would misrepresent the control.
+    expect(actionField).not.toHaveAttribute("role")
+    expect(actionField).not.toHaveAttribute("aria-autocomplete")
     expect(document.querySelectorAll("#audit-action-candidates option").length).toBeGreaterThan(50)
   })
 

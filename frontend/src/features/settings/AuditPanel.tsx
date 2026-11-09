@@ -200,8 +200,6 @@ export function AuditPanel() {
           <Input
             id="audit-action"
             list="audit-action-candidates"
-            role="combobox"
-            aria-autocomplete="list"
             placeholder="如 auth.login 或 settings"
             value={draft.action}
             onChange={(event) =>
