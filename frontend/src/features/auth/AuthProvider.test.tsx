@@ -335,6 +335,21 @@ describe("safeNext", () => {
     expect(safeNext("/login/reset")).toBe("/versions")
   })
 
+  it("rejects dot-segment targets that normalize to a protocol-relative path", () => {
+    // `?next=/..//evil.example` resolves to the pathname "//evil.example" while
+    // the origin check still passes; returning it makes Next hard-navigate to
+    // https://evil.example/. The resolved and serialized forms must both stay
+    // single-slash-rooted.
+    expect(safeNext("/..//evil.example")).toBe("/versions")
+    expect(safeNext("/%2e%2e//evil.example")).toBe("/versions")
+    expect(safeNext("/foo/..//evil.example")).toBe("/versions")
+  })
+
+  it("rejects backslash variants of the dot-segment target", () => {
+    expect(safeNext("/..\\/evil.example")).toBe("/versions")
+    expect(safeNext("/..\\//evil.example")).toBe("/versions")
+  })
+
   it("rejects encoded control characters (%0A / %09 / %0D) in the target", () => {
     // `?next=/%0A//evil.example` decodes to "/\n//evil.example"; without this
     // guard Next resolves it to https://evil.example/ (open redirect).

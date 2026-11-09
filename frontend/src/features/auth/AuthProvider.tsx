@@ -69,6 +69,25 @@ function hasUnsafeControlChars(value: string): boolean {
 const SAFE_NEXT_BASE = "http://internal.invalid"
 
 /**
+ * True when `value` is a single-slash-rooted same-origin path. It must start
+ * with exactly one `/` (a leading scheme or `//` authority therefore cannot be
+ * interpreted), contain no backslash (URL parsers normalize `\` to `/`), and no
+ * control characters. Re-parsing proves the serialized form stays on our origin.
+ */
+function isSingleSlashRootedPath(value: string): boolean {
+  if (!value.startsWith("/") || value.startsWith("//")) return false
+  if (value.includes("\\")) return false
+  if (hasUnsafeControlChars(value)) return false
+  let reparsed: URL
+  try {
+    reparsed = new URL(value, SAFE_NEXT_BASE)
+  } catch {
+    return false
+  }
+  return reparsed.origin === SAFE_NEXT_BASE
+}
+
+/**
  * Restricts a `next` redirect target to a same-origin path. Anything that could
  * leave the app (absolute URL, protocol-relative `//`, backslash normalization,
  * embedded ASCII control characters such as an encoded `%0A`) or loop back to
@@ -95,8 +114,16 @@ export function safeNext(next: string | null | undefined): string {
   // Normalization (dot segments, backslashes, scheme-relative forms) must not
   // move the target off the internal origin.
   if (resolved.origin !== SAFE_NEXT_BASE) return fallback
+  // Dot segments can collapse into a protocol-relative pathname while keeping
+  // the internal origin: `/..//evil.example` resolves to `//evil.example`,
+  // which Next treats as `https://evil.example/`.
+  if (resolved.pathname.startsWith("//")) return fallback
+  if (resolved.pathname.includes("\\")) return fallback
   if (resolved.pathname === "/login" || resolved.pathname.startsWith("/login/")) return fallback
-  return `${resolved.pathname}${resolved.search}${resolved.hash}`
+  const serialized = `${resolved.pathname}${resolved.search}${resolved.hash}`
+  // Re-check what is actually returned to the router, not just the input.
+  if (!isSingleSlashRootedPath(serialized)) return fallback
+  return serialized
 }
 
 /**

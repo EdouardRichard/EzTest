@@ -187,6 +187,37 @@ describe("LoginPage", () => {
     await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/versions"))
   })
 
+  it.each([
+    { label: "raw dot-segment", nextPath: "/..//evil.example" },
+    {
+      label: "percent-encoded dot-segment",
+      // The login route supplies the already-decoded search param; this mirrors
+      // `?next=%2F..%2F%2Fevil.example` reaching the page.
+      nextPath: new URLSearchParams("next=%2F..%2F%2Fevil.example").get("next") ?? "",
+    },
+    { label: "backslash dot-segment", nextPath: "/..\\/evil.example" },
+  ])(
+    "falls back to /versions for a $label next target without cross-origin navigation",
+    async ({ nextPath }) => {
+      fetchMock.mockResolvedValue(
+        jsonResponse({
+          data: { token: "ezt_login", expires_at: "2099-01-01T00:00:00Z", user: admin },
+        }),
+      )
+      renderLoginPage(nextPath)
+      await submitLogin()
+
+      await waitFor(() => expect(nav.push).toHaveBeenCalledWith("/versions"))
+      expect(nav.push).toHaveBeenCalledTimes(1)
+      for (const [target] of nav.push.mock.calls) {
+        expect(typeof target).toBe("string")
+        expect(target.startsWith("/")).toBe(true)
+        expect(target.startsWith("//")).toBe(false)
+      }
+      expect(nav.replace).not.toHaveBeenCalled()
+    },
+  )
+
   it("sends an already authenticated visitor to /versions", async () => {
     setSession("ezt_stored", admin)
     fetchMock.mockResolvedValue(jsonResponse({ data: { user: admin } }))
