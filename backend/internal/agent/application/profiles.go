@@ -293,6 +293,7 @@ func Profiles() []agent.AgentProfile {
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()
 	for i := range seeds {
+		seeds[i].SeedVersion = ProfileSeedVersion
 		seeds[i] = applyP5ProfileTools(seeds[i])
 		seeds[i] = applyP7ProfileTools(seeds[i])
 		seeds[i] = applyV022ProfileTools(seeds[i])

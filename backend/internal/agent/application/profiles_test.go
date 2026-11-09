@@ -291,4 +291,10 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if second[0].Name != "管理员改过的 Host" {
 		t.Fatalf("admin edit overwritten: %q", second[0].Name)
 	}
+	for _, profile := range second {
+		if profile.SeedVersion != agentapp.ProfileSeedVersion {
+			t.Fatalf("fresh profile %s seed version = %d, want %d",
+				profile.Key, profile.SeedVersion, agentapp.ProfileSeedVersion)
+		}
+	}
 }

@@ -803,6 +803,77 @@ func TestProfileAdminNilDependencies(t *testing.T) {
 
 /* -------------------------------- helpers ------------------------------- */
 
+func TestAdminCatalogRegistryCoversV022ProfileTools(t *testing.T) {
+	catalog := tools.AdminCatalogRegistry()
+	for _, names := range agentapp.V022ProfileTools() {
+		for _, name := range names {
+			if _, ok := catalog.Get(name); !ok {
+				t.Fatalf("admin catalog is missing v0.22 profile tool %q", name)
+			}
+		}
+	}
+	for _, name := range []string{
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolAttachmentImageRef,
+		tools.ToolToolResultRead,
+		tools.ToolSUTDatabaseList,
+	} {
+		if _, ok := catalog.Get(name); !ok {
+			t.Fatalf("admin catalog is missing Host tool %q", name)
+		}
+	}
+}
+
+func TestAdminCatalogRegistryMetadataToolsFailClosed(t *testing.T) {
+	catalog := tools.AdminCatalogRegistry()
+	for _, name := range []string{
+		tools.ToolPlanUpdate,
+		tools.ToolQuestionAsk,
+		tools.ToolClarificationSearch,
+		tools.ToolTaskComplete,
+		tools.ToolToolResultRead,
+		tools.ToolSUTDatabaseList,
+	} {
+		tool, ok := catalog.Get(name)
+		if !ok {
+			t.Fatalf("catalog is missing %q", name)
+		}
+		if tool.Description() == "" || len(tool.Parameters()) == 0 {
+			t.Fatalf("catalog tool %q has no metadata", name)
+		}
+		if _, err := catalog.Execute(context.Background(), tools.Scope{VersionID: 1}, name, json.RawMessage(`{}`)); err == nil {
+			t.Fatalf("metadata-only tool %q executed without dependencies", name)
+		}
+	}
+}
+
+func TestProfileAdminPatchAcceptsCatalogQuestionAsk(t *testing.T) {
+	repo := newFakeProfileAdminRepo(t)
+	service := agentapp.NewProfileAdminService(repo, tools.AdminCatalogRegistry(), nil, nil)
+	host := repo.profiles[agentapp.ProfileKeyClarificationHost]
+	allowed := append(append([]string(nil), host.AllowedTools...), tools.ToolQuestionAsk)
+	view, changed, err := service.Patch(context.Background(), adminActor(),
+		agentapp.ProfileKeyClarificationHost, agentapp.PatchInput{AllowedTools: &allowed})
+	if err != nil {
+		t.Fatalf("Patch question.ask: %v", err)
+	}
+	if !changed {
+		t.Fatal("Patch reported no change")
+	}
+	found := false
+	for _, name := range view.AllowedTools {
+		if name == tools.ToolQuestionAsk {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("question.ask not saved: %v", view.AllowedTools)
+	}
+}
+
 func sameStringPointer(a, b *string) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil

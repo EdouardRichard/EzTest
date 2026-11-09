@@ -95,6 +95,8 @@ func TestMigrations021Schema(t *testing.T) {
 		{"requirement_attachment", "page_refs", "jsonb", "jsonb", "NO", "NEVER", "'[]'::jsonb"},
 		// conversation: per-conversation model override (spec §12.2).
 		{"conversation", "model_override", "text", "text", "YES", "NEVER", ""},
+		// agent_profile: the v0.2.3 seed marker that fences the one-time backfill.
+		{"agent_profile", "seed_version", "integer", "int4", "NO", "NEVER", "0"},
 		// sut_page: route_template is now optional and normalized_url is generated.
 		{"sut_page", "route_template", "text", "text", "YES", "NEVER", ""},
 		{"sut_page", "normalized_url", "text", "text", "NO", "ALWAYS", ""},
@@ -124,8 +126,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 64 {
-		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
+	if len(applied) != 65 {
+		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {

@@ -19,8 +19,12 @@ type AgentProfile struct {
 	Model        *string
 	Budgets      ProfileBudgets
 	Enabled      bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// SeedVersion is the built-in seed revision the profile row has been
+	// reconciled to. Legacy rows start at 0; a fresh seed writes the current
+	// version so the one-time backfill never rewrites an administrator edit.
+	SeedVersion int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // ProfileBudgets is the budgets JSONB shape from the P1 profile contract.
@@ -28,6 +32,16 @@ type ProfileBudgets struct {
 	MaxTurns    int `json:"max_turns,omitempty"`
 	SoftSeconds int `json:"soft_seconds,omitempty"`
 	HardSeconds int `json:"hard_seconds,omitempty"`
+}
+
+// ProfileSeedBackfill is the marker-fenced update applied by the one-time
+// profile backfill. Nil fields keep the stored value; SeedVersion is the new
+// marker. It never carries a prompt body: prompt upgrades are append-only
+// revision writes.
+type ProfileSeedBackfill struct {
+	AllowedTools *[]string
+	Budgets      *ProfileBudgets
+	SeedVersion  int
 }
 
 // Validate checks the profile key/prompt and budget bounds.
@@ -53,6 +67,9 @@ func (p AgentProfile) Validate() error {
 	if p.Budgets.SoftSeconds > 0 && p.Budgets.HardSeconds > 0 &&
 		p.Budgets.SoftSeconds > p.Budgets.HardSeconds {
 		return platform.Invalid("budgets", "soft_seconds must not exceed hard_seconds")
+	}
+	if p.SeedVersion < 0 {
+		return platform.Invalid("seed_version", "must not be negative")
 	}
 	return nil
 }

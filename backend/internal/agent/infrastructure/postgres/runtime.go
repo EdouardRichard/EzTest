@@ -16,7 +16,7 @@ import (
 )
 
 const profileColumns = `id, key, name, system_prompt, allowed_tools, model, budgets, enabled,
-	created_at, updated_at`
+	seed_version, created_at, updated_at`
 
 const runColumns = `id, profile_key, work_item_id, conversation_id, status, terminal_reason,
 	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at,
@@ -65,12 +65,12 @@ func (r *RuntimeRepository) EnsureProfile(ctx context.Context, profile agent.Age
 
 	stored, err := scanProfile(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_profile (id, key, name, system_prompt, allowed_tools, model,
-			budgets, enabled, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10)
+			budgets, enabled, seed_version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9, $10, $11)
 		ON CONFLICT (key) DO NOTHING
 		RETURNING `+profileColumns,
 		profile.ID, profile.Key, profile.Name, profile.SystemPrompt, encodedTools,
-		profile.Model, encodedBudgets, profile.Enabled, createdAt, updatedAt))
+		profile.Model, encodedBudgets, profile.Enabled, profile.SeedVersion, createdAt, updatedAt))
 	if err == nil {
 		return stored, true, nil
 	}
@@ -115,6 +115,60 @@ func (r *RuntimeRepository) ListProfiles(ctx context.Context) ([]agent.AgentProf
 		return nil, fmt.Errorf("list agent profiles: %w", err)
 	}
 	return profiles, nil
+}
+
+// ApplyProfileSeedBackfill writes the one-time v0.2.3 seed reconciliation. The
+// update is fenced by seed_version so a concurrent writer or a second startup
+// cannot apply it twice; nil fields keep the stored value. It reports whether a
+// row changed and returns the current row when the marker already advanced.
+func (r *RuntimeRepository) ApplyProfileSeedBackfill(
+	ctx context.Context,
+	key string,
+	update agent.ProfileSeedBackfill,
+) (agent.AgentProfile, bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return agent.AgentProfile{}, false, platform.Invalid("key", "must not be empty")
+	}
+	if update.SeedVersion <= 0 {
+		return agent.AgentProfile{}, false, platform.Invalid("seed_version", "must be a positive integer")
+	}
+	var encodedTools any
+	if update.AllowedTools != nil {
+		value, err := encodeJSONArray("profile backfill allowed tools", *update.AllowedTools)
+		if err != nil {
+			return agent.AgentProfile{}, false, err
+		}
+		encodedTools = value
+	}
+	var encodedBudgets any
+	if update.Budgets != nil {
+		value, err := encodeJSONObject("profile backfill budgets", *update.Budgets)
+		if err != nil {
+			return agent.AgentProfile{}, false, err
+		}
+		encodedBudgets = value
+	}
+	stored, err := scanProfile(r.pool.QueryRow(ctx, `
+		UPDATE agent_profile
+		SET allowed_tools = COALESCE($2::jsonb, allowed_tools),
+		    budgets = COALESCE($3::jsonb, budgets),
+		    seed_version = $4,
+		    updated_at = now()
+		WHERE key = $1 AND seed_version < $4
+		RETURNING `+profileColumns,
+		key, encodedTools, encodedBudgets, update.SeedVersion))
+	if err == nil {
+		return stored, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return agent.AgentProfile{}, false, wrapDB("apply profile seed backfill", err)
+	}
+	// The marker was already advanced (idempotent second pass).
+	existing, getErr := r.GetProfile(ctx, key)
+	if getErr != nil {
+		return agent.AgentProfile{}, false, getErr
+	}
+	return existing, false, nil
 }
 
 // CreateRun inserts one agent_run row with the run's status. A dispatch-ready
@@ -426,7 +480,7 @@ func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 	var profile agent.AgentProfile
 	var toolsRaw, budgetsRaw []byte
 	if err := row.Scan(&profile.ID, &profile.Key, &profile.Name, &profile.SystemPrompt,
-		&toolsRaw, &profile.Model, &budgetsRaw, &profile.Enabled,
+		&toolsRaw, &profile.Model, &budgetsRaw, &profile.Enabled, &profile.SeedVersion,
 		&profile.CreatedAt, &profile.UpdatedAt); err != nil {
 		return agent.AgentProfile{}, err
 	}
