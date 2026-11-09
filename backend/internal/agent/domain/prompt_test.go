@@ -167,10 +167,18 @@ func TestPromptWriteValidate(t *testing.T) {
 		t.Fatal("empty prompt accepted")
 	}
 
+	// expected_version 0 is valid: it fences an append on a profile that has no
+	// revision yet (the upgrade backfill's no-revision branch).
+	zeroExpected := valid
+	zeroExpected.ExpectedVersion = promptIntPtr(0)
+	if err := zeroExpected.Validate(); err != nil {
+		t.Fatalf("expected version 0 rejected: %v", err)
+	}
+
 	badExpected := valid
-	badExpected.ExpectedVersion = promptIntPtr(0)
+	badExpected.ExpectedVersion = promptIntPtr(-1)
 	if err := badExpected.Validate(); err == nil {
-		t.Fatal("non-positive expected version accepted")
+		t.Fatal("negative expected version accepted")
 	}
 }
 

@@ -123,6 +123,13 @@ func backfillSeedPrompt(
 		candidate = latest.SystemPrompt
 		version := latest.Version
 		write.ExpectedVersion = &version
+	} else {
+		// A pre-revision database has current version 0. Fence the append on it
+		// so a concurrent startup (duplicate seed) or an administrator write
+		// that lands between the snapshot and the insert conflicts instead of
+		// appending a second revision over the winner.
+		zero := 0
+		write.ExpectedVersion = &zero
 	}
 	if normalizePromptBody(candidate) == normalizePromptBody(current) {
 		return false, nil

@@ -797,7 +797,7 @@ func TestBackfillProfilesUpgradesLegacyProfile(t *testing.T) {
 		t.Fatalf("legacy seed version = %d, want 0", stored.SeedVersion)
 	}
 
-	if err := agentapp.BackfillProfiles(ctx, repo); err != nil {
+	if err := agentapp.BackfillProfiles(ctx, repo, nil); err != nil {
 		t.Fatalf("BackfillProfiles: %v", err)
 	}
 	got, err := repo.GetProfile(ctx, agentapp.ProfileKeyClarificationHost)
@@ -846,7 +846,7 @@ func TestBackfillProfilesUpgradesLegacyProfile(t *testing.T) {
 	if updated.Budgets != customBudgets || containsProfileTool(updated.AllowedTools, "question.ask") {
 		t.Fatalf("admin edit not stored: %#v", updated)
 	}
-	if err := agentapp.BackfillProfiles(ctx, repo); err != nil {
+	if err := agentapp.BackfillProfiles(ctx, repo, nil); err != nil {
 		t.Fatalf("second BackfillProfiles: %v", err)
 	}
 	after, err := repo.GetProfile(ctx, admin.Key)
@@ -878,6 +878,91 @@ func TestBackfillProfilesUpgradesLegacyProfile(t *testing.T) {
 	}
 	if !changed || !containsProfileTool(view.AllowedTools, tools.ToolQuestionAsk) {
 		t.Fatalf("PATCH question.ask = %#v changed=%v", view.AllowedTools, changed)
+	}
+}
+
+// TestApplyProfileSeedBackfillFencesConcurrentAdminEdit proves the marker
+// UPDATE reconciles against the current row instead of the pre-snapshot values:
+// a tool and a budget added by an administrator after ListProfiles must survive,
+// while the v0.22 tool increment is still unioned in and deduplicated.
+func TestApplyProfileSeedBackfillFencesConcurrentAdminEdit(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewRuntimeRepository(pool, newIDs(t))
+	ctx := context.Background()
+
+	legacy := agent.AgentProfile{
+		Key:          agentapp.ProfileKeyClarificationHost,
+		Name:         "澄清 Host",
+		SystemPrompt: "[profile:clarification_host] legacy prompt",
+		AllowedTools: []string{"context.version_pack", "admin.custom_tool"},
+		Budgets:      agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+		Enabled:      true,
+		SeedVersion:  0,
+	}
+	if _, created, err := repo.EnsureProfile(ctx, legacy); err != nil || !created {
+		t.Fatalf("EnsureProfile: created=%v err=%v", created, err)
+	}
+
+	// The backfill already took its snapshot; this PATCH lands before the
+	// marker write. question.ask overlaps the increment on purpose.
+	adminTools := append(append([]string(nil), legacy.AllowedTools...), tools.ToolQuestionAsk)
+	customBudgets := agent.ProfileBudgets{MaxTurns: 9, SoftSeconds: 100, HardSeconds: 200}
+	if _, changed, err := repo.UpdateProfile(ctx, legacy.Key, agent.ProfileUpdate{
+		AllowedTools: &adminTools,
+		Budgets:      &customBudgets,
+	}); err != nil || !changed {
+		t.Fatalf("admin PATCH: changed=%v err=%v", changed, err)
+	}
+
+	upgrade := agent.ProfileBudgetUpgrade{
+		Legacy:  agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+		Current: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900},
+	}
+	increment := agentapp.V022ProfileTools()[legacy.Key]
+	got, applied, err := repo.ApplyProfileSeedBackfill(ctx, legacy.Key, agent.ProfileSeedBackfill{
+		AddAllowedTools: increment,
+		BudgetUpgrade:   &upgrade,
+		SeedVersion:     agentapp.ProfileSeedVersion,
+	})
+	if err != nil || !applied {
+		t.Fatalf("ApplyProfileSeedBackfill: applied=%v err=%v", applied, err)
+	}
+	seen := make(map[string]bool, len(got.AllowedTools))
+	for _, name := range got.AllowedTools {
+		if seen[name] {
+			t.Fatalf("duplicate tool %q after union: %v", name, got.AllowedTools)
+		}
+		seen[name] = true
+	}
+	for _, name := range increment {
+		if !seen[name] {
+			t.Fatalf("union dropped the v0.22 increment %q: %v", name, got.AllowedTools)
+		}
+	}
+	if !seen["admin.custom_tool"] || !seen[tools.ToolQuestionAsk] {
+		t.Fatalf("concurrent admin tools lost: %v", got.AllowedTools)
+	}
+	if got.Budgets != customBudgets {
+		t.Fatalf("concurrent admin budgets overwritten: %+v, want %+v", got.Budgets, customBudgets)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+
+	// The marker fences a second pass: no rewrite and no further changes.
+	again, appliedAgain, err := repo.ApplyProfileSeedBackfill(ctx, legacy.Key, agent.ProfileSeedBackfill{
+		AddAllowedTools: increment,
+		BudgetUpgrade: &agent.ProfileBudgetUpgrade{
+			Legacy:  upgrade.Legacy,
+			Current: agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900},
+		},
+		SeedVersion: agentapp.ProfileSeedVersion,
+	})
+	if err != nil || appliedAgain {
+		t.Fatalf("second ApplyProfileSeedBackfill: applied=%v err=%v", appliedAgain, err)
+	}
+	if again.Budgets != customBudgets || !containsProfileTool(again.AllowedTools, tools.ToolQuestionAsk) {
+		t.Fatalf("second pass changed the row: %#v", again)
 	}
 }
 

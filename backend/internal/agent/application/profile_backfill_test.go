@@ -30,12 +30,14 @@ const legacyClarificationPromptV021 = `你是 EzTest 的澄清 Host（需求澄�
 // backfill tests. It applies the same semantics as the Postgres repository:
 // marker-fenced writes and append-only prompt revisions.
 type fakeBackfillRepo struct {
-	profiles  map[string]agent.AgentProfile
-	revisions map[string][]agent.PromptRevision
-	writes    []agent.PromptWrite
-	applied   []agent.ProfileSeedBackfill
-	applyErr  error
-	listErr   error
+	profiles    map[string]agent.AgentProfile
+	revisions   map[string][]agent.PromptRevision
+	writes      []agent.PromptWrite
+	applied     []agent.ProfileSeedBackfill
+	applyErr    error
+	listErr     error
+	beforeSave  func()
+	beforeApply func()
 }
 
 func newFakeBackfillRepo() *fakeBackfillRepo {
@@ -71,8 +73,15 @@ func (f *fakeBackfillRepo) ListPromptRevisions(
 }
 
 func (f *fakeBackfillRepo) SavePromptRevision(
-	_ context.Context, write agent.PromptWrite,
+	ctx context.Context, write agent.PromptWrite,
 ) (agent.PromptWriteResult, error) {
+	if f.beforeSave != nil {
+		// Simulate a concurrent admin/startup writer landing between the
+		// ListPromptRevisions snapshot and this write.
+		hook := f.beforeSave
+		f.beforeSave = nil
+		hook()
+	}
 	if err := write.Validate(); err != nil {
 		return agent.PromptWriteResult{}, err
 	}
@@ -80,7 +89,16 @@ func (f *fakeBackfillRepo) SavePromptRevision(
 	if !ok {
 		return agent.PromptWriteResult{}, agent.ErrNotFound
 	}
-	version := len(f.revisions[write.ProfileKey]) + 1
+	currentVersion := len(f.revisions[write.ProfileKey])
+	// Mirror the Postgres optimistic lock: expected_version must equal the
+	// current max version (0 when no revision exists yet).
+	if write.ExpectedVersion != nil && *write.ExpectedVersion != currentVersion {
+		return agent.PromptWriteResult{}, agent.ErrPromptVersionConflict
+	}
+	if write.NoOpOnSame && profile.SystemPrompt == write.SystemPrompt {
+		return agent.PromptWriteResult{Version: currentVersion, Changed: false}, nil
+	}
+	version := currentVersion + 1
 	f.writes = append(f.writes, write)
 	f.revisions[write.ProfileKey] = append(f.revisions[write.ProfileKey], agent.PromptRevision{
 		ProfileKey:   write.ProfileKey,
@@ -104,19 +122,47 @@ func (f *fakeBackfillRepo) ApplyProfileSeedBackfill(
 	if !ok {
 		return agent.AgentProfile{}, false, agent.ErrNotFound
 	}
+	if f.beforeApply != nil {
+		// Simulate a concurrent admin PATCH landing between ListProfiles and
+		// the marker write, then re-read the row exactly like the SQL does
+		// against the current row.
+		hook := f.beforeApply
+		f.beforeApply = nil
+		hook()
+		profile, ok = f.profiles[key]
+		if !ok {
+			return agent.AgentProfile{}, false, agent.ErrNotFound
+		}
+	}
 	if profile.SeedVersion >= update.SeedVersion {
 		return profile, false, nil
 	}
 	f.applied = append(f.applied, update)
-	if update.AllowedTools != nil {
-		profile.AllowedTools = append([]string(nil), (*update.AllowedTools)...)
+	if len(update.AddAllowedTools) > 0 {
+		profile.AllowedTools = unionProfileTools(profile.AllowedTools, update.AddAllowedTools)
 	}
-	if update.Budgets != nil {
-		profile.Budgets = *update.Budgets
+	if upgrade := update.BudgetUpgrade; upgrade != nil && profile.Budgets == upgrade.Legacy {
+		profile.Budgets = upgrade.Current
 	}
 	profile.SeedVersion = update.SeedVersion
 	f.profiles[key] = profile
 	return profile, true, nil
+}
+
+// unionProfileTools mirrors the repository's set union against the current row.
+func unionProfileTools(stored, additions []string) []string {
+	seen := make(map[string]struct{}, len(stored)+len(additions))
+	merged := make([]string, 0, len(stored)+len(additions))
+	for _, list := range [][]string{stored, additions} {
+		for _, name := range list {
+			if _, duplicate := seen[name]; duplicate {
+				continue
+			}
+			seen[name] = struct{}{}
+			merged = append(merged, name)
+		}
+	}
+	return merged
 }
 
 func seedLegacyClarification(repo *fakeBackfillRepo) agent.AgentProfile {
@@ -248,7 +294,7 @@ func TestBackfillProfilesUpgradesLegacyBodyWithoutRevision(t *testing.T) {
 	profile := seedLegacyClarification(repo)
 	delete(repo.revisions, profile.Key)
 
-	if err := agentapp.BackfillProfiles(context.Background(), repo); err != nil {
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
 		t.Fatalf("BackfillProfiles: %v", err)
 	}
 	got := repo.profiles[profile.Key]
@@ -262,6 +308,120 @@ func TestBackfillProfilesUpgradesLegacyBodyWithoutRevision(t *testing.T) {
 	}
 	if got.SeedVersion != agentapp.ProfileSeedVersion {
 		t.Fatalf("seed version = %d, want marker set", got.SeedVersion)
+	}
+}
+
+func TestBackfillProfilesPromptConflictKeepsConcurrentAdminRevision(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	profile := seedLegacyClarification(repo)
+	delete(repo.revisions, profile.Key)
+
+	adminBody := "[profile:clarification_host] 管理员并发写入"
+	repo.beforeSave = func() {
+		// The admin PATCH wins the race: it lands between the revision snapshot
+		// and the seed write.
+		repo.revisions[profile.Key] = []agent.PromptRevision{{
+			ID:           99,
+			ProfileKey:   profile.Key,
+			Version:      1,
+			SystemPrompt: adminBody,
+			Source:       agent.PromptSourceAdmin,
+		}}
+		current := repo.profiles[profile.Key]
+		current.SystemPrompt = adminBody
+		repo.profiles[profile.Key] = current
+	}
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	got := repo.profiles[profile.Key]
+	if got.SystemPrompt != adminBody {
+		t.Fatalf("concurrent admin prompt overwritten: %q", got.SystemPrompt)
+	}
+	revisions := repo.revisions[profile.Key]
+	if len(revisions) != 1 || revisions[0].Source != agent.PromptSourceAdmin {
+		t.Fatalf("seed write was not fenced: %#v", revisions)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+}
+
+func TestBackfillProfilesDuplicateStartAppendsOneSeedRevision(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	profile := seedLegacyClarification(repo)
+	delete(repo.revisions, profile.Key)
+	wantPrompt, ok := agentapp.DefaultPrompt(profile.Key)
+	if !ok {
+		t.Fatal("DefaultPrompt missing")
+	}
+
+	repo.beforeSave = func() {
+		// A concurrent startup instance wins the no-revision race and appends
+		// the current seed revision at expected_version 0.
+		zero := 0
+		if _, err := repo.SavePromptRevision(context.Background(), agent.PromptWrite{
+			ProfileKey:      profile.Key,
+			SystemPrompt:    wantPrompt,
+			Note:            "upgrade 0.2.3",
+			Source:          agent.PromptSourceSeed,
+			ExpectedVersion: &zero,
+		}); err != nil {
+			t.Fatalf("concurrent seed write: %v", err)
+		}
+	}
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	revisions := repo.revisions[profile.Key]
+	if len(revisions) != 1 {
+		t.Fatalf("duplicate startup appended %d seed revisions", len(revisions)-1)
+	}
+	if revisions[0].Source != agent.PromptSourceSeed || revisions[0].SystemPrompt != wantPrompt {
+		t.Fatalf("winning revision = %#v", revisions[0])
+	}
+	got := repo.profiles[profile.Key]
+	if got.SystemPrompt != wantPrompt {
+		t.Fatalf("profile body = %q, want the single seed body", got.SystemPrompt)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+}
+
+func TestBackfillProfilesKeepsConcurrentAdminEdits(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	profile := seedLegacyClarification(repo)
+	concurrentBudgets := agent.ProfileBudgets{MaxTurns: 7, SoftSeconds: 50, HardSeconds: 90}
+	repo.beforeApply = func() {
+		// Admin PATCH between ListProfiles and the marker write: a new tool and
+		// a custom budget must survive the backfill.
+		current := repo.profiles[profile.Key]
+		current.AllowedTools = append(append([]string(nil), current.AllowedTools...), "admin.concurrent_tool")
+		current.Budgets = concurrentBudgets
+		repo.profiles[profile.Key] = current
+	}
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	got := repo.profiles[profile.Key]
+	for _, name := range agentapp.V022ProfileTools()[profile.Key] {
+		if !toolListContains(got.AllowedTools, name) {
+			t.Fatalf("backfill dropped the v0.22 increment %q: %v", name, got.AllowedTools)
+		}
+	}
+	if !toolListContains(got.AllowedTools, "admin.custom_tool") ||
+		!toolListContains(got.AllowedTools, "admin.concurrent_tool") {
+		t.Fatalf("admin tools lost: %v", got.AllowedTools)
+	}
+	if got.Budgets != concurrentBudgets {
+		t.Fatalf("concurrent admin budgets overwritten: %+v, want %+v", got.Budgets, concurrentBudgets)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
 	}
 }
 
@@ -279,7 +439,7 @@ func TestBackfillProfilesKeepsAdminPromptRevision(t *testing.T) {
 		Source:       agent.PromptSourceAdmin,
 	}}
 
-	if err := agentapp.BackfillProfiles(context.Background(), repo); err != nil {
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
 		t.Fatalf("BackfillProfiles: %v", err)
 	}
 	got := repo.profiles[profile.Key]
@@ -311,7 +471,7 @@ func TestBackfillProfilesDoesNotUpgradeUnknownSeedPrompt(t *testing.T) {
 		Source:       agent.PromptSourceSeed,
 	}}
 
-	if err := agentapp.BackfillProfiles(context.Background(), repo); err != nil {
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
 		t.Fatalf("BackfillProfiles: %v", err)
 	}
 	got := repo.profiles[profile.Key]
@@ -344,7 +504,7 @@ func TestBackfillProfilesSkipsCurrentSeedVersion(t *testing.T) {
 }
 
 func TestBackfillProfilesRequiresRepository(t *testing.T) {
-	if err := agentapp.BackfillProfiles(context.Background(), nil); err == nil {
+	if err := agentapp.BackfillProfiles(context.Background(), nil, nil); err == nil {
 		t.Fatal("expected an unavailable error for a nil repository")
 	}
 }
@@ -353,14 +513,14 @@ func TestBackfillProfilesPropagatesRepositoryErrors(t *testing.T) {
 	want := errors.New("list boom")
 	repo := newFakeBackfillRepo()
 	repo.listErr = want
-	if err := agentapp.BackfillProfiles(context.Background(), repo); !errors.Is(err, want) {
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); !errors.Is(err, want) {
 		t.Fatalf("list error = %v", err)
 	}
 
 	repo = newFakeBackfillRepo()
 	seedLegacyClarification(repo)
 	repo.applyErr = errors.New("apply boom")
-	if err := agentapp.BackfillProfiles(context.Background(), repo); err == nil {
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err == nil {
 		t.Fatal("expected the apply error to propagate")
 	}
 }

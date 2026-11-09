@@ -52,18 +52,21 @@ var legacyProfileBudgetUpgrades = map[string]struct {
 // seed exactly once, fenced by agent_profile.seed_version. The flow is
 // idempotent and preserves administrator edits:
 //
-//   - allowed_tools becomes union(stored, v0.22 increment); a tool removed after
-//     the marker is never re-added;
-//   - budgets are raised only when they still equal the known legacy defaults;
+//   - allowed_tools becomes union(stored, v0.22 increment); the union and the
+//     budget fence run inside the repository UPDATE against the current row, so
+//     a concurrent administrator PATCH is preserved; a tool removed after the
+//     marker is never re-added;
+//   - budgets are raised only when the stored row still equals the known legacy
+//     defaults;
 //   - an old built-in prompt revision (source=seed and a known legacy body) gets
 //     a new append-only source=seed revision; source=admin/reset is untouched;
 //   - model/name/enabled are never written;
 //   - seed_version is written last, after the prompt upgrade succeeded.
 //
-// Optional audit recorders receive one agent_profile.backfilled event per
-// actually-changed profile. The composition root passes its audit service; the
-// two-argument call remains valid for callers without one.
-func BackfillProfiles(ctx context.Context, repo ProfileBackfillRepository, auditors ...auditapp.Recorder) error {
+// audit receives one agent_profile.backfilled event per actually-changed
+// profile; pass nil when the caller has no audit trail (Task 20 wires the
+// composition root's audit service).
+func BackfillProfiles(ctx context.Context, repo ProfileBackfillRepository, audit auditapp.Recorder) error {
 	if repo == nil {
 		return platform.Unavailable("agent profile backfill repository is not configured")
 	}
@@ -71,65 +74,75 @@ func BackfillProfiles(ctx context.Context, repo ProfileBackfillRepository, audit
 	if err != nil {
 		return err
 	}
-	var audit auditapp.Recorder
-	for _, candidate := range auditors {
-		if candidate != nil {
-			audit = candidate
-			break
-		}
-	}
 	for _, stored := range profiles {
 		if stored.SeedVersion >= ProfileSeedVersion {
 			continue
 		}
 		update := agent.ProfileSeedBackfill{SeedVersion: ProfileSeedVersion}
-		changed := make([]string, 0, 3)
-
-		if increment := v022ProfileTools[stored.Key]; len(increment) > 0 {
-			merged := mergeProfileTools(stored, increment).AllowedTools
-			if !sameProfileTools(merged, stored.AllowedTools) {
-				update.AllowedTools = &merged
-				changed = append(changed, "allowed_tools")
-			}
+		toolsPlanned := false
+		if increment := v022ProfileTools[stored.Key]; len(increment) > 0 &&
+			!profileToolsContainAll(stored.AllowedTools, increment) {
+			update.AddAllowedTools = increment
+			toolsPlanned = true
 		}
+		budgetsPlanned := false
 		if rule, ok := legacyProfileBudgetUpgrades[stored.Key]; ok && stored.Budgets == rule.legacy {
-			budgets := rule.current
-			update.Budgets = &budgets
-			changed = append(changed, "budgets")
+			update.BudgetUpgrade = &agent.ProfileBudgetUpgrade{
+				Legacy:  rule.legacy,
+				Current: rule.current,
+			}
+			budgetsPlanned = true
 		}
 		promptChanged, err := backfillSeedPrompt(ctx, repo, stored.Key, stored.SystemPrompt)
 		if err != nil {
 			return err
-		}
-		if promptChanged {
-			changed = append(changed, "system_prompt")
 		}
 
 		appliedProfile, applied, err := repo.ApplyProfileSeedBackfill(ctx, stored.Key, update)
 		if err != nil {
 			return err
 		}
-		if applied && len(changed) > 0 {
+		if !applied {
+			continue
+		}
+		changed := make([]string, 0, 3)
+		if toolsPlanned {
+			changed = append(changed, "allowed_tools")
+		}
+		// A concurrent administrator budget edit makes the repository's budget
+		// CASE skip the upgrade; only report the field when the row moved.
+		if budgetsPlanned && appliedProfile.Budgets != stored.Budgets {
+			changed = append(changed, "budgets")
+		}
+		if promptChanged {
+			changed = append(changed, "system_prompt")
+		}
+		if len(changed) > 0 {
 			recordProfileBackfilled(ctx, audit, appliedProfile, changed)
 		}
 	}
 	return nil
 }
 
-// sameProfileTools reports whether two tool lists are identical (the backfill
-// only writes allowed_tools when the union actually adds a name).
-func sameProfileTools(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
+// profileToolsContainAll reports whether every increment tool is already in the
+// stored set. The repository still unions against the live row, so this is only
+// the cheap "do we need to write at all" pre-check.
+func profileToolsContainAll(stored, wanted []string) bool {
+	seen := make(map[string]struct{}, len(stored))
+	for _, name := range stored {
+		seen[name] = struct{}{}
 	}
-	for i := range left {
-		if left[i] != right[i] {
+	for _, name := range wanted {
+		if _, ok := seen[name]; !ok {
 			return false
 		}
 	}
 	return true
 }
 
+// recordProfileBackfilled is best-effort: it runs after the marker write, so a
+// crash in between loses the event but never re-applies or blocks the backfill,
+// and a recorder failure never fails the upgrade.
 func recordProfileBackfilled(
 	ctx context.Context,
 	audit auditapp.Recorder,

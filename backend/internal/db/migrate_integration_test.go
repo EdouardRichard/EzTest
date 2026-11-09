@@ -22,7 +22,7 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
+		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -184,7 +184,7 @@ func TestP3ExecutionTables(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
+		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -325,7 +325,7 @@ func TestP4DeliverySchema(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
+		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -1094,7 +1094,7 @@ func TestP8HardeningSchema(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 64: %v", len(applied), applied)
+		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
 	}
 
 	columns := []struct {

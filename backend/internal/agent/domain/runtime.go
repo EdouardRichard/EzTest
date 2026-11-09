@@ -35,13 +35,22 @@ type ProfileBudgets struct {
 }
 
 // ProfileSeedBackfill is the marker-fenced update applied by the one-time
-// profile backfill. Nil fields keep the stored value; SeedVersion is the new
-// marker. It never carries a prompt body: prompt upgrades are append-only
-// revision writes.
+// profile backfill. The repository applies the tool increment as a set union
+// against the row it is updating and the budget upgrade only while the stored
+// budgets still equal the legacy triple, so an administrator edit that lands
+// between the backfill snapshot and the write is never overwritten. It never
+// carries a prompt body: prompt upgrades are append-only revision writes.
 type ProfileSeedBackfill struct {
-	AllowedTools *[]string
-	Budgets      *ProfileBudgets
-	SeedVersion  int
+	AddAllowedTools []string
+	BudgetUpgrade   *ProfileBudgetUpgrade
+	SeedVersion     int
+}
+
+// ProfileBudgetUpgrade raises one legacy budget envelope to the current one.
+// Current is applied only when the stored budgets still equal Legacy.
+type ProfileBudgetUpgrade struct {
+	Legacy  ProfileBudgets
+	Current ProfileBudgets
 }
 
 // Validate checks the profile key/prompt and budget bounds.

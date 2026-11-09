@@ -119,8 +119,11 @@ func (r *RuntimeRepository) ListProfiles(ctx context.Context) ([]agent.AgentProf
 
 // ApplyProfileSeedBackfill writes the one-time v0.2.3 seed reconciliation. The
 // update is fenced by seed_version so a concurrent writer or a second startup
-// cannot apply it twice; nil fields keep the stored value. It reports whether a
-// row changed and returns the current row when the marker already advanced.
+// cannot apply it twice. The tool increment is unioned against the row being
+// updated and the budget upgrade only applies while the stored budgets still
+// equal the legacy snapshot, so a concurrent administrator PATCH is never
+// overwritten with values read before it. It reports whether a row changed and
+// returns the current row when the marker already advanced.
 func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 	ctx context.Context,
 	key string,
@@ -132,31 +135,50 @@ func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 	if update.SeedVersion <= 0 {
 		return agent.AgentProfile{}, false, platform.Invalid("seed_version", "must be a positive integer")
 	}
-	var encodedTools any
-	if update.AllowedTools != nil {
-		value, err := encodeJSONArray("profile backfill allowed tools", *update.AllowedTools)
-		if err != nil {
-			return agent.AgentProfile{}, false, err
-		}
-		encodedTools = value
+	increment := update.AddAllowedTools
+	if increment == nil {
+		increment = []string{}
 	}
-	var encodedBudgets any
-	if update.Budgets != nil {
-		value, err := encodeJSONObject("profile backfill budgets", *update.Budgets)
+	encodedTools, err := encodeJSONArray("profile backfill allowed tools", increment)
+	if err != nil {
+		return agent.AgentProfile{}, false, err
+	}
+	var encodedLegacyBudgets, encodedCurrentBudgets any
+	if update.BudgetUpgrade != nil {
+		encodedLegacyBudgets, err = encodeJSONObject(
+			"profile backfill legacy budgets", update.BudgetUpgrade.Legacy)
 		if err != nil {
 			return agent.AgentProfile{}, false, err
 		}
-		encodedBudgets = value
+		encodedCurrentBudgets, err = encodeJSONObject(
+			"profile backfill budgets", update.BudgetUpgrade.Current)
+		if err != nil {
+			return agent.AgentProfile{}, false, err
+		}
 	}
 	stored, err := scanProfile(r.pool.QueryRow(ctx, `
 		UPDATE agent_profile
-		SET allowed_tools = COALESCE($2::jsonb, allowed_tools),
-		    budgets = COALESCE($3::jsonb, budgets),
-		    seed_version = $4,
+		SET allowed_tools = CASE
+		        WHEN jsonb_array_length($2::jsonb) = 0 THEN allowed_tools
+		        ELSE (
+		            SELECT COALESCE(jsonb_agg(value ORDER BY first_ord), '[]'::jsonb)
+		            FROM (
+		                SELECT DISTINCT ON (value) value, ord AS first_ord
+		                FROM jsonb_array_elements_text(allowed_tools || $2::jsonb)
+		                     WITH ORDINALITY AS entries(value, ord)
+		                ORDER BY value, ord
+		            ) deduped
+		        )
+		    END,
+		    budgets = CASE
+		        WHEN $3::jsonb IS NOT NULL AND budgets = $3::jsonb THEN $4::jsonb
+		        ELSE budgets
+		    END,
+		    seed_version = $5,
 		    updated_at = now()
-		WHERE key = $1 AND seed_version < $4
+		WHERE key = $1 AND seed_version < $5
 		RETURNING `+profileColumns,
-		key, encodedTools, encodedBudgets, update.SeedVersion))
+		key, encodedTools, encodedLegacyBudgets, encodedCurrentBudgets, update.SeedVersion))
 	if err == nil {
 		return stored, true, nil
 	}
