@@ -129,6 +129,32 @@ function dragDivider(divider: HTMLElement, fromY: number, toY: number, pointerId
   fireEvent.pointerUp(divider, { pointerId, clientY: toY })
 }
 
+/**
+ * jsdom has no layout engine, so the workspace viewport maths (D-01/D-03) needs
+ * deterministic element boxes. Only the listed test ids get a box; everything
+ * else stays at the jsdom default (top 0, height 0), which keeps the divider
+ * overflow detection off unless a test asks for it.
+ */
+function mockViewportRects(rects: Record<string, Partial<DOMRect>>): void {
+  const base: DOMRect = {
+    x: 0,
+    y: 0,
+    width: 800,
+    height: 0,
+    top: 0,
+    right: 800,
+    bottom: 0,
+    left: 0,
+    toJSON: () => ({}),
+  }
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    const override = rects[this.dataset.testid ?? ""] ?? {}
+    return { ...base, ...override } as DOMRect
+  })
+}
+
 describe("DesignTab split layout (R-D2)", () => {
   beforeEach(() => {
     for (const fn of Object.values(designApi)) fn.mockReset()
@@ -364,5 +390,72 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(await screen.findByTestId("design-chat-titlebar")).toBeInTheDocument()
     expect(screen.getByTestId("design-graph")).toBeInTheDocument()
     expect(screen.getByTestId("design-detail")).toBeInTheDocument()
+  })
+
+  it("gives the graph and detail panes readable pixel floors with internal scroll", async () => {
+    const { graph, detail, workbenchSplit } = await renderWorkspace()
+
+    // D-01: percentage-only panes collapsed the graph to ~110px and the canvas
+    // to 0 on 1440x900. The floors keep both panes usable; the split scrolls
+    // instead of squeezing them below their minimum.
+    expect(graph.style.minHeight).toBe("220px")
+    expect(detail.style.minHeight).toBe("180px")
+    expect(workbenchSplit).toHaveClass("overflow-y-auto")
+  })
+
+  it("fits the workspace to a short viewport instead of forcing 320px", async () => {
+    // D-03: 1280x800 has ~245px left below the version chrome (507 + the 48px
+    // app-content inset); the old hard MIN of 320 pushed the page 75px tall.
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800)
+    mockViewportRects({
+      "design-scroll": { top: 507, height: 245, bottom: 752 },
+      "design-split-workbench": { top: 0, height: 100, bottom: 100 },
+    })
+
+    // The short viewport auto-folds the chat, so render the tab directly and
+    // wait for the collapsed title bar instead of the full chat shell.
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-chat-titlebar")
+
+    const root = screen.getByTestId("design-scroll")
+    const workbenchSplit = screen.getByTestId("design-split-workbench")
+    const workbenchDivider = screen.getByTestId("design-split-workbench-divider")
+
+    await waitFor(() => expect(root.style.height).toBe("245px"))
+    expect(workbenchSplit).toHaveClass("overflow-y-auto")
+    expect(workbenchSplit).toHaveAttribute("data-overflowing", "true")
+
+    // The short viewport compacts the design header: the duplicated host /
+    // context / model rows are dropped, the title and stats stay.
+    expect(screen.getByText("用例设计")).toBeInTheDocument()
+    expect(screen.getByTestId("design-stats")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-header-host")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("design-header-context")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("design-header-model")).not.toBeInTheDocument()
+
+    // Both panes keep their floors, so the divider is locked while the split
+    // cannot honour the minimums.
+    expect(screen.getByTestId("design-graph").style.minHeight).toBe("220px")
+    expect(screen.getByTestId("design-detail").style.minHeight).toBe("180px")
+    await waitFor(() => expect(workbenchDivider).toHaveAttribute("aria-disabled", "true"))
+  })
+
+  it("keeps a readable chat pane and a 200px workbench floor when expanded on a short viewport", async () => {
+    // D-02: the expanded chat used to be 40% of a ~345px workspace, leaving
+    // ~32px for the message list. DesignChat's own chrome (header + composer +
+    // team room) measures ~222px, so the floor leaves ≥180px for the thread.
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800)
+    mockViewportRects({ "design-scroll": { top: 507, height: 245, bottom: 752 } })
+
+    render(<DesignTab versionId="2001" />)
+    const titleBar = await screen.findByTestId("design-chat-titlebar")
+    await waitFor(() => expect(screen.getByTestId("design-scroll").style.height).toBe("245px"))
+
+    fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
+
+    const mainTop = await screen.findByTestId("design-split-main-top")
+    expect(mainTop.style.minHeight).toBe("420px")
+    expect(screen.getByTestId("design-split-main-bottom").style.minHeight).toBe("200px")
+    expect(screen.getByTestId("design-split-main")).toHaveClass("overflow-y-auto")
   })
 })

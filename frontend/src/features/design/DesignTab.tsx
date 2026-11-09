@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
+import { cn } from "@/components/ui/cn"
 import { Dialog } from "@/components/ui/Dialog"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
@@ -94,7 +95,6 @@ function activityText(payload: Record<string, unknown>): string | null {
 
 /** `.app-content` bottom padding, reserved so the page itself never scrolls. */
 const PAGE_BOTTOM_INSET = 48
-const MIN_WORKSPACE_HEIGHT = 320
 /**
  * Below this available height (viewport minus the version header/tabs) the
  * design chat folds into its title bar so the graph and detail stay usable
@@ -103,6 +103,23 @@ const MIN_WORKSPACE_HEIGHT = 320
 const SHORT_WORKSPACE_HEIGHT = 620
 /** Narrow viewports get the same collapse: the workbench is prioritised. */
 const NARROW_WORKSPACE_WIDTH = 960
+/**
+ * Pixel floors of the expanded split panes (D-01/D-02). The workspace never
+ * forces a taller-than-viewport block any more; when these floors cannot fit,
+ * the split scrolls internally and the page stays scroll-free.
+ */
+const CHAT_PANE_MIN_HEIGHT = 300
+/**
+ * DesignChat fixed chrome measured from the 0.2.2 UAT evidence: header 60 +
+ * composer ~90-115 + team room 38 ≈ 222px (floating panel: message list 543 of a
+ * 765px content box). A 300px inline floor would leave the message list ~78px,
+ * below the 180px readability target, so short viewports (1440x900/1280x800)
+ * use a floor that leaves ≥180px after that chrome.
+ */
+const CHAT_PANE_MIN_HEIGHT_COMPACT = 420
+const WORKBENCH_PANE_MIN_HEIGHT = 200
+const GRAPH_PANE_MIN_HEIGHT = 220
+const DETAIL_PANE_MIN_HEIGHT = 180
 
 /**
  * Collapsed chat title bar (R-D2-4). It replaces the full DesignChat on a
@@ -113,14 +130,20 @@ const NARROW_WORKSPACE_WIDTH = 960
 function ChatTitleBar({
   conversationTitle,
   onExpand,
+  compact = false,
 }: {
   conversationTitle: string | null
   onExpand: () => void
+  /** Short viewports spend the pixels on the graph instead of this bar. */
+  compact?: boolean
 }) {
   return (
     <div
       data-testid="design-chat-titlebar"
-      className="surface-card flex min-w-0 shrink-0 items-center gap-2 overflow-hidden border border-border px-3 py-2"
+      className={cn(
+        "surface-card flex min-w-0 shrink-0 items-center gap-2 overflow-hidden border border-border px-3",
+        compact ? "py-1" : "py-2",
+      )}
     >
       <h2 className="shrink-0 text-sm font-semibold text-foreground">设计对话</h2>
       <p className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
@@ -630,14 +653,17 @@ export function DesignTab({
 
   // The version page is not a flex column, so the workspace measures the space
   // left below its own top edge and caps itself to the viewport. That keeps the
-  // document from growing: only the three panes (and their panels) scroll.
+  // document from growing: only the panes (and their panels) scroll.
+  // D-03: the old hard 320px minimum pushed a 1280x800 page 75px tall, so the
+  // workspace now takes exactly `innerHeight - top - bottom inset` (0 at worst).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stage changes move the chrome above the workspace without a resize event
   useEffect(() => {
     if (loading || graph === null) return undefined
     const updateHeight = () => {
       const workspace = workspaceRef.current
       if (workspace === null) return
       const top = workspace.getBoundingClientRect().top
-      const available = Math.max(MIN_WORKSPACE_HEIGHT, window.innerHeight - top - PAGE_BOTTOM_INSET)
+      const available = Math.max(0, window.innerHeight - top - PAGE_BOTTOM_INSET)
       setWorkspaceHeight(`${Math.round(available)}px`)
       const isShort =
         available < SHORT_WORKSPACE_HEIGHT || window.innerWidth < NARROW_WORKSPACE_WIDTH
@@ -649,8 +675,20 @@ export function DesignTab({
     }
     updateHeight()
     window.addEventListener("resize", updateHeight)
-    return () => window.removeEventListener("resize", updateHeight)
-  }, [loading, graph])
+    // Stage notices / blocker panels change the chrome above the workspace and
+    // move its top edge without firing `resize`; observe the parent so the
+    // height follows the new available space (D-03).
+    const parent = workspaceRef.current?.parentElement ?? null
+    const observer =
+      parent !== null && typeof ResizeObserver === "function"
+        ? new ResizeObserver(updateHeight)
+        : null
+    observer?.observe(parent as Element)
+    return () => {
+      window.removeEventListener("resize", updateHeight)
+      observer?.disconnect()
+    }
+  }, [loading, graph, stage])
 
   if (loading) {
     return (
@@ -675,6 +713,8 @@ export function DesignTab({
   }
 
   const stats = graph.stats
+  /** Short/narrow viewports compress the chrome so the graph keeps its floor. */
+  const compact = shortViewport
   const autoDesign = overview?.auto_design_new_requirements ?? graph.auto_design_new_requirements
   const roundTitle = overview?.active_round
     ? `设计轮次 #${overview.active_round.round_no}`
@@ -698,10 +738,17 @@ export function DesignTab({
     >
       <header
         data-testid="design-workbench-toolbar"
-        className="flex shrink-0 flex-wrap items-center gap-2 px-1 pb-1"
+        className={cn(
+          "flex shrink-0 flex-wrap items-center gap-2 px-1",
+          compact ? "pb-0.5" : "pb-1",
+        )}
       >
         <h2 className="text-sm font-semibold text-foreground">用例工作区</h2>
-        <span className="text-[10px] text-muted-foreground">图在上 · 详情紧接在下 · 内部滚动</span>
+        {compact ? null : (
+          <span className="text-[10px] text-muted-foreground">
+            图在上 · 详情紧接在下 · 内部滚动
+          </span>
+        )}
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <span data-testid="design-workbench-live" className="text-[10px] text-muted-foreground">
             {sseLabel}
@@ -737,6 +784,9 @@ export function DesignTab({
         ariaLabel="调整用例图与用例详情高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
         topOverflow="auto"
         bottomOverflow="auto"
+        topMinHeightPx={GRAPH_PANE_MIN_HEIGHT}
+        bottomMinHeightPx={DETAIL_PANE_MIN_HEIGHT}
+        scrollOnOverflow
         className="min-h-0 flex-1"
         topClassName="[&>section]:min-h-0 [&>section]:flex-1"
         top={
@@ -756,6 +806,7 @@ export function DesignTab({
           ) : (
             <DesignMindmap
               graph={graph}
+              compact={compact}
               selectedCaseId={selectedCaseId}
               confirmingKey={confirmingKey}
               executionResults={executionResults}
@@ -796,10 +847,17 @@ export function DesignTab({
       ref={workspaceRef}
       data-testid="design-scroll"
       data-short-viewport={shortViewport ? "true" : "false"}
+      data-compact={compact ? "true" : "false"}
       className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
       style={{ height: workspaceHeight, overflow: "hidden" }}
     >
-      <header data-testid="design-header" className="flex shrink-0 flex-wrap items-start gap-2">
+      <header
+        data-testid="design-header"
+        className={cn(
+          "flex shrink-0 flex-wrap",
+          compact ? "items-center gap-1" : "items-start gap-2",
+        )}
+      >
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span
@@ -810,18 +868,22 @@ export function DesignTab({
             </span>
             <span className="text-[10px] text-muted-foreground">用例设计</span>
             <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
-            <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
-              Design Host 单写者 · 事件通道：{sseLabel}
-            </span>
+            {compact ? null : (
+              <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
+                Design Host 单写者 · 事件通道：{sseLabel}
+              </span>
+            )}
             <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
               需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
               {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
             </span>
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
-            <span data-testid="design-header-context">上下文水位 —</span>
-            <span data-testid="design-header-model">模型 {effectiveModel}</span>
-          </div>
+          {compact ? null : (
+            <div className="mt-0.5 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+              <span data-testid="design-header-context">上下文水位 —</span>
+              <span data-testid="design-header-model">模型 {effectiveModel}</span>
+            </div>
+          )}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <Button
@@ -925,10 +987,19 @@ export function DesignTab({
         topCollapsed={chatCollapsed}
         topOverflow="hidden"
         bottomOverflow="hidden"
+        topMinHeightPx={
+          chatCollapsed ? undefined : compact ? CHAT_PANE_MIN_HEIGHT_COMPACT : CHAT_PANE_MIN_HEIGHT
+        }
+        bottomMinHeightPx={chatCollapsed ? undefined : WORKBENCH_PANE_MIN_HEIGHT}
+        scrollOnOverflow
         className="min-h-0 flex-1"
         top={
           chatCollapsed ? (
-            <ChatTitleBar conversationTitle={chatTitle} onExpand={toggleChatCollapsed} />
+            <ChatTitleBar
+              conversationTitle={chatTitle}
+              onExpand={toggleChatCollapsed}
+              compact={compact}
+            />
           ) : (
             <div
               data-testid="design-chat-pane"

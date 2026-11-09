@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -85,5 +85,48 @@ describe("DesignMindmap", () => {
     expect(screen.getByTestId("design-zoom-out")).toBeInTheDocument()
     expect(screen.getByTestId("design-fit-view")).toBeInTheDocument()
     fireEvent.click(screen.getByTestId("design-zoom-in"))
+  })
+
+  it("renders the graph overview minimap", async () => {
+    // D-07: the inline canvas clipped a tall graph with no overview; the
+    // minimap is the approved discoverability affordance.
+    renderMindmap()
+
+    const minimap = await screen.findByTestId("rf__minimap")
+    expect(minimap).toBeInTheDocument()
+    expect(within(minimap).getByRole("img", { name: "脑图缩略图" })).toBeInTheDocument()
+  })
+
+  it("keeps the canvas above a minimum readable height", async () => {
+    renderMindmap()
+
+    expect(await screen.findByTestId("design-mindmap-canvas")).toHaveClass("min-h-[180px]")
+  })
+
+  it("hides the empty batch bar in compact mode and reveals it after a selection", async () => {
+    // Short viewports prioritise the canvas: an empty batch bar costs ~45px.
+    renderMindmap({ compact: true })
+
+    await screen.findByTestId("case-card-7001")
+    expect(screen.queryByTestId("case-batch-bar")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("case-checkbox-7001"))
+    expect(await screen.findByTestId("case-batch-bar")).toHaveTextContent("已选 1 条")
+  })
+
+  it("keeps the always-visible batch bar outside compact mode", async () => {
+    renderMindmap()
+
+    expect(await screen.findByTestId("case-batch-bar")).toBeInTheDocument()
+  })
+
+  it("renders compact filters with accessible labels on a single short row", async () => {
+    renderMindmap({ compact: true })
+
+    const filters = screen.getByTestId("design-case-filters")
+    expect(filters).toHaveClass("py-1")
+    // The visible labels become screen-reader-only, not removed.
+    expect(screen.getByLabelText("搜索")).toBe(screen.getByTestId("design-search"))
+    expect(within(filters).getByLabelText("状态")).toBeInTheDocument()
   })
 })

@@ -11,6 +11,8 @@ import type { DesignRequirement } from "./types"
 
 type RequirementData = Extract<DesignNodeData, { kind: "requirement" }> & {
   actions: DesignNodeActions
+  /** D-09: hidden below the minimum action zoom (React Flow scales the node). */
+  destructiveActionsDisabled?: boolean
 }
 
 /** Requirement node: title, clarified revision, coverage and "确认全部". */
@@ -45,7 +47,8 @@ export function RequirementNode({ data }: NodeProps) {
       <p className="text-[11px] text-muted-foreground">
         SUT {requirement.target_version_sut_ids.length} 个目标
       </p>
-      {node.actions.caseReviewEnabled === false ? null : (
+      {node.actions.caseReviewEnabled === false ||
+      node.destructiveActionsDisabled === true ? null : (
         <Button
           size="sm"
           variant="secondary"
