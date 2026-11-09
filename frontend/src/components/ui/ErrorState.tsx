@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 
 import { ApiError } from "@/lib/api-client"
+import { localizeApiError } from "@/lib/api-error-messages"
 
 import { Button } from "./Button"
 import { cn } from "./cn"
@@ -17,27 +18,22 @@ type ErrorDescription = {
   requestId?: string
   code?: string
   retryable?: boolean
-  /** Typed API `details.next_action` (e.g. stage-gate guidance). */
+  /** Localized or typed API `details.next_action` guidance. */
   nextAction?: string
 }
 
 function describeError(error: unknown): ErrorDescription {
+  const localized = localizeApiError(error)
   if (error instanceof ApiError) {
-    const nextAction =
-      typeof error.details.next_action === "string" && error.details.next_action.length > 0
-        ? error.details.next_action
-        : undefined
     return {
-      message: error.message,
+      message: localized.message,
       requestId: error.requestId,
       code: error.code,
       retryable: error.retryable,
-      nextAction,
+      nextAction: localized.nextAction,
     }
   }
-  if (error instanceof Error) return { message: error.message }
-  if (typeof error === "string" && error.length > 0) return { message: error }
-  return { message: "发生未知错误，请稍后重试" }
+  return { message: localized.message, nextAction: localized.nextAction }
 }
 
 export function ErrorState({ error, title = "加载失败", onRetry, className }: ErrorStateProps) {
@@ -71,15 +67,17 @@ export function ErrorState({ error, title = "加载失败", onRetry, className }
 
 export type InlineErrorProps = {
   error: unknown
+  /** Optional scenario-specific main copy that overrides the localized message. */
+  message?: string
   children?: ReactNode
 }
 
 /** Compact one-line error for toolbars and forms. */
-export function InlineError({ error, children }: InlineErrorProps) {
+export function InlineError({ error, message, children }: InlineErrorProps) {
   const description = describeError(error)
   return (
     <p role="alert" className="text-xs text-destructive">
-      {description.message}
+      {message ?? description.message}
       {description.nextAction ? (
         <span className="ml-2 text-muted-foreground">下一步：{description.nextAction}</span>
       ) : null}
