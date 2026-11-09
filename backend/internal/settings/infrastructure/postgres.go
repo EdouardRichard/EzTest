@@ -89,28 +89,31 @@ func (r *Repository) Seed(ctx context.Context, definitions []settings.Definition
 	return nil
 }
 
-// Update writes a revision and the new value atomically.
-func (r *Repository) Update(ctx context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (settings.Setting, error) {
+// Update writes a revision and the new value atomically. It returns the
+// previous value read under the same SELECT ... FOR UPDATE row lock so callers
+// can record an atomic old/new audit pair.
+func (r *Repository) Update(ctx context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (json.RawMessage, settings.Setting, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return settings.Setting{}, fmt.Errorf("begin settings update: %w", err)
+		return nil, settings.Setting{}, fmt.Errorf("begin settings update: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
 	var oldValue []byte
 	err = tx.QueryRow(ctx, `SELECT value_json FROM system_setting WHERE key = $1 FOR UPDATE`, key).Scan(&oldValue)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return settings.Setting{}, settings.ErrNotFound
+		return nil, settings.Setting{}, settings.ErrNotFound
 	}
 	if err != nil {
-		return settings.Setting{}, fmt.Errorf("lock setting %s: %w", key, err)
+		return nil, settings.Setting{}, fmt.Errorf("lock setting %s: %w", key, err)
 	}
+	previous := append(json.RawMessage(nil), oldValue...)
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO system_setting_revision (id, setting_key, old_value, new_value, actor_id, created_at)
 		VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
 	`, revisionID, key, oldValue, string(value), actorID, at); err != nil {
-		return settings.Setting{}, fmt.Errorf("insert setting revision: %w", err)
+		return nil, settings.Setting{}, fmt.Errorf("insert setting revision: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -118,7 +121,7 @@ func (r *Repository) Update(ctx context.Context, key string, value json.RawMessa
 		SET value_json = $2::jsonb, version = version + 1, updated_by = $3, updated_at = $4
 		WHERE key = $1
 	`, key, string(value), actorID, at); err != nil {
-		return settings.Setting{}, fmt.Errorf("update setting: %w", err)
+		return nil, settings.Setting{}, fmt.Errorf("update setting: %w", err)
 	}
 
 	row := tx.QueryRow(ctx, `
@@ -129,12 +132,12 @@ func (r *Repository) Update(ctx context.Context, key string, value json.RawMessa
 	`, key)
 	item, err := scanSetting(row)
 	if err != nil {
-		return settings.Setting{}, fmt.Errorf("read updated setting: %w", err)
+		return nil, settings.Setting{}, fmt.Errorf("read updated setting: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return settings.Setting{}, fmt.Errorf("commit setting update: %w", err)
+		return nil, settings.Setting{}, fmt.Errorf("commit setting update: %w", err)
 	}
-	return item, nil
+	return previous, item, nil
 }
 
 // Revisions returns change history, newest first.

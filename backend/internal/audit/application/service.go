@@ -2,6 +2,7 @@ package auditapp
 
 import (
 	"context"
+	"slices"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -77,11 +78,17 @@ func (s *Service) Record(ctx context.Context, event Event) error {
 	})
 }
 
-// ActionCandidates returns the curated audit action catalog. The HTTP layer
-// exposes no candidate endpoint; the frontend keeps a static copy and this
-// helper exists for server-side callers/tests that need the same list.
+// ActionCandidates returns a deep copy of the curated audit action catalog.
+// The HTTP layer exposes no candidate endpoint; the frontend keeps a static
+// copy and this helper exists for server-side callers/tests that need the same
+// list. Cloning Aliases keeps callers from mutating the shared catalog.
 func ActionCandidates() []audit.Action {
-	return append([]audit.Action(nil), audit.Actions...)
+	candidates := make([]audit.Action, len(audit.Actions))
+	for i, action := range audit.Actions {
+		candidates[i] = action
+		candidates[i].Aliases = slices.Clone(action.Aliases)
+	}
+	return candidates
 }
 
 // List returns one page of entries newest first and reports whether an older

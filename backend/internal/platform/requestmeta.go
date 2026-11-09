@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -43,10 +44,25 @@ func RequestMetaFor(r *http.Request) RequestMeta {
 	}
 }
 
+// remoteHost extracts the address from RemoteAddr. net.SplitHostPort handles
+// the usual "host:port" form and strips IPv6 brackets; a bare address (in-proc
+// transports and tests may set RemoteAddr without a port) is validated and
+// normalized through netip. Unparseable input is returned trimmed rather than
+// dropped, so the audit row still records what the transport supplied.
 func remoteHost(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		return remoteAddr
+	addr := strings.TrimSpace(remoteAddr)
+	if addr == "" {
+		return ""
 	}
-	return host
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	bare := addr
+	if strings.HasPrefix(bare, "[") && strings.HasSuffix(bare, "]") {
+		bare = bare[1 : len(bare)-1]
+	}
+	if parsed, err := netip.ParseAddr(bare); err == nil {
+		return parsed.String()
+	}
+	return addr
 }

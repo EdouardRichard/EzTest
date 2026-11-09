@@ -13,10 +13,12 @@ type Action struct {
 	Aliases []string
 }
 
-// Actions is the curated audit action catalog. It covers the actions emitted by
-// auth, user, settings, llm, resource, version and agent. Recording code keeps
-// using string literals; this catalog is the discovery/filter surface, and the
-// frontend candidate list mirrors it (see actions_test.go).
+// Actions is the curated audit action catalog: the admin-facing suggestion list
+// for the list filter, not an allowlist. Recording code keeps using string
+// literals/constants, and the filter accepts any action (unknown names still
+// match by prefix), so this slice only grows when an action should be
+// discoverable in the UI. actions_test.go pins a subset of entries to the code
+// that emits them, and the frontend catalog mirrors this slice entry for entry.
 var Actions = []Action{
 	{Name: "auth.login", Label: "登录"},
 	{Name: "auth.login_failed", Label: "登录失败"},
@@ -96,6 +98,16 @@ var Actions = []Action{
 	{Name: "agent.run.failed", Label: "Agent 运行失败"},
 	{Name: "job.canceled", Label: "取消任务"},
 	{Name: "job.requeued", Label: "重排任务"},
+
+	// Actions recorded by other contexts. They are not part of this package's
+	// own emitters but are valuable in the admin filter; keep the order in
+	// sync with the frontend mirror.
+	{Name: "agent_profile.backfilled", Label: "回填 Agent Profile"},
+	{Name: "quality.eval_recorded", Label: "记录质量评估"},
+	{Name: "case.updated", Label: "更新用例"},
+	{Name: "execution.credentials_read", Label: "读取执行凭证"},
+	{Name: "visual.diff.create", Label: "创建视觉差异"},
+	{Name: "content.uploaded", Label: "上传内容"},
 }
 
 // HasAction reports whether name is one of the catalog's canonical actions.

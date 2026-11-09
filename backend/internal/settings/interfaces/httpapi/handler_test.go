@@ -253,16 +253,17 @@ func (r *staleSettingsRepo) Seed(_ context.Context, definitions []settings.Defin
 	return nil
 }
 
-func (r *staleSettingsRepo) Update(_ context.Context, key string, value json.RawMessage, _ int64, _ int64, at time.Time) (settings.Setting, error) {
+func (r *staleSettingsRepo) Update(_ context.Context, key string, value json.RawMessage, _ int64, _ int64, at time.Time) (json.RawMessage, settings.Setting, error) {
 	item, ok := r.items[key]
 	if !ok {
-		return settings.Setting{}, settings.ErrNotFound
+		return nil, settings.Setting{}, settings.ErrNotFound
 	}
+	previous := append(json.RawMessage(nil), item.Value...)
 	item.Value = value
 	item.Version++
 	item.UpdatedAt = at
 	r.items[key] = item
-	return item, nil
+	return previous, item, nil
 }
 
 func (r *staleSettingsRepo) Revisions(context.Context, string, int, *int64) ([]settings.Revision, error) {

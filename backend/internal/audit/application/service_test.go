@@ -236,3 +236,17 @@ func TestActionCandidatesMirrorsCatalog(t *testing.T) {
 		t.Fatal("candidates are missing settings.updated")
 	}
 }
+
+// TestActionCandidatesAreDeepCopied keeps callers from mutating the shared
+// catalog through the returned slice.
+func TestActionCandidatesAreDeepCopied(t *testing.T) {
+	candidates := ActionCandidates()
+	for i := range candidates {
+		if len(candidates[i].Aliases) > 0 {
+			candidates[i].Aliases[0] = "mutated.alias"
+		}
+	}
+	if got := audit.ResolveAlias("setting.update"); got != "settings.updated" {
+		t.Fatalf("ResolveAlias(setting.update) = %q after mutating candidates; catalog aliases were shared", got)
+	}
+}

@@ -1,8 +1,10 @@
 /**
  * Static audit action candidates shown in the AuditPanel datalist.
  *
- * There is deliberately no candidate endpoint: the backend keeps the canonical
- * catalog in `backend/internal/audit/domain/actions.go`, and its
+ * This is the admin-facing suggestion list for the audit filter, not an
+ * allowlist: the list filter accepts any action, and unknown names still match
+ * by prefix. There is deliberately no candidate endpoint. The backend keeps the
+ * canonical catalog in `backend/internal/audit/domain/actions.go`, and its
  * `TestFrontendCatalogMatchesBackend` test fails if this list drifts. Keep
  * entries in the same order as the backend catalog.
  */
@@ -91,4 +93,14 @@ export const AUDIT_ACTIONS: AuditAction[] = [
   { name: "agent.run.failed", label: "Agent 运行失败", aliases: [] },
   { name: "job.canceled", label: "取消任务", aliases: [] },
   { name: "job.requeued", label: "重排任务", aliases: [] },
+
+  // Actions recorded by other contexts. They are not part of the backend audit
+  // package's own emitters but are valuable in the admin filter; keep the order
+  // in sync with the backend mirror.
+  { name: "agent_profile.backfilled", label: "回填 Agent Profile", aliases: [] },
+  { name: "quality.eval_recorded", label: "记录质量评估", aliases: [] },
+  { name: "case.updated", label: "更新用例", aliases: [] },
+  { name: "execution.credentials_read", label: "读取执行凭证", aliases: [] },
+  { name: "visual.diff.create", label: "创建视觉差异", aliases: [] },
+  { name: "content.uploaded", label: "上传内容", aliases: [] },
 ]

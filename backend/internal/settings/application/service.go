@@ -136,17 +136,8 @@ func (s *Service) Update(ctx context.Context, key string, value any, actorID int
 		return settings.Setting{}, err
 	}
 
-	// Read the current value before writing so the audit entry can carry the
-	// old/new pair. Secrets are excluded from both fields.
-	var oldValue json.RawMessage
-	if !def.Secret {
-		if current, getErr := s.repo.Get(ctx, key); getErr == nil {
-			oldValue = current.Value
-		}
-	}
-
 	at := s.clock.Now()
-	updated, err := s.repo.Update(ctx, key, encoded, s.ids.Next(), actorID, at)
+	previous, updated, err := s.repo.Update(ctx, key, encoded, s.ids.Next(), actorID, at)
 	if err != nil {
 		return settings.Setting{}, err
 	}
@@ -163,8 +154,8 @@ func (s *Service) Update(ctx context.Context, key string, value any, actorID int
 	if s.audit != nil {
 		metadata := map[string]any{"key": key, "category": def.Category}
 		if !def.Secret {
-			if oldValue != nil {
-				metadata["old_value"] = settingAuditValue(oldValue)
+			if len(previous) > 0 {
+				metadata["old_value"] = settingAuditValue(previous)
 			}
 			metadata["new_value"] = settingAuditValue(updated.Value)
 		}

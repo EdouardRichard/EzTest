@@ -65,6 +65,8 @@ type Repository interface {
 	List(ctx context.Context) ([]Setting, error)
 	Get(ctx context.Context, key string) (Setting, error)
 	Seed(ctx context.Context, definitions []Definition) error
-	Update(ctx context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (Setting, error)
+	// Update writes one value and returns the previous value read under the
+	// same row lock, so callers can audit an atomic old/new pair.
+	Update(ctx context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (previous json.RawMessage, current Setting, err error)
 	Revisions(ctx context.Context, key string, limit int, beforeID *int64) ([]Revision, error)
 }

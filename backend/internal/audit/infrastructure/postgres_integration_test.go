@@ -151,6 +151,9 @@ func TestRepositoryResolvesActionAlias(t *testing.T) {
 		{ID: 9201, Action: "auth.login"},
 		{ID: 9202, ActorID: &actor, Action: "settings.updated", TargetKind: "setting", TargetID: "execution.global_concurrency"},
 		{ID: 9203, Action: "user.created"},
+		// Legacy row written before the canonical rename: the alias filter must
+		// find it through the escaped prefix branch.
+		{ID: 9204, ActorID: &actor, Action: "setting.update", TargetKind: "setting", TargetID: "execution.global_concurrency"},
 	} {
 		if err := repo.Insert(ctx, entry); err != nil {
 			t.Fatalf("Insert(%d): %v", entry.ID, err)
@@ -161,11 +164,11 @@ func TestRepositoryResolvesActionAlias(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List by alias: %v", err)
 	}
-	if len(aliased) != 1 || aliased[0].ID != 9202 {
-		t.Fatalf("alias result = %#v", aliased)
+	if len(aliased) != 2 || aliased[0].ID != 9204 || aliased[1].ID != 9202 {
+		t.Fatalf("alias result = %#v, want legacy 9204 and canonical 9202", aliased)
 	}
-	if aliased[0].ActorName != "admin" {
-		t.Fatalf("actor name = %q, want admin", aliased[0].ActorName)
+	if aliased[0].ActorName != "admin" || aliased[1].ActorName != "admin" {
+		t.Fatalf("alias actor names = %q/%q, want admin", aliased[0].ActorName, aliased[1].ActorName)
 	}
 
 	unknown, err := repo.List(ctx, audit.Filter{Action: "nope"}, 10, nil)
@@ -174,6 +177,51 @@ func TestRepositoryResolvesActionAlias(t *testing.T) {
 	}
 	if len(unknown) != 0 {
 		t.Fatalf("unknown action matched %#v", unknown)
+	}
+}
+
+func TestRepositoryEscapesLikeWildcards(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := auditpg.New(pool)
+	ctx := context.Background()
+	for _, entry := range []audit.Entry{
+		{ID: 9301, Action: "weird%action"},
+		{ID: 9302, Action: "weirdXaction"},
+		{ID: 9303, Action: "a_c"},
+		{ID: 9304, Action: "abc"},
+		{ID: 9305, Action: `trail\`},
+		{ID: 9306, Action: "trailX"},
+	} {
+		if err := repo.Insert(ctx, entry); err != nil {
+			t.Fatalf("Insert(%d): %v", entry.ID, err)
+		}
+	}
+
+	cases := []struct {
+		filter string
+		wantID int64
+	}{
+		{"weird%", 9301},
+		{"a_c", 9303},
+		{`trail\`, 9305},
+	}
+	for _, tc := range cases {
+		page, err := repo.List(ctx, audit.Filter{Action: tc.filter}, 10, nil)
+		if err != nil {
+			t.Fatalf("List(%q): %v", tc.filter, err)
+		}
+		if len(page) != 1 || page[0].ID != tc.wantID {
+			t.Fatalf("List(%q) = %#v, want only %d", tc.filter, page, tc.wantID)
+		}
+	}
+
+	// A literal "%" prefix must not degenerate into a match-all wildcard.
+	wildcard, err := repo.List(ctx, audit.Filter{Action: "%"}, 10, nil)
+	if err != nil {
+		t.Fatalf("List(%%): %v", err)
+	}
+	if len(wildcard) != 0 {
+		t.Fatalf("a literal %% prefix matched %#v", wildcard)
 	}
 }
 

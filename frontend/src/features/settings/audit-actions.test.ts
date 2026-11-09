@@ -4,15 +4,15 @@ import { AUDIT_ACTIONS } from "./audit-actions"
 
 describe("AUDIT_ACTIONS", () => {
   it("has unique names and aliases that do not shadow canonical names", () => {
-    const names = new Set<string>()
+    const names = new Set(AUDIT_ACTIONS.map((action) => action.name))
+    expect(names.size).toBe(AUDIT_ACTIONS.length)
     const aliases = new Set<string>()
     for (const action of AUDIT_ACTIONS) {
       expect(action.name).toMatch(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_.]*$/)
       expect(action.label.length).toBeGreaterThan(0)
-      expect(names.has(action.name)).toBe(false)
-      names.add(action.name)
       for (const alias of action.aliases) {
         expect(alias).not.toBe(action.name)
+        expect(names.has(alias)).toBe(false)
         expect(aliases.has(alias)).toBe(false)
         aliases.add(alias)
       }
@@ -20,7 +20,21 @@ describe("AUDIT_ACTIONS", () => {
   })
 
   it("covers every audit domain exposed by the backend", () => {
-    const prefixes = ["auth.", "user.", "settings.", "llm.", "resource.", "version.", "agent."]
+    const prefixes = [
+      "auth.",
+      "user.",
+      "settings.",
+      "llm.",
+      "resource.",
+      "version.",
+      "agent.",
+      "agent_profile.",
+      "quality.",
+      "case.",
+      "execution.",
+      "visual.",
+      "content.",
+    ]
     for (const prefix of prefixes) {
       expect(AUDIT_ACTIONS.some((action) => action.name.startsWith(prefix))).toBe(true)
     }

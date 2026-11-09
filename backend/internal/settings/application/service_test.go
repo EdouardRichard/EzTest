@@ -28,6 +28,8 @@ type fakeRepo struct {
 	items     map[string]settings.Setting
 	revisions []settings.Revision
 	seedCalls int
+	getCalls  int
+	getErr    error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -44,6 +46,10 @@ func (f *fakeRepo) List(context.Context) ([]settings.Setting, error) {
 }
 
 func (f *fakeRepo) Get(_ context.Context, key string) (settings.Setting, error) {
+	f.getCalls++
+	if f.getErr != nil {
+		return settings.Setting{}, f.getErr
+	}
 	item, ok := f.items[key]
 	if !ok {
 		return settings.Setting{}, settings.ErrNotFound
@@ -66,11 +72,12 @@ func (f *fakeRepo) Seed(_ context.Context, definitions []settings.Definition) er
 	return nil
 }
 
-func (f *fakeRepo) Update(_ context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (settings.Setting, error) {
+func (f *fakeRepo) Update(_ context.Context, key string, value json.RawMessage, revisionID, actorID int64, at time.Time) (json.RawMessage, settings.Setting, error) {
 	item, ok := f.items[key]
 	if !ok {
-		return settings.Setting{}, settings.ErrNotFound
+		return nil, settings.Setting{}, settings.ErrNotFound
 	}
+	previous := append(json.RawMessage(nil), item.Value...)
 	f.revisions = append(f.revisions, settings.Revision{
 		ID: revisionID, Key: key, OldValue: item.Value, NewValue: value,
 		ActorID: &actorID, CreatedAt: at,
@@ -80,7 +87,7 @@ func (f *fakeRepo) Update(_ context.Context, key string, value json.RawMessage, 
 	item.UpdatedBy = &actorID
 	item.UpdatedAt = at
 	f.items[key] = item
-	return item, nil
+	return previous, item, nil
 }
 
 func (f *fakeRepo) Revisions(_ context.Context, key string, limit int, beforeID *int64) ([]settings.Revision, error) {
@@ -501,6 +508,31 @@ func TestUpdateAuditRecordsOldAndNewValues(t *testing.T) {
 	metadata := audit.events[1].Metadata
 	if metadata["old_value"] != "5" || metadata["new_value"] != "6" {
 		t.Fatalf("metadata = %#v, want old_value=5 new_value=6", metadata)
+	}
+}
+
+// TestUpdateUsesAtomicPreviousValue pins the repository contract: Update
+// returns the previous value it locked inside the write transaction, so the
+// service must not pre-read. A failed pre-read used to drop old_value silently.
+func TestUpdateUsesAtomicPreviousValue(t *testing.T) {
+	repo := newFakeRepo()
+	svc, audit, _ := newTestService(t, repo)
+	ctx := context.Background()
+	if err := svc.SeedDefaults(ctx); err != nil {
+		t.Fatalf("SeedDefaults: %v", err)
+	}
+
+	repo.getCalls = 0
+	repo.getErr = errors.New("service must not pre-read settings")
+	if _, err := svc.Update(ctx, "execution.global_concurrency", 5, 42); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if repo.getCalls != 0 {
+		t.Fatalf("Update called repository Get %d time(s), want 0", repo.getCalls)
+	}
+	metadata := audit.events[0].Metadata
+	if metadata["old_value"] != "3" || metadata["new_value"] != "5" {
+		t.Fatalf("metadata = %#v, want old_value=3 new_value=5", metadata)
 	}
 }
 

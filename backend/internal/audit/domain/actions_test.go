@@ -32,8 +32,14 @@ func TestActionsCatalogIsUniqueAndWellFormed(t *testing.T) {
 			aliases[alias] = true
 		}
 	}
+	for alias := range aliases {
+		if names[alias] {
+			t.Fatalf("alias %q shadows another action's canonical name", alias)
+		}
+	}
 	for _, prefix := range []string{
 		"auth.", "user.", "settings.", "llm.", "resource.", "version.", "agent.",
+		"agent_profile.", "quality.", "case.", "execution.", "visual.", "content.",
 	} {
 		found := false
 		for name := range names {
@@ -44,6 +50,37 @@ func TestActionsCatalogIsUniqueAndWellFormed(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("catalog has no %q action", prefix)
+		}
+	}
+}
+
+// curatedEmitterActions ties the catalog to code that actually records audit
+// entries. The list is intentionally curated rather than generated: it stays
+// stable across refactors, while the source check catches a renamed or removed
+// emitter so the catalog cannot keep advertising a dead action.
+var curatedEmitterActions = []struct {
+	action string
+	source string // relative to backend/internal
+}{
+	{"agent_profile.backfilled", "agent/application/profile_backfill.go"},
+	{"quality.eval_recorded", "quality/application/service.go"},
+	{"case.updated", "design/application/data_plan.go"},
+	{"execution.credentials_read", "execution/application/credentials.go"},
+	{"visual.diff.create", "visual/application/diff_service.go"},
+	{"content.uploaded", "storage/application/service.go"},
+}
+
+func TestCuratedEmitterActionsAreInCatalog(t *testing.T) {
+	for _, emitter := range curatedEmitterActions {
+		if !HasAction(emitter.action) {
+			t.Errorf("emitter action %q (%s) is missing from the catalog", emitter.action, emitter.source)
+		}
+		raw, err := os.ReadFile(filepath.Join("..", "..", emitter.source))
+		if err != nil {
+			t.Fatalf("read emitter source %s: %v", emitter.source, err)
+		}
+		if !strings.Contains(string(raw), `"`+emitter.action+`"`) {
+			t.Errorf("%s no longer emits %q; update the catalog and this list together", emitter.source, emitter.action)
 		}
 	}
 }
