@@ -14,7 +14,7 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { listEvidence } from "@/features/execution/api"
-import { EvidenceViewer } from "@/features/execution/EvidenceViewer"
+import { EvidenceViewer, revokeSoon } from "@/features/execution/EvidenceViewer"
 import type { Evidence } from "@/features/execution/types"
 import { formatDateTime } from "@/lib/format"
 
@@ -71,7 +71,8 @@ function saveBlob(blob: Blob, filename: string): void {
   document.body.appendChild(anchor)
   anchor.click()
   anchor.remove()
-  URL.revokeObjectURL(url)
+  // X-05: give the browser a tick to consume the download before revoking.
+  revokeSoon(url)
 }
 
 /**
@@ -127,6 +128,11 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
   const [regenerating, setRegenerating] = useState(false)
   const [regenerateError, setRegenerateError] = useState<unknown>(null)
 
+  // The list effect auto-selects inside the kind the UI is currently showing;
+  // keep the live kind in a ref so the callback does not need it as a dep.
+  const kindRef = useRef<ReportKind>(kind)
+  kindRef.current = kind
+
   // Follow URL deep links (back/forward) without rewriting them on mount.
   useEffect(() => {
     const urlReport = searchParams.get("report")
@@ -155,8 +161,11 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
         setSelectedReportId((current) => {
           if (current !== null) return current
           if (linkedReportId !== null) return linkedReportId
-          const versionReport = items.find((report) => report.kind === "version")
-          return versionReport?.id ?? items[0]?.id ?? null
+          // X-06: only auto-select a report of the kind currently shown. A
+          // wave-only version previously selected `items[0]` while the list
+          // stayed on "version", leaving 0 rows but a wave detail.
+          const currentKindReport = items.find((report) => report.kind === kindRef.current)
+          return currentKindReport?.id ?? null
         })
       })
       .catch((cause: unknown) => {
@@ -445,7 +454,9 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       const download = await downloadHTML(versionId, detail.id, revision.revision)
       const url = URL.createObjectURL(download.blob)
       window.open(url, "_blank", "noopener,noreferrer")
-      URL.revokeObjectURL(url)
+      // X-05: the new tab may not have committed its navigation yet; revoking
+      // in the same tick races it and can surface ERR_FILE_NOT_FOUND.
+      revokeSoon(url)
     } catch (cause) {
       setActionError(cause)
     } finally {
@@ -693,6 +704,7 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       <EvidenceViewer
         versionId={versionId}
         evidence={viewerEvidence}
+        candidates={evidence}
         open={viewerEvidence !== null}
         onClose={() => setViewerEvidence(null)}
       />

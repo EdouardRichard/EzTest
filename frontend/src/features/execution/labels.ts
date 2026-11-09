@@ -208,11 +208,39 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   timeout: "执行超时",
   executor_lost: "执行器失联",
   agent_failure: "Agent 运行失败",
+  // v0.2.3 X-01/X-02: executor transport and capability typing. These are the
+  // stable causes Task 11 persists; the UI must never show the raw code.
+  executor_timeout: "执行器超时",
+  executor_context_create_failed: "执行器上下文创建失败",
+  executor_unavailable: "执行器不可用",
+  executor_capability: "执行器能力不足",
+  lease_expired: "执行租约过期",
 }
 
 export function terminalCauseLabel(value: string | undefined): string | null {
   if (value === undefined || value === "") return null
   return CASE_RUN_TERMINAL_CAUSE_LABEL[value] ?? value
+}
+
+/**
+ * Renders a stable cause / failure-class enum as Chinese (X-07).
+ *
+ * `summary.verdict_reason` and `summary.last_error` normally carry a stable
+ * code, but historical rows wrote the raw failure enum into either field. A
+ * whole value that matches a known cause or failure class is localized; any
+ * other value is treated as prose and passed through untouched. Empty values
+ * render nothing.
+ */
+export function causeTextLabel(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? ""
+  if (trimmed === "") return null
+  if (trimmed in CASE_RUN_TERMINAL_CAUSE_LABEL) {
+    return CASE_RUN_TERMINAL_CAUSE_LABEL[trimmed]
+  }
+  if (trimmed in FAILURE_CLASS_LABEL) {
+    return FAILURE_CLASS_LABEL[trimmed as FailureClassKey]
+  }
+  return trimmed
 }
 
 /** Stable `case_run.summary.next_action` codes and their human affordance. */

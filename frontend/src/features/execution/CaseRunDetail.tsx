@@ -23,6 +23,7 @@ import {
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
   CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
+  causeTextLabel,
   EVIDENCE_KIND_LABEL,
   failureClassLabel,
   nextActionLabel,
@@ -164,11 +165,7 @@ type CreateIssueDialogProps = {
  */
 function CreateIssueDialog({ versionId, run, evidence, onClose }: CreateIssueDialogProps) {
   const defaultSummary =
-    typeof run.summary.last_error === "string" && run.summary.last_error.length > 0
-      ? run.summary.last_error
-      : typeof run.summary.verdict_reason === "string"
-        ? run.summary.verdict_reason
-        : ""
+    causeTextLabel(run.summary.last_error) ?? causeTextLabel(run.summary.verdict_reason) ?? ""
   const evidenceIds = evidence.slice(0, 5).map((item) => item.id)
 
   const [title, setTitle] = useState(run.title)
@@ -327,9 +324,10 @@ export function CaseRunDetailView({
     (item) => item.step_seq === null || item.step_seq === undefined,
   )
   const terminalCause = terminalCauseLabel(run.summary.terminal_cause)
-  const verdictReason =
-    typeof run.summary.verdict_reason === "string" ? run.summary.verdict_reason.trim() : ""
-  const lastError = typeof run.summary.last_error === "string" ? run.summary.last_error.trim() : ""
+  // `verdict_reason`/`last_error` may still carry a raw stable enum on legacy
+  // rows; localize a bare code before deciding whether there is prose to show.
+  const verdictReason = causeTextLabel(run.summary.verdict_reason) ?? ""
+  const lastError = causeTextLabel(run.summary.last_error) ?? ""
   const nextAction =
     nextActionLabel(run.summary.next_action) ??
     (run.status === "blocked" ? "先解决阻塞条件（账号/环境/数据），再重跑用例" : null)
@@ -469,6 +467,7 @@ export function CaseRunDetailView({
       <EvidenceViewer
         versionId={versionId}
         evidence={viewerEvidence}
+        candidates={detail.evidence}
         open={viewerEvidence !== null}
         onClose={() => setViewerEvidence(null)}
       />

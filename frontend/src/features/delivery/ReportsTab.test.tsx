@@ -261,7 +261,10 @@ describe("ReportsTab", () => {
   })
 
   afterEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
     cleanup()
+    vi.clearAllTimers()
+    vi.useRealTimers()
     Reflect.deleteProperty(URL, "createObjectURL")
     Reflect.deleteProperty(URL, "revokeObjectURL")
   })
@@ -436,7 +439,18 @@ describe("ReportsTab", () => {
     expect(screen.getByText(/已提交重新生成/)).toBeInTheDocument()
   })
 
-  it("opens the report HTML in a new window through apiDownload", async () => {
+  it("does not auto-select a wave report under the version kind (X-06)", async () => {
+    api.listReports.mockResolvedValue([waveReport])
+
+    render(<ReportsTab versionId="2001" />)
+
+    expect(await screen.findByText("暂无报告")).toBeInTheDocument()
+    expect(screen.getByText("0 份")).toBeInTheDocument()
+    expect(await screen.findByText("请选择报告")).toBeInTheDocument()
+    expect(api.getReport).not.toHaveBeenCalled()
+  })
+
+  it("opens the report HTML in a new window and revokes the blob URL after a delay", async () => {
     const createObjectURL = vi.fn(() => "blob:report-html")
     const revokeObjectURL = vi.fn()
     Object.assign(URL, { createObjectURL, revokeObjectURL })
@@ -444,12 +458,27 @@ describe("ReportsTab", () => {
 
     render(<ReportsTab versionId="2001" />)
     await screen.findByTestId("report-8101")
+    const openButton = await within(detailPanel()).findByRole("button", { name: "打开报告 HTML" })
 
-    fireEvent.click(await within(detailPanel()).findByRole("button", { name: "打开报告 HTML" }))
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+    try {
+      fireEvent.click(openButton)
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
 
-    await waitFor(() => expect(api.downloadHTML).toHaveBeenCalledWith("2001", "8101", 2))
-    expect(open).toHaveBeenCalledWith("blob:report-html", "_blank", "noopener,noreferrer")
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:report-html")
+      expect(api.downloadHTML).toHaveBeenCalledWith("2001", "8101", 2)
+      expect(open).toHaveBeenCalledWith("blob:report-html", "_blank", "noopener,noreferrer")
+      expect(revokeObjectURL).not.toHaveBeenCalled()
+
+      act(() => {
+        vi.advanceTimersByTime(1000)
+      })
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:report-html")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("downloads the report HTML with the server filename", async () => {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -30,7 +30,11 @@ vi.mock("@/features/clarification/useVersionEvents", () => ({
   useVersionEvents: () => "live",
 }))
 
-import { passedCaseRunFixture, runningWaveFixture } from "@/features/execution/test-fixtures"
+import {
+  doneWaveFixture,
+  passedCaseRunFixture,
+  runningWaveFixture,
+} from "@/features/execution/test-fixtures"
 import {
   visualAssertionFixture,
   visualAssertionWithoutBaselineFixture,
@@ -123,6 +127,22 @@ describe("VisualView", () => {
       "href",
       "/quality?version=2001",
     )
+  })
+
+  it("labels wave options in Chinese instead of raw status enums (X-04)", async () => {
+    executionApi.listWaves.mockResolvedValue([runningWaveFixture, doneWaveFixture])
+
+    render(<VisualView versionId="2001" />)
+
+    await screen.findByTestId("visual-view")
+    const select = await screen.findByLabelText("波次")
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["#9201 · 执行中", "#9199 · 已完成"])
+    expect(select.textContent).not.toContain("running")
+    expect(select.textContent).not.toContain("done")
   })
 
   it("opens the diff viewer and approves the actual evidence as a baseline", async () => {

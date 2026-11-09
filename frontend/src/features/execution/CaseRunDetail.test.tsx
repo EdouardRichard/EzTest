@@ -59,6 +59,21 @@ function blockedDetail(): CaseRunDetail {
 
 afterEach(cleanup)
 
+function overrideSummary(
+  overrides: Partial<CaseRunDetail["case_run"]> = {},
+  summary: CaseRunDetail["case_run"]["summary"] = {},
+): CaseRunDetail {
+  const base = caseRunDetailFixture
+  return {
+    ...base,
+    case_run: {
+      ...base.case_run,
+      ...overrides,
+      summary: { ...base.case_run.summary, ...summary },
+    },
+  }
+}
+
 describe("CaseRunDetail incomplete cause", () => {
   it("explains an incomplete run with its concrete budget cause", () => {
     render(
@@ -218,5 +233,78 @@ describe("CaseRunDetail incomplete cause", () => {
     const usage = screen.getByTestId("case-run-usage")
     expect(usage).toHaveTextContent("180000")
     expect(usage).toHaveTextContent("12 轮")
+  })
+})
+
+describe("CaseRunDetail cause labels (X-07)", () => {
+  it("localizes an executor_lost failure and never renders the raw enum", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "executor_lost" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_lost",
+            last_error: "executor_lost",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent("执行器失联")
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent("执行器失联")
+    expect(document.body.textContent).not.toContain("executor_lost")
+  })
+
+  it("localizes a legacy running row's raw verdict reason", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "running", failure_class: "" },
+          { verdict_reason: "executor_lost", last_error: "executor_lost" },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("执行中")
+    expect(screen.getByText(/执行器失联/)).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain("executor_lost")
+  })
+
+  it.each([
+    ["executor_timeout", "执行器超时"],
+    ["executor_context_create_failed", "执行器上下文创建失败"],
+    ["executor_capability", "执行器能力不足"],
+  ])("maps the %s terminal cause to %s", (cause, label) => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: cause,
+            terminal_cause: cause,
+            last_error: cause,
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent(label)
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(label)
+    expect(document.body.textContent).not.toContain(cause)
   })
 })

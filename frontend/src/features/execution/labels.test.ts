@@ -6,7 +6,9 @@ import {
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
   CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
+  CASE_RUN_TERMINAL_CAUSE_LABEL,
   CASE_RUN_TERMINAL_STATUSES,
+  causeTextLabel,
   EVIDENCE_KIND_LABEL,
   EXECUTOR_STATUS_LABEL,
   FAILURE_CLASS_LABEL,
@@ -84,6 +86,30 @@ describe("failure class labels", () => {
     expect(failureClassLabel("")).toBe("—")
     expect(failureClassLabel("application")).toBe("应用缺陷")
     expect(failureClassLabel("executor_lost" as FailureClass)).toBe("执行器失联")
+  })
+})
+
+describe("terminal cause labels (X-01/X-02/X-07)", () => {
+  it("labels the new executor causes from v0.2.3", () => {
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_timeout).toBe("执行器超时")
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_context_create_failed).toBe(
+      "执行器上下文创建失败",
+    )
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_capability).toBe("执行器能力不足")
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_unavailable).toBe("执行器不可用")
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.lease_expired).toBe("执行租约过期")
+  })
+
+  it("humanizes stable cause/failure enum values but leaves prose alone", () => {
+    expect(causeTextLabel("executor_timeout")).toBe("执行器超时")
+    expect(causeTextLabel("executor_context_create_failed")).toBe("执行器上下文创建失败")
+    expect(causeTextLabel("executor_capability")).toBe("执行器能力不足")
+    expect(causeTextLabel("executor_lost")).toBe("执行器失联")
+    expect(causeTextLabel("agent_failure")).toBe("Agent 运行失败")
+    expect(causeTextLabel("missing_account")).toBe("缺少测试账号")
+    expect(causeTextLabel("登录后跳转超时")).toBe("登录后跳转超时")
+    expect(causeTextLabel("")).toBeNull()
+    expect(causeTextLabel(undefined)).toBeNull()
   })
 })
 
