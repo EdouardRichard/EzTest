@@ -101,7 +101,8 @@ export function Topbar() {
 
       <div className="ml-auto flex items-center gap-2">
         <CommandPalette />
-        <TodoDrawerButton versionId={currentVersionId} />
+        {/* Public shell (e.g. the custom 404) has no session: never start the authenticated todo poll. */}
+        {token === null ? null : <TodoDrawerButton versionId={currentVersionId} />}
 
         <span
           data-testid="sse-status"
