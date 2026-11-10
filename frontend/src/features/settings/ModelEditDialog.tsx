@@ -166,12 +166,18 @@ export function ModelEditDialog({ model, onClose, onModelChange }: ModelEditDial
       return
     }
 
-    const patch: UpdateLLMModelInput = {
-      supports_tools: supportsTools,
-      supports_vision: supportsVision,
-      supports_reasoning: supportsReasoning,
-      supports_prompt_cache: supportsPromptCache,
-      deprecated,
+    // Diff capabilities against the last known server row (`current`, which a
+    // successful reset replaces) so editing one flag never turns the untouched
+    // catalog-owned flags into manual overrides (R2-S-01).
+    const baseline = modelCapabilities(current)
+    const patch: UpdateLLMModelInput = { deprecated }
+    if (supportsTools !== baseline.supports_tools) patch.supports_tools = supportsTools
+    if (supportsVision !== baseline.supports_vision) patch.supports_vision = supportsVision
+    if (supportsReasoning !== baseline.supports_reasoning) {
+      patch.supports_reasoning = supportsReasoning
+    }
+    if (supportsPromptCache !== baseline.supports_prompt_cache) {
+      patch.supports_prompt_cache = supportsPromptCache
     }
     // Only send numeric fields that actually changed, so editing capabilities
     // never silently flips a catalog-owned value to manual.
