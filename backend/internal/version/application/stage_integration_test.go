@@ -352,13 +352,15 @@ func TestStageHappyPathToCompleted(t *testing.T) {
 		}
 	}
 
-	// The design handoff hook, the version-report ensurer and the version closer
-	// each ran exactly once through their production edges.
+	// The design handoff hook and the version closer each ran exactly once
+	// through their production edges. The version-report ensurer is not part of
+	// the executing -> reporting edge any more (R2-NEW-02): the stage-entry
+	// report.version job and the P4 reconciler own report generation.
 	if len(env.handoff.versionIDs) != 1 || env.handoff.versionIDs[0] != stageServiceVersionID {
 		t.Fatalf("handoff calls = %#v, want one for %d", env.handoff.versionIDs, stageServiceVersionID)
 	}
-	if len(env.reports.versionIDs) != 1 || env.reports.versionIDs[0] != stageServiceVersionID {
-		t.Fatalf("report ensure calls = %#v, want one for %d", env.reports.versionIDs, stageServiceVersionID)
+	if len(env.reports.versionIDs) != 0 {
+		t.Fatalf("executing -> reporting ensured a version report: %#v", env.reports.versionIDs)
 	}
 	if len(env.closer.versionIDs) != 1 || env.closer.versionIDs[0] != stageServiceVersionID {
 		t.Fatalf("version close calls = %#v, want one for %d", env.closer.versionIDs, stageServiceVersionID)
@@ -751,19 +753,38 @@ func TestHandoffFailureDoesNotBlockDesigning(t *testing.T) {
 	env.requireStage(t, version.StageDesigning)
 }
 
-// TestStageReportsFailureBlocksReporting pins the report-generation half of the
-// executing -> reporting gate: without an ensured version report the callback
-// rejects with a typed gate error.
-func TestStageReportsFailureBlocksReporting(t *testing.T) {
+// TestStageRequiresOnlyTerminalWavesForReporting pins the corrected
+// executing -> reporting edge (R2-NEW-02): the edge waits only for every wave to
+// be terminal. Producing the version report is the reporting stage's job (its
+// stage-entry report.version job and the P4 report reconciler), so a report
+// ensure failure must no longer block the edge.
+func TestStageRequiresOnlyTerminalWavesForReporting(t *testing.T) {
 	env := newStageServiceEnv(t, version.StageExecuting)
+	// The reports port is deliberately failing: it must not participate.
 	env.reports.err = errors.New("report generation gate is closed")
-	err := env.svc.OnWaveTerminal(requestContext(), 71)
-	var gateErr *versionapp.StageGateError
-	if !errors.As(err, &gateErr) || gateErr.Reason != "report_not_generated" {
-		t.Fatalf("report gate error = %v", err)
+
+	if err := env.svc.OnWaveTerminal(requestContext(), 71); err != nil {
+		t.Fatalf("OnWaveTerminal with a failing report port: %v", err)
 	}
-	if len(env.repo.applied) != 0 {
-		t.Fatalf("report gate failure wrote stage: %#v", env.repo.applied)
+	env.requireStage(t, version.StageReporting)
+	if len(env.reports.versionIDs) != 0 {
+		t.Fatalf("executing -> reporting ensured a version report: %#v", env.reports.versionIDs)
+	}
+	if len(env.jobs.jobs) != 1 || env.jobs.jobs[0].Kind != versionapp.StageJobReportVersion {
+		t.Fatalf("stage-entry jobs = %#v, want one report.version job", env.jobs.jobs)
+	}
+
+	// The gate itself still requires every wave to be terminal.
+	active := newStageServiceEnv(t, version.StageExecuting)
+	active.gates.wavesTerminal = false
+	err := active.svc.OnWaveTerminal(requestContext(), 71)
+	var gateErr *versionapp.StageGateError
+	if !errors.As(err, &gateErr) || gateErr.Reason != "waves_active" {
+		t.Fatalf("active-wave error = %v, want a waves_active gate", err)
+	}
+	active.requireStage(t, version.StageExecuting)
+	if len(active.repo.applied) != 0 {
+		t.Fatalf("active-wave gate wrote stage: %#v", active.repo.applied)
 	}
 }
 
@@ -913,32 +934,70 @@ func TestOnReportPublishedRetriesAfterCloseWonButStageCASLost(t *testing.T) {
 	}
 }
 
-// TestStageReconcileRetriesTransientReportFailure covers review fix 2: a
-// transient EnsureVersionReport failure after the wave already finalized must be
-// retryable without a manual stage API call. Reconcile is the production
-// reconciler hook; the first pass fails the report gate, the second advances.
-func TestStageReconcileRetriesTransientReportFailure(t *testing.T) {
+// TestStageReconcileEntersReportingWithOpenRequirements replaces the obsolete
+// transient-report retry contract (R2-NEW-02): a version whose waves are all
+// terminal enters reporting even when the report cannot be ensured yet, because
+// the report gate no longer participates in this stage edge. The version may
+// still have open requirements (for example blocked/inconclusive execution), so
+// the old "retry until the report is created" deadlock must not come back.
+func TestStageReconcileEntersReportingWithOpenRequirements(t *testing.T) {
 	env := newStageServiceEnv(t, version.StageExecuting)
 	env.reports.err = errors.New("report store unavailable")
 
-	err := env.svc.Reconcile(requestContext(), stageServiceVersionID)
-	var gateErr *versionapp.StageGateError
-	if !errors.As(err, &gateErr) || gateErr.Reason != "report_not_generated" {
-		t.Fatalf("first Reconcile error = %v, want report_not_generated gate", err)
-	}
-	env.requireStage(t, version.StageExecuting)
-	if len(env.repo.applied) != 0 {
-		t.Fatalf("failed reconcile wrote stage: %#v", env.repo.applied)
-	}
-
-	env.reports.err = nil
 	if err := env.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
-		t.Fatalf("retry Reconcile: %v", err)
+		t.Fatalf("Reconcile with a failing report port: %v", err)
 	}
 	env.requireStage(t, version.StageReporting)
-	if len(env.reports.versionIDs) != 2 {
-		t.Fatalf("report ensure calls = %#v, want two", env.reports.versionIDs)
+	if len(env.reports.versionIDs) != 0 {
+		t.Fatalf("reconcile ensured a version report: %#v", env.reports.versionIDs)
 	}
+	if len(env.jobs.jobs) != 1 || env.jobs.jobs[0].Kind != versionapp.StageJobReportVersion {
+		t.Fatalf("stage-entry jobs = %#v, want one report.version job", env.jobs.jobs)
+	}
+}
+
+// TestStageReconcileNoopsOnDeterministicCloseGate pins the reporting branch's
+// deterministic-gate no-op (R2-NEW-02): a version close rejected by the close
+// predicate (for example requirements not closed under the legacy completed
+// semantics) cannot be fixed by retrying on every scheduler tick, so Reconcile
+// returns nil and leaves the 30s reconciler to retry. Before the fix this
+// surfaced as a per-second WARN storm.
+func TestStageReconcileNoopsOnDeterministicCloseGate(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageReporting)
+	env.gates.reportPublished = true
+	env.closer.err = &version.ErrVersionClosePredicateFailed{
+		Failed: map[string]int{"requirements_closed": 1},
+	}
+
+	if err := env.svc.Reconcile(requestContext(), stageServiceVersionID); err != nil {
+		t.Fatalf("Reconcile with a deterministic close gate: %v", err)
+	}
+	env.requireStage(t, version.StageReporting)
+	if len(env.repo.applied) != 0 {
+		t.Fatalf("deterministic close gate wrote the stage: %#v", env.repo.applied)
+	}
+	if len(env.closer.versionIDs) != 1 {
+		t.Fatalf("closer calls = %#v, want one", env.closer.versionIDs)
+	}
+}
+
+// TestStageReconcileKeepsRetryingTransientCloseError is the counterpart: a
+// port/database failure while closing the version is transient and must stay a
+// *StageGateError so the scheduler keeps the version pending and retries.
+func TestStageReconcileKeepsRetryingTransientCloseError(t *testing.T) {
+	env := newStageServiceEnv(t, version.StageReporting)
+	env.gates.reportPublished = true
+	env.closer.err = errors.New("db down")
+
+	err := env.svc.Reconcile(requestContext(), stageServiceVersionID)
+	var gateErr *versionapp.StageGateError
+	if !errors.As(err, &gateErr) {
+		t.Fatalf("transient close error = %v, want *StageGateError", err)
+	}
+	if gateErr.Gate != "version_close" {
+		t.Fatalf("transient close gate = %q, want version_close", gateErr.Gate)
+	}
+	env.requireStage(t, version.StageReporting)
 }
 
 // TestStageReconcileNoOpsWhenNotReady documents the reconciler contract: a

@@ -201,6 +201,16 @@ type RequirementSnapshot struct {
 	CloseRound       int32
 	ReopenCount      int
 	UpdatedAt        time.Time
+	// ExecutionSettled is derived execution metadata: true when the requirement
+	// has at least one current+confirmed case version and every such case
+	// version's latest non-superseded case_run is terminal (blocked,
+	// inconclusive and skipped count as terminal). It is deliberately NOT part of
+	// the canonical fingerprint payload (report_fingerprint.go): adding it there
+	// would change every stored fingerprint and mass-mark published reports
+	// stale. The report due gate uses it so a requirement whose closure predicate
+	// can never pass (blocked/inconclusive case, failed case without an issue
+	// yet) does not block the version report forever (R2-NEW-02).
+	ExecutionSettled bool
 }
 
 // WaveSnapshot is one wave projection of a report. Counts are fixed fields (no

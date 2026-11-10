@@ -755,4 +755,81 @@ func TestReportDataReaderVersionReportReady(t *testing.T) {
 	}
 }
 
+// TestReadModelRequirementExecutionSettled pins the derived settled projection
+// the report due gate consumes (R2-NEW-02). A requirement is settled only when
+// it has at least one executable case and every executable case's latest
+// non-superseded run is terminal (blocked/inconclusive count as terminal, a
+// missing run does not). A requirement without executable cases is never
+// settled. ExecutionSettled is derived metadata and must not participate in the
+// report fingerprint.
+func TestReadModelRequirementExecutionSettled(t *testing.T) {
+	deps, _ := newReadModelFixture()
+	design := deps.Design.(*fakeDesign)
+	requirements := deps.Requirements.(*fakeRequirements)
+	requirements.views[7] = append(requirements.views[7], versionapp.RequirementView{
+		ID: 102, Title: "Requirement B", Status: "clarified", UpdatedAt: fixtureAfter,
+	})
+	reader := NewReportDataReader(deps)
+
+	// The fixture requirement 101 has two executable cases whose latest runs are
+	// failed and passed: both are terminal, so the requirement is settled.
+	snapshot, err := reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot: %v", err)
+	}
+	settledByID := func(snapshot delivery.ReportSnapshot) map[int64]bool {
+		out := make(map[int64]bool, len(snapshot.Requirements))
+		for _, requirement := range snapshot.Requirements {
+			out[requirement.ID] = requirement.ExecutionSettled
+		}
+		return out
+	}
+	settled := settledByID(snapshot)
+	if !settled[101] {
+		t.Fatalf("requirement 101 settled = false, want true (failed+passed runs are terminal)")
+	}
+	if settled[102] {
+		t.Fatalf("requirement 102 without executable cases settled = true, want false")
+	}
+
+	// A third executable case without any run leaves the requirement unsettled.
+	design.cases[7] = append(design.cases[7], designapp.ExecutableCaseView{
+		CaseID: 203, CaseVersionID: 3004, RequirementID: 101, RequirementVersionID: 1001, Title: "Case C",
+	})
+	snapshot, err = reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot after adding an unrun case: %v", err)
+	}
+	if settledByID(snapshot)[101] {
+		t.Fatal("requirement 101 settled = true while one executable case has no run")
+	}
+
+	// A terminal blocked run settles the remaining case: blocked is terminal.
+	runs := deps.CaseRuns.(*fakeCaseRuns)
+	runs.runs = append(runs.runs, execution.CaseRun{
+		ID: 5004, WaveID: 11, CaseVersionID: 3004, Status: execution.CaseRunBlocked,
+		CreatedAt: fixtureTime, UpdatedAt: fixtureTime,
+	})
+	settledSnapshot, err := reader.VersionSnapshot(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("VersionSnapshot after the blocked run: %v", err)
+	}
+	settled = settledByID(settledSnapshot)
+	if !settled[101] {
+		t.Fatal("requirement 101 settled = false after every executable case became terminal")
+	}
+	if settled[102] {
+		t.Fatal("requirement 102 without executable cases settled = true, want false")
+	}
+
+	// The derived flag must never enter the canonical fingerprint payload.
+	baseline := delivery.Fingerprint(settledSnapshot)
+	for index := range settledSnapshot.Requirements {
+		settledSnapshot.Requirements[index].ExecutionSettled = false
+	}
+	if got := delivery.Fingerprint(settledSnapshot); got != baseline {
+		t.Fatalf("fingerprint changed with ExecutionSettled: %s != %s", got, baseline)
+	}
+}
+
 func intPtr(value int) *int { return &value }

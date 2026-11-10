@@ -465,6 +465,11 @@ type RequirementSnapshot struct {
 	CloseRound       int32
 	ReopenCount      int
 	UpdatedAt        time.Time
+	// ExecutionSettled mirrors delivery.RequirementSnapshot.ExecutionSettled: it
+	// is derived execution metadata (every current+confirmed case version has a
+	// terminal latest case_run), is never fingerprinted, and lets the report due
+	// gate treat an executed-but-not-closed requirement as settled (R2-NEW-02).
+	ExecutionSettled bool
 }
 
 // VersionSUTSnapshot is one version SUT binding used to label report rows and
