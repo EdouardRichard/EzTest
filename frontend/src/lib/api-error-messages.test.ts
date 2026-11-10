@@ -237,6 +237,105 @@ describe("localizeApiError default-model capability errors", () => {
   })
 })
 
+describe("localizeApiError stage gate rejections", () => {
+  it("localizes the requirement_confirmation gate to Chinese guidance", () => {
+    const localized = localizeApiError(
+      apiError(
+        409,
+        "stage_gate_failed",
+        "stage gate requirement_confirmation is closed: requirements_unconfirmed (confirm every current requirement before starting design)",
+        {
+          gate: "requirement_confirmation",
+          reason: "requirements_unconfirmed",
+          action: "confirm every current requirement before starting design",
+          next: "designing",
+          // Even a future typed hint must not override the Chinese catalog copy.
+          next_action: "confirm every current requirement before starting design",
+        },
+      ),
+    )
+
+    expect(localized.message).toBe("需先确认全部需求，才能开始设计")
+    expect(localized.message).not.toContain("requirements_unconfirmed")
+    expect(localized.message).not.toContain("stage gate")
+    expect(localized.nextAction).toContain("草案")
+    expect(localized.nextAction).toContain("批量确认")
+    expect(localized.nextAction).not.toContain("confirm every current requirement")
+  })
+
+  it("never leaks the raw English gate message for an unmapped gate reason", () => {
+    const localized = localizeApiError(
+      apiError(
+        409,
+        "stage_gate_failed",
+        "stage gate wave is closed: waves_active (wait for every wave to finish)",
+        {
+          gate: "wave",
+          reason: "waves_active",
+          action: "wait for every wave to finish",
+          next: "reporting",
+        },
+      ),
+    )
+
+    expect(localized.message).toBe("当前操作未通过版本阶段门禁")
+    expect(localized.message).not.toContain("stage gate")
+    expect(localized.message).not.toContain("waves_active")
+    expect(localized.nextAction).not.toContain("wait for every wave")
+    expect(localized.nextAction).not.toContain("reporting")
+  })
+})
+
+describe("localizeApiError default-model delete guard", () => {
+  it("localizes the default-model delete guard and replaces the English next action", () => {
+    const localized = localizeApiError(
+      apiError(
+        409,
+        "default_model_in_use",
+        'model "deepseek-flash" is the default model of llm config "acceptance-deepseek-flash"; set default_model_id to another model before deleting it',
+        {
+          config_id: "7001",
+          config_name: "acceptance-deepseek-flash",
+          default_model_id: "8001",
+          field: "default_model_id",
+          next_action: "choose another model as default_model_id, then delete this model",
+        },
+      ),
+    )
+
+    expect(localized.message).toBe("该模型是当前配置的默认模型，无法删除")
+    expect(localized.nextAction).toBe("请先切换默认模型，再删除该模型")
+    expect(localized.field).toBe("default_model_id")
+    expect(localized.nextAction).not.toMatch(/choose another model/)
+  })
+
+  it("keeps the Chinese catalog copy when the English message embeds a CJK config name", () => {
+    // The backend message embeds the user-editable config name, so a CJK name
+    // inside an otherwise English message must not make it look "Chinese
+    // enough" to keep as the main copy.
+    const localized = localizeApiError(
+      apiError(
+        409,
+        "default_model_in_use",
+        'model "manual-a" is the default model of llm config "验收配置"; set default_model_id to another model before deleting it',
+        {
+          config_id: "7001",
+          config_name: "验收配置",
+          default_model_id: "8001",
+          field: "default_model_id",
+          next_action: "choose another model as default_model_id, then delete this model",
+        },
+      ),
+    )
+
+    expect(localized.message).toBe("该模型是当前配置的默认模型，无法删除")
+    expect(localized.message).not.toContain("验收配置")
+    expect(localized.message).not.toContain("is the default model of llm config")
+    expect(localized.nextAction).toBe("请先切换默认模型，再删除该模型")
+    expect(localized.nextAction).not.toContain("choose another model")
+  })
+})
+
 describe("localizeApiError fallbacks", () => {
   it("keeps the API message and typed next action for unmapped codes", () => {
     const localized = localizeApiError(

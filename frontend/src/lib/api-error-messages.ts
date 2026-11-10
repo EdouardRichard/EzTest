@@ -89,6 +89,30 @@ const DEFAULT_MODEL_FOREIGN: CatalogEntry = {
   nextAction: "请在「设置 → LLM 配置」中从该配置的模型里选择默认模型",
 }
 
+/**
+ * 409 stage_gate_failed (versionapp.StageGateError.APIError). The backend keeps
+ * the English gate/action/next machine hints; the UI owns the Chinese copy and
+ * the actionable next step. Keyed by `details.reason`.
+ */
+const STAGE_GATE_MESSAGES: Record<string, CatalogEntry> = {
+  requirements_unconfirmed: {
+    message: "需先确认全部需求，才能开始设计",
+    nextAction: "筛选「草案」→ 批量确认需求 → 再开始设计",
+  },
+}
+
+/** Unknown gate reasons must never print the raw English StageGateError text. */
+const STAGE_GATE_FALLBACK: CatalogEntry = {
+  message: "当前操作未通过版本阶段门禁",
+  nextAction: "请按页面提示完成前置条件后重试",
+}
+
+/** Deleting the config's current default model is blocked by the M-07 guard. */
+const DEFAULT_MODEL_IN_USE: CatalogEntry = {
+  message: "该模型是当前配置的默认模型，无法删除",
+  nextAction: "请先切换默认模型，再删除该模型",
+}
+
 function readString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
@@ -136,6 +160,31 @@ export function localizeApiError(error: unknown, context: LocalizeContext = {}):
           REQUIREMENT_CLOSED_MESSAGES[context.kind ?? "rerun"],
         ),
         nextAction: typedNextAction,
+        field,
+      }
+    }
+
+    if (error.code === "stage_gate_failed") {
+      // Never fall back to the raw English gate message or the English
+      // details.action/next/next_action hints: the catalog owns the UI copy.
+      const mappedGate = reason === undefined ? undefined : STAGE_GATE_MESSAGES[reason]
+      const gateEntry = mappedGate ?? STAGE_GATE_FALLBACK
+      return {
+        message: preferSpecificMessage(error.message, gateEntry.message),
+        nextAction: gateEntry.nextAction,
+        field,
+      }
+    }
+
+    if (error.code === "default_model_in_use") {
+      // The backend message embeds the user-editable config name, which may
+      // contain CJK even though the message itself is English, so
+      // `preferSpecificMessage` cannot distinguish it from a Chinese backend
+      // message. The catalog copy is authoritative for this code; the backend
+      // types an English next_action that must not replace it either.
+      return {
+        message: DEFAULT_MODEL_IN_USE.message,
+        nextAction: DEFAULT_MODEL_IN_USE.nextAction,
         field,
       }
     }

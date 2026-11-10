@@ -10,6 +10,7 @@ import type { ConversationModel } from "@/features/conversation/api"
 import type { VersionStage } from "@/features/design/types"
 import { getVersion } from "@/features/versions/api"
 import type { Version } from "@/features/versions/types"
+import { ApiError } from "@/lib/api-client"
 
 import {
   confirmRequirements,
@@ -75,6 +76,15 @@ function activityText(payload: Record<string, unknown>): string | null {
   if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
   if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
   return "AI 正在处理…"
+}
+
+/** The 409 start-design gate rejected because drafts are still unconfirmed. */
+function isUnconfirmedRequirementsGate(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.code === "stage_gate_failed" &&
+    error.details.reason === "requirements_unconfirmed"
+  )
 }
 
 /** Status labels of the requirement extraction card (API-5). */
@@ -942,7 +952,25 @@ export function RequirementsTab({
             }}
           />
 
-          {designError !== null ? <InlineError error={designError} /> : null}
+          {designError !== null ? (
+            <InlineError error={designError}>
+              {isUnconfirmedRequirementsGate(designError) ? (
+                <button
+                  type="button"
+                  className="ml-2 underline underline-offset-2"
+                  onClick={() => {
+                    // The alert has done its job once the user jumps to the
+                    // draft list; leaving it on top of the list hides the very
+                    // requirements the user must confirm.
+                    setDesignError(null)
+                    setFilter("draft")
+                  }}
+                >
+                  查看未确认需求
+                </button>
+              ) : null}
+            </InlineError>
+          ) : null}
 
           {bulkNotice !== null ? (
             <p

@@ -559,11 +559,11 @@ describe("LLMSettings", () => {
         method(call[1] ?? {}) === "PATCH" &&
         new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models/8010",
     )
+    // ModelEditDialog sends only the capability keys this interaction changed:
+    // tools and prompt cache stay catalog-owned instead of being re-asserted.
     expect(readBody(patch?.[1] ?? {})).toEqual({
-      supports_tools: true,
       supports_vision: true,
       supports_reasoning: true,
-      supports_prompt_cache: false,
       deprecated: false,
     })
   })
@@ -1153,6 +1153,56 @@ describe("LLMSettings", () => {
     await waitFor(() => expect(screen.queryByTestId("llm-model-8001")).not.toBeInTheDocument())
     const remove = fetchMock.mock.calls.find((call) => method(call[1] ?? {}) === "DELETE")
     expect(String(remove?.[0])).toContain("/api/admin/llm/configs/7001/models/8001")
+  })
+
+  it("localizes the default-model delete guard and opens the default-model editor", async () => {
+    const defaultConfig: LLMConfig = { ...config, default_model_id: "8001" }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [defaultConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [model] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7001/models/8001" && method(init) === "DELETE") {
+        return jsonResponse(
+          {
+            error: {
+              code: "default_model_in_use",
+              message:
+                'model "manual-a" is the default model of llm config "local-fake"; set default_model_id to another model before deleting it',
+              details: {
+                config_id: "7001",
+                config_name: "local-fake",
+                default_model_id: "8001",
+                field: "default_model_id",
+                next_action: "choose another model as default_model_id, then delete this model",
+              },
+            },
+          },
+          409,
+        )
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    fireEvent.click(
+      within(screen.getByTestId("llm-model-8001")).getByRole("button", { name: "删除模型" }),
+    )
+
+    expect(await screen.findByText("该模型是当前配置的默认模型，无法删除")).toBeVisible()
+    expect(screen.getByText(/下一步：请先切换默认模型，再删除该模型/)).toBeVisible()
+    expect(screen.queryByText(/choose another model/)).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "切换默认模型" }))
+
+    const dialog = screen.getByRole("dialog")
+    expect(within(dialog).getByLabelText("默认模型")).toHaveValue("8001")
+    expect(within(dialog).getByLabelText("默认模型")).toHaveFocus()
   })
 
   it("sends explicit 0 for automatic window and output when adding a model", async () => {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -58,7 +58,7 @@ vi.mock("./useVersionEvents", () => ({
 }))
 
 import { RequirementsTab } from "./RequirementsTab"
-import { requirementSecondFixture } from "./test-fixtures"
+import { requirementFixture, requirementSecondFixture } from "./test-fixtures"
 
 const publicModels = [
   {
@@ -123,6 +123,7 @@ describe("RequirementsTab shell", () => {
   beforeEach(() => {
     for (const fn of Object.values(api)) fn.mockReset()
     versionsApi.getVersion.mockReset()
+    navigation.push.mockReset()
     navigation.replace.mockReset()
     conversationApi.listPublicModels.mockReset()
     conversationApi.updateConversationModel.mockReset()
@@ -252,6 +253,55 @@ describe("RequirementsTab shell", () => {
 
     await waitFor(() => expect(api.confirmRequirements).toHaveBeenCalledWith("2001", ["6002"]))
     await waitFor(() => expect(api.confirmStageRequirements).toHaveBeenCalledWith("2001", ["6002"]))
+  })
+
+  it("shows Chinese gate guidance and switches to drafts when start-design is rejected by unconfirmed requirements", async () => {
+    api.listRequirements.mockResolvedValue([requirementFixture, requirementSecondFixture])
+    api.confirmStageRequirements.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "stage_gate_failed",
+        message:
+          "stage gate requirement_confirmation is closed: requirements_unconfirmed (confirm every current requirement before starting design)",
+        requestId: "req_09e1192ec1db",
+        details: {
+          gate: "requirement_confirmation",
+          reason: "requirements_unconfirmed",
+          action: "confirm every current requirement before starting design",
+          next: "designing",
+        },
+      }),
+    )
+    const onStageChanged = vi.fn()
+
+    render(
+      <RequirementsTab
+        versionId="2001"
+        stage="requirement_review"
+        onStageChanged={onStageChanged}
+      />,
+    )
+
+    expect(await screen.findByTestId("design-cta")).toHaveTextContent("1 条需求待设计")
+    fireEvent.click(screen.getByRole("button", { name: "开始设计" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("需先确认全部需求，才能开始设计")
+    expect(alert).toHaveTextContent("批量确认")
+    expect(alert).not.toHaveTextContent("requirements_unconfirmed")
+    expect(alert).not.toHaveTextContent("confirm every current requirement")
+    // The rejected gate must not advance the stage nor navigate anywhere.
+    expect(onStageChanged).not.toHaveBeenCalled()
+    expect(navigation.push).not.toHaveBeenCalled()
+    expect(navigation.replace).not.toHaveBeenCalled()
+
+    fireEvent.click(within(alert).getByRole("button", { name: "查看未确认需求" }))
+
+    // The alert must not stay over the draft list it just switched to.
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    expect(screen.getByTestId("req-filter-draft")).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByTestId("requirement-item-6001")).toBeInTheDocument()
+    expect(screen.queryByTestId("requirement-item-6002")).not.toBeInTheDocument()
   })
 
   it("prefers the server pending_design_count projection over the local clarified count", async () => {

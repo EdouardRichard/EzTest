@@ -93,6 +93,11 @@ function errorText(caught: unknown, fallback: string): string {
   return fallback
 }
 
+/** Deleting the config's current default model is blocked by the M-07 guard. */
+function isDefaultModelInUse(caught: unknown): boolean {
+  return caught instanceof ApiError && caught.code === "default_model_in_use"
+}
+
 /** Reads one capability provenance from the flat DTO or the nested mirror. */
 function capabilitySource(model: LLMModel, key: string): string | undefined {
   const flat = (model as unknown as Record<string, unknown>)[`${key}_source`]
@@ -184,11 +189,19 @@ type ConfigFormDialogProps = {
   config: LLMConfig | null
   /** Catalog rows belonging to this config (empty while creating). */
   models: LLMModel[]
+  /** Focus the default-model select on mount (delete-guard recovery entry). */
+  focusDefaultModel?: boolean
   onClose: () => void
   onSaved: (saved: LLMConfig, created: boolean) => void
 }
 
-function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialogProps) {
+function ConfigFormDialog({
+  config,
+  models,
+  focusDefaultModel = false,
+  onClose,
+  onSaved,
+}: ConfigFormDialogProps) {
   const initialThinkingType = config?.thinking_type ?? "auto"
   const [name, setName] = useState(config?.name ?? "")
   const [protocol, setProtocol] = useState<LLMProtocol>(
@@ -214,6 +227,14 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
     (model) => !model.deprecated && model.status !== "disabled",
   )
   const defaultModelRequired = selectableModels.length > 0
+
+  // The "切换默认模型" recovery entry opens this dialog on the field the user
+  // must change; focusing it also scrolls it into view in browsers.
+  useEffect(() => {
+    if (!focusDefaultModel) return
+    const target = document.getElementById("llm-default-model")
+    if (target instanceof HTMLSelectElement) target.focus()
+  }, [focusDefaultModel])
 
   function updateThinkingType(value: LLMThinkingType): void {
     setThinkingType(value)
@@ -673,7 +694,7 @@ export function LLMSettings() {
   const [reloadKey, setReloadKey] = useState(0)
 
   const [formState, setFormState] = useState<
-    { mode: "create" } | { mode: "edit"; config: LLMConfig } | null
+    { mode: "create" } | { mode: "edit"; config: LLMConfig; focusDefaultModel?: boolean } | null
   >(null)
   const [deleteTarget, setDeleteTarget] = useState<LLMConfig | null>(null)
   const [modelTarget, setModelTarget] = useState<LLMConfig | null>(null)
@@ -1040,8 +1061,19 @@ export function LLMSettings() {
               ) : null}
 
               {actionError ? (
-                <div className="mt-3">
+                <div className="mt-3 space-y-2">
                   <InlineError error={actionError} />
+                  {isDefaultModelInUse(actionError) ? (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() =>
+                        setFormState({ mode: "edit", config, focusDefaultModel: true })
+                      }
+                    >
+                      切换默认模型
+                    </Button>
+                  ) : null}
                 </div>
               ) : null}
               {notice ? (
@@ -1147,6 +1179,7 @@ export function LLMSettings() {
         <ConfigFormDialog
           key={formState.mode === "edit" ? formState.config.id : "new"}
           config={formState.mode === "edit" ? formState.config : null}
+          focusDefaultModel={formState.mode === "edit" && formState.focusDefaultModel === true}
           models={
             formState.mode === "edit"
               ? models.filter((model) => model.config_id === formState.config.id)
