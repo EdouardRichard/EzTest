@@ -263,15 +263,80 @@ describe("localizeApiError stage gate rejections", () => {
     expect(localized.nextAction).not.toContain("confirm every current requirement")
   })
 
+  it("localizes the requirement_gap open-gap gate to actionable Chinese guidance", () => {
+    const localized = localizeApiError(
+      apiError(
+        409,
+        "stage_gate_failed",
+        "stage gate requirement_gap is closed: open_gap (resolve or explicitly accept every open requirement gap)",
+        {
+          action: "resolve or explicitly accept every open requirement gap",
+          gate: "requirement_gap",
+          next: "designing",
+          reason: "open_gap",
+        },
+      ),
+    )
+
+    expect(localized.message).toBe("还有待回答的问题或未接受的开放缺口，无法开始设计")
+    expect(localized.message).not.toContain("open_gap")
+    expect(localized.message).not.toContain("stage gate")
+    expect(localized.nextAction).toContain("需求与澄清")
+    expect(localized.nextAction).toContain("开放缺口")
+    expect(localized.nextAction).not.toContain("resolve or explicitly accept")
+  })
+
+  it("localizes every system gate reason instead of falling back to the generic copy", () => {
+    const cases: Array<[string, string]> = [
+      ["missing_requirement", "需求"],
+      ["environment_not_bound", "环境"],
+      ["no_confirmed_case_draft", "用例"],
+      ["coverage_not_computed", "覆盖"],
+      ["cases_unconfirmed", "用例"],
+      ["executor_offline", "执行器"],
+      ["account_invalid", "账号"],
+      ["waves_active", "执行波次"],
+      ["report_not_published", "报告"],
+      ["open_blocking_issue", "阻塞"],
+      ["version_close_failed", "收尾"],
+      ["gate_check_failed", "重试"],
+      ["gate_not_configured", "管理员"],
+      ["blocker_not_cleared", "阻塞"],
+      ["wave_not_scoped", "刷新"],
+      ["wave_not_terminal", "波次"],
+    ]
+
+    for (const [reason, needle] of cases) {
+      const localized = localizeApiError(
+        apiError(
+          409,
+          "stage_gate_failed",
+          `stage gate demo is closed: ${reason} (english action for ${reason})`,
+          {
+            action: `english action for ${reason}`,
+            gate: "demo",
+            next: "somewhere",
+            reason,
+          },
+        ),
+      )
+
+      expect(localized.message, reason).not.toBe("当前操作未通过版本阶段门禁")
+      expect(localized.message, reason).not.toContain(reason)
+      expect(`${localized.message} ${localized.nextAction ?? ""}`, reason).toContain(needle)
+      expect(localized.nextAction, reason).not.toContain(`english action for ${reason}`)
+    }
+  })
+
   it("never leaks the raw English gate message for an unmapped gate reason", () => {
     const localized = localizeApiError(
       apiError(
         409,
         "stage_gate_failed",
-        "stage gate wave is closed: waves_active (wait for every wave to finish)",
+        "stage gate wave is closed: future_gate_reason (wait for every wave to finish)",
         {
           gate: "wave",
-          reason: "waves_active",
+          reason: "future_gate_reason",
           action: "wait for every wave to finish",
           next: "reporting",
         },
@@ -280,7 +345,7 @@ describe("localizeApiError stage gate rejections", () => {
 
     expect(localized.message).toBe("当前操作未通过版本阶段门禁")
     expect(localized.message).not.toContain("stage gate")
-    expect(localized.message).not.toContain("waves_active")
+    expect(localized.message).not.toContain("future_gate_reason")
     expect(localized.nextAction).not.toContain("wait for every wave")
     expect(localized.nextAction).not.toContain("reporting")
   })

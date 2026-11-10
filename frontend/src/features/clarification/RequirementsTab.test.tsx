@@ -304,6 +304,37 @@ describe("RequirementsTab shell", () => {
     expect(screen.queryByTestId("requirement-item-6002")).not.toBeInTheDocument()
   })
 
+  it("shows the open-gap gate reason when start-design is rejected by unanswered questions", async () => {
+    api.listRequirements.mockResolvedValue([requirementFixture, requirementSecondFixture])
+    api.confirmStageRequirements.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "stage_gate_failed",
+        message:
+          "stage gate requirement_gap is closed: open_gap (resolve or explicitly accept every open requirement gap)",
+        requestId: "req_5a2c0e5b2898",
+        details: {
+          action: "resolve or explicitly accept every open requirement gap",
+          gate: "requirement_gap",
+          next: "designing",
+          reason: "open_gap",
+        },
+      }),
+    )
+
+    render(<RequirementsTab versionId="2001" stage="requirement_review" />)
+
+    expect(await screen.findByTestId("design-cta")).toHaveTextContent("1 条需求待设计")
+    fireEvent.click(screen.getByRole("button", { name: "开始设计" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("还有待回答的问题或未接受的开放缺口，无法开始设计")
+    expect(alert).toHaveTextContent("需求与澄清")
+    expect(alert).not.toHaveTextContent("open_gap")
+    expect(alert).not.toHaveTextContent("请按页面提示完成前置条件后重试")
+    expect(alert).not.toHaveTextContent("resolve or explicitly accept")
+  })
+
   it("prefers the server pending_design_count projection over the local clarified count", async () => {
     versionsApi.getVersion.mockResolvedValue({ id: "2001", bindings: [], pending_design_count: 4 })
     api.listRequirements.mockResolvedValue([])

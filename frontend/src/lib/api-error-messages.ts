@@ -92,12 +92,82 @@ const DEFAULT_MODEL_FOREIGN: CatalogEntry = {
 /**
  * 409 stage_gate_failed (versionapp.StageGateError.APIError). The backend keeps
  * the English gate/action/next machine hints; the UI owns the Chinese copy and
- * the actionable next step. Keyed by `details.reason`.
+ * the actionable next step. Keyed by `details.reason`, every reason the v0.22
+ * stage machine emits has an entry so a gate rejection never degrades to the
+ * generic fallback (R3-E-02: `open_gap` printed only "当前操作未通过版本阶段门禁").
  */
 const STAGE_GATE_MESSAGES: Record<string, CatalogEntry> = {
   requirements_unconfirmed: {
     message: "需先确认全部需求，才能开始设计",
     nextAction: "筛选「草案」→ 批量确认需求 → 再开始设计",
+  },
+  open_gap: {
+    message: "还有待回答的问题或未接受的开放缺口，无法开始设计",
+    nextAction: "请在「需求与澄清」中回答待回答问题，或明确接受/关闭开放缺口后重试",
+  },
+  missing_requirement: {
+    message: "版本还没有任何需求，无法进入需求评审",
+    nextAction: "先在「需求与澄清」中抽取或新增至少一条需求",
+  },
+  environment_not_bound: {
+    message: "版本尚未绑定可用的 SUT 环境，无法进入澄清",
+    nextAction: "请在「版本总览 → 绑定概览」中绑定 SUT 环境后重试",
+  },
+  no_confirmed_case_draft: {
+    message: "还没有已确认的用例草案，无法进入用例评审",
+    nextAction: "请在「用例设计」中生成并确认至少一条用例草案",
+  },
+  coverage_not_computed: {
+    message: "覆盖矩阵尚未计算，无法进入用例评审",
+    nextAction: "请等待覆盖矩阵计算完成后再试",
+  },
+  cases_unconfirmed: {
+    message: "还没有已确认的用例，无法进入执行",
+    nextAction: "请在「用例设计」中确认至少一条用例",
+  },
+  executor_offline: {
+    message: "执行器离线，无法进入执行",
+    nextAction: "请确认执行器已启动并完成心跳后重试",
+  },
+  account_invalid: {
+    message: "测试账号或目标数据库绑定无效，无法进入执行",
+    nextAction: "请在「版本总览 → 绑定概览」中修正测试账号或目标数据库绑定",
+  },
+  waves_active: {
+    message: "仍有执行波次未结束，无法进入报告生成",
+    nextAction: "请等待执行波次全部结束后重试",
+  },
+  report_not_published: {
+    message: "版本报告尚未发布，无法完成版本",
+    nextAction: "请在「报告」中生成并发布版本报告后再完成",
+  },
+  open_blocking_issue: {
+    message: "仍有阻塞级问题未关闭，无法完成版本",
+    nextAction: "请在「问题」中关闭或处置全部阻塞级问题",
+  },
+  version_close_failed: {
+    message: "版本收尾条件尚未全部满足，无法完成版本",
+    nextAction: "请先处理未闭环需求与未结束的执行/计划项，系统会自动重试",
+  },
+  gate_check_failed: {
+    message: "版本阶段门禁检查暂时失败",
+    nextAction: "请稍后重试；若持续失败，请查看服务端日志",
+  },
+  gate_not_configured: {
+    message: "版本阶段门禁尚未完成配置",
+    nextAction: "请联系管理员检查服务端的阶段门禁配置",
+  },
+  blocker_not_cleared: {
+    message: "版本阻塞原因尚未清除，无法解除阻塞",
+    nextAction: "请先在「版本阻塞」中确认阻塞原因已消失，再解除阻塞",
+  },
+  wave_not_scoped: {
+    message: "指定的执行波次不属于当前版本",
+    nextAction: "请刷新页面后从执行波次列表重新选择",
+  },
+  wave_not_terminal: {
+    message: "执行波次尚未结束",
+    nextAction: "请等待该波次结束后重试",
   },
 }
 
