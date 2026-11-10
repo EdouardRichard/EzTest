@@ -283,20 +283,18 @@ describe("PageAPIPanel", () => {
     expect(await screen.findByText("该页面已被版本绑定引用，无法删除")).toBeVisible()
 
     const editableGroup = screen.getByTestId("resource-editable-versions")
-    expect(
-      within(editableGroup).getByRole("link", { name: "设计中的版本" }),
-    ).toHaveAttribute("href", "/versions/2001?tab=overview")
-    expect(
-      within(editableGroup).getByText(/请先在引用版本的页面范围中排除该页面/),
-    ).toBeVisible()
+    expect(within(editableGroup).getByRole("link", { name: "设计中的版本" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=overview",
+    )
+    expect(within(editableGroup).getByText(/请先在引用版本的页面范围中排除该页面/)).toBeVisible()
 
     const terminalGroup = screen.getByTestId("resource-terminal-versions")
-    expect(
-      within(terminalGroup).getByRole("link", { name: "已完成版本" }),
-    ).toHaveAttribute("href", "/versions/2002?tab=overview")
-    expect(
-      within(terminalGroup).getByText(/终态版本只读，需管理员\/运维处理/),
-    ).toBeVisible()
+    expect(within(terminalGroup).getByRole("link", { name: "已完成版本" })).toHaveAttribute(
+      "href",
+      "/versions/2002?tab=overview",
+    )
+    expect(within(terminalGroup).getByText(/终态版本只读，需管理员\/运维处理/)).toBeVisible()
     // The terminal group must never suggest the impossible scope edit.
     expect(within(terminalGroup).queryByText(/排除/)).toBeNull()
   })
