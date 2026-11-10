@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: v0.2.2" src="https://img.shields.io/badge/status-v0.2.2-orange">
+  <img alt="Status: v0.2.3" src="https://img.shields.io/badge/status-v0.2.3-orange">
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Go 1.24" src="https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-black">
@@ -16,7 +16,7 @@
   <img alt="Playwright 1.64" src="https://img.shields.io/badge/Playwright-1.64-2EAD33">
 </p>
 
-> **状态：v0.2.2（预发布）。** EzTest 已实现下文完整链路，并在维护者主机上用真实浏览器、
+> **状态：v0.2.3（预发布）。** EzTest 已实现下文完整链路，并在维护者主机上用真实浏览器、
 > 真实 OpenAI 兼容模型完成端到端演练。这是供评估的预览版，不是生产版本——依赖它之前请先在自己的
 > 环境验证。
 
@@ -24,6 +24,7 @@
 
 ## 目录
 
+- [目录](#目录)
 - [概述](#概述)
 - [工作方式](#工作方式)
 - [截图](#截图)
@@ -36,12 +37,18 @@
   - [视觉回归](#视觉回归)
   - [平台](#平台)
 - [使用方式](#使用方式)
-  - 方式 A —— 免安装可运行包（Windows / Linux）
-  - 方式 B —— Docker Compose
-  - 方式 C —— 从源码运行
-  - 首次使用配置
-  - 端口与健康检查
+  - [方式 A —— 免安装可运行包（Windows / Linux）](#方式-a--免安装可运行包windows--linux)
+  - [方式 B —— Docker Compose](#方式-b--docker-compose)
+  - [方式 C —— 从源码运行](#方式-c--从源码运行)
+  - [首次使用配置](#首次使用配置)
+  - [端口与健康检查](#端口与健康检查)
 - [主要技术路线](#主要技术路线)
+  - [技术栈](#技术栈)
+  - [1. 系统架构](#1-系统架构)
+  - [2. 控制面是唯一执行队列](#2-控制面是唯一执行队列)
+  - [3. Agent 运行时与上下文工程](#3-agent-运行时与上下文工程)
+  - [4. 多 SUT 执行与证据](#4-多-sut-执行与证据)
+  - [5. 配置与运维](#5-配置与运维)
 - [项目结构](#项目结构)
 - [许可证](#许可证)
 
@@ -126,7 +133,7 @@ sequenceDiagram
 
 ## 截图
 
-*以下截图均来自 2026-11-07 的 v0.2.2 最终验收（FA）运行：真实 Chromium 执行器 + 真实
+*以下截图均来自 2026-11-07 的 v0.2.3 最终验收（FA）运行：真实 Chromium 执行器 + 真实
 OpenAI 兼容模型。*
 
 ![在对话中与 AI 团队澄清需求](assets/screenshots/01-hero-requirements.png)
@@ -226,8 +233,8 @@ EzTest 以单机栈运行。API、Web UI、执行器和 PDF renderer 是独立�
 
 | 平台 | 压缩包 |
 |---|---|
-| Windows x64 | `eztest-0.2.2-windows-x64.zip`（约 400 MB） |
-| Linux x64（glibc） | `eztest-0.2.2-linux-x64.tar.gz`（约 400 MB） |
+| Windows x64 | `eztest-0.2.3-windows-x64.zip`（约 400 MB） |
+| Linux x64（glibc） | `eztest-0.2.3-linux-x64.tar.gz`（约 400 MB） |
 | 校验和 | `SHA256SUMS.txt` |
 
 请从 [Releases](https://github.com/EdouardRichard/EzTest/releases) 页面下载。每个包内还附带
@@ -237,8 +244,8 @@ EzTest 以单机栈运行。API、Web UI、执行器和 PDF renderer 是独立�
 
 ```powershell
 # Windows（PowerShell）—— 解压并进入包目录
-Expand-Archive .\eztest-0.2.2-windows-x64.zip -DestinationPath .\eztest
-cd .\eztest\eztest-0.2.2-windows-x64
+Expand-Archive .\eztest-0.2.3-windows-x64.zip -DestinationPath .\eztest
+cd .\eztest\eztest-0.2.3-windows-x64
 .\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 .\start-eztest.ps1        # 启动 API、执行器、renderer 与 Web，并等待健康检查
 .\status-eztest.ps1       # 进程、健康探针与 PostgreSQL 状态
@@ -247,7 +254,7 @@ cd .\eztest\eztest-0.2.2-windows-x64
 ```
 
 这些命令必须在**直接包含 `init-config.ps1`、`start-eztest.ps1` 的目录**（即解压目录里的
-`eztest-0.2.2-windows-x64` 文件夹）中运行。如果 PowerShell 提示找不到 `.\init-config.ps1`，
+`eztest-0.2.3-windows-x64` 文件夹）中运行。如果 PowerShell 提示找不到 `.\init-config.ps1`，
 说明当前还在上一级目录——用 `Get-ChildItem -Recurse -Filter init-config.ps1` 找到包目录后 `cd` 进去。
 
 包内脚本没有代码签名。如果 PowerShell 报错"...未对文件...进行数字签名。无法在当前系统上运行该脚本"，
@@ -266,8 +273,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```bash
 # Linux（x64）—— 解压并进入包目录
 mkdir -p eztest
-tar -xzf eztest-0.2.2-linux-x64.tar.gz -C eztest
-cd eztest/eztest-0.2.2-linux-x64
+tar -xzf eztest-0.2.3-linux-x64.tar.gz -C eztest
+cd eztest/eztest-0.2.3-linux-x64
 bash install-linux-deps.sh                                  # 仅首次，需要 sudo
 bash init-config.sh --database-url "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 bash start-eztest.sh
