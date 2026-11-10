@@ -6,6 +6,7 @@ import {
   type Edge,
   MiniMap,
   type Node,
+  type NodeChange,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -29,6 +30,7 @@ import {
   filterDesignLayout,
   matchDesignNodes,
 } from "./layout"
+import { mergeMeasuredDimensions, type NodeMeasurements } from "./measurements"
 import type { DesignNodeActions } from "./nodeActions"
 import { RequirementNode } from "./RequirementNode"
 import { ScenarioNode } from "./ScenarioNode"
@@ -94,6 +96,7 @@ const RESULT_NODE_CLASS: Record<CaseRunVerdict, string> = {
 const SEARCH_HIT_CLASS = "mindmap-search-hit rounded-xl ring-2 ring-warning/70"
 
 const EMPTY_RESULTS: DesignExecutionResults = {}
+const EMPTY_MEASUREMENTS: NodeMeasurements = {}
 
 type FitState = {
   timer: ReturnType<typeof setTimeout> | null
@@ -317,6 +320,14 @@ function MindmapCanvas({
     )
   }, [])
 
+  // R2-D-03: the controlled `nodes` prop drops React Flow's dimensions changes,
+  // so `userNode.measured` never exists and the MiniMap renders no thumbnails.
+  // Feed the reported boxes back into the nodes instead.
+  const [measuredById, setMeasuredById] = useState<NodeMeasurements>(EMPTY_MEASUREMENTS)
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    setMeasuredById((current) => mergeMeasuredDimensions(current, changes))
+  }, [])
+
   const classesFor = useCallback(
     (node: DesignLayoutNode): string => {
       const classes: string[] = []
@@ -341,6 +352,7 @@ function MindmapCanvas({
           id: node.id,
           type: node.type,
           position: node.position,
+          measured: measuredById[node.id],
           className: classesFor(node),
           selected,
           data: {
@@ -359,6 +371,7 @@ function MindmapCanvas({
       selection.selectedIds,
       classesFor,
       destructiveActionsDisabled,
+      measuredById,
     ],
   )
 
@@ -493,6 +506,7 @@ function MindmapCanvas({
               minZoom={0.2}
               nodesDraggable={false}
               nodesConnectable={false}
+              onNodesChange={handleNodesChange}
               proOptions={{ hideAttribution: true }}
               onNodeClick={(_event, node) => {
                 if (node.type === "case") {

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -15,8 +15,8 @@ function renderMindmap(overrides: Partial<Parameters<typeof DesignMindmap>[0]> =
     onConfirmRequirement: vi.fn(),
     ...overrides,
   }
-  render(<DesignMindmap {...props} />)
-  return props
+  const { container } = render(<DesignMindmap {...props} />)
+  return { ...props, container }
 }
 
 describe("DesignMindmap", () => {
@@ -95,6 +95,18 @@ describe("DesignMindmap", () => {
     const minimap = await screen.findByTestId("rf__minimap")
     expect(minimap).toBeInTheDocument()
     expect(within(minimap).getByRole("img", { name: "脑图缩略图" })).toBeInTheDocument()
+  })
+
+  it("renders minimap nodes once node dimensions are measured", async () => {
+    // R2-D-03: the minimap reads `userNode.measured`, which only exists when the
+    // controlled `nodes` prop feeds React Flow's dimensions changes back in.
+    // Without that merge the minimap renders only its title and mask.
+    const { container } = renderMindmap()
+
+    await screen.findByTestId("rf__minimap")
+    await waitFor(() => {
+      expect(container.querySelectorAll(".react-flow__minimap-node").length).toBeGreaterThan(0)
+    })
   })
 
   it("keeps the canvas above a minimum readable height", async () => {
