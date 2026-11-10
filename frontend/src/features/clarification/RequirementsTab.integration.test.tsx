@@ -201,25 +201,24 @@ describe("RequirementsTab integration", () => {
     expect(await screen.findByTestId("requirement-editor")).toHaveTextContent("退款到账时效")
   })
 
-  it("restores the page and requirement-list scroll after selecting a requirement", async () => {
-    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {})
-    let pageScrollY = 400
-    vi.spyOn(window, "scrollY", "get").mockImplementation(() => pageScrollY)
-
-    render(<RequirementsTab versionId="2001" />)
+  it("applies a new conversation deep link without reloading the workspace", async () => {
+    const { rerender } = render(<RequirementsTab versionId="2001" />)
     await screen.findByTestId("requirements-tab")
+    const composer = await screen.findByTestId("composer-textarea")
+    fireEvent.change(composer, { target: { value: "未发送的草稿" } })
+    const conversationCalls = api.listConversations.mock.calls.length
+    const requirementCalls = api.listRequirements.mock.calls.length
 
-    const list = screen.getByTestId("requirement-list")
-    list.scrollTop = 120
+    // The in-page URL sync arrives back as a server prop (same conversation as
+    // the active one). Loading the workspace again would unmount the whole tab
+    // for a loading card: the chat composer draft would be lost and the document
+    // scroll would clamp to the top.
+    rerender(<RequirementsTab versionId="2001" initialConversationId="4001" />)
 
-    fireEvent.click(screen.getByRole("button", { name: "退款到账时效" }))
-
-    // The RSC transition clamps both offsets to the top before the restore runs.
-    pageScrollY = 0
-    list.scrollTop = 0
-
-    await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 400), { timeout: 1000 })
-    expect(list.scrollTop).toBe(120)
+    expect(screen.queryByText("正在加载澄清工作区…")).not.toBeInTheDocument()
+    expect(api.listConversations).toHaveBeenCalledTimes(conversationCalls)
+    expect(api.listRequirements).toHaveBeenCalledTimes(requirementCalls)
+    expect(screen.getByTestId("composer-textarea")).toHaveValue("未发送的草稿")
   })
 
   it("switches conversations from the history dropdown and writes the URL", async () => {

@@ -438,15 +438,13 @@ export function RequirementsTab({
   // `extraction.*` SSE events can arrive once per segment; coalesce them into a
   // single progress read instead of one GET per event.
   const extractionEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  /**
-   * The in-page URL sync about to run can remount the chat panel for one frame
-   * while the RSC transition settles; the document then clamps to the top and
-   * the requirement list loses its offset. Remember both offsets before the
-   * selection and restore them once the transition has painted (the jump is a
-   * UX regression only — the selection itself keeps the URL contract).
-   */
-  const pendingScrollRestore = useRef<{ windowY: number; listTop: number } | null>(null)
-  const requirementListRef = useRef<HTMLDivElement | null>(null)
+  // The URL deep link seeds the initial conversation choice. Keep it in a ref so
+  // `loadWorkspace` stays stable: depending on it directly made every in-page
+  // URL sync (selecting a requirement/conversation) re-run the workspace load,
+  // which unmounted the whole tab content for a loading card — dropping the chat
+  // composer draft and clamping the document scroll to the top.
+  const initialConversationIdRef = useRef(initialConversationId)
+  initialConversationIdRef.current = initialConversationId
 
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
@@ -473,10 +471,10 @@ export function RequirementsTab({
           return current
         }
         if (
-          initialConversationId !== undefined &&
-          nextConversations.some((item) => item.id === initialConversationId)
+          initialConversationIdRef.current !== undefined &&
+          nextConversations.some((item) => item.id === initialConversationIdRef.current)
         ) {
-          return initialConversationId
+          return initialConversationIdRef.current
         }
         return nextConversations[0]?.id ?? null
       })
@@ -485,7 +483,7 @@ export function RequirementsTab({
     } finally {
       setLoading(false)
     }
-  }, [versionId, initialConversationId])
+  }, [versionId])
 
   useEffect(() => {
     void loadWorkspace()
@@ -608,35 +606,6 @@ export function RequirementsTab({
     onExtractionChanged: scheduleExtractionRefresh,
   })
 
-  // Restore the pre-selection scroll offsets after the in-page URL transition.
-  // The first timer covers a same-tick clamp, the second one the RSC remount
-  // window; a later restore only runs while the page is still at the top.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the selection ids are the re-run trigger; the saved offsets live in a ref.
-  useEffect(() => {
-    const saved = pendingScrollRestore.current
-    if (saved === null) return undefined
-    let cancelled = false
-    const restore = () => {
-      if (cancelled) return
-      if (saved.windowY > 0 && window.scrollY === 0) window.scrollTo(0, saved.windowY)
-      const list = requirementListRef.current
-      if (list !== null && saved.listTop > 0 && list.scrollTop === 0) {
-        list.scrollTop = saved.listTop
-      }
-    }
-    const firstFrame = setTimeout(restore, 0)
-    const afterTransition = setTimeout(restore, 150)
-    const clear = setTimeout(() => {
-      pendingScrollRestore.current = null
-    }, 900)
-    return () => {
-      cancelled = true
-      clearTimeout(firstFrame)
-      clearTimeout(afterTransition)
-      clearTimeout(clear)
-    }
-  }, [selectedRequirementId, activeConversationId])
-
   const targetOptions = useMemo<TargetOptions>(() => {
     if (version === null) return { suts: [], pages: [], apis: [] }
     const suts = new Map<string, string>()
@@ -671,15 +640,7 @@ export function RequirementsTab({
   const stats = version as (Version & Partial<VersionClarificationStats>) | null
   const pendingDesignCount = stats?.pending_design_count ?? clarifiedCount
 
-  function rememberScrollPosition(): void {
-    pendingScrollRestore.current = {
-      windowY: window.scrollY,
-      listTop: requirementListRef.current?.scrollTop ?? 0,
-    }
-  }
-
   function selectRequirement(requirementId: string): void {
-    rememberScrollPosition()
     setSelectedRequirementId(requirementId)
     setBulkNotice(null)
     setEditorNotice(null)
@@ -689,7 +650,6 @@ export function RequirementsTab({
   }
 
   function selectConversation(conversationId: string): void {
-    rememberScrollPosition()
     setActiveConversationId(conversationId)
     setActivity(null)
     router.replace(buildWorkspaceUrl(versionId, conversationId, selectedRequirementId), {
@@ -1040,7 +1000,6 @@ export function RequirementsTab({
           {detailError !== null ? <InlineError error={detailError} /> : null}
 
           <RequirementSidebar
-            listRef={requirementListRef}
             requirements={requirements}
             targetOptions={targetOptions}
             filter={filter}
