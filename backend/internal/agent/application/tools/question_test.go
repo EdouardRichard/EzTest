@@ -219,6 +219,160 @@ func TestQuestionAskToolDescriptionDoesNotPromiseSkipWakeUp(t *testing.T) {
 	}
 }
 
+// jsonStringArray renders a JSON array of strings for test payloads.
+func jsonStringArray(values []string) string {
+	raw, err := json.Marshal(values)
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
+// equalStringSlices reports whether two string slices hold the same values in
+// the same order.
+func equalStringSlices(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestQuestionAskToolAcceptsBatchSourceRefs covers R3-E-03: the model may put
+// source_refs at the payload top level (batch-level refs shared by every
+// question) instead of repeating them inside each question.
+func TestQuestionAskToolAcceptsBatchSourceRefs(t *testing.T) {
+	batchRefs := []string{"attachment:spec", "requirement:FR-012"}
+	payload := `{"questions":` + questionItemsJSON(2) + `,"source_refs":` + jsonStringArray(batchRefs) + `}`
+	asker := &fakeQuestionAsker{}
+	value, err := NewQuestionAskTool(asker).Execute(t.Context(), questionAskScope(), json.RawMessage(payload))
+	if err != nil {
+		t.Fatalf("batch source_refs must be accepted: %v", err)
+	}
+	if asker.calls != 1 {
+		t.Fatalf("asker calls = %d, want 1", asker.calls)
+	}
+	if len(asker.input.Questions) != 2 {
+		t.Fatalf("questions = %d, want 2", len(asker.input.Questions))
+	}
+	for index, question := range asker.input.Questions {
+		if !equalStringSlices(question.SourceRefs, batchRefs) {
+			t.Fatalf("questions[%d].source_refs = %#v, want %#v", index, question.SourceRefs, batchRefs)
+		}
+	}
+	if _, ok := value.(map[string]any); !ok {
+		t.Fatalf("result = %#v, want an object", value)
+	}
+}
+
+// TestQuestionAskToolMergesBatchSourceRefs pins the merge order: the question's
+// own refs come first, the batch-level refs are appended, duplicates are
+// dropped and the original order is preserved.
+func TestQuestionAskToolMergesBatchSourceRefs(t *testing.T) {
+	payload := `{"questions":[` +
+		`{"id":"q1","text":"问题 1","options":[{"id":"a","label":"A"}],"allow_free_text":true,"source_refs":["attachment:spec"]},` +
+		`{"id":"q2","text":"问题 2","options":[{"id":"a","label":"A"}],"allow_free_text":true}` +
+		`],"source_refs":["requirement:FR-012","attachment:spec"]}`
+	asker := &fakeQuestionAsker{}
+	if _, err := NewQuestionAskTool(asker).Execute(t.Context(), questionAskScope(), json.RawMessage(payload)); err != nil {
+		t.Fatalf("merged source_refs must be accepted: %v", err)
+	}
+	if asker.calls != 1 {
+		t.Fatalf("asker calls = %d, want 1", asker.calls)
+	}
+	if len(asker.input.Questions) != 2 {
+		t.Fatalf("questions = %d, want 2", len(asker.input.Questions))
+	}
+	if got, want := asker.input.Questions[0].SourceRefs, []string{"attachment:spec", "requirement:FR-012"}; !equalStringSlices(got, want) {
+		t.Fatalf("questions[0].source_refs = %#v, want %#v", got, want)
+	}
+	if got, want := asker.input.Questions[1].SourceRefs, []string{"requirement:FR-012", "attachment:spec"}; !equalStringSlices(got, want) {
+		t.Fatalf("questions[1].source_refs = %#v, want %#v", got, want)
+	}
+}
+
+// TestQuestionAskToolRejectsInvalidBatchSourceRefs keeps malformed batch refs a
+// typed, retryable invalid_argument before any state is created.
+func TestQuestionAskToolRejectsInvalidBatchSourceRefs(t *testing.T) {
+	tooManyRefs := make([]string, maxAskSourceRefs+1)
+	for index := range tooManyRefs {
+		tooManyRefs[index] = fmt.Sprintf("ref:%d", index)
+	}
+	questionRefs := make([]string, 6)
+	for index := range questionRefs {
+		questionRefs[index] = fmt.Sprintf("question-ref:%d", index)
+	}
+	batchRefs := make([]string, 5)
+	for index := range batchRefs {
+		batchRefs[index] = fmt.Sprintf("batch-ref:%d", index)
+	}
+	mergedOverCap := `{"questions":[{"id":"q1","text":"问题 1","options":[{"id":"a","label":"A"}],"allow_free_text":true,"source_refs":` +
+		jsonStringArray(questionRefs) + `}],"source_refs":` + jsonStringArray(batchRefs) + `}`
+	tests := []struct {
+		name    string
+		payload string
+		field   string
+	}{
+		{"too many batch refs", `{"questions":` + questionItemsJSON(1) + `,"source_refs":` + jsonStringArray(tooManyRefs) + `}`, "source_refs"},
+		{"blank batch ref", `{"questions":` + questionItemsJSON(1) + `,"source_refs":["  "]}`, "source_refs[0]"},
+		{"merged refs exceed cap", mergedOverCap, "questions[0].source_refs"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			asker := &fakeQuestionAsker{}
+			_, err := NewQuestionAskTool(asker).Execute(t.Context(), questionAskScope(), json.RawMessage(test.payload))
+			toolErr := asToolError(t, err)
+			if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
+				t.Fatalf("tool error = %+v", toolErr)
+			}
+			if got := toolErr.Details["field"]; got != test.field {
+				t.Fatalf("details.field = %#v, want %q (details %#v)", got, test.field, toolErr.Details)
+			}
+			if asker.calls != 0 {
+				t.Fatalf("invalid payload reached the port (%d calls)", asker.calls)
+			}
+		})
+	}
+}
+
+// TestQuestionAskToolSchemaDeclaresBatchSourceRefs pins the advertised contract:
+// the schema declares the optional batch-level source_refs array (max 10) and
+// still never exposes the injected scope.
+func TestQuestionAskToolSchemaDeclaresBatchSourceRefs(t *testing.T) {
+	raw := NewQuestionAskTool(nil).Parameters()
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("schema is not JSON: %v", err)
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema properties = %#v", schema["properties"])
+	}
+	batch, ok := properties["source_refs"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no top-level source_refs: %#v", properties)
+	}
+	if batch["type"] != "array" {
+		t.Fatalf("source_refs type = %#v, want array", batch["type"])
+	}
+	if batch["maxItems"] != float64(maxAskSourceRefs) {
+		t.Fatalf("source_refs maxItems = %#v, want %d", batch["maxItems"], maxAskSourceRefs)
+	}
+	items, ok := batch["items"].(map[string]any)
+	if !ok || items["type"] != "string" {
+		t.Fatalf("source_refs items = %#v, want string items", batch["items"])
+	}
+	for _, forbidden := range []string{"version_id", "conversation_id", "agent_run_id"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("schema leaks the injected scope field %q: %s", forbidden, raw)
+		}
+	}
+}
+
 // TestQuestionAskToolSchemaHidesScope pins the shared scope-hiding contract.
 func TestQuestionAskToolSchemaHidesScope(t *testing.T) {
 	tool := NewQuestionAskTool(nil)
