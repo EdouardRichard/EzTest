@@ -64,10 +64,9 @@ import { designCaseDetailFixture, designGraphFixture, designOverviewFixture } fr
 const TIMESTAMP = "2026-10-31T12:00:00Z"
 
 /**
- * Persisted split preferences (R-D2-2). Keys are literals here so the first red
- * run fails on the missing layout instead of a missing module export.
+ * Persisted workbench split preference (R-D2-2). The key is a literal here so
+ * the first red run fails on the missing layout instead of a missing export.
  */
-const CHAT_SPLIT_KEY = "eztest.design.chat-split"
 const WORKBENCH_SPLIT_KEY = "eztest.design.workbench-split"
 
 function mockWorkspace(): void {
@@ -98,12 +97,12 @@ async function renderWorkspace() {
     root: screen.getByTestId("design-scroll"),
     header: screen.getByTestId("design-header"),
     chat: screen.getByTestId("design-chat"),
+    chatPane: screen.getByTestId("design-chat-pane"),
+    main: screen.getByTestId("design-split-main"),
+    workbenchSlot: screen.getByTestId("design-workbench-slot"),
+    workbench: screen.getByTestId("design-workbench"),
     graph: screen.getByTestId("design-graph"),
     detail: screen.getByTestId("design-detail"),
-    mainSplit: screen.getByTestId("design-split-main"),
-    mainTop: screen.getByTestId("design-split-main-top"),
-    mainBottom: screen.getByTestId("design-split-main-bottom"),
-    mainDivider: screen.getByTestId("design-split-main-divider"),
     workbenchSplit: screen.getByTestId("design-split-workbench"),
     workbenchDivider: screen.getByTestId("design-split-workbench-divider"),
   }
@@ -207,8 +206,9 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(screen.getByTestId("design-workbench-zoom")).toHaveAttribute("aria-expanded", "false")
   })
 
-  it("stacks the chat over the graph and detail without scrolling the page", async () => {
-    const { root, chat, graph, detail, mainSplit, workbenchSplit } = await renderWorkspace()
+  it("places the chat left of the workbench in a fixed grid without scrolling the page", async () => {
+    const { root, chat, chatPane, graph, detail, main, workbench, workbenchSlot, workbenchSplit } =
+      await renderWorkspace()
 
     // The outer shell is fixed to the viewport remainder and clips: only the
     // panels inside scroll.
@@ -216,44 +216,54 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(root).toHaveStyle({ overflow: "hidden" })
     expect(root).toHaveClass("overflow-hidden", "min-h-0", "min-w-0")
 
-    // Chat above the workbench; inside it graph directly above detail.
-    expect(chat.compareDocumentPosition(graph) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(graph.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(
-      mainSplit.compareDocumentPosition(workbenchSplit) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy()
+    // Fixed two-column grid: chat 40% (2fr) / workbench 60% (3fr). The outer
+    // 40/60 split is not draggable any more.
+    expect(main).toHaveClass(
+      "grid",
+      "min-h-0",
+      "flex-1",
+      "gap-3",
+      "grid-cols-[minmax(0,2fr)_minmax(0,3fr)]",
+    )
+    expect(screen.queryByTestId("design-split-main-divider")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("design-split-main-top")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("design-split-main-bottom")).not.toBeInTheDocument()
+
+    // Chat is the left column; the workbench owns the right column and keeps
+    // its own graph/detail split.
+    expect(main).toContainElement(chatPane)
+    expect(chatPane).toContainElement(chat)
+    expect(main).toContainElement(workbenchSlot)
+    expect(workbenchSlot).toContainElement(workbench)
+    expect(workbench).toContainElement(workbenchSplit)
+    expect(workbenchSlot).toHaveClass("flex-1", "min-h-0", "min-w-0", "overflow-hidden")
+    expect(chatPane.compareDocumentPosition(workbench) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    )
+    expect(graph.compareDocumentPosition(detail) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    )
 
     // Each panel owns its scroll: graph and detail auto, chat is clipped and
     // scrolls internally (message list + composer).
     expect(graph).toHaveStyle({ overflow: "auto" })
     expect(detail).toHaveStyle({ overflow: "auto" })
-    expect(screen.getByTestId("design-chat-pane")).toHaveStyle({ overflow: "hidden" })
+    expect(chatPane).toHaveStyle({ overflow: "hidden" })
+    expect(chatPane).toHaveClass(
+      "flex",
+      "h-full",
+      "min-h-0",
+      "min-w-0",
+      "flex-col",
+      "overflow-hidden",
+    )
   })
 
-  it("defaults to a 40/60 chat split and a 65/35 graph/detail split", async () => {
-    const { mainTop, mainBottom, graph, detail } = await renderWorkspace()
+  it("defaults to a 65/35 graph/detail split inside the workbench", async () => {
+    const { graph, detail } = await renderWorkspace()
 
-    expect(mainTop.style.flexBasis).toBe("40%")
-    expect(mainBottom.style.flexBasis).toBe("60%")
     expect(graph.style.flexBasis).toBe("65%")
     expect(detail.style.flexBasis).toBe("35%")
-  })
-
-  it("drags the chat/workbench divider and persists the ratio", async () => {
-    const { mainSplit, mainTop, mainBottom, mainDivider } = await renderWorkspace()
-    mockHeight(mainSplit, 1000)
-
-    dragDivider(mainDivider, 400, 500)
-
-    expect(mainTop.style.flexBasis).toBe("50%")
-    expect(mainBottom.style.flexBasis).toBe("50%")
-    expect(window.localStorage.getItem(CHAT_SPLIT_KEY)).toBe("50")
-
-    // The ratio survives a remount (refresh / navigation).
-    cleanup()
-    await renderWorkspace()
-    expect(screen.getByTestId("design-split-main-top").style.flexBasis).toBe("50%")
-    expect(screen.getByTestId("design-split-main-bottom").style.flexBasis).toBe("50%")
   })
 
   it("drags the graph/detail divider and persists the ratio", async () => {
@@ -272,39 +282,28 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(screen.getByTestId("design-detail").style.flexBasis).toBe("25%")
   })
 
-  it("clamps both splits, resets on double-click and resizes from the keyboard", async () => {
-    const { mainSplit, mainTop, mainDivider, workbenchSplit, workbenchDivider, graph } =
-      await renderWorkspace()
-    mockHeight(mainSplit, 1000)
+  it("clamps the workbench split, resets on double-click and resizes from the keyboard", async () => {
+    const { workbenchSplit, workbenchDivider, graph } = await renderWorkspace()
     mockHeight(workbenchSplit, 1000)
 
     // Overshoot both directions: the panes clamp exactly at their limits.
-    dragDivider(mainDivider, 500, 1500)
-    expect(Number.parseFloat(mainTop.style.flexBasis)).toBe(80)
-    dragDivider(mainDivider, 500, -1500)
-    expect(Number.parseFloat(mainTop.style.flexBasis)).toBe(20)
-
     dragDivider(workbenchDivider, 500, 1500)
     expect(Number.parseFloat(graph.style.flexBasis)).toBe(85)
     dragDivider(workbenchDivider, 500, -1500)
     expect(Number.parseFloat(graph.style.flexBasis)).toBe(25)
 
-    // Double-click restores the approved defaults (40/60, 65/35).
-    fireEvent.doubleClick(mainDivider)
-    expect(mainTop.style.flexBasis).toBe("40%")
+    // Double-click restores the approved default (65/35).
     fireEvent.doubleClick(workbenchDivider)
     expect(graph.style.flexBasis).toBe("65%")
 
     // Keyboard resize is the accessible equivalent of dragging: arrows step
     // ±5%, Home/End jump to the min/max split and the aria-label documents it.
-    expect(mainDivider).toHaveAttribute("aria-label", expect.stringContaining("Home 最小"))
-    expect(mainDivider).toHaveAttribute("aria-label", expect.stringContaining("End 最大"))
-    fireEvent.keyDown(mainDivider, { key: "ArrowDown" })
-    expect(mainTop.style.flexBasis).toBe("45%")
-    fireEvent.keyDown(mainDivider, { key: "Home" })
-    expect(mainTop.style.flexBasis).toBe("20%")
-    fireEvent.keyDown(mainDivider, { key: "End" })
-    expect(mainTop.style.flexBasis).toBe("80%")
+    expect(workbenchDivider).toHaveAttribute("aria-label", expect.stringContaining("Home 最小"))
+    expect(workbenchDivider).toHaveAttribute("aria-label", expect.stringContaining("End 最大"))
+    fireEvent.keyDown(workbenchDivider, { key: "ArrowDown" })
+    expect(graph.style.flexBasis).toBe("70%")
+    fireEvent.keyDown(workbenchDivider, { key: "ArrowUp" })
+    expect(graph.style.flexBasis).toBe("65%")
     fireEvent.keyDown(workbenchDivider, { key: "Home" })
     expect(graph.style.flexBasis).toBe("25%")
     fireEvent.keyDown(workbenchDivider, { key: "End" })
@@ -348,38 +347,7 @@ describe("DesignTab split layout (R-D2)", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   })
 
-  it("collapses the chat to a title bar on a short viewport and keeps the workbench usable", async () => {
-    vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
-
-    render(<DesignTab versionId="2001" />)
-    await screen.findByTestId("design-mindmap")
-
-    const titleBar = await screen.findByTestId("design-chat-titlebar")
-    expect(within(titleBar).getByRole("heading", { name: "设计对话" })).toBeInTheDocument()
-    expect(screen.queryByTestId("design-chat")).not.toBeInTheDocument()
-    expect(screen.queryByTestId("message-list")).not.toBeInTheDocument()
-
-    // Graph + detail are prioritised and the collapsed top does not consume a
-    // percentage of the height.
-    expect(screen.getByTestId("design-graph")).toBeInTheDocument()
-    expect(screen.getByTestId("design-detail")).toBeInTheDocument()
-    expect(screen.getByTestId("design-split-main-top").style.flex).toBe("0 0 auto")
-    expect(screen.getByTestId("design-split-main-bottom").style.flex).toBe("1 1 0%")
-
-    // No horizontal overflow, no Tabs: the column stays min-w-0 all the way.
-    const root = screen.getByTestId("design-scroll")
-    expect(root).toHaveClass("overflow-hidden", "min-w-0")
-    expect(screen.getByTestId("design-split-main")).toHaveClass("min-w-0")
-    expect(screen.getByTestId("design-split-main-bottom")).toHaveClass("min-w-0")
-    expect(screen.queryByRole("tablist")).not.toBeInTheDocument()
-
-    // The title bar expands the chat again.
-    fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
-    expect(await screen.findByTestId("design-chat")).toBeInTheDocument()
-    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
-  })
-
-  it("collapses the chat on a narrow viewport with a normal height", async () => {
+  it("folds the chat into a full-width title bar below 960px and expands back to the left column", async () => {
     // Width alone triggers the collapse: 800px < 960px while the available
     // height stays above the short-viewport band (900px viewport).
     vi.spyOn(window, "innerWidth", "get").mockReturnValue(800)
@@ -391,23 +359,95 @@ describe("DesignTab split layout (R-D2)", () => {
     const titleBar = await screen.findByTestId("design-chat-titlebar")
     expect(within(titleBar).getByRole("heading", { name: "设计对话" })).toBeInTheDocument()
     expect(screen.queryByTestId("design-chat")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("message-list")).not.toBeInTheDocument()
 
-    // The graph and detail stay available and no tabbed fallback is introduced.
+    // Collapsed keeps the stacked form: the title bar on top and the workbench
+    // filling the remaining full width below it.
+    const main = screen.getByTestId("design-split-main")
+    expect(main).toHaveAttribute("data-collapsed", "true")
+    expect(main).toHaveClass("flex", "flex-col", "min-h-0", "flex-1")
+    expect(main).not.toHaveClass("grid")
+    expect(main).toContainElement(titleBar)
+    expect(main).toContainElement(screen.getByTestId("design-workbench-slot"))
+    expect(main).toContainElement(screen.getByTestId("design-workbench"))
+    // The workbench takes the full remaining height below the title bar.
+    expect(screen.getByTestId("design-workbench-slot")).toHaveClass("flex-1", "min-h-0")
     expect(screen.getByTestId("design-graph")).toBeInTheDocument()
     expect(screen.getByTestId("design-detail")).toBeInTheDocument()
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument()
+
+    // No horizontal overflow: the column stays min-w-0 all the way down.
+    const root = screen.getByTestId("design-scroll")
+    expect(root).toHaveClass("overflow-hidden", "min-w-0")
+    expect(main).toHaveClass("min-w-0")
+
+    // The title bar expands the chat back into the left column.
+    fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
+    expect(await screen.findByTestId("design-chat")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
+    expect(screen.getByTestId("design-split-main")).toHaveClass(
+      "grid",
+      "grid-cols-[minmax(0,2fr)_minmax(0,3fr)]",
+    )
+    expect(screen.getByTestId("design-chat-pane")).toContainElement(
+      screen.getByTestId("design-chat"),
+    )
   })
 
-  it("collapses the chat when a resize enters the short-viewport band", async () => {
+  it.each([
+    [1440, 900],
+    [1280, 800],
+  ])("keeps the left chat on a %ix%i viewport", async (width, height) => {
+    // The approved desktop sizes must show the chat inline: only a narrow
+    // width (< 960px) auto-folds it.
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(width)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(height)
+
+    const { main } = await renderWorkspace()
+
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
+    expect(main).toHaveAttribute("data-collapsed", "false")
+    expect(main).toHaveClass("grid")
+  })
+
+  it("does not auto-collapse the chat on a short but wide viewport", async () => {
+    // Short height only compacts the chrome now; it must not hide the chat.
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1440)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
+
+    const { main } = await renderWorkspace()
+
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
+    expect(main).toHaveClass("grid")
+  })
+
+  it("only auto-collapses when the width crosses into the narrow band", async () => {
+    const width = vi.spyOn(window, "innerWidth", "get").mockReturnValue(1440)
     await renderWorkspace()
     expect(screen.getByTestId("design-chat")).toBeInTheDocument()
 
-    vi.spyOn(window, "innerHeight", "get").mockReturnValue(560)
+    // Entering the narrow band folds the chat.
+    width.mockReturnValue(800)
     fireEvent(window, new Event("resize"))
-
     expect(await screen.findByTestId("design-chat-titlebar")).toBeInTheDocument()
-    expect(screen.getByTestId("design-graph")).toBeInTheDocument()
-    expect(screen.getByTestId("design-detail")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat")).not.toBeInTheDocument()
+
+    // The user expands it again: resizes inside the narrow band keep it open.
+    fireEvent.click(screen.getByTestId("design-chat-collapse-toggle"))
+    expect(await screen.findByTestId("design-chat")).toBeInTheDocument()
+    width.mockReturnValue(880)
+    fireEvent(window, new Event("resize"))
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
+    expect(screen.queryByTestId("design-chat-titlebar")).not.toBeInTheDocument()
+
+    // Leaving and re-entering the band folds it again.
+    width.mockReturnValue(1200)
+    fireEvent(window, new Event("resize"))
+    width.mockReturnValue(800)
+    fireEvent(window, new Event("resize"))
+    expect(await screen.findByTestId("design-chat-titlebar")).toBeInTheDocument()
   })
 
   it("gives the graph and detail panes readable pixel floors with internal scroll", async () => {
@@ -424,22 +464,19 @@ describe("DesignTab split layout (R-D2)", () => {
   it("fits the workspace to a short viewport instead of forcing 320px", async () => {
     // D-03: 1280x800 has ~245px left below the version chrome (507 + the 48px
     // app-content inset); the old hard MIN of 320 pushed the page 75px tall.
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(1280)
     vi.spyOn(window, "innerHeight", "get").mockReturnValue(800)
     mockViewportRects({
       "design-scroll": { top: 507, height: 245, bottom: 752 },
       "design-split-workbench": { top: 0, height: 100, bottom: 100 },
     })
 
-    // The short viewport auto-folds the chat, so render the tab directly and
-    // wait for the collapsed title bar instead of the full chat shell.
-    render(<DesignTab versionId="2001" />)
-    await screen.findByTestId("design-chat-titlebar")
-
-    const root = screen.getByTestId("design-scroll")
-    const workbenchSplit = screen.getByTestId("design-split-workbench")
-    const workbenchDivider = screen.getByTestId("design-split-workbench-divider")
+    // Short height compacts the chrome but keeps the left chat inline; the
+    // workspace still fits the 245px remainder.
+    const { root, workbenchSplit, workbenchDivider } = await renderWorkspace()
 
     await waitFor(() => expect(root.style.height).toBe("245px"))
+    expect(screen.getByTestId("design-chat")).toBeInTheDocument()
     expect(workbenchSplit).toHaveClass("overflow-y-auto")
     expect(workbenchSplit).toHaveAttribute("data-overflowing", "true")
 
@@ -456,25 +493,6 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(screen.getByTestId("design-graph").style.minHeight).toBe("220px")
     expect(screen.getByTestId("design-detail").style.minHeight).toBe("180px")
     await waitFor(() => expect(workbenchDivider).toHaveAttribute("aria-disabled", "true"))
-  })
-
-  it("keeps a readable chat pane and a 200px workbench floor when expanded on a short viewport", async () => {
-    // D-02: the expanded chat used to be 40% of a ~345px workspace, leaving
-    // ~32px for the message list. DesignChat's own chrome (header + composer +
-    // team room) measures ~222px, so the floor leaves ≥180px for the thread.
-    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800)
-    mockViewportRects({ "design-scroll": { top: 507, height: 245, bottom: 752 } })
-
-    render(<DesignTab versionId="2001" />)
-    const titleBar = await screen.findByTestId("design-chat-titlebar")
-    await waitFor(() => expect(screen.getByTestId("design-scroll").style.height).toBe("245px"))
-
-    fireEvent.click(within(titleBar).getByTestId("design-chat-collapse-toggle"))
-
-    const mainTop = await screen.findByTestId("design-split-main-top")
-    expect(mainTop.style.minHeight).toBe("420px")
-    expect(screen.getByTestId("design-split-main-bottom").style.minHeight).toBe("200px")
-    expect(screen.getByTestId("design-split-main")).toHaveClass("overflow-y-auto")
   })
 
   it("uses the full remaining viewport height and contains page scroll on a short viewport", async () => {

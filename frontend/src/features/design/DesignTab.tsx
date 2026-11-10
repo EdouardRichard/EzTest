@@ -47,13 +47,10 @@ import { ExportCasesDialog } from "./ExportCasesDialog"
 import { ExportDetailPanel } from "./ExportDetailPanel"
 import { HandoffPanel } from "./HandoffPanel"
 import {
-  DEFAULT_CHAT_SPLIT,
   DEFAULT_WORKBENCH_SPLIT,
   DESIGN_SPLIT_STORAGE_KEYS,
   type DesignExecutionResults,
-  MAX_CHAT_SPLIT,
   MAX_GRAPH_SPLIT,
-  MIN_CHAT_SPLIT,
   MIN_GRAPH_SPLIT,
 } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
@@ -104,33 +101,21 @@ type AgentActivity = {
 const PAGE_BOTTOM_INSET = 48
 /**
  * Below this available height (viewport minus the version header/tabs) the
- * design chat folds into its title bar so the graph and detail stay usable
- * (R-D2-4). The user can expand it again from the bar.
+ * design chrome compacts (R-D2-4). Height only squeezes the header now: the
+ * chat stays inline as the left column.
  */
 const SHORT_WORKSPACE_HEIGHT = 620
-/** Narrow viewports get the same collapse: the workbench is prioritised. */
+/**
+ * Below this width the chat folds into its title bar so the workbench keeps a
+ * usable canvas; the user can expand it again from the bar.
+ */
 const NARROW_WORKSPACE_WIDTH = 960
-/**
- * Pixel floors of the expanded split panes (D-01/D-02). The workspace never
- * forces a taller-than-viewport block any more; when these floors cannot fit,
- * the split scrolls internally and the page stays scroll-free.
- */
-const CHAT_PANE_MIN_HEIGHT = 300
-/**
- * DesignChat fixed chrome measured from the 0.2.2 UAT evidence: header 60 +
- * composer ~90-115 + team room 38 ≈ 222px (floating panel: message list 543 of a
- * 765px content box). A 300px inline floor would leave the message list ~78px,
- * below the 180px readability target, so short viewports (1440x900/1280x800)
- * use a floor that leaves ≥180px after that chrome.
- */
-const CHAT_PANE_MIN_HEIGHT_COMPACT = 420
-const WORKBENCH_PANE_MIN_HEIGHT = 200
 const GRAPH_PANE_MIN_HEIGHT = 220
 const DETAIL_PANE_MIN_HEIGHT = 180
 
 /**
  * Collapsed chat title bar (R-D2-4). It replaces the full DesignChat on a
- * short/narrow viewport or after the user collapses it; one click restores the
+ * narrow viewport or after the user collapses it; one click restores the
  * inline thread and composer. Kept deliberately thin (header row only) so the
  * graph + detail workbench keeps the available height.
  */
@@ -173,11 +158,11 @@ function ChatTitleBar({
 }
 
 /**
- * D-2 design workspace: page header + a vertical split with the design chat on
- * top (40%) and the case workbench below (60%). The workbench itself splits
- * into the graph (65%) over the case detail (35%); both dividers drag, reset on
- * double-click and persist their ratio. The page never scrolls — each panel
- * scrolls internally (R-D2-1..R-D2-6).
+ * D-2 design workspace: page header + a fixed left/right layout with the design
+ * chat as the 40% left column and the case workbench as the 60% right column.
+ * The workbench itself splits into the graph (65%) over the case detail (35%);
+ * only that divider drags, resets on double-click and persists its ratio. The
+ * page never scrolls — each panel scrolls internally (R-D2-1..R-D2-6).
  *
  * The URL is the deep-link source of truth and the `version:{id}` SSE channel
  * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
@@ -273,8 +258,8 @@ export function DesignTab({
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
-  /** Previous short/narrow state so crossing the threshold collapses the chat. */
-  const wasShortViewport = useRef(false)
+  /** Previous narrow state so crossing the width threshold folds the chat. */
+  const wasNarrowViewport = useRef(false)
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true)
@@ -426,7 +411,9 @@ export function DesignTab({
       const params = new URLSearchParams({ tab: "design" })
       if (conversationId !== null) params.set("conversation", conversationId)
       if (caseId !== null) params.set("case", caseId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )
@@ -727,13 +714,14 @@ export function DesignTab({
       const bottomInset = shortMediaViewport ? 0 : PAGE_BOTTOM_INSET
       const available = Math.max(0, window.innerHeight - top - bottomInset)
       setWorkspaceHeight(`${Math.floor(available)}px`)
-      const isShort =
-        available < SHORT_WORKSPACE_HEIGHT || window.innerWidth < NARROW_WORKSPACE_WIDTH
-      setShortViewport(isShort)
-      // Collapse when the workspace *enters* the short/narrow band. Resizes
-      // while already short never override the user's explicit expand.
-      if (isShort && !wasShortViewport.current) setChatCollapsed(true)
-      wasShortViewport.current = isShort
+      // Short height only compacts the page chrome; only a narrow width may
+      // fold the chat so the workbench keeps a usable canvas.
+      const isNarrow = window.innerWidth < NARROW_WORKSPACE_WIDTH
+      setShortViewport(available < SHORT_WORKSPACE_HEIGHT || isNarrow)
+      // Collapse when the window *enters* the narrow band. Resizes while
+      // already narrow never override the user's explicit expand.
+      if (isNarrow && !wasNarrowViewport.current) setChatCollapsed(true)
+      wasNarrowViewport.current = isNarrow
     }
     updateHeight()
     window.addEventListener("resize", updateHeight)
@@ -1045,67 +1033,70 @@ export function DesignTab({
         />
       ) : null}
 
-      {/* R-D2-1/2: chat above the workbench (40/60), each pane owns its scroll. */}
-      <DesignSplitPane
-        testId="design-split-main"
-        defaultPercent={DEFAULT_CHAT_SPLIT}
-        minPercent={MIN_CHAT_SPLIT}
-        maxPercent={MAX_CHAT_SPLIT}
-        storageKey={DESIGN_SPLIT_STORAGE_KEYS.chat}
-        ariaLabel="调整设计对话与用例工作区高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
-        topCollapsed={chatCollapsed}
-        topOverflow="hidden"
-        bottomOverflow="hidden"
-        topMinHeightPx={
-          chatCollapsed ? undefined : compact ? CHAT_PANE_MIN_HEIGHT_COMPACT : CHAT_PANE_MIN_HEIGHT
-        }
-        bottomMinHeightPx={chatCollapsed ? undefined : WORKBENCH_PANE_MIN_HEIGHT}
-        scrollOnOverflow
-        className="min-h-0 flex-1"
-        top={
-          chatCollapsed ? (
-            <ChatTitleBar
-              conversationTitle={chatTitle}
-              onExpand={toggleChatCollapsed}
-              compact={compact}
+      {/*
+       * R-D2-1/2: fixed left/right layout — chat 40% (left) and the workbench
+       * 60% (right). The workbench keeps its own draggable 65/35 graph/detail
+       * split; the outer columns are fixed and never dragged. A narrow window
+       * folds the chat into a full-width title bar above the workbench.
+       */}
+      <div
+        data-testid="design-split-main"
+        data-collapsed={chatCollapsed ? "true" : "false"}
+        className={cn(
+          "min-h-0 min-w-0 flex-1 gap-3",
+          chatCollapsed
+            ? "flex flex-col"
+            : "grid grid-rows-1 grid-cols-[minmax(0,2fr)_minmax(0,3fr)]",
+        )}
+      >
+        {chatCollapsed ? (
+          <ChatTitleBar
+            conversationTitle={chatTitle}
+            onExpand={toggleChatCollapsed}
+            compact={compact}
+          />
+        ) : (
+          <div
+            data-testid="design-chat-pane"
+            className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+            style={{ overflow: "hidden" }}
+          >
+            <DesignChat
+              versionId={versionId}
+              conversations={conversations}
+              activeConversationId={activeConversationId}
+              onSelectConversation={selectConversation}
+              onCreateConversation={createConversation}
+              creatingConversation={creatingConversation}
+              liveMessages={liveMessages}
+              activity={activity}
+              sseStatus={sseStatus}
+              staleNotice={staleNotice}
+              draftText={chatDraft}
+              onDraftTextChange={setChatDraft}
+              refreshToken={teamRoomToken}
+              collapsed={false}
+              onToggleCollapsed={toggleChatCollapsed}
+              onConversationModelChanged={applyConversationModel}
+              caseReferences={chatCaseReferences}
+              onCaseReferencesChange={setChatCaseReferences}
+              onCaseSelect={selectCase}
             />
-          ) : (
-            <div
-              data-testid="design-chat-pane"
-              className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
-              style={{ overflow: "hidden" }}
-            >
-              <DesignChat
-                versionId={versionId}
-                conversations={conversations}
-                activeConversationId={activeConversationId}
-                onSelectConversation={selectConversation}
-                onCreateConversation={createConversation}
-                creatingConversation={creatingConversation}
-                liveMessages={liveMessages}
-                activity={activity}
-                sseStatus={sseStatus}
-                staleNotice={staleNotice}
-                draftText={chatDraft}
-                onDraftTextChange={setChatDraft}
-                refreshToken={teamRoomToken}
-                collapsed={false}
-                onToggleCollapsed={toggleChatCollapsed}
-                onConversationModelChanged={applyConversationModel}
-                caseReferences={chatCaseReferences}
-                onCaseReferencesChange={setChatCaseReferences}
-                onCaseSelect={selectCase}
-              />
-            </div>
-          )
-        }
-        bottom={
-          // R-D2-3: graph + detail move together into the 90vw×90vh dialog.
+          </div>
+        )}
+
+        {/* R-D2-3: graph + detail move together into the 90vw×90vh dialog.
+            `flex-1` fills the remaining height when collapsed into the stacked
+            form; in grid mode the flex property is ignored by the grid item. */}
+        <div
+          data-testid="design-workbench-slot"
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+        >
           <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
             {workbench}
           </DesignFocusDialog>
-        }
-      />
+        </div>
+      </div>
 
       <ExportCasesDialog
         versionId={versionId}
