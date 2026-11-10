@@ -30,11 +30,11 @@ const (
 	// minCaseLease stays above the 75s executor client bound so a single slow
 	// action can never outlive the lease even before the first heartbeat.
 	minCaseLease = 80 * time.Second
-	// DefaultCaseLease is the case_run lease the agent stamps in Prepare and
-	// keeps alive with the independent heartbeat. The scheduler's dispatch lease
-	// must never be shorter (SchedulerDeps.LeaseTTL is clamped to it): a queued
-	// work item may wait a long time before any worker claims it, and Recovery
-	// must not interrupt that wait.
+	// DefaultCaseLease is the case_run execution lease the agent stamps in
+	// Prepare and keeps alive with the independent heartbeat. It is deliberately
+	// shorter than the scheduler's DefaultDispatchLease: the scheduler stamps the
+	// dispatch lease when the work item is only queued, and Prepare replaces it
+	// with this lease once an agent worker actually claims the run.
 	DefaultCaseLease         = 90 * time.Second
 	heartbeatRetryDelay      = time.Second
 	defaultEvidenceMaxBytes  = int64(5 << 20)
@@ -552,6 +552,15 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 		run.LeaseUntil = &leaseUntil
 		if run.Attempts < 1 {
 			run.Attempts = 1
+		}
+		// Claiming the work item is the only proof the run left the queue:
+		// Recovery uses this marker to tell a dispatch (queue) timeout from an
+		// execution lease expiry.
+		if run.Summary.Dispatch == nil {
+			run.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{Attempt: run.Attempts}
+		}
+		if run.Summary.Dispatch.ClaimedAt == "" {
+			run.Summary.Dispatch.ClaimedAt = now.UTC().Format(time.RFC3339Nano)
 		}
 		return nil
 	})
@@ -1892,14 +1901,25 @@ func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execut
 	return fact
 }
 
+// UnauthenticatedAccountRole is the conventional account-role label of a step
+// that runs without credentials (a logged-out or negative case, such as the
+// "not logged in" acceptance case). It is deliberately allowed by
+// executionSUTBindings but is not a bound test account, so it must never seed
+// knowledge bindings: the knowledge success hook would warn that the role is
+// unbound (R2-OBS-02). Custom unbound roles keep their existing unmapped warning.
+const UnauthenticatedAccountRole = "anonymous"
+
 // caseObservationIDs extracts the deduplicated page/API/account-role
-// back-references of one case snapshot in case order.
+// back-references of one case snapshot in case order. The documented
+// unauthenticated role is skipped: it has no credentials to reuse and no
+// knowledge binding dimension.
 func caseObservationIDs(snapshot execution.CaseSnapshot) (roles []string, pages []int64, apis []int64) {
 	seenRoles := map[string]struct{}{}
 	seenPages := map[int64]struct{}{}
 	seenAPIs := map[int64]struct{}{}
 	for _, step := range snapshot.Steps {
-		if role := strings.TrimSpace(step.AccountRole); role != "" {
+		role := strings.TrimSpace(step.AccountRole)
+		if role != "" && !strings.EqualFold(role, UnauthenticatedAccountRole) {
 			if _, seen := seenRoles[role]; !seen {
 				seenRoles[role] = struct{}{}
 				roles = append(roles, role)

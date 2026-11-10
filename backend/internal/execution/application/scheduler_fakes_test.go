@@ -82,6 +82,14 @@ type fakeIntentStore struct {
 	byID       map[int64]execution.ExecutionIntent
 	createC    int
 	createErrs []error // returned (and consumed) before the next successful Create
+	// transitionErr injects a failure of the execution claim transition
+	// (open/claimed -> running) that dispatchPending performs after the work
+	// item was queued. It pins the intent-Transition failure release path.
+	transitionErr error
+	// onTransitionErr runs after transitionErr fired and before the scheduler
+	// releases the dispatch. Tests use it to simulate a worker claiming the run
+	// in the window between queueing the work item and the release.
+	onTransitionErr func()
 }
 
 func newFakeIntentStore() *fakeIntentStore {
@@ -182,6 +190,15 @@ func (s *fakeIntentStore) listActive(status execution.IntentStatus, versionID in
 
 func (s *fakeIntentStore) Transition(_ context.Context, id int64, from []execution.IntentStatus, to execution.IntentStatus) (bool, error) {
 	s.mu.Lock()
+	if s.transitionErr != nil && to == execution.IntentRunning {
+		err := s.transitionErr
+		hook := s.onTransitionErr
+		s.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		return false, err
+	}
 	defer s.mu.Unlock()
 	intent, ok := s.byID[id]
 	if !ok {
@@ -660,11 +677,17 @@ type fakeWorkQueue struct {
 	mu    sync.Mutex
 	items []ensuredItem
 	byKey map[string]bool
+	// err injects a queue write failure: the scheduler must release the run it
+	// already marked running instead of stranding it until the lease expires.
+	err error
 }
 
 func (q *fakeWorkQueue) Ensure(_ context.Context, in WorkItemInput) (int64, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.err != nil {
+		return 0, false, q.err
+	}
 	if q.byKey == nil {
 		q.byKey = map[string]bool{}
 	}

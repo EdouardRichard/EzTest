@@ -3,6 +3,7 @@ import type { BadgeTone } from "@/components/ui/Badge"
 import type {
   AssertionKind,
   AssertionVerdict,
+  CaseRun,
   CaseRunStatus,
   EvidenceKind,
   ExecutorStatus,
@@ -33,6 +34,34 @@ export const CASE_RUN_TELEMETRY_TERMINAL_STATUSES: CaseRunStatus[] = [
   "skipped",
   "superseded",
 ]
+
+/**
+ * How long after a terminal verdict the usage telemetry may still be attached.
+ *
+ * `CaseRunner.Finish` persists the verdict and publishes `case_run.finished`
+ * before the agent loop's `Finalize` attaches usage (`usage: null` in the
+ * meantime), and the latter publishes no event. Within this window the UI calls
+ * the null usage "遥测写入中…" instead of "遥测不可用"; older runs genuinely have
+ * no telemetry.
+ */
+export const TELEMETRY_PENDING_WINDOW_MS = 120_000
+
+/** True while a just-finished verdict may still receive its usage record. */
+export function isTelemetryPending(
+  run: Pick<CaseRun, "status" | "finished_at" | "summary">,
+  nowMs: number = Date.now(),
+): boolean {
+  if (!CASE_RUN_TERMINAL_STATUSES.includes(run.status)) return false
+  const usage = run.summary.usage ?? null
+  if (usage !== null && typeof usage.total_tokens === "number" && usage.total_tokens > 0) {
+    return false
+  }
+  if (run.finished_at === null) return false
+  const finished = Date.parse(run.finished_at)
+  if (Number.isNaN(finished)) return false
+  const age = nowMs - finished
+  return age >= 0 && age < TELEMETRY_PENDING_WINDOW_MS
+}
 
 export const CASE_RUN_STATUS_LABEL: Record<CaseRunStatus, string> = {
   pending: "待执行",
@@ -216,6 +245,9 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   executor_unavailable: "执行器不可用",
   executor_capability: "执行器能力不足",
   lease_expired: "执行租约过期",
+  // R2-NEW-01: the dispatch lease expired before any agent worker claimed the
+  // queued work item. It is a queue stall, not an executor/environment failure.
+  dispatch_timeout: "执行排队超时（未被 Agent 领取）",
 }
 
 export function terminalCauseLabel(value: string | undefined): string | null {

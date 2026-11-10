@@ -271,6 +271,51 @@ func TestPrepareSetsRunningLeaseAndSnapshot(t *testing.T) {
 	}
 }
 
+// TestPrepareMarksDispatchClaimed: an agent worker claiming the work item is the
+// only proof the run left the queue. Prepare stamps summary.dispatch.claimed_at
+// so Recovery can tell a queue stall (dispatch_timeout) from an execution lease
+// expiry instead of always reporting lease_expired/environment.
+func TestPrepareMarksDispatchClaimed(t *testing.T) {
+	t.Run("existing dispatch snapshot is preserved and marked", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		row := fixture.caseRuns.rows[3001]
+		row.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+			OwnerExecutorID: 7,
+			Endpoint:        "http://127.0.0.1:13336",
+			DispatchAt:      "2026-11-01T00:59:00Z",
+			Attempt:         1,
+		}
+		fixture.caseRuns.rows[3001] = row
+		prepareCaseRun(t, fixture)
+
+		stored := fixture.caseRuns.get(t, 3001)
+		if stored.Summary.Dispatch == nil {
+			t.Fatal("Prepare dropped the dispatch snapshot")
+		}
+		if stored.Summary.Dispatch.ClaimedAt == "" {
+			t.Fatal("Prepare did not mark the dispatch as claimed")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, stored.Summary.Dispatch.ClaimedAt); err != nil {
+			t.Fatalf("claimed_at = %q, want RFC3339Nano: %v", stored.Summary.Dispatch.ClaimedAt, err)
+		}
+		if stored.Summary.Dispatch.Attempt != 1 ||
+			stored.Summary.Dispatch.OwnerExecutorID != 7 ||
+			stored.Summary.Dispatch.DispatchAt != "2026-11-01T00:59:00Z" {
+			t.Fatalf("Prepare rewrote the dispatch snapshot: %+v", stored.Summary.Dispatch)
+		}
+	})
+
+	t.Run("missing dispatch snapshot is created", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		prepareCaseRun(t, fixture)
+
+		stored := fixture.caseRuns.get(t, 3001)
+		if stored.Summary.Dispatch == nil || stored.Summary.Dispatch.ClaimedAt == "" {
+			t.Fatalf("dispatch snapshot = %+v, want a claimed marker", stored.Summary.Dispatch)
+		}
+	})
+}
+
 func TestPrepareRejectsNonCurrentCase(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	fixture.cases.err = execution.ErrNotFound
@@ -1355,8 +1400,8 @@ func TestDispatchLeaseSurvivesDelayedClaim(t *testing.T) {
 	if dispatched.LeaseUntil == nil {
 		t.Fatal("dispatch did not stamp a case_run lease")
 	}
-	if lease := dispatched.LeaseUntil.Sub(fixture.clock.Now()); lease < 90*time.Second {
-		t.Fatalf("dispatch lease = %v, want at least the 90s agent lease", lease)
+	if lease := dispatched.LeaseUntil.Sub(fixture.clock.Now()); lease < executionapp.DefaultDispatchLease {
+		t.Fatalf("dispatch lease = %v, want at least the %v queue-wait lease", lease, executionapp.DefaultDispatchLease)
 	}
 
 	// The work item waits 45s behind a busy worker before any agent claims it.
@@ -1389,6 +1434,11 @@ func TestDispatchLeaseSurvivesDelayedClaim(t *testing.T) {
 	if claimed.Status != execution.CaseRunRunning || claimed.LeaseUntil == nil ||
 		!claimed.LeaseUntil.After(fixture.clock.Now()) {
 		t.Fatalf("delayed claim did not refresh the lease: %+v", claimed)
+	}
+	// Prepare replaces the long dispatch (queue-wait) lease with the short agent
+	// execution lease: the two leases stay separate.
+	if lease := claimed.LeaseUntil.Sub(fixture.clock.Now()); lease != executionapp.DefaultCaseLease {
+		t.Fatalf("execution lease after the claim = %v, want %v", lease, executionapp.DefaultCaseLease)
 	}
 }
 

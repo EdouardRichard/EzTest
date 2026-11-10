@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"sort"
@@ -34,6 +36,13 @@ const (
 	BlockedReasonExecutorDegraded    = "executor_degraded"
 	BlockedReasonExecutorUnavailable = "executor_unavailable"
 )
+
+// DefaultDispatchLease is the dispatch-time case_run lease. It is deliberately
+// longer than DefaultCaseLease (the agent-side execution lease): the scheduler
+// stamps it when the work item is only queued, and the agent worker (default
+// concurrency 4) may not claim the item for minutes. Prepare replaces it with
+// the 90s agent lease + heartbeat once the run actually starts.
+const DefaultDispatchLease = 10 * time.Minute
 
 // Scheduler is the deterministic execution planner/reconciler (ARCH §7.1,
 // P3-D-15): it groups open intents into waves, dispatches pending case_runs
@@ -66,7 +75,7 @@ type Scheduler struct {
 	// whose callback failed and which are retried until a reconcile succeeds.
 	stageReconciler StageReconciler
 	pendingStageMu  sync.Mutex
-	pendingStage    map[int64]struct{}
+	pendingStage    map[int64]stageRetryState
 	// retestNotifier is the v0.22 W2-5 retest writeback callback. nil keeps the
 	// pre-v0.22 behavior; the composition root binds the delivery adapter.
 	retestNotifier WaveTerminalRetestNotifier
@@ -111,9 +120,9 @@ type StageReconciler interface {
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
 // then read from CaseRunRepository.ListRunning. LeaseTTL is the dispatch-time
-// case_run lease; it is clamped to at least DefaultCaseLease (the agent-side
+// case_run lease; it is clamped to at least DefaultDispatchLease (the queue-wait
 // lease), because the work item may wait in the queue before any agent claims
-// it.
+// it. CaseRunner keeps the separate, shorter DefaultCaseLease execution lease.
 type SchedulerDeps struct {
 	Intents     IntentRepository
 	Waves       WaveRepository
@@ -155,11 +164,13 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		quota = execution.QuotaFromSettings(0, 0, 0)
 	}
 	lease := deps.LeaseTTL
-	if lease < DefaultCaseLease {
-		// The dispatch lease must outlive the agent lease: a queued work item
-		// can wait behind a busy worker, and Recovery interrupts a running
-		// case_run whose lease expired before the agent even claimed it.
-		lease = DefaultCaseLease
+	if lease < DefaultDispatchLease {
+		// The dispatch lease must cover the queue wait, not the agent lease: a
+		// queued work item can wait behind a busy worker for minutes, and
+		// Recovery interrupts a running case_run whose lease expired before the
+		// agent even claimed it. CaseRunner.Prepare replaces this lease with the
+		// 90s execution lease once the run is actually claimed.
+		lease = DefaultDispatchLease
 	}
 	return &Scheduler{
 		intents:         deps.Intents,
@@ -182,7 +193,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		stageReconciler: deps.StageReconciler,
 		delta:           deps.Delta,
 		retestNotifier:  deps.RetestNotifier,
-		pendingStage:    map[int64]struct{}{},
+		pendingStage:    map[int64]stageRetryState{},
 		blocked:         map[int64]string{},
 	}
 }
@@ -400,6 +411,11 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 			},
 		}
 		if _, _, err := s.workQueue.Ensure(ctx, workItem); err != nil {
+			// The run is already running with a dispatch lease/owner. A failed
+			// work-item ensure must not strand it until that lease expires:
+			// release the dispatch (new epoch fences the never-created item) and
+			// persist the concrete error so a later interruption is explainable.
+			s.releaseDispatch(ctx, &run, fmt.Errorf("ensure execute work item: %w", err))
 			return mapExecutionError(err, "work item")
 		}
 		if wave.Status == execution.WavePlanned {
@@ -417,6 +433,11 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 			}
 		}
 		if _, err := s.intents.Transition(ctx, intent.ID, activeIntentStatuses, execution.IntentRunning); err != nil {
+			// The work item is already queued but the intent could not be
+			// marked running. Releasing the dispatch under a new epoch keeps the
+			// run pending and fences the item just queued, so no stale worker
+			// can claim a run the scheduler does not consider dispatched.
+			s.releaseDispatch(ctx, &run, fmt.Errorf("transition execution intent: %w", err))
 			return mapExecutionError(err, "intent")
 		}
 		publishEvent(ctx, s.events, EventCaseRunStarted, wave.VersionID,
@@ -433,6 +454,100 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 			}, nil)
 	}
 	return nil
+}
+
+// errDispatchReleaseSkipped fences releaseDispatch: the stored row no longer
+// carries the exact ledger state the failed dispatch wrote (a worker claimed it,
+// or another path advanced it), so the release must not overwrite it.
+var errDispatchReleaseSkipped = errors.New("case_run dispatch was claimed or advanced")
+
+// releaseDispatch returns a run whose dispatch ledger write failed to pending
+// under a new epoch: the old token can never claim it, no lease/owner survives,
+// and the local failure is the retry reason. The dispatch snapshot is
+// deliberately kept so the attempt stays attributable. A stale/never-created
+// work item is fenced by the epoch bump (its Prepare fails with lease_lost).
+//
+// The write is a CAS on the ledger state the dispatch wrote (running, matching
+// epoch/token, not claimed): on the intent-Transition failure path the work item
+// is already queued, so a worker can claim/Prepare the run in the window before
+// this release. An unconditional update would pull that claimed/running row back
+// to pending and the next tick could dispatch the case a second time, while the
+// worker is still executing it. A CAS miss leaves the row untouched and logs.
+func (s *Scheduler) releaseDispatch(ctx context.Context, run *execution.CaseRun, cause error) {
+	if run == nil || cause == nil {
+		return
+	}
+	dispatchedEpoch := run.DispatchEpoch
+	dispatchedToken := run.DispatchToken
+	if dispatchedToken == "" {
+		// Nothing fenced: never risk overwriting a row that this dispatch did not
+		// stamp (defensive; dispatchPending always sets a token first).
+		slog.Default().WarnContext(ctx,
+			"execution: skipped releasing a case_run dispatch without a dispatch token",
+			"case_run_id", platformid.Format(run.ID),
+			"wave_id", platformid.Format(run.WaveID),
+			"attempt", run.Attempts,
+			"reason", cause.Error())
+		return
+	}
+	now := s.now()
+	ok, err := s.caseRuns.UpdateCAS(ctx, run.ID, dispatchedEpoch, dispatchedToken,
+		func(current *execution.CaseRun) error {
+			// The ledger state this dispatch wrote, still unclaimed. A claim flips
+			// ClaimedAt; any later transition changes the status or the epoch/token.
+			if current.Status != execution.CaseRunRunning ||
+				current.DispatchEpoch != dispatchedEpoch ||
+				current.DispatchToken != dispatchedToken ||
+				current.Summary.Dispatch == nil ||
+				current.Summary.Dispatch.ClaimedAt != "" {
+				return errDispatchReleaseSkipped
+			}
+			current.Status = execution.CaseRunPending
+			current.FailureClass = ""
+			current.Summary.VerdictReason = ""
+			current.Summary.LastError = cause.Error()
+			current.Summary.RetryReason = "dispatch_failed"
+			current.DispatchEpoch++
+			current.DispatchToken = ""
+			current.LeaseUntil = nil
+			current.OwnerExecutorID = nil
+			current.OwnerInstance = ""
+			current.StartedAt = nil
+			current.UpdatedAt = now
+			return nil
+		})
+	switch {
+	case errors.Is(err, errDispatchReleaseSkipped):
+		slog.Default().WarnContext(ctx,
+			"execution: skipped releasing a case_run dispatch because the run was already claimed or advanced; leaving it untouched",
+			"case_run_id", platformid.Format(run.ID),
+			"wave_id", platformid.Format(run.WaveID),
+			"attempt", run.Attempts,
+			"reason", cause.Error())
+		return
+	case err != nil:
+		slog.Default().WarnContext(ctx,
+			"execution: failed to release a stranded case_run dispatch",
+			"case_run_id", platformid.Format(run.ID),
+			"wave_id", platformid.Format(run.WaveID),
+			"attempt", run.Attempts,
+			"error", err)
+		return
+	case !ok:
+		slog.Default().WarnContext(ctx,
+			"execution: skipped releasing a case_run dispatch because its dispatch ledger advanced; leaving it untouched",
+			"case_run_id", platformid.Format(run.ID),
+			"wave_id", platformid.Format(run.WaveID),
+			"attempt", run.Attempts,
+			"reason", cause.Error())
+		return
+	}
+	slog.Default().WarnContext(ctx,
+		"execution: released a stranded case_run dispatch; the run is retried on a later tick",
+		"case_run_id", platformid.Format(run.ID),
+		"wave_id", platformid.Format(run.WaveID),
+		"attempt", run.Attempts,
+		"reason", cause.Error())
 }
 
 // runningUsage reads the running case set for quota accounting.
@@ -582,26 +697,94 @@ func (s *Scheduler) notifyRetestWaveTerminal(ctx context.Context, versionID, wav
 	}
 }
 
+// stageRetryState is the per-version retry schedule of a failed wave-terminal
+// stage callback. A deterministic gate (for example a close predicate that
+// cannot pass yet) must not be re-evaluated and logged on every 1s tick.
+type stageRetryState struct {
+	attempts int
+	next     time.Time
+}
+
+// pendingStageRetry is one due version retry read under the pendingStage lock.
+type pendingStageRetry struct {
+	versionID int64
+	attempts  int
+}
+
+const (
+	stageRetryBaseDelay = time.Second
+	stageRetryMaxDelay  = 60 * time.Second
+)
+
+// stageRetryDelay returns the exponential backoff of a failed stage retry:
+// 1s, 2s, 4s, ... capped at stageRetryMaxDelay. Attempt 1 is the initial
+// failure, so the first retry waits the base delay.
+func stageRetryDelay(attempts int) time.Duration {
+	if attempts <= 1 {
+		return stageRetryBaseDelay
+	}
+	delay := stageRetryBaseDelay << (attempts - 1)
+	if delay <= 0 || delay > stageRetryMaxDelay {
+		return stageRetryMaxDelay
+	}
+	return delay
+}
+
 // retryPendingStageNotifications re-drives the stage machine for every version
-// whose wave-terminal callback failed on an earlier tick. A still-failing
-// reconcile keeps the version pending for the next tick; a success clears it.
-// Reconcile failures never fail the scheduler tick (best effort, one version
-// must not block the others).
+// whose wave-terminal callback failed on an earlier tick. A version is only
+// retried once its exponential backoff window elapsed (1s, 2s, 4s, ... capped at
+// 60s): a deterministic gate failure must not be re-evaluated and logged on
+// every 1s tick. A still-failing reconcile keeps the version pending for a later
+// tick; a success clears it immediately. Reconcile failures never fail the
+// scheduler tick (best effort, one version must not block the others).
 func (s *Scheduler) retryPendingStageNotifications(ctx context.Context) error {
-	versionIDs := s.pendingStageVersions()
-	if len(versionIDs) == 0 || s.stageReconciler == nil {
+	if s.stageReconciler == nil {
 		return nil
 	}
-	for _, versionID := range versionIDs {
-		if err := s.stageReconciler.Reconcile(ctx, versionID); err != nil {
-			slog.Default().WarnContext(ctx,
-				"execution: stage reconcile retry failed; keeping the version pending",
-				"version_id", versionID, "error", err)
+	for _, retry := range s.dueStageRetries(s.now()) {
+		if err := s.stageReconciler.Reconcile(ctx, retry.versionID); err != nil {
+			s.recordStageRetryFailure(ctx, retry, err)
 			continue
 		}
-		s.clearPendingStage(versionID)
+		s.clearPendingStage(retry.versionID)
 	}
 	return nil
+}
+
+// dueStageRetries returns the pending versions whose backoff window elapsed,
+// sorted by version ID.
+func (s *Scheduler) dueStageRetries(now time.Time) []pendingStageRetry {
+	s.pendingStageMu.Lock()
+	defer s.pendingStageMu.Unlock()
+	due := make([]pendingStageRetry, 0, len(s.pendingStage))
+	for versionID, state := range s.pendingStage {
+		if state.next.After(now) {
+			continue
+		}
+		due = append(due, pendingStageRetry{versionID: versionID, attempts: state.attempts})
+	}
+	sort.Slice(due, func(i, j int) bool { return due[i].versionID < due[j].versionID })
+	return due
+}
+
+// recordStageRetryFailure reschedules a failed retry. It only updates the entry
+// if no concurrent callback replaced it (the attempts guard), so a success that
+// cleared the entry is never resurrected.
+func (s *Scheduler) recordStageRetryFailure(ctx context.Context, retry pendingStageRetry, cause error) {
+	s.pendingStageMu.Lock()
+	state, ok := s.pendingStage[retry.versionID]
+	if !ok || state.attempts != retry.attempts {
+		s.pendingStageMu.Unlock()
+		return
+	}
+	state.attempts++
+	delay := stageRetryDelay(state.attempts)
+	state.next = s.now().Add(delay)
+	s.pendingStage[retry.versionID] = state
+	s.pendingStageMu.Unlock()
+	slog.Default().WarnContext(ctx,
+		"execution: stage reconcile retry failed; keeping the version pending with exponential backoff",
+		"version_id", retry.versionID, "attempt", state.attempts, "retry_in", delay, "error", cause)
 }
 
 func (s *Scheduler) markPendingStage(versionID int64) {
@@ -611,26 +794,24 @@ func (s *Scheduler) markPendingStage(versionID int64) {
 	s.pendingStageMu.Lock()
 	defer s.pendingStageMu.Unlock()
 	if s.pendingStage == nil {
-		s.pendingStage = map[int64]struct{}{}
+		s.pendingStage = map[int64]stageRetryState{}
 	}
-	s.pendingStage[versionID] = struct{}{}
+	if _, ok := s.pendingStage[versionID]; ok {
+		// An earlier failure already scheduled this version: keep its backoff
+		// schedule instead of pushing the retry back on every new failure.
+		return
+	}
+	attempts := 1
+	s.pendingStage[versionID] = stageRetryState{
+		attempts: attempts,
+		next:     s.now().Add(stageRetryDelay(attempts)),
+	}
 }
 
 func (s *Scheduler) clearPendingStage(versionID int64) {
 	s.pendingStageMu.Lock()
 	defer s.pendingStageMu.Unlock()
 	delete(s.pendingStage, versionID)
-}
-
-func (s *Scheduler) pendingStageVersions() []int64 {
-	s.pendingStageMu.Lock()
-	defer s.pendingStageMu.Unlock()
-	versionIDs := make([]int64, 0, len(s.pendingStage))
-	for versionID := range s.pendingStage {
-		versionIDs = append(versionIDs, versionID)
-	}
-	sort.Slice(versionIDs, func(i, j int) bool { return versionIDs[i] < versionIDs[j] })
-	return versionIDs
 }
 
 // completeIntent projects one finished case_run onto its intent (§4.1).

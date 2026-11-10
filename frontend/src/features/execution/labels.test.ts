@@ -16,15 +16,17 @@ import {
   HUMAN_REQUEST_KIND_LABEL,
   HUMAN_REQUEST_STATUS_LABEL,
   HUMAN_REQUEST_STATUS_TONE,
+  isTelemetryPending,
   nextActionLabel,
   PAUSE_MODE_LABEL,
   STEP_STATUS_LABEL,
+  TELEMETRY_PENDING_WINDOW_MS,
   terminalCauseLabel,
   WAVE_STATUS_LABEL,
   WAVE_STATUS_TONE,
   WAVE_TRIGGER_LABEL,
 } from "./labels"
-import type { CaseRunStatus, FailureClass } from "./types"
+import type { CaseRun, CaseRunStatus, FailureClass } from "./types"
 
 describe("case run labels", () => {
   it("labels the four terminal verdicts and every process state", () => {
@@ -68,6 +70,48 @@ describe("case run labels", () => {
   })
 })
 
+describe("telemetry pending window (R2-OBS-01)", () => {
+  const finishedAt = "2026-11-10T12:33:43Z"
+  const finishedMs = Date.parse(finishedAt)
+  const run: Pick<CaseRun, "status" | "finished_at" | "summary"> = {
+    status: "passed",
+    finished_at: finishedAt,
+    summary: { usage: null },
+  }
+
+  it("treats a just-finished terminal run without usage as telemetry pending", () => {
+    expect(TELEMETRY_PENDING_WINDOW_MS).toBe(120_000)
+    expect(isTelemetryPending(run, finishedMs + 30_000)).toBe(true)
+    // The write window is bounded: older runs really have no telemetry.
+    expect(isTelemetryPending(run, finishedMs + TELEMETRY_PENDING_WINDOW_MS)).toBe(false)
+    expect(isTelemetryPending(run, finishedMs + 5 * 60_000)).toBe(false)
+  })
+
+  it("is not pending once usage arrives, on a non-verdict status, or without a valid end", () => {
+    expect(
+      isTelemetryPending(
+        {
+          ...run,
+          summary: {
+            usage: { turns: 1, total_tokens: 1, prompt_tokens: 1, completion_tokens: 0 },
+          },
+        },
+        finishedMs + 30_000,
+      ),
+    ).toBe(false)
+    expect(isTelemetryPending({ ...run, status: "skipped" }, finishedMs + 30_000)).toBe(false)
+    expect(
+      isTelemetryPending({ ...run, status: "running", finished_at: null }, finishedMs + 30_000),
+    ).toBe(false)
+    expect(isTelemetryPending({ ...run, finished_at: null }, finishedMs + 30_000)).toBe(false)
+    expect(isTelemetryPending({ ...run, finished_at: "not-a-date" }, finishedMs + 30_000)).toBe(
+      false,
+    )
+    // A finished_at in the future (clock skew) is not a pending write window.
+    expect(isTelemetryPending(run, finishedMs - 1_000)).toBe(false)
+  })
+})
+
 describe("failure class labels", () => {
   it("labels all nine failure classes from spec §4.5", () => {
     expect(FAILURE_CLASS_LABEL).toEqual({
@@ -100,6 +144,9 @@ describe("terminal cause labels (X-01/X-02/X-07)", () => {
     expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_capability).toBe("执行器能力不足")
     expect(CASE_RUN_TERMINAL_CAUSE_LABEL.executor_unavailable).toBe("执行器不可用")
     expect(CASE_RUN_TERMINAL_CAUSE_LABEL.lease_expired).toBe("执行租约过期")
+    // R2-NEW-01: an expired dispatch lease on a run no agent worker claimed is a
+    // queue stall, not an execution/environment failure.
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.dispatch_timeout).toBe("执行排队超时（未被 Agent 领取）")
   })
 
   it("humanizes stable cause/failure enum values but leaves prose alone", () => {

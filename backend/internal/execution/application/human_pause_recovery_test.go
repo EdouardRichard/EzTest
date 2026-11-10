@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -349,6 +350,148 @@ func TestLeaseExpiredRecovery(t *testing.T) {
 	untouched, _ := f.runs.Get(ctx, 501)
 	if untouched.Status != execution.CaseRunRunning {
 		t.Fatal("recovery must not interrupt a live lease (no bulk interrupt on restart)")
+	}
+}
+
+// seedOnlineExecutor registers an active executor with a fresh heartbeat so
+// Recovery classifies an expired lease from the recorded cause, not as lost.
+func seedOnlineExecutor(f *task9Fixture, id int64) {
+	now := f.clock.Now()
+	f.executors.byID[id] = execution.ExecutorInstance{
+		ID: id, Name: "executor", Endpoint: "http://127.0.0.1:13336",
+		Status: execution.ExecutorActive, LastHeartbeat: &now,
+	}
+}
+
+// TestClassifyInterruptedRunUnclaimedDispatchIsDispatchTimeout pins the stable
+// cause split: an expired dispatch lease on a run no agent worker ever claimed is
+// a queue stall (dispatch_timeout), while a claimed run keeps the execution
+// lease_expired classification.
+func TestClassifyInterruptedRunUnclaimedDispatchIsDispatchTimeout(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	seedOnlineExecutor(f, 1)
+
+	if execution.TerminalCauseDispatchTimeout != "dispatch_timeout" {
+		t.Fatalf("terminal cause = %q, want dispatch_timeout", execution.TerminalCauseDispatchTimeout)
+	}
+	unclaimed := execution.CaseRun{
+		ID: 500, WaveID: 50, IntentID: 1, Status: execution.CaseRunRunning, Attempts: 1,
+		OwnerExecutorID: int64PtrValue(1),
+		Summary: execution.CaseRunSummary{
+			Dispatch: &execution.CaseRunDispatchDiagnostic{Attempt: 1, DispatchAt: "2026-11-01T02:59:00Z"},
+		},
+	}
+	class, cause := f.recovery.classifyInterruptedRun(ctx, unclaimed)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("unclaimed expired lease = %s/%s, want environment/%s",
+			class, cause, execution.TerminalCauseDispatchTimeout)
+	}
+
+	claimed := unclaimed
+	claimed.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		Attempt: 1, DispatchAt: "2026-11-01T02:59:00Z", ClaimedAt: "2026-11-01T02:59:30Z",
+	}
+	class, cause = f.recovery.classifyInterruptedRun(ctx, claimed)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseLeaseExpired {
+		t.Fatalf("claimed expired lease = %s/%s, want environment/lease_expired", class, cause)
+	}
+
+	// A run without a dispatch snapshot cannot prove a claim either: it is a
+	// queue stall too.
+	unknown := unclaimed
+	unknown.Summary.Dispatch = nil
+	class, cause = f.recovery.classifyInterruptedRun(ctx, unknown)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("no-dispatch expired lease = %s/%s, want environment/%s",
+			class, cause, execution.TerminalCauseDispatchTimeout)
+	}
+}
+
+// TestRecoveryLogsLeaseExpiryDispatchDiagnostics: an expired lease must leave a
+// structured local WARN (the UAT missing diagnostic): run/wave/attempt,
+// whether an agent claimed it, the owner, the dispatch time and the last error.
+func TestRecoveryLogsLeaseExpiryDispatchDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	seedOnlineExecutor(f, 1)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.Attempts = 2
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 1, Attempt: 2, DispatchAt: "2026-11-01T02:59:00Z",
+	}
+	f.runs.byID[500] = run
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	logs := captureSchedulerSlog(t)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	logged := logs.String()
+	for _, want := range []string{
+		"lease expired",
+		"case_run_id=500",
+		"wave_id=50",
+		"attempt=2",
+		"agent_claimed=false",
+		"owner_executor_id=1",
+		"dispatch_at=2026-11-01T02:59:00Z",
+		"lease_until=",
+		"last_error=",
+		"retry_reason=",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("lease expiry log is missing %q: %s", want, logged)
+		}
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("unclaimed retry status = %s, want pending", stored.Status)
+	}
+	if stored.Summary.RetryReason != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("retry reason = %q, want %q", stored.Summary.RetryReason, execution.TerminalCauseDispatchTimeout)
+	}
+}
+
+// TestRecoveryLogsClaimedLeaseExpiryAsLeaseExpired: a claimed run keeps the
+// existing lease_expired/environment classification and logs agent_claimed=true.
+func TestRecoveryLogsClaimedLeaseExpiryAsLeaseExpired(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	seedOnlineExecutor(f, 1)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.Attempts = 3
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 1, Attempt: 3, DispatchAt: "2026-11-01T02:59:00Z",
+		ClaimedAt: "2026-11-01T02:59:30Z",
+	}
+	f.runs.byID[500] = run
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	logs := captureSchedulerSlog(t)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "agent_claimed=true") {
+		t.Fatalf("claimed lease expiry log missing agent_claimed=true: %s", logged)
+	}
+	failed, _ := f.runs.Get(ctx, 500)
+	if failed.Status != execution.CaseRunFailed || failed.FailureClass != execution.FailureClassEnvironment {
+		t.Fatalf("claimed exhausted run = %s/%s, want failed/environment", failed.Status, failed.FailureClass)
+	}
+	if failed.Summary.TerminalCause != execution.TerminalCauseLeaseExpired {
+		t.Fatalf("terminal cause = %q, want %q", failed.Summary.TerminalCause, execution.TerminalCauseLeaseExpired)
 	}
 }
 

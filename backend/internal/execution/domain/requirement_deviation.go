@@ -71,6 +71,10 @@ const (
 	// TerminalCauseLeaseExpired is the stable cause of an expired lease on an
 	// online executor with no recorded transport failure.
 	TerminalCauseLeaseExpired = "lease_expired"
+	// TerminalCauseDispatchTimeout is the stable cause of a dispatched case_run
+	// whose dispatch lease expired before any agent worker claimed the work item
+	// (queue wait), distinguishable from an execution lease_expired.
+	TerminalCauseDispatchTimeout = "dispatch_timeout"
 )
 
 // executorLimitationCodes is the closed set of executor capability limitation
@@ -158,6 +162,7 @@ func ExecutorFailureCause(text string) string {
 		TerminalCauseExecutorCapability,
 		string(FailureClassExecutorLost),
 		TerminalCauseLeaseExpired,
+		TerminalCauseDispatchTimeout,
 	} {
 		if strings.Contains(lower, cause) {
 			return cause

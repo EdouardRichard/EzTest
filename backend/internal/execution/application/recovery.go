@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -187,6 +188,11 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 	}
 	s.closeRunContexts(ctx, run.ID)
 	now := s.now()
+	// The UAT could not tell a queue stall from an execution hang: every
+	// interrupted lease now leaves one structured local diagnostic with the
+	// dispatch/claim state (the executor HTTP diagnostics only fire on a real
+	// request, and a never-claimed run makes none).
+	s.logLeaseExpiryDiagnostic(ctx, intent, run)
 	class, cause := s.classifyInterruptedRun(ctx, run)
 	retry := run.Attempts < s.maxAttempts && intent.Status.Active()
 	oldEpoch := run.DispatchEpoch
@@ -254,6 +260,46 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 	return nil
 }
 
+// logLeaseExpiryDiagnostic emits the local dispatch/claim diagnostic of one
+// interrupted lease. agent_claimed=false means the work item was never picked up
+// by an agent worker (the lease is the dispatch/queue lease), while true means an
+// execution lease expired after the run had started.
+func (s *Recovery) logLeaseExpiryDiagnostic(ctx context.Context, intent execution.ExecutionIntent, run execution.CaseRun) {
+	claimed := !dispatchUnclaimed(run)
+	ownerExecutorID := int64(0)
+	if run.OwnerExecutorID != nil {
+		ownerExecutorID = *run.OwnerExecutorID
+	}
+	leaseUntil := ""
+	if run.LeaseUntil != nil {
+		leaseUntil = run.LeaseUntil.UTC().Format(time.RFC3339Nano)
+	}
+	dispatchAt := ""
+	if run.Summary.Dispatch != nil {
+		dispatchAt = run.Summary.Dispatch.DispatchAt
+	}
+	slog.Default().WarnContext(ctx,
+		"execution: case run lease expired",
+		"case_run_id", platformid.Format(run.ID),
+		"version_id", platformid.Format(intent.VersionID),
+		"wave_id", platformid.Format(run.WaveID),
+		"attempt", run.Attempts,
+		"agent_claimed", claimed,
+		"owner_executor_id", ownerExecutorID,
+		"owner_instance", run.OwnerInstance,
+		"lease_until", leaseUntil,
+		"dispatch_at", dispatchAt,
+		"last_error", run.Summary.LastError,
+		"retry_reason", run.Summary.RetryReason,
+	)
+}
+
+// dispatchUnclaimed reports whether the run was never claimed by an agent
+// worker: no dispatch snapshot (legacy row) or an empty claimed_at marker.
+func dispatchUnclaimed(run execution.CaseRun) bool {
+	return run.Summary.Dispatch == nil || run.Summary.Dispatch.ClaimedAt == ""
+}
+
 // classifyInterruptedRun types one expired-lease interruption from the
 // executor health and its most recent recorded transport error.
 func (s *Recovery) classifyInterruptedRun(ctx context.Context, run execution.CaseRun) (execution.FailureClass, string) {
@@ -270,6 +316,12 @@ func (s *Recovery) classifyInterruptedRun(ctx context.Context, run execution.Cas
 	if execution.ExecutorDialRefused(run.Summary.LastError) {
 		return execution.FailureClassExecutorLost, string(execution.FailureClassExecutorLost)
 	}
+	// The executor is reachable but the run was never claimed by an agent worker:
+	// the dispatch (queue) lease expired, which is a queue stall, not an
+	// execution lease_expired. A recorded executor failure still wins.
+	if cause == "" && dispatchUnclaimed(run) {
+		return execution.FailureClassEnvironment, execution.TerminalCauseDispatchTimeout
+	}
 	switch cause {
 	case execution.TerminalCauseExecutorContextCreateFailed, execution.TerminalCauseExecutorTimeout:
 		return execution.FailureClassTimeout, cause
@@ -279,6 +331,8 @@ func (s *Recovery) classifyInterruptedRun(ctx context.Context, run execution.Cas
 		return execution.FailureClassEnvironment, cause
 	case execution.TerminalCauseExecutorCapability:
 		return execution.FailureClassBlocked, cause
+	case execution.TerminalCauseDispatchTimeout:
+		return execution.FailureClassEnvironment, cause
 	default:
 		// The executor is reachable (fresh heartbeat) and no known executor
 		// failure was recorded: an expired lease is an environment condition,

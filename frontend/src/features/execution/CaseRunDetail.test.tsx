@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { CaseRunDetailView } from "./CaseRunDetail"
@@ -233,6 +233,90 @@ describe("CaseRunDetail incomplete cause", () => {
     const usage = screen.getByTestId("case-run-usage")
     expect(usage).toHaveTextContent("180000")
     expect(usage).toHaveTextContent("12 轮")
+  })
+})
+
+describe("CaseRunDetail telemetry pending (R2-OBS-01)", () => {
+  it("marks telemetry pending and refetches at 5s then 15s for a just-finished run", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const onRetry = vi.fn()
+      const detail: CaseRunDetail = {
+        ...caseRunDetailFixture,
+        case_run: {
+          ...caseRunDetailFixture.case_run,
+          status: "passed",
+          failure_class: "",
+          // Usage is attached by Finalize after `case_run.finished`: right after
+          // the event the snapshot can still answer `usage: null`.
+          finished_at: new Date().toISOString(),
+          summary: { ...caseRunDetailFixture.case_run.summary, usage: null },
+        },
+      }
+
+      render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={detail}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      expect(screen.getByTestId("case-run-telemetry-pending")).toHaveTextContent("遥测写入中")
+      expect(screen.queryByTestId("case-run-telemetry-unavailable")).not.toBeInTheDocument()
+      expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(1)
+
+      act(() => {
+        vi.advanceTimersByTime(15_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+
+      // One-shot: the delayed refetch never runs more than twice.
+      act(() => {
+        vi.advanceTimersByTime(60_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps telemetry unavailable once the write window has passed", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const detail = overrideSummary(
+        {
+          status: "passed",
+          failure_class: "",
+          finished_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+        },
+        { usage: null },
+      )
+
+      render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={detail}
+          loading={false}
+          error={null}
+          onRetry={() => {}}
+        />,
+      )
+
+      expect(screen.getByTestId("case-run-telemetry-unavailable")).toHaveTextContent("遥测不可用")
+      expect(screen.queryByTestId("case-run-telemetry-pending")).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

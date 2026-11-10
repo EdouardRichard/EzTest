@@ -293,6 +293,10 @@ type CaseRunDispatchDiagnostic struct {
 	RegistryHit bool   `json:"registry_hit"`
 	DispatchAt  string `json:"dispatch_at,omitempty"`
 	Attempt     int    `json:"attempt,omitempty"`
+	// ClaimedAt is set by CaseRunner.Prepare when an agent worker actually
+	// claims the run. Empty means the lease expired while the work item was
+	// still queued (dispatch_timeout), not during execution.
+	ClaimedAt string `json:"claimed_at,omitempty"`
 }
 
 // CaseRunSummary is the case_run.summary JSONB projection.

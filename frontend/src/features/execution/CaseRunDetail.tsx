@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -26,6 +26,7 @@ import {
   causeTextLabel,
   EVIDENCE_KIND_LABEL,
   failureClassLabel,
+  isTelemetryPending,
   nextActionLabel,
   STEP_STATUS_LABEL,
   terminalCauseLabel,
@@ -39,6 +40,14 @@ export type CaseRunDetailProps = {
   error: unknown
   onRetry: () => void
 }
+
+/**
+ * One-shot refetches while a just-finished verdict's usage is still being
+ * written: after 5s, then 15s later (at most twice). `case_run.finished` is
+ * published before `Finalize` attaches usage and no event follows it, so the
+ * snapshot has to be pulled again rather than pushed.
+ */
+const TELEMETRY_RETRY_DELAYS_MS = [5_000, 15_000] as const
 
 function spanDuration(start: string | null, end: string | null): string {
   if (start === null || end === null) return "—"
@@ -308,6 +317,35 @@ export function CaseRunDetailView({
   const [viewerEvidence, setViewerEvidence] = useState<Evidence | null>(null)
   const [issueDialogOpen, setIssueDialogOpen] = useState(false)
 
+  // The parent passes an inline arrow (`() => setDetailToken(...)`), so its
+  // identity changes on every render. Keep the latest callback in a ref but out
+  // of the effect deps: otherwise each SSE refresh would clear and reschedule
+  // the retry timer, possibly forever.
+  const onRetryRef = useRef(onRetry)
+  useEffect(() => {
+    onRetryRef.current = onRetry
+  }, [onRetry])
+
+  const telemetryRetryRef = useRef(0)
+  const pendingRun = detail?.case_run ?? null
+  const telemetryPending = pendingRun !== null && isTelemetryPending(pendingRun)
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: switching to another pending run restarts the one-shot refetch schedule
+  useEffect(() => {
+    if (!telemetryPending) {
+      telemetryRetryRef.current = 0
+      return
+    }
+    const retry = (): void => {
+      telemetryRetryRef.current += 1
+      onRetryRef.current()
+      if (telemetryRetryRef.current >= TELEMETRY_RETRY_DELAYS_MS.length) return
+      timer = setTimeout(retry, TELEMETRY_RETRY_DELAYS_MS[telemetryRetryRef.current])
+    }
+    let timer = setTimeout(retry, TELEMETRY_RETRY_DELAYS_MS[0])
+    return () => clearTimeout(timer)
+  }, [telemetryPending, pendingRun?.id, pendingRun?.finished_at])
+
   if (loading) return <LoadingCard label="正在加载用例详情…" />
 
   if (error !== null) {
@@ -411,6 +449,13 @@ export function CaseRunDetailView({
           <span className="font-medium text-foreground">用量：</span>
           {usage.total_tokens} tokens
           {usage.turns > 0 ? ` · ${usage.turns} 轮` : ""}
+        </p>
+      ) : telemetryPending ? (
+        <p
+          data-testid="case-run-telemetry-pending"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          遥测写入中…
         </p>
       ) : CASE_RUN_TELEMETRY_TERMINAL_STATUSES.includes(run.status) ? (
         <p
