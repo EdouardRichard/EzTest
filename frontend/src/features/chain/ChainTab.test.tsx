@@ -508,7 +508,9 @@ describe("ChainTab", () => {
       "href",
       "/versions/2001?tab=issues&issue=9101",
     )
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=chain&node=issue%3A9101")
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=chain&node=issue%3A9101", {
+      scroll: false,
+    })
   })
 
   it("restores a ?node= deep link, keeps focus_node on the request and does not rewrite the URL", async () => {
@@ -657,6 +659,7 @@ describe("ChainTab", () => {
     )
     expect(navigation.replace).toHaveBeenLastCalledWith(
       expect.stringContaining("q=%E9%80%80%E6%AC%BE"),
+      { scroll: false },
     )
 
     fireEvent.click(screen.getByTestId("chain-filter-abnormal"))
@@ -774,7 +777,10 @@ describe("ChainTab", () => {
     expect(layerTruncation).toHaveTextContent("问题")
 
     expect(screen.getByTestId("chain-replay-truncated")).toHaveTextContent("event_limit")
-    expect(api.listChainEvents).toHaveBeenCalledWith("2001", { limit: 5 })
+    // The history read fires once at mount with the default limit and again once
+    // the chain (and its replay.event_limit) lands; wait for the second request
+    // instead of assuming the effect already flushed on a slow CI runner.
+    await waitFor(() => expect(api.listChainEvents).toHaveBeenCalledWith("2001", { limit: 5 }))
   })
 
   it("shows P6 typed meta in the node list and detail sheet", async () => {

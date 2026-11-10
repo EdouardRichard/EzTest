@@ -9,6 +9,7 @@ import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { createIntent, listCaseRuns, listWaves } from "@/features/execution/api"
 import { rerunPurpose } from "@/features/execution/intent-purpose"
+import { WAVE_STATUS_LABEL } from "@/features/execution/labels"
 import type { CaseRun, RunWave } from "@/features/execution/types"
 
 import { getVisualOverview, listVisualAssertions, listVisualDiffs } from "./api"
@@ -209,7 +210,7 @@ export function VisualView({ versionId, initialWaveId }: VisualViewProps) {
               >
                 {waves.map((wave) => (
                   <option key={wave.id} value={wave.id}>
-                    #{wave.id} · {wave.status}
+                    #{wave.id} · {WAVE_STATUS_LABEL[wave.status]}
                   </option>
                 ))}
               </Select>

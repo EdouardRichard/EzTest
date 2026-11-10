@@ -31,28 +31,50 @@ func NewExecutorRouter(resolver *executorinfra.Resolver, lookup ExecutorLookup, 
 	return &ExecutorRouter{resolver: resolver, lookup: lookup, primary: primary}
 }
 
+// ExecutorRouteDiagnostic describes how an executor id was resolved. It is
+// attached to executor call diagnostics so a failure names the owner, the
+// endpoint that was actually used, and whether the registry supplied it.
+type ExecutorRouteDiagnostic struct {
+	OwnerExecutorID int64
+	Endpoint        string
+	RegistryHit     bool
+}
+
+// clientFor routes one call. Unknown or offline owners fall back to the primary
+// endpoint; the action then fails with a typed transport error, which the
+// adapter annotates with registry_hit=false.
 func (r *ExecutorRouter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
+	client, _, err := r.clientForDiagnostics(ctx, executorID)
+	return client, err
+}
+
+// clientForDiagnostics is clientFor plus the route diagnostic. An offline or
+// unknown owner is never dialed: the primary endpoint is used instead and
+// registry_hit stays false.
+func (r *ExecutorRouter) clientForDiagnostics(ctx context.Context, executorID int64) (executorinfra.Client, ExecutorRouteDiagnostic, error) {
+	diagnostic := ExecutorRouteDiagnostic{OwnerExecutorID: executorID}
 	if r == nil || r.resolver == nil {
-		return nil, errNotConfigured("executor client")
+		return nil, diagnostic, errNotConfigured("executor client")
 	}
 	endpoint := r.primary
 	if executorID > 0 && r.lookup != nil {
 		instance, err := r.lookup.Get(ctx, executorID)
-		if err == nil && instance.Endpoint != "" {
+		if err == nil && instance.Endpoint != "" && instance.Status != execution.ExecutorOffline {
 			endpoint = instance.Endpoint
+			diagnostic.RegistryHit = true
 		}
-		// Unknown/offline ids fall back to the primary endpoint; the action then
-		// fails with context_not_found, which the caller maps to a retryable
-		// failure exactly like P3 single-endpoint mode.
+		// Unknown/offline ids fall back to the primary endpoint; they are never
+		// routed to a stale/offline endpoint.
 	}
 	if endpoint == "" {
-		return nil, errNotConfigured("executor endpoint")
+		return nil, diagnostic, errNotConfigured("executor endpoint")
 	}
 	client := r.resolver.Client(endpoint)
 	if client == nil {
-		return nil, errNotConfigured("executor client")
+		return nil, diagnostic, errNotConfigured("executor client")
 	}
-	return client, nil
+	diagnostic.Endpoint = endpoint
+	return client, diagnostic, nil
 }
 
 type routedClient struct {

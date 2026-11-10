@@ -44,12 +44,28 @@ export type DesignSplitPaneProps = {
   bottomClassName?: string
   topOverflow?: "auto" | "hidden"
   bottomOverflow?: "auto" | "hidden"
+  /**
+   * Pixel floor for the top pane (D-01). Percentage-only panes collapsed the
+   * graph to ~110px on a 1440x900 viewport; a floor keeps the canvas usable.
+   */
+  topMinHeightPx?: number
+  /** Pixel floor for the bottom pane (D-01/D-02). */
+  bottomMinHeightPx?: number
+  /**
+   * Scroll the split itself when both pixel floors cannot fit the caller's
+   * height (short viewports). The page stays scroll-free; the divider is locked
+   * because the ratio cannot be honoured.
+   */
+  scrollOnOverflow?: boolean
 }
 
 type DragState = {
   startY: number
   startPercent: number
 }
+
+/** Height of the divider (`h-2`) reserved when checking the floors. */
+const DIVIDER_HEIGHT_PX = 8
 
 /**
  * Vertical two-pane splitter with the accessible divider contract from the
@@ -77,6 +93,9 @@ export function DesignSplitPane({
   bottomClassName,
   topOverflow = "auto",
   bottomOverflow = "auto",
+  topMinHeightPx,
+  bottomMinHeightPx,
+  scrollOnOverflow = false,
 }: DesignSplitPaneProps) {
   const [percent, setPercent] = useState(() =>
     readStoredSplit(storageKey, defaultPercent, minPercent, maxPercent),
@@ -84,6 +103,31 @@ export function DesignSplitPane({
   const containerRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<DragState | null>(null)
   const [dragging, setDragging] = useState(false)
+  /**
+   * True when the caller's height cannot hold both pixel floors: the panes
+   * keep their minimums, the split scrolls and the divider is locked.
+   */
+  const [overflowing, setOverflowing] = useState(false)
+
+  // Measure once and on every resize: the floors and the available height both
+  // change with the viewport, stage notices and the focus dialog.
+  useEffect(() => {
+    const element = containerRef.current
+    if (element === null) return undefined
+    const measure = () => {
+      const height = element.getBoundingClientRect().height
+      const floors =
+        (topCollapsed ? 0 : (topMinHeightPx ?? 0)) + (bottomMinHeightPx ?? 0) + DIVIDER_HEIGHT_PX
+      setOverflowing(floors > DIVIDER_HEIGHT_PX && height > 0 && height < floors)
+    }
+    measure()
+    if (typeof ResizeObserver !== "function") return undefined
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [bottomMinHeightPx, topCollapsed, topMinHeightPx])
+
+  const interactionDisabled = topCollapsed || overflowing
 
   // Persist on every committed change (drag, keyboard, double-click reset).
   useEffect(() => {
@@ -93,7 +137,7 @@ export function DesignSplitPane({
   const bottomPercent = roundSplitPercent(100 - percent)
 
   function handlePointerDown(event: PointerEvent<HTMLDivElement>): void {
-    if (topCollapsed) return
+    if (interactionDisabled) return
     dragRef.current = { startY: event.clientY, startPercent: percent }
     setDragging(true)
     if (typeof event.currentTarget.setPointerCapture === "function") {
@@ -124,12 +168,12 @@ export function DesignSplitPane({
   }
 
   function reset(): void {
-    if (topCollapsed) return
+    if (interactionDisabled) return
     setPercent(defaultPercent)
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>): void {
-    if (topCollapsed) return
+    if (interactionDisabled) return
     if (event.key === "Home" || event.key === "End") {
       event.preventDefault()
       setPercent(event.key === "Home" ? minPercent : maxPercent)
@@ -141,6 +185,8 @@ export function DesignSplitPane({
     setPercent((current) => clampSplitPercent(current + delta, minPercent, maxPercent))
   }
 
+  const topMinHeight = topCollapsed ? 0 : (topMinHeightPx ?? 0)
+  const bottomMinHeight = bottomMinHeightPx ?? 0
   const topStyle = topCollapsed
     ? { flex: "0 0 auto", overflow: topOverflow, minHeight: 0, minWidth: 0 }
     : {
@@ -148,17 +194,17 @@ export function DesignSplitPane({
         flexGrow: 0,
         flexShrink: 1,
         overflow: topOverflow,
-        minHeight: 0,
+        minHeight: topMinHeight,
         minWidth: 0,
       }
   const bottomStyle = topCollapsed
-    ? { flex: "1 1 0%", overflow: bottomOverflow, minHeight: 0, minWidth: 0 }
+    ? { flex: "1 1 0%", overflow: bottomOverflow, minHeight: bottomMinHeight, minWidth: 0 }
     : {
         flexBasis: `${bottomPercent}%`,
         flexGrow: 0,
         flexShrink: 1,
         overflow: bottomOverflow,
-        minHeight: 0,
+        minHeight: bottomMinHeight,
         minWidth: 0,
       }
 
@@ -168,7 +214,12 @@ export function DesignSplitPane({
       data-testid={testId}
       data-split-top={roundSplitPercent(percent)}
       data-collapsed={topCollapsed ? "true" : "false"}
-      className={cn("flex min-h-0 min-w-0 flex-col", className)}
+      data-overflowing={overflowing ? "true" : "false"}
+      className={cn(
+        "flex min-h-0 min-w-0 flex-col",
+        scrollOnOverflow && "overflow-y-auto",
+        className,
+      )}
     >
       <div
         data-testid={topTestId ?? `${testId}-top`}
@@ -186,9 +237,10 @@ export function DesignSplitPane({
         aria-label={ariaLabel}
         aria-valuemin={minPercent}
         aria-valuemax={maxPercent}
-        aria-valuenow={topCollapsed ? undefined : Math.round(percent)}
-        aria-disabled={topCollapsed ? true : undefined}
-        tabIndex={topCollapsed ? -1 : 0}
+        aria-valuenow={interactionDisabled ? undefined : Math.round(percent)}
+        aria-disabled={interactionDisabled ? true : undefined}
+        title={overflowing ? "可用高度不足，已锁定分隔条" : undefined}
+        tabIndex={interactionDisabled ? -1 : 0}
         style={topCollapsed ? { display: "none" } : undefined}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -201,7 +253,7 @@ export function DesignSplitPane({
           "after:absolute after:left-1/2 after:top-1/2 after:h-1 after:w-12 after:-translate-x-1/2 after:-translate-y-1/2",
           "after:rounded-full after:bg-border after:transition-colors after:content-['']",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-          topCollapsed
+          interactionDisabled
             ? "cursor-not-allowed opacity-60"
             : "cursor-row-resize hover:after:bg-primary/60",
           dragging && "after:bg-primary",

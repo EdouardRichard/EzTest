@@ -240,3 +240,31 @@ func TestTrackInflightSkipsHealthAndSSE(t *testing.T) {
 		t.Fatalf("request not balanced: inflight=%d", got)
 	}
 }
+
+// TestRequestIDMiddlewareCapturesRequestMeta covers the audit IP/UA source: the
+// address must come from RemoteAddr only, never from X-Forwarded-For.
+func TestRequestIDMiddlewareCapturesRequestMeta(t *testing.T) {
+	var meta platform.RequestMeta
+	var ok bool
+	handler := RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		meta, ok = platform.RequestMetaFrom(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/settings", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("User-Agent", "vitest-agent")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if !ok {
+		t.Fatal("request metadata was not stored in the context")
+	}
+	if meta.IP != "127.0.0.1" {
+		t.Fatalf("ip = %q, want the RemoteAddr host 127.0.0.1", meta.IP)
+	}
+	if meta.UserAgent != "vitest-agent" {
+		t.Fatalf("user agent = %q", meta.UserAgent)
+	}
+}

@@ -621,6 +621,102 @@ func (r *Repository) RepositoryInUse(ctx context.Context, id int64) (bool, error
 			OR EXISTS (SELECT 1 FROM version_repository_override WHERE repo_id = $1)`, id)
 }
 
+// ReferencingVersions lists the versions whose binding references a resource of
+// one kind, joined with the version lifecycle status/stage so the resource
+// delete conflict can report whether a binding edit is still possible. Its
+// predicates mirror the usage guards, so a positive in-use check is explained by
+// the versions it returns.
+func (r *Repository) ReferencingVersions(ctx context.Context, kind string, id int64) ([]version.ReferencingVersion, error) {
+	var query string
+	switch kind {
+	case "sut":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_sut vs ON vs.version_id = v.id
+			WHERE vs.sut_id = $1
+			ORDER BY v.id`
+	case "environment":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_sut vs ON vs.version_id = v.id
+			WHERE vs.environment_id = $1
+			ORDER BY v.id`
+	case "page":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_sut vs ON vs.version_id = v.id
+			JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
+			WHERE p.id = $1 AND p.status = 'approved'
+			  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
+			ORDER BY v.id`
+	case "api":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_sut vs ON vs.version_id = v.id
+			JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
+			WHERE a.id = $1 AND a.status = 'approved'
+			  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
+			ORDER BY v.id`
+	case "database":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_sut vs ON vs.version_id = v.id
+			JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
+			WHERE d.id = $1 AND d.status = 'active'
+			  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
+			ORDER BY v.id`
+	case "account":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			JOIN version_account va ON va.version_id = v.id
+			WHERE va.account_id = $1
+			ORDER BY v.id`
+	case "repository":
+		query = `
+			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
+			FROM version v
+			LEFT JOIN version_sut vs ON vs.version_id = v.id
+			WHERE vs.sut_id IN (SELECT sut_id FROM sut_repository WHERE repo_id = $1)
+			   OR EXISTS (
+				SELECT 1 FROM version_repository_override vro
+				WHERE vro.version_id = v.id AND vro.repo_id = $1
+			   )
+			ORDER BY v.id`
+	default:
+		return nil, fmt.Errorf("referencing versions: unknown resource kind %q", kind)
+	}
+	rows, err := r.pool.Query(ctx, query, id)
+	if err != nil {
+		return nil, fmt.Errorf("referencing versions: %w", err)
+	}
+	defer rows.Close()
+	refs := make([]version.ReferencingVersion, 0)
+	for rows.Next() {
+		var ref version.ReferencingVersion
+		var stage string
+		var suspendedFrom *string
+		if err := rows.Scan(&ref.ID, &ref.Title, &ref.Status, &stage, &suspendedFrom); err != nil {
+			return nil, fmt.Errorf("scan referencing version: %w", err)
+		}
+		ref.Stage = version.Stage(stage)
+		if suspendedFrom != nil {
+			previous := version.Stage(*suspendedFrom)
+			ref.SuspendedFrom = &previous
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("referencing versions: %w", err)
+	}
+	return refs, nil
+}
+
 func (r *Repository) exists(ctx context.Context, query string, id int64) (bool, error) {
 	var used bool
 	if err := r.pool.QueryRow(ctx, query, id).Scan(&used); err != nil {

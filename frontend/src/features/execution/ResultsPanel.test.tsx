@@ -212,14 +212,18 @@ describe("ResultsPanel", () => {
     expect(onRerunComplete).toHaveBeenCalledTimes(1)
   })
 
-  it("turns a closed-requirement retry 409 into a reopen entry", async () => {
+  it("turns a closed-requirement retry 409 into a localized reopen entry", async () => {
     api.createIntent.mockRejectedValueOnce(
       new ApiError({
         status: 409,
         code: "state_conflict",
         message: "the requirement is closed; reopen it before creating an execution intent",
         requestId: "req_closed",
-        details: { reason: "requirement_closed", requirement_id: "6001" },
+        details: {
+          reason: "requirement_closed",
+          requirement_id: "6001",
+          next_action: "在「需求与澄清」页重新打开该需求，然后重试执行",
+        },
       }),
     )
     const { onOpenRequirement } = renderPanel()
@@ -228,7 +232,13 @@ describe("ResultsPanel", () => {
     fireEvent.click(within(failed).getByRole("button", { name: "重跑" }))
     fireEvent.click(within(failed).getByRole("button", { name: "确认重跑" }))
 
-    expect(await screen.findByText(/该用例所属需求已闭环/)).toBeInTheDocument()
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("无法重跑")
+    expect(alert).toHaveTextContent("该用例所属需求已闭环")
+    expect(alert).not.toHaveTextContent("the requirement is closed")
+    // One Chinese sentence is the primary copy; the old panel hint is gone.
+    expect(screen.getAllByText(/该用例所属需求已闭环/)).toHaveLength(1)
+
     fireEvent.click(screen.getByRole("button", { name: "前往重新打开需求" }))
     expect(onOpenRequirement).toHaveBeenCalledWith("6001")
   })

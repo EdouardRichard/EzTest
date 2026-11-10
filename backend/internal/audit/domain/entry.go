@@ -14,6 +14,9 @@ type Entry struct {
 	// ActorID is the authenticated user that performed the action. It is nil
 	// for anonymous actions such as a failed login.
 	ActorID *int64
+	// ActorName is the display name joined from app_user at read time. It is
+	// empty when the actor no longer exists or the entry is anonymous.
+	ActorName string
 	// Action names what happened, for example "auth.login".
 	Action string
 	// TargetKind and TargetID identify the object the action applied to.

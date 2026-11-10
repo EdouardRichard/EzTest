@@ -241,10 +241,10 @@ func (s *ReportService) EnsureVersionReport(ctx context.Context, versionID int64
 }
 
 // requireVersionReportDue applies the §5.3 report gate: execution data exists
-// (terminal waves with case runs), every requirement is closed/obsolete and no
-// pending user-visible blocker (active intent or open human request) is
-// outstanding. A gate rejection is *VersionReportNotDueError; a read failure
-// propagates untouched.
+// (terminal waves with case runs), every requirement is settled and no pending
+// user-visible blocker (active intent or open human request) is outstanding. A
+// gate rejection is *VersionReportNotDueError; a read failure propagates
+// untouched.
 func (s *ReportService) requireVersionReportDue(ctx context.Context, versionID int64) error {
 	if s.data == nil {
 		return reportServiceNotConfigured("report data reader")
@@ -269,12 +269,12 @@ func (s *ReportService) requireVersionReportDue(ctx context.Context, versionID i
 }
 
 // EnsureReports is the reconciler entry point (spec §4.4/§7.4): it creates the
-// missing terminal-wave reports and, when the §5.3 execution gate is open (all
-// requirements closed or obsolete, every wave terminal, at least one case_run)
-// and no pending user-visible blocker exists, marks changed reports stale and
-// ensures the version report (regenerating it when stale). Active-intent checks
-// are owned by the reader/wiring layer; this method consumes the version
-// snapshot.
+// missing terminal-wave reports and, when the §5.3 execution gate is open (every
+// wave terminal, at least one case_run, every requirement settled: closed or
+// obsolete, or executed to a terminal latest run) and no pending user-visible
+// blocker exists, marks changed reports stale and ensures the version report
+// (regenerating it when stale). Active-intent checks are owned by the
+// reader/wiring layer; this method consumes the version snapshot.
 func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) error {
 	if versionID <= 0 {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
@@ -1024,8 +1024,9 @@ func terminalWaveStatus(status string) bool {
 // produced execution data. At least one wave must be terminal, every wave must
 // be terminal (done/failed/cancelled; an active or unknown wave means execution
 // is still in flight), at least one case_run must exist, and every requirement
-// must be closed or obsolete (spec §5.3/§7.4). An empty version never generates
-// a report: it has no terminal wave and no case run.
+// must be settled: closed/obsolete, or executed to a terminal latest run
+// (R2-NEW-02). An empty version never generates a report: it has no terminal
+// wave and no case run.
 func versionReportDue(snapshot delivery.ReportSnapshot) bool {
 	return versionReportGateReason(snapshot) == ""
 }
@@ -1046,9 +1047,18 @@ func versionReportGateReason(snapshot delivery.ReportSnapshot) string {
 		return versionReportNotDueNoExecutionData
 	}
 	for _, requirement := range snapshot.Requirements {
-		if requirement.Status != "closed" && requirement.Status != "obsolete" {
-			return versionReportNotDueRequirementsOpen
+		if requirement.Status == "closed" || requirement.Status == "obsolete" {
+			continue
 		}
+		// A requirement whose execution is settled but whose closure predicate
+		// can never pass (blocked/inconclusive case, failed case without an
+		// issue yet) must not block the report forever: the report projects the
+		// failure and a later closure/reopen regenerates it through the
+		// fingerprint change. See version.requirement_closure.go CasesVerified.
+		if requirement.ExecutionSettled {
+			continue
+		}
+		return versionReportNotDueRequirementsOpen
 	}
 	return ""
 }

@@ -31,21 +31,21 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -69,28 +69,28 @@ jobs:
           Get-Content .tmp/release/SHA256SUMS.txt
 
       - name: Upload Windows package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eztest-${{ inputs.version }}-windows-x64
           path: .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
           if-no-files-found: error
 
       - name: Upload Linux package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eztest-${{ inputs.version }}-linux-x64
           path: .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
           if-no-files-found: error
 
       - name: Upload checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: eztest-${{ inputs.version }}-checksums
           path: .tmp/release/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ inputs.version }}
           name: EzTest ${{ inputs.version }}

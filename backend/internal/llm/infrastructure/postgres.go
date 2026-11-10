@@ -383,7 +383,10 @@ func scanModel(row rowScanner) (llm.Model, error) {
 
 // encodeCapabilities serializes the full capability set into the JSONB object.
 // The legacy columns stay authoritative for tools/vision/context_window; the
-// object also carries reasoning/prompt-cache for readers that need them.
+// object also carries reasoning/prompt-cache for readers that need them. The
+// per-capability catalog|manual source markers travel in the same object, so
+// UpsertModels/UpdateModel persist the provenance the application computed and
+// a later refresh can preserve manually corrected capabilities (S-02).
 func encodeCapabilities(capabilities llm.Capabilities) ([]byte, error) {
 	raw, err := json.Marshal(capabilities)
 	if err != nil {

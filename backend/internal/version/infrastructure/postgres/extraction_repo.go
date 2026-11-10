@@ -931,6 +931,9 @@ func normalizeReconciliationReport(report versionapp.ReconciliationReport) versi
 	if report.MissingIDs == nil {
 		report.MissingIDs = []string{}
 	}
+	if report.SkippedIDs == nil {
+		report.SkippedIDs = []string{}
+	}
 	if report.PlannedIDs == nil {
 		report.PlannedIDs = []string{}
 	}
@@ -982,6 +985,43 @@ func (r *ExtractionRepository) ListExtractedExternalIDs(ctx context.Context, ver
 	return ids, nil
 }
 
+// ListSkippedExternalIDs returns the unique external ids of non-draft
+// extraction requirements of the version, sorted for deterministic
+// reconciliation. UpsertExtractedRequirements refuses to overwrite them (C-03
+// product decision), so the report must list them as skipped instead of
+// missing.
+func (r *ExtractionRepository) ListSkippedExternalIDs(ctx context.Context, versionID int64) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT external_id FROM requirement
+		WHERE version_id = $1
+		  AND source_key LIKE 'extraction:%'
+		  AND status <> 'draft'
+		  AND external_id <> ''
+	`, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("list skipped external ids: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{})
+	ids := make([]string, 0)
+	for rows.Next() {
+		var externalID string
+		if err := rows.Scan(&externalID); err != nil {
+			return nil, fmt.Errorf("list skipped external ids: scan: %w", err)
+		}
+		if _, duplicate := seen[externalID]; duplicate {
+			continue
+		}
+		seen[externalID] = struct{}{}
+		ids = append(ids, externalID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list skipped external ids: %w", err)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
 // UpsertExtractedRequirements upserts requirements keyed by
 // (version_id, external_id) inside one transaction. The version advisory lock
 // serializes concurrent segment sinks; an existing requirement keeps its status
@@ -1009,13 +1049,16 @@ func (r *ExtractionRepository) UpsertExtractedRequirements(ctx context.Context, 
 		if externalID == "" {
 			return versionapp.ExtractionEmitCounts{}, fmt.Errorf("upsert extracted requirements: empty external_id")
 		}
-		created, err := r.upsertExtractedRequirementTx(ctx, tx, source, externalID, requirement, now)
+		created, skipped, err := r.upsertExtractedRequirementTx(ctx, tx, source, externalID, requirement, now)
 		if err != nil {
 			return versionapp.ExtractionEmitCounts{}, err
 		}
-		if created {
+		switch {
+		case skipped:
+			counts.Skipped++
+		case created:
 			counts.Created++
-		} else {
+		default:
 			counts.Updated++
 		}
 	}
@@ -1025,74 +1068,99 @@ func (r *ExtractionRepository) UpsertExtractedRequirements(ctx context.Context, 
 	return counts, nil
 }
 
-func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context, tx pgx.Tx, source versionapp.ExtractionSource, externalID string, requirement versionapp.ExtractionRequirement, now time.Time) (bool, error) {
+func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context, tx pgx.Tx, source versionapp.ExtractionSource, externalID string, requirement versionapp.ExtractionRequirement, now time.Time) (bool, bool, error) {
 	sourceKey := versionapp.ExtractionRequirementSourceKey(externalID)
-	priority := strings.TrimSpace(requirement.Priority)
-	if priority == "" {
-		priority = version.DefaultPriority
-	}
-	acceptance := strings.Join(requirement.AcceptanceCriteria, "\n")
-	revision := version.RequirementVersion{
-		Title:              requirement.Title,
-		Description:        requirement.Description,
-		AcceptanceCriteria: acceptance,
-		Priority:           priority,
-		Constraints:        requirement.ConstraintsJSON,
-	}
-	contentHash, err := revision.ComputeContentHash()
-	if err != nil {
-		return false, fmt.Errorf("upsert extracted requirement %s: %w", externalID, err)
-	}
 
 	var requirementID int64
 	var currentVersionID *int64
-	err = tx.QueryRow(ctx, `
-		SELECT id, current_version_id FROM requirement
+	var currentStatus string
+	var currentConfidence float64
+	var currentQuote string
+	err := tx.QueryRow(ctx, `
+		SELECT id, current_version_id, status, COALESCE(confidence, -1), COALESCE(source_quote, '')
+		FROM requirement
 		WHERE version_id = $1 AND source_key = $2 AND status <> 'obsolete'
 		ORDER BY id LIMIT 1
 		FOR UPDATE
-	`, source.VersionID, sourceKey).Scan(&requirementID, &currentVersionID)
+	`, source.VersionID, sourceKey).Scan(&requirementID, &currentVersionID, &currentStatus, &currentConfidence, &currentQuote)
 	switch {
 	case err == nil:
-		var currentHash string
-		if currentVersionID != nil {
-			if scanErr := tx.QueryRow(ctx, `
-				SELECT content_hash FROM requirement_version WHERE id = $1
-			`, *currentVersionID).Scan(&currentHash); scanErr != nil {
-				return false, fmt.Errorf("upsert extracted requirement %s: current revision: %w", externalID, scanErr)
-			}
+		// C-03 product decision: extracted catalog rows never overwrite a
+		// requirement a user already clarified/closed. The skip is reported in
+		// the emit counts instead of failing the batch.
+		if currentStatus != "draft" {
+			return false, true, nil
 		}
+		current := versionapp.ExtractionRequirement{
+			ExternalID: externalID, SourceQuote: currentQuote, Confidence: currentConfidence,
+		}
+		currentRevision := 0
+		if currentVersionID != nil {
+			var revision int
+			var constraints []byte
+			var acceptanceCriteria string
+			if scanErr := tx.QueryRow(ctx, `
+				SELECT title, description, acceptance_criteria, priority, constraints, revision
+				FROM requirement_version WHERE id = $1
+			`, *currentVersionID).Scan(&current.Title, &current.Description,
+				&acceptanceCriteria, &current.Priority, &constraints, &revision); scanErr != nil {
+				return false, false, fmt.Errorf("upsert extracted requirement %s: current revision: %w", externalID, scanErr)
+			}
+			current.AcceptanceCriteria = splitExtractionAcceptanceCriteria(acceptanceCriteria)
+			current.ConstraintsJSON = append(json.RawMessage(nil), constraints...)
+			currentRevision = revision
+		}
+		effective := versionapp.MergeExtractionRequirement(current, requirement)
+		if strings.TrimSpace(effective.Priority) == "" {
+			effective.Priority = version.DefaultPriority
+		}
+		acceptance := strings.Join(effective.AcceptanceCriteria, "\n")
+		contentHash, err := requirementRevisionHash(effective, acceptance)
+		if err != nil {
+			return false, false, fmt.Errorf("upsert extracted requirement %s: %w", externalID, err)
+		}
+		// Provenance is always refreshed for a draft row (the latest run owns
+		// it), even when the merge produced identical content.
 		if _, err := tx.Exec(ctx, `
 			UPDATE requirement
 			SET extraction_run_id = $2, source_quote = $3, external_id = $4,
 			    confidence = $5::float8::numeric, updated_at = $6
 			WHERE id = $1
-		`, requirementID, source.RunID, requirement.SourceQuote, externalID, requirement.Confidence, now); err != nil {
-			return false, fmt.Errorf("upsert extracted requirement %s: provenance: %w", externalID, err)
+		`, requirementID, source.RunID, effective.SourceQuote, externalID, effective.Confidence, now); err != nil {
+			return false, false, fmt.Errorf("upsert extracted requirement %s: provenance: %w", externalID, err)
+		}
+		var currentHash string
+		if currentVersionID != nil {
+			if scanErr := tx.QueryRow(ctx, `
+				SELECT content_hash FROM requirement_version WHERE id = $1
+			`, *currentVersionID).Scan(&currentHash); scanErr != nil {
+				return false, false, fmt.Errorf("upsert extracted requirement %s: current hash: %w", externalID, scanErr)
+			}
 		}
 		if currentVersionID == nil || currentHash != contentHash {
-			nextRevision := 1
-			if currentVersionID != nil {
-				if scanErr := tx.QueryRow(ctx, `
-					SELECT revision FROM requirement_version WHERE id = $1
-				`, *currentVersionID).Scan(&nextRevision); scanErr != nil {
-					return false, fmt.Errorf("upsert extracted requirement %s: revision: %w", externalID, scanErr)
-				}
-				nextRevision++
-			}
+			nextRevision := currentRevision + 1
 			versionID := r.ids.Next()
 			if err := insertExtractionRevision(ctx, tx, versionID, requirementID, nextRevision,
-				requirement, acceptance, priority, contentHash, now); err != nil {
-				return false, fmt.Errorf("upsert extracted requirement %s: revision insert: %w", externalID, err)
+				effective, acceptance, effective.Priority, contentHash, now); err != nil {
+				return false, false, fmt.Errorf("upsert extracted requirement %s: revision insert: %w", externalID, err)
 			}
 			if _, err := tx.Exec(ctx, `
 				UPDATE requirement SET current_version_id = $2 WHERE id = $1
 			`, requirementID, versionID); err != nil {
-				return false, fmt.Errorf("upsert extracted requirement %s: repoint revision: %w", externalID, err)
+				return false, false, fmt.Errorf("upsert extracted requirement %s: repoint revision: %w", externalID, err)
 			}
 		}
-		return false, nil
+		return false, false, nil
 	case errors.Is(err, pgx.ErrNoRows):
+		effective := versionapp.MergeExtractionRequirement(versionapp.ExtractionRequirement{ExternalID: externalID}, requirement)
+		if strings.TrimSpace(effective.Priority) == "" {
+			effective.Priority = version.DefaultPriority
+		}
+		acceptance := strings.Join(effective.AcceptanceCriteria, "\n")
+		contentHash, err := requirementRevisionHash(effective, acceptance)
+		if err != nil {
+			return false, false, fmt.Errorf("upsert extracted requirement %s: %w", externalID, err)
+		}
 		requirementID = r.ids.Next()
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requirement (
@@ -1102,23 +1170,50 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 			)
 			VALUES ($1, $2, NULL, 'draft', '[]'::jsonb, $3, $3, $4, $5, $6, $7, $8::float8::numeric)
 		`, requirementID, source.VersionID, now, sourceKey, source.RunID,
-			requirement.SourceQuote, externalID, requirement.Confidence); err != nil {
-			return false, fmt.Errorf("upsert extracted requirement %s: insert requirement: %w", externalID, err)
+			effective.SourceQuote, externalID, effective.Confidence); err != nil {
+			return false, false, fmt.Errorf("upsert extracted requirement %s: insert requirement: %w", externalID, err)
 		}
 		versionID := r.ids.Next()
 		if err := insertExtractionRevision(ctx, tx, versionID, requirementID, 1,
-			requirement, acceptance, priority, contentHash, now); err != nil {
-			return false, fmt.Errorf("upsert extracted requirement %s: first revision: %w", externalID, err)
+			effective, acceptance, effective.Priority, contentHash, now); err != nil {
+			return false, false, fmt.Errorf("upsert extracted requirement %s: first revision: %w", externalID, err)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE requirement SET current_version_id = $2 WHERE id = $1
 		`, requirementID, versionID); err != nil {
-			return false, fmt.Errorf("upsert extracted requirement %s: repoint first revision: %w", externalID, err)
+			return false, false, fmt.Errorf("upsert extracted requirement %s: repoint first revision: %w", externalID, err)
 		}
-		return true, nil
+		return true, false, nil
 	default:
-		return false, fmt.Errorf("upsert extracted requirement %s: lookup: %w", externalID, err)
+		return false, false, fmt.Errorf("upsert extracted requirement %s: lookup: %w", externalID, err)
 	}
+}
+
+// requirementRevisionHash hashes the effective (already merged) revision.
+func requirementRevisionHash(requirement versionapp.ExtractionRequirement, acceptance string) (string, error) {
+	revision := version.RequirementVersion{
+		Title:              requirement.Title,
+		Description:        requirement.Description,
+		AcceptanceCriteria: acceptance,
+		Priority:           requirement.Priority,
+		Constraints:        requirement.ConstraintsJSON,
+	}
+	return revision.ComputeContentHash()
+}
+
+// splitExtractionAcceptanceCriteria splits the persisted newline list back into
+// the criteria slice expected by the merge policy.
+func splitExtractionAcceptanceCriteria(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	criteria := make([]string, 0, 4)
+	for _, line := range strings.Split(value, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			criteria = append(criteria, trimmed)
+		}
+	}
+	return criteria
 }
 
 func insertExtractionRevision(ctx context.Context, tx pgx.Tx, revisionID, requirementID int64, revision int, requirement versionapp.ExtractionRequirement, acceptance, priority, contentHash string, now time.Time) error {

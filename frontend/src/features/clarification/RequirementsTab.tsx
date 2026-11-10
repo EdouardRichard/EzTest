@@ -10,6 +10,7 @@ import type { ConversationModel } from "@/features/conversation/api"
 import type { VersionStage } from "@/features/design/types"
 import { getVersion } from "@/features/versions/api"
 import type { Version } from "@/features/versions/types"
+import { ApiError } from "@/lib/api-client"
 
 import {
   confirmRequirements,
@@ -75,6 +76,15 @@ function activityText(payload: Record<string, unknown>): string | null {
   if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
   if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
   return "AI 正在处理…"
+}
+
+/** The 409 start-design gate rejected because drafts are still unconfirmed. */
+function isUnconfirmedRequirementsGate(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.code === "stage_gate_failed" &&
+    error.details.reason === "requirements_unconfirmed"
+  )
 }
 
 /** Status labels of the requirement extraction card (API-5). */
@@ -403,6 +413,10 @@ export function RequirementsTab({
   const [bulkConfirming, setBulkConfirming] = useState(false)
   const [bulkNotice, setBulkNotice] = useState<string | null>(null)
   const [bulkError, setBulkError] = useState<unknown>(null)
+  // C-06: the editor is keyed by `current_version_id`, so a rollback/save
+  // remounts it. The success notice must live here to survive that remount and
+  // actually paint after `requirementUpdated` replaces the detail.
+  const [editorNotice, setEditorNotice] = useState<string | null>(null)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [cleanupNotice, setCleanupNotice] = useState<string | null>(null)
   const [cleanupError, setCleanupError] = useState<unknown>(null)
@@ -424,6 +438,13 @@ export function RequirementsTab({
   // `extraction.*` SSE events can arrive once per segment; coalesce them into a
   // single progress read instead of one GET per event.
   const extractionEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The URL deep link seeds the initial conversation choice. Keep it in a ref so
+  // `loadWorkspace` stays stable: depending on it directly made every in-page
+  // URL sync (selecting a requirement/conversation) re-run the workspace load,
+  // which unmounted the whole tab content for a loading card — dropping the chat
+  // composer draft and clamping the document scroll to the top.
+  const initialConversationIdRef = useRef(initialConversationId)
+  initialConversationIdRef.current = initialConversationId
 
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
@@ -450,10 +471,10 @@ export function RequirementsTab({
           return current
         }
         if (
-          initialConversationId !== undefined &&
-          nextConversations.some((item) => item.id === initialConversationId)
+          initialConversationIdRef.current !== undefined &&
+          nextConversations.some((item) => item.id === initialConversationIdRef.current)
         ) {
-          return initialConversationId
+          return initialConversationIdRef.current
         }
         return nextConversations[0]?.id ?? null
       })
@@ -462,7 +483,7 @@ export function RequirementsTab({
     } finally {
       setLoading(false)
     }
-  }, [versionId, initialConversationId])
+  }, [versionId])
 
   useEffect(() => {
     void loadWorkspace()
@@ -622,13 +643,18 @@ export function RequirementsTab({
   function selectRequirement(requirementId: string): void {
     setSelectedRequirementId(requirementId)
     setBulkNotice(null)
-    router.replace(buildWorkspaceUrl(versionId, activeConversationId, requirementId))
+    setEditorNotice(null)
+    router.replace(buildWorkspaceUrl(versionId, activeConversationId, requirementId), {
+      scroll: false,
+    })
   }
 
   function selectConversation(conversationId: string): void {
     setActiveConversationId(conversationId)
     setActivity(null)
-    router.replace(buildWorkspaceUrl(versionId, conversationId, selectedRequirementId))
+    router.replace(buildWorkspaceUrl(versionId, conversationId, selectedRequirementId), {
+      scroll: false,
+    })
   }
 
   async function createNewConversation(): Promise<void> {
@@ -645,7 +671,7 @@ export function RequirementsTab({
       setDetail(null)
       setLiveMessages([])
       setActivity(null)
-      router.replace(buildWorkspaceUrl(versionId, conversation.id, null))
+      router.replace(buildWorkspaceUrl(versionId, conversation.id, null), { scroll: false })
     } catch (cause) {
       setCreateError(cause)
     } finally {
@@ -721,7 +747,7 @@ export function RequirementsTab({
       if (selectedRequirementId !== null && deleted.includes(selectedRequirementId)) {
         setSelectedRequirementId(null)
         setDetail(null)
-        router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, null), { scroll: false })
       }
     } catch (cause) {
       setCleanupError(failure ?? cause)
@@ -746,7 +772,9 @@ export function RequirementsTab({
       if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
         setSelectedRequirementId(targetRequirementId)
         setDetailToken((token) => token + 1)
-        router.replace(buildWorkspaceUrl(versionId, activeConversationId, targetRequirementId))
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, targetRequirementId), {
+          scroll: false,
+        })
       } else if (selectedRequirementId === targetRequirementId) {
         setDetailToken((token) => token + 1)
       }
@@ -772,7 +800,9 @@ export function RequirementsTab({
         if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
           setSelectedRequirementId(null)
           setDetail(null)
-          router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+          router.replace(buildWorkspaceUrl(versionId, activeConversationId, null), {
+            scroll: false,
+          })
         }
       }
       await Promise.all([loadRequirements(), loadVersion()])
@@ -821,6 +851,7 @@ export function RequirementsTab({
   }
 
   function requirementUpdated(next: RequirementDetail): void {
+    setEditorNotice(null)
     setDetail(next)
     void loadRequirements().catch(() => {})
     void loadVersion().catch(() => {})
@@ -936,7 +967,25 @@ export function RequirementsTab({
             }}
           />
 
-          {designError !== null ? <InlineError error={designError} /> : null}
+          {designError !== null ? (
+            <InlineError error={designError}>
+              {isUnconfirmedRequirementsGate(designError) ? (
+                <button
+                  type="button"
+                  className="ml-2 underline underline-offset-2"
+                  onClick={() => {
+                    // The alert has done its job once the user jumps to the
+                    // draft list; leaving it on top of the list hides the very
+                    // requirements the user must confirm.
+                    setDesignError(null)
+                    setFilter("draft")
+                  }}
+                >
+                  查看未确认需求
+                </button>
+              ) : null}
+            </InlineError>
+          ) : null}
 
           {bulkNotice !== null ? (
             <p
@@ -989,13 +1038,25 @@ export function RequirementsTab({
             }
             editor={
               detail !== null ? (
-                <RequirementEditor
-                  key={`${detail.id}-${detail.current_version_id}`}
-                  versionId={versionId}
-                  requirement={detail}
-                  targetOptions={targetOptions}
-                  onUpdated={requirementUpdated}
-                />
+                <>
+                  {editorNotice !== null ? (
+                    <p
+                      data-testid="requirement-notice"
+                      role="status"
+                      className="border-t border-border bg-card px-3 py-2 text-[11px] text-success"
+                    >
+                      {editorNotice}
+                    </p>
+                  ) : null}
+                  <RequirementEditor
+                    key={`${detail.id}-${detail.current_version_id}`}
+                    versionId={versionId}
+                    requirement={detail}
+                    targetOptions={targetOptions}
+                    onUpdated={requirementUpdated}
+                    onNotice={setEditorNotice}
+                  />
+                </>
               ) : null
             }
           />

@@ -64,7 +64,9 @@ func NewExtractionHandler(svc ExtractionService) *ExtractionHandler {
 // projection with the persisted reconciliation report flattened into
 // expected/extracted/missing/missing_ids/planned_count/planned_ids/
 // low_confidence/skipped_images plus the segment cursor and coverage ratio.
-// A version without any run is a typed 404.
+// A version without any run and no explicit selector is an empty read: 200
+// with a null data body (G-09). An explicit `?run_id=`/`?attachment_id=` that
+// does not resolve, or a run of another version, stays a typed 404.
 func (h *ExtractionHandler) Get(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireActor(w, r); !ok {
 		return
@@ -103,7 +105,11 @@ func (h *ExtractionHandler) Get(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(runs) == 0 {
-			httpx.Error(w, r, platform.NotFound("requirement extraction run"))
+			// Default "latest for the version" with nothing recorded is an
+			// empty read: 200 with a null data body (G-09), so the browser
+			// network layer records no 404. Explicit selectors never reach
+			// this branch and keep their typed 404.
+			httpx.JSON(w, http.StatusOK, nil)
 			return
 		}
 		run = runs[len(runs)-1]

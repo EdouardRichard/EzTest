@@ -627,6 +627,10 @@ func (f *fakeAttachmentPort) AttachmentImageRef(context.Context, int64, int64, i
 	return tools.AttachmentImage{}, nil
 }
 
+func (f *fakeAttachmentPort) AttachmentImageRefByImage(context.Context, int64, int64, int64) (tools.AttachmentImage, error) {
+	return tools.AttachmentImage{}, nil
+}
+
 // fakeResourcePort implements tools.ResourcePort.
 type fakeResourcePort struct{}
 

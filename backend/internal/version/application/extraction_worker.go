@@ -183,6 +183,26 @@ type ExtractionSource = tools.ExtractionSource
 // ExtractionRequirement is one validated fixed-core-schema requirement.
 type ExtractionRequirement = tools.ExtractionRequirement
 
+// ExtractionMergeMode is the in-process no-downgrade merge policy (C-03): FR
+// body declarations replace, catalog table rows fill_empty. It is never
+// persisted and never model supplied.
+type ExtractionMergeMode = tools.ExtractionMergeMode
+
+const (
+	// ExtractionMergeReplace overwrites non-empty fields but never clears them
+	// with an empty value.
+	ExtractionMergeReplace = tools.ExtractionMergeReplace
+	// ExtractionMergeFillEmpty only fills fields that are still empty.
+	ExtractionMergeFillEmpty = tools.ExtractionMergeFillEmpty
+)
+
+// MergeExtractionRequirement applies the incoming row to the current one under
+// the incoming merge policy. It is shared by the in-batch duplicate merge, the
+// deterministic processor and the PostgreSQL upsert.
+func MergeExtractionRequirement(current, incoming ExtractionRequirement) ExtractionRequirement {
+	return tools.MergeExtractionRequirement(current, incoming)
+}
+
 // ExtractionEmitCounts is the created/updated result of one sink call.
 type ExtractionEmitCounts = tools.ExtractionEmitCounts
 
@@ -243,6 +263,10 @@ type ExtractionRepository interface {
 	// ListExtractedExternalIDs returns the external ids currently attributed to
 	// this run (requirement.extraction_run_id), used for missing_ids.
 	ListExtractedExternalIDs(ctx context.Context, versionID, runID int64) ([]string, error)
+	// ListSkippedExternalIDs returns the non-draft extraction requirements of
+	// the version. The upsert skips them instead of overwriting user work, so
+	// reconciliation reports them in skipped_ids (never missing_ids).
+	ListSkippedExternalIDs(ctx context.Context, versionID int64) ([]string, error)
 	// UpsertExtractedRequirements updates by (version_id, external_id) and
 	// never inserts a second requirement for the same external id. Superseded
 	// (archived) runs are rejected with ErrExtractionRunState.
@@ -719,7 +743,9 @@ func (s *ExtractionService) ListRuns(ctx context.Context, versionID int64) ([]Ex
 // expected_count/extracted_count on the run. low_confidence is derived from the
 // run's requirement rows (requirement.confidence below
 // DefaultLowConfidenceThreshold) instead of trusting a caller; skippedImages is
-// accepted from the parser coverage and persisted in the report.
+// accepted from the parser coverage and persisted in the report. Non-draft
+// extraction requirements of the version are reported in skipped_ids instead of
+// missing_ids (the sink refused to overwrite them, spec D).
 func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, documentText string, skippedImages int) (ReconciliationReport, error) {
 	run, err := s.mustGetRun(ctx, runID)
 	if err != nil {
@@ -729,12 +755,17 @@ func (s *ExtractionService) Reconcile(ctx context.Context, runID int64, document
 	if err != nil {
 		return ReconciliationReport{}, err
 	}
+	skippedIDs, err := s.repo.ListSkippedExternalIDs(ctx, run.VersionID)
+	if err != nil {
+		return ReconciliationReport{}, err
+	}
 	lowConfidence, err := s.repo.CountLowConfidence(ctx, run.ID, DefaultLowConfidenceThreshold)
 	if err != nil {
 		return ReconciliationReport{}, err
 	}
 	report := ReconcileDocument(documentText, ReconciliationInput{
 		ExtractedIDs:  extracted,
+		SkippedIDs:    skippedIDs,
 		LowConfidence: lowConfidence,
 		SkippedImages: skippedImages,
 	})

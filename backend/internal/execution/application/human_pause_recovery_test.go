@@ -2,6 +2,7 @@ package executionapp
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,6 +353,148 @@ func TestLeaseExpiredRecovery(t *testing.T) {
 	}
 }
 
+// seedOnlineExecutor registers an active executor with a fresh heartbeat so
+// Recovery classifies an expired lease from the recorded cause, not as lost.
+func seedOnlineExecutor(f *task9Fixture, id int64) {
+	now := f.clock.Now()
+	f.executors.byID[id] = execution.ExecutorInstance{
+		ID: id, Name: "executor", Endpoint: "http://127.0.0.1:13336",
+		Status: execution.ExecutorActive, LastHeartbeat: &now,
+	}
+}
+
+// TestClassifyInterruptedRunUnclaimedDispatchIsDispatchTimeout pins the stable
+// cause split: an expired dispatch lease on a run no agent worker ever claimed is
+// a queue stall (dispatch_timeout), while a claimed run keeps the execution
+// lease_expired classification.
+func TestClassifyInterruptedRunUnclaimedDispatchIsDispatchTimeout(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	seedOnlineExecutor(f, 1)
+
+	if execution.TerminalCauseDispatchTimeout != "dispatch_timeout" {
+		t.Fatalf("terminal cause = %q, want dispatch_timeout", execution.TerminalCauseDispatchTimeout)
+	}
+	unclaimed := execution.CaseRun{
+		ID: 500, WaveID: 50, IntentID: 1, Status: execution.CaseRunRunning, Attempts: 1,
+		OwnerExecutorID: int64PtrValue(1),
+		Summary: execution.CaseRunSummary{
+			Dispatch: &execution.CaseRunDispatchDiagnostic{Attempt: 1, DispatchAt: "2026-11-01T02:59:00Z"},
+		},
+	}
+	class, cause := f.recovery.classifyInterruptedRun(ctx, unclaimed)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("unclaimed expired lease = %s/%s, want environment/%s",
+			class, cause, execution.TerminalCauseDispatchTimeout)
+	}
+
+	claimed := unclaimed
+	claimed.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		Attempt: 1, DispatchAt: "2026-11-01T02:59:00Z", ClaimedAt: "2026-11-01T02:59:30Z",
+	}
+	class, cause = f.recovery.classifyInterruptedRun(ctx, claimed)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseLeaseExpired {
+		t.Fatalf("claimed expired lease = %s/%s, want environment/lease_expired", class, cause)
+	}
+
+	// A run without a dispatch snapshot cannot prove a claim either: it is a
+	// queue stall too.
+	unknown := unclaimed
+	unknown.Summary.Dispatch = nil
+	class, cause = f.recovery.classifyInterruptedRun(ctx, unknown)
+	if class != execution.FailureClassEnvironment || cause != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("no-dispatch expired lease = %s/%s, want environment/%s",
+			class, cause, execution.TerminalCauseDispatchTimeout)
+	}
+}
+
+// TestRecoveryLogsLeaseExpiryDispatchDiagnostics: an expired lease must leave a
+// structured local WARN (the UAT missing diagnostic): run/wave/attempt,
+// whether an agent claimed it, the owner, the dispatch time and the last error.
+func TestRecoveryLogsLeaseExpiryDispatchDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	seedOnlineExecutor(f, 1)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.Attempts = 2
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 1, Attempt: 2, DispatchAt: "2026-11-01T02:59:00Z",
+	}
+	f.runs.byID[500] = run
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	logs := captureSchedulerSlog(t)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	logged := logs.String()
+	for _, want := range []string{
+		"lease expired",
+		"case_run_id=500",
+		"wave_id=50",
+		"attempt=2",
+		"agent_claimed=false",
+		"owner_executor_id=1",
+		"dispatch_at=2026-11-01T02:59:00Z",
+		"lease_until=",
+		"last_error=",
+		"retry_reason=",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("lease expiry log is missing %q: %s", want, logged)
+		}
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("unclaimed retry status = %s, want pending", stored.Status)
+	}
+	if stored.Summary.RetryReason != execution.TerminalCauseDispatchTimeout {
+		t.Fatalf("retry reason = %q, want %q", stored.Summary.RetryReason, execution.TerminalCauseDispatchTimeout)
+	}
+}
+
+// TestRecoveryLogsClaimedLeaseExpiryAsLeaseExpired: a claimed run keeps the
+// existing lease_expired/environment classification and logs agent_claimed=true.
+func TestRecoveryLogsClaimedLeaseExpiryAsLeaseExpired(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	seedOnlineExecutor(f, 1)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.Attempts = 3
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 1, Attempt: 3, DispatchAt: "2026-11-01T02:59:00Z",
+		ClaimedAt: "2026-11-01T02:59:30Z",
+	}
+	f.runs.byID[500] = run
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	logs := captureSchedulerSlog(t)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "agent_claimed=true") {
+		t.Fatalf("claimed lease expiry log missing agent_claimed=true: %s", logged)
+	}
+	failed, _ := f.runs.Get(ctx, 500)
+	if failed.Status != execution.CaseRunFailed || failed.FailureClass != execution.FailureClassEnvironment {
+		t.Fatalf("claimed exhausted run = %s/%s, want failed/environment", failed.Status, failed.FailureClass)
+	}
+	if failed.Summary.TerminalCause != execution.TerminalCauseLeaseExpired {
+		t.Fatalf("terminal cause = %q, want %q", failed.Summary.TerminalCause, execution.TerminalCauseLeaseExpired)
+	}
+}
+
 func TestSupersededCancelsActive(t *testing.T) {
 	ctx := context.Background()
 	f := newTask9Fixture()
@@ -558,5 +701,207 @@ func TestRecoveryCleansStaleAndOrphanContexts(t *testing.T) {
 	}
 	if f.control.deletedContext("foreign-ctx") {
 		t.Fatal("non-execution context must not be deleted")
+	}
+}
+
+// v0.2.3 X-01: an expired lease on an ONLINE executor is not automatically an
+// executor_lost. Only an offline (or heartbeat-expired) executor keeps that
+// classification; an online executor is typed from the most recent transport
+// error recorded by the run.
+func TestOnlineExecutorExpiredLeaseNotLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	run.Summary.LastError = "executor_timeout: executor request timed out while creating the browser context"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("status = %s, want pending", stored.Status)
+	}
+	if stored.FailureClass == execution.FailureClassExecutorLost {
+		t.Fatal("online executor lease expiry was misread as executor_lost")
+	}
+	if stored.Summary.VerdictReason != "" {
+		t.Fatalf("non-terminal retry wrote verdict_reason %q", stored.Summary.VerdictReason)
+	}
+	if stored.Summary.RetryReason != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("retry reason = %q, want executor_timeout", stored.Summary.RetryReason)
+	}
+	if stored.LeaseUntil != nil {
+		t.Fatalf("retry kept a lease until %v", stored.LeaseUntil)
+	}
+}
+
+func TestOfflineExecutorExpiredLeaseLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	f.runs.byID[500] = run
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorOffline,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunPending {
+		t.Fatalf("status = %s, want pending", stored.Status)
+	}
+	if stored.Summary.RetryReason != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("retry reason = %q, want executor_lost", stored.Summary.RetryReason)
+	}
+}
+
+func TestHeartbeatExpiredExecutorIsLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	f.runs.byID[500] = run
+	stale := f.clock.Now().Add(-2 * time.Minute)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &stale,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Summary.RetryReason != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("retry reason = %q, want executor_lost for an expired heartbeat", stored.Summary.RetryReason)
+	}
+}
+
+// TestOnlineExecutorLeaseExpiryFromDialRefusedIsLost: a recorded dial/connection
+// refusal proves the executor is unreachable, so the expiry stays executor_lost
+// instead of being downgraded to a generic environment lease_expired.
+func TestOnlineExecutorLeaseExpiryFromDialRefusedIsLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 1
+	run.Summary.LastError = "executor_unavailable: executor request failed: dial tcp 127.0.0.1:13336: connect: connection refused"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Summary.RetryReason != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("retry reason = %q, want executor_lost for a refused dial (last error: %q)",
+			stored.Summary.RetryReason, stored.Summary.LastError)
+	}
+	if stored.FailureClass == execution.FailureClassEnvironment {
+		t.Fatal("refused dial was classified as environment")
+	}
+}
+
+// A recorded executor_lost transport cause on a reachable (online) executor is
+// still an executor_lost; the generic lease-expired environment default must not
+// swallow it when the run exhausts its dispatch budget.
+func TestOnlineExecutorRecordedLostCauseKeepsExecutorLost(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 3
+	run.Summary.RetryReason = string(execution.FailureClassExecutorLost) + ": executor transport failed"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunFailed || stored.FailureClass != execution.FailureClassExecutorLost {
+		t.Fatalf("terminal run = %s/%s, want failed/executor_lost", stored.Status, stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal cause = %q, want executor_lost", stored.Summary.TerminalCause)
+	}
+	if stored.Summary.VerdictReason != execution.VerdictReasonAgentFailure {
+		t.Fatalf("verdict reason = %q, want agent_failure", stored.Summary.VerdictReason)
+	}
+}
+
+// A terminal online run keeps the timeout/environment classification and a
+// stable cause instead of the legacy raw executor_lost.
+func TestOnlineExecutorExhaustedLeaseKeepsTypedCause(t *testing.T) {
+	ctx := context.Background()
+	f := newTask9Fixture()
+	f.seedWave(execution.WaveRunning)
+	f.seedIntent(1, 300)
+	run := f.seedRun(500, 1, execution.CaseRunRunning)
+	past := f.clock.Now().Add(-time.Minute)
+	run.LeaseUntil = &past
+	run.OwnerExecutorID = int64PtrValue(1)
+	run.Attempts = 3
+	run.Summary.LastError = "executor_timeout: executor request timed out while creating the browser context"
+	f.runs.byID[500] = run
+	heartbeat := f.clock.Now().Add(-time.Second)
+	f.executors.byID[1] = execution.ExecutorInstance{
+		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
+	}
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	if err := f.recovery.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	stored, _ := f.runs.Get(ctx, 500)
+	if stored.Status != execution.CaseRunFailed || stored.FailureClass != execution.FailureClassTimeout {
+		t.Fatalf("terminal run = %s/%s, want failed/timeout", stored.Status, stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("terminal cause = %q, want executor_timeout", stored.Summary.TerminalCause)
+	}
+	if stored.Summary.VerdictReason != execution.VerdictReasonAgentFailure {
+		t.Fatalf("verdict reason = %q, want agent_failure", stored.Summary.VerdictReason)
 	}
 }

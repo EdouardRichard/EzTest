@@ -3,6 +3,7 @@ package versionapp_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
@@ -496,6 +497,113 @@ func (f *fakeRepo) RepositoryInUse(_ context.Context, id int64) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (f *fakeRepo) ReferencingVersions(_ context.Context, kind string, id int64) ([]version.ReferencingVersion, error) {
+	matched := map[int64]struct{}{}
+	add := func(versionID int64) { matched[versionID] = struct{}{} }
+	switch kind {
+	case "sut":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if binding.SUTID == id {
+					add(versionID)
+				}
+			}
+		}
+	case "environment":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if binding.EnvironmentID == id {
+					add(versionID)
+				}
+			}
+		}
+	case "page", "api", "database":
+		if f.catalog != nil {
+			var environmentID, sutID, status string
+			switch kind {
+			case "page":
+				page := f.catalog.pages[id]
+				environmentID, sutID, status = page.EnvironmentID, page.SUTID, page.Status
+			case "api":
+				api := f.catalog.apis[id]
+				environmentID, sutID, status = api.EnvironmentID, api.SUTID, api.Status
+			case "database":
+				database := f.catalog.databases[id]
+				environmentID, sutID, status = database.EnvironmentID, database.SUTID, database.Status
+			}
+			if status == "approved" || status == "active" {
+				for versionID, bindings := range f.bindings {
+					for _, binding := range bindings {
+						if idString(binding.EnvironmentID) != environmentID || idString(binding.SUTID) != sutID {
+							continue
+						}
+						var excluded bool
+						switch kind {
+						case "page":
+							excluded = containsInt64(binding.ScopeExclude.Pages, id)
+						case "api":
+							excluded = containsInt64(binding.ScopeExclude.APIs, id)
+						case "database":
+							excluded = containsInt64(binding.ScopeExclude.Databases, id)
+						}
+						if !excluded {
+							add(versionID)
+						}
+					}
+				}
+			}
+		}
+	case "account":
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				for _, account := range binding.Accounts {
+					if account.AccountID == id {
+						add(versionID)
+					}
+				}
+			}
+		}
+	case "repository":
+		sutIDs := map[string]struct{}{}
+		if f.catalog != nil {
+			for _, associations := range f.catalog.sutRepos {
+				for _, association := range associations {
+					if association.Repository.ID == idString(id) {
+						sutIDs[association.SUTID] = struct{}{}
+					}
+				}
+			}
+		}
+		for versionID, bindings := range f.bindings {
+			for _, binding := range bindings {
+				if _, ok := sutIDs[idString(binding.SUTID)]; ok {
+					add(versionID)
+				}
+				for _, override := range binding.RepositoryOverrides {
+					if override.RepoID == id {
+						add(versionID)
+					}
+				}
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown resource kind %q", kind)
+	}
+	out := make([]version.ReferencingVersion, 0, len(matched))
+	for versionID := range matched {
+		entity := f.versions[versionID]
+		out = append(out, version.ReferencingVersion{
+			ID:            versionID,
+			Title:         entity.Title,
+			Status:        entity.Status,
+			Stage:         entity.Stage,
+			SuspendedFrom: entity.SuspendedFrom,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 var _ version.Repository = (*fakeRepo)(nil)
@@ -1236,6 +1344,15 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
 		}
 	}
+	// The conflict-details port resolves the same range to the referencing
+	// versions, carrying the version title the resource context cannot read.
+	refs, err := usage.ReferencingVersions(requestContext(), "page", 1302)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(page): %v", err)
+	}
+	if len(refs) != 1 || refs[0].ID != created.ID || refs[0].Title != "Version" {
+		t.Fatalf("page referencing versions = %#v", refs)
+	}
 	// An explicit exclusion removes the resource from the version range, so the
 	// guard must stop blocking its deletion. In-range resources and explicit
 	// repository overrides still count.
@@ -1265,6 +1382,87 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 		}
 		if used != tc.want {
 			t.Fatalf("%s(%d) = %v, want %v", tc.name, tc.id, used, tc.want)
+		}
+	}
+	excludedRefs, err := usage.ReferencingVersions(requestContext(), "page", 1301)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(excluded page): %v", err)
+	}
+	if len(excludedRefs) != 0 {
+		t.Fatalf("excluded page referencing versions = %#v", excludedRefs)
+	}
+	repositoryRefs, err := usage.ReferencingVersions(requestContext(), "repository", 1203)
+	if err != nil {
+		t.Fatalf("ReferencingVersions(repository override): %v", err)
+	}
+	if len(repositoryRefs) != 1 || repositoryRefs[0].ID != created.ID {
+		t.Fatalf("repository referencing versions = %#v", repositoryRefs)
+	}
+}
+
+// TestReferencingVersionsCarriesStatusStageAndEditable pins the resource delete
+// conflict projection: the resource context needs the lifecycle status, the
+// effective stage and whether a binding edit is actually possible. A completed
+// version is terminal regardless of a lagging stage projection, and a suspended
+// version uses the stage it was suspended from.
+func TestReferencingVersionsCarriesStatusStageAndEditable(t *testing.T) {
+	env := newTestEnv(t)
+	completed := createVersion(t, env, "Completed")
+	executing := createVersion(t, env, "Executing")
+	suspendedDesigning := createVersion(t, env, "Suspended designing")
+	suspendedExecuting := createVersion(t, env, "Suspended executing")
+
+	stageDesigning := version.StageDesigning
+	stageExecuting := version.StageExecuting
+	set := func(id int64, status string, stage version.Stage, suspendedFrom *version.Stage) {
+		entity := env.repo.versions[id]
+		entity.Status = status
+		entity.Stage = stage
+		entity.SuspendedFrom = suspendedFrom
+		env.repo.versions[id] = entity
+		env.repo.stages[id] = version.StageState{
+			VersionID: id, Stage: stage, SuspendedFrom: suspendedFrom,
+		}
+	}
+	// The persisted stage lags behind the completed status: status is the close
+	// gate, so the effective stage must still project completed/read-only.
+	set(completed.ID, version.StatusCompleted, version.StageReporting, nil)
+	set(executing.ID, version.StatusRunning, version.StageExecuting, nil)
+	set(suspendedDesigning.ID, version.StatusRunning, version.StageBlocked, &stageDesigning)
+	set(suspendedExecuting.ID, version.StatusRunning, version.StagePaused, &stageExecuting)
+
+	refs, err := env.svc.ReferencingVersions(requestContext(), "environment", 1101)
+	if err != nil {
+		t.Fatalf("ReferencingVersions: %v", err)
+	}
+	got := make(map[int64]resourceapp.VersionRef, len(refs))
+	for _, ref := range refs {
+		got[ref.ID] = ref
+	}
+	want := map[int64]resourceapp.VersionRef{
+		completed.ID: {
+			ID: completed.ID, Title: "Completed", Status: version.StatusCompleted,
+			Stage: string(version.StageCompleted), Editable: false,
+		},
+		executing.ID: {
+			ID: executing.ID, Title: "Executing", Status: version.StatusRunning,
+			Stage: string(version.StageExecuting), Editable: false,
+		},
+		suspendedDesigning.ID: {
+			ID: suspendedDesigning.ID, Title: "Suspended designing", Status: version.StatusRunning,
+			Stage: string(version.StageDesigning), Editable: true,
+		},
+		suspendedExecuting.ID: {
+			ID: suspendedExecuting.ID, Title: "Suspended executing", Status: version.StatusRunning,
+			Stage: string(version.StageExecuting), Editable: false,
+		},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("referencing versions = %#v, want %d entries", got, len(want))
+	}
+	for id, expected := range want {
+		if got[id] != expected {
+			t.Fatalf("referencing version %d = %#v, want %#v", id, got[id], expected)
 		}
 	}
 }

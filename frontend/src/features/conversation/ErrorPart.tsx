@@ -53,12 +53,11 @@ export function ErrorPart({ part, onAction }: ErrorPartProps) {
         ) : null}
         {allowed.length > 0 ? (
           <p className="mt-0.5 text-[10px] text-muted-foreground">
-            允许值：<code className="break-all font-mono text-foreground">{allowed.join(", ")}</code>
+            允许值：
+            <code className="break-all font-mono text-foreground">{allowed.join(", ")}</code>
           </p>
         ) : null}
-        {hint !== "" ? (
-          <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p>
-        ) : null}
+        {hint !== "" ? <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p> : null}
       </div>
       {actionLabel !== null && onAction !== undefined ? (
         <Button

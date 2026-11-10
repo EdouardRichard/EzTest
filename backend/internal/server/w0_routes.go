@@ -78,6 +78,7 @@ func registerW0Routes(
 	// work; the legacy unscoped paths are deliberately not mounted.
 	attachment := versionapi.NewAttachmentHandler(deps.Attachments)
 	attachment.SetVersionResolver(deps.Attachments)
+	mux.Handle("GET /api/versions/{id}/attachments", authenticated(http.HandlerFunc(attachment.ListVersionAttachments)))
 	mux.Handle("GET /api/versions/{id}/attachments/{attachmentId}/images", authenticated(http.HandlerFunc(attachment.ListImagesForVersion)))
 	mux.Handle("POST /api/versions/{id}/attachments/{attachmentId}/reanalyze", authenticated(http.HandlerFunc(attachment.ReanalyzeForVersion)))
 

@@ -1113,6 +1113,293 @@ func TestPatchOneSideKeepsOtherCatalogSource(t *testing.T) {
 	}
 }
 
+// TestRefreshPreservesManualCapabilities pins S-02: a capability an
+// administrator corrected by hand survives an upstream refresh, while every
+// catalog-sourced capability (and the numeric parameters) still follows the
+// upstream. It also proves the refreshed-default vision guard evaluates the
+// merged capability set instead of the raw upstream one.
+func TestRefreshPreservesManualCapabilities(t *testing.T) {
+	svc, repo, client, audit, _ := newTestService(t)
+	ctx := context.Background()
+	input := validCreate()
+	input.APIKey = strPtr("sk-refresh-secret")
+	cfg, err := svc.CreateConfig(ctx, input, 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	client.models = []RemoteModel{{
+		ID: "gpt-4o", ContextWindow: 128000, MaxOutput: 8192,
+	}}
+	refreshed, err := svc.RefreshModels(ctx, cfg.ID, 7)
+	if err != nil {
+		t.Fatalf("first RefreshModels: %v", err)
+	}
+	modelID := refreshed[0].ID
+	if refreshed[0].EffectiveCapabilities().SupportsVisionSource != llm.SourceCatalog {
+		t.Fatalf("new catalog capability source = %#v", refreshed[0].Capabilities)
+	}
+
+	// The gateway did not advertise vision; the administrator corrects it.
+	updated, err := svc.UpdateModel(ctx, cfg.ID, modelID, ModelPatch{SupportsVision: boolPtr(true)}, 7)
+	if err != nil {
+		t.Fatalf("UpdateModel: %v", err)
+	}
+	if !updated.SupportsVision || updated.EffectiveCapabilities().SupportsVisionSource != llm.SourceManual {
+		t.Fatalf("manual vision = %#v", updated)
+	}
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &modelID}, 7); err != nil {
+		t.Fatalf("set default model: %v", err)
+	}
+
+	// The next refresh still reports no vision (the raw upstream value), but
+	// updates tools/reasoning/window. Merging must keep the manual vision, and
+	// the default-model guard must accept the merged value.
+	client.models = []RemoteModel{{
+		ID: "gpt-4o", ContextWindow: 200000, MaxOutput: 16384,
+		SupportsTools: true, SupportsReasoning: true, SupportsPromptCache: true,
+	}}
+	merged, err := svc.RefreshModels(ctx, cfg.ID, 7)
+	if err != nil {
+		t.Fatalf("second RefreshModels rejected merged manual vision: %v", err)
+	}
+	model := merged[0]
+	capabilities := model.EffectiveCapabilities()
+	if !capabilities.SupportsVision || capabilities.SupportsVisionSource != llm.SourceManual {
+		t.Fatalf("manual vision was overwritten: %#v", capabilities)
+	}
+	if !capabilities.SupportsTools || capabilities.SupportsToolsSource != llm.SourceCatalog {
+		t.Fatalf("catalog tools not refreshed: %#v", capabilities)
+	}
+	if !capabilities.SupportsReasoning || capabilities.SupportsReasoningSource != llm.SourceCatalog {
+		t.Fatalf("catalog reasoning not refreshed: %#v", capabilities)
+	}
+	if !capabilities.SupportsPromptCache || capabilities.SupportsPromptCacheSource != llm.SourceCatalog {
+		t.Fatalf("catalog prompt cache not refreshed: %#v", capabilities)
+	}
+	if model.ContextWindow != 200000 || model.MaxOutput != 16384 {
+		t.Fatalf("numeric parameters were not refreshed: %d/%d", model.ContextWindow, model.MaxOutput)
+	}
+
+	stored := repo.models[modelID]
+	if !stored.SupportsVision || stored.EffectiveCapabilities().SupportsVisionSource != llm.SourceManual {
+		t.Fatalf("stored manual vision = %#v", stored)
+	}
+
+	actions := make(map[string]bool, len(audit.events))
+	for _, event := range audit.events {
+		actions[event.Action] = true
+	}
+	if !actions["llm.model_updated"] || !actions["llm.config_refreshed"] {
+		t.Fatalf("audit actions = %v, want model_updated and config_refreshed", actions)
+	}
+	assertNoSecret(t, audit.events, "sk-refresh-secret")
+}
+
+// TestAddModelMarksCapabilitiesManual pins S-02 for manual rows: every
+// capability supplied through AddModel is administrator input, so it keeps its
+// value when an upstream refresh later reports the same model name.
+func TestAddModelMarksCapabilitiesManual(t *testing.T) {
+	svc, _, client, audit, _ := newTestService(t)
+	ctx := context.Background()
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 8192,
+		SupportsTools: true, SupportsVision: false,
+	}, 7)
+	if err != nil {
+		t.Fatalf("AddModel: %v", err)
+	}
+	capabilities := model.EffectiveCapabilities()
+	if capabilities.SupportsToolsSource != llm.SourceManual ||
+		capabilities.SupportsVisionSource != llm.SourceManual ||
+		capabilities.SupportsReasoningSource != llm.SourceManual ||
+		capabilities.SupportsPromptCacheSource != llm.SourceManual {
+		t.Fatalf("manual model capability sources = %#v", capabilities)
+	}
+
+	client.models = []RemoteModel{{
+		ID: "gpt-4o", ContextWindow: 200000, MaxOutput: 16384,
+		SupportsTools: false, SupportsVision: true, SupportsReasoning: true,
+	}}
+	refreshed, err := svc.RefreshModels(ctx, cfg.ID, 7)
+	if err != nil {
+		t.Fatalf("RefreshModels: %v", err)
+	}
+	after := refreshed[0].EffectiveCapabilities()
+	if !after.SupportsTools || after.SupportsVision {
+		t.Fatalf("manual capability values were overwritten: %#v", after)
+	}
+	if after.SupportsToolsSource != llm.SourceManual || after.SupportsVisionSource != llm.SourceManual {
+		t.Fatalf("manual capability sources were reset: %#v", after)
+	}
+
+	var added *auditapp.Event
+	for i := range audit.events {
+		if audit.events[i].Action == "llm.model_added" {
+			added = &audit.events[i]
+		}
+	}
+	if added == nil {
+		t.Fatalf("audit actions = %#v, want llm.model_added", audit.events)
+	}
+	if added.TargetKind != "llm_model" || added.TargetID != formatID(model.ID) {
+		t.Fatalf("model audit target = %#v", added)
+	}
+	if added.ActorID == nil || *added.ActorID != 7 {
+		t.Fatalf("model audit actor = %v", added.ActorID)
+	}
+	if added.Metadata["model"] != "gpt-4o" || added.Metadata["config_id"] != formatID(cfg.ID) {
+		t.Fatalf("model audit metadata = %#v", added.Metadata)
+	}
+}
+
+// TestUpdateModelMarksSuppliedCapabilitiesManual pins the per-field provenance
+// of the capability editor and the changed-fields audit trail (S-02/S-05): only
+// the supplied capability becomes manual, the others stay catalog, and the
+// audit entry records the old/new values and resulting sources.
+func TestUpdateModelMarksSuppliedCapabilitiesManual(t *testing.T) {
+	svc, repo, _, audit, _ := newTestService(t)
+	ctx := context.Background()
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	repo.models[50] = llm.Model{
+		ID: 50, ConfigID: cfg.ID, Model: "gpt-4o", DisplayName: "gpt-4o",
+		ContextWindow: 128000, MaxOutput: 8192,
+		Source: llm.SourceCatalog, Status: llm.ModelStatusActive,
+		WindowSource: llm.SourceCatalog, OutputSource: llm.SourceCatalog,
+		Capabilities: llm.Capabilities{
+			SupportsTools:             true,
+			SupportsVisionSource:      llm.SourceCatalog,
+			SupportsToolsSource:       llm.SourceCatalog,
+			SupportsReasoningSource:   llm.SourceCatalog,
+			SupportsPromptCacheSource: llm.SourceCatalog,
+			ContextWindow:             128000,
+		},
+	}
+
+	updated, err := svc.UpdateModel(ctx, cfg.ID, 50, ModelPatch{SupportsVision: boolPtr(true)}, 7)
+	if err != nil {
+		t.Fatalf("UpdateModel: %v", err)
+	}
+	capabilities := updated.EffectiveCapabilities()
+	if !capabilities.SupportsVision || capabilities.SupportsVisionSource != llm.SourceManual {
+		t.Fatalf("vision = %#v, want manual true", capabilities)
+	}
+	if capabilities.SupportsToolsSource != llm.SourceCatalog ||
+		capabilities.SupportsReasoningSource != llm.SourceCatalog ||
+		capabilities.SupportsPromptCacheSource != llm.SourceCatalog {
+		t.Fatalf("unsupplied capability sources = %#v", capabilities)
+	}
+
+	var entry *auditapp.Event
+	for i := range audit.events {
+		if audit.events[i].Action == "llm.model_updated" {
+			entry = &audit.events[i]
+		}
+	}
+	if entry == nil {
+		t.Fatalf("audit actions = %#v, want llm.model_updated", audit.events)
+	}
+	if entry.TargetKind != "llm_model" || entry.TargetID != "50" {
+		t.Fatalf("audit target = %#v", entry)
+	}
+	if entry.ActorID == nil || *entry.ActorID != 7 {
+		t.Fatalf("audit actor = %v", entry.ActorID)
+	}
+	changed, _ := entry.Metadata["changed_fields"].([]string)
+	if !containsString(changed, "supports_vision") || !containsString(changed, "supports_vision_source") {
+		t.Fatalf("changed fields = %#v", entry.Metadata["changed_fields"])
+	}
+	oldValues, _ := entry.Metadata["old_values"].(map[string]any)
+	newValues, _ := entry.Metadata["new_values"].(map[string]any)
+	if oldValues["supports_vision"] != false || newValues["supports_vision"] != true {
+		t.Fatalf("old/new values = %#v/%#v", oldValues, newValues)
+	}
+	sources, _ := entry.Metadata["capability_sources"].(map[string]any)
+	if sources["supports_vision"] != llm.SourceManual || sources["supports_tools"] != llm.SourceCatalog {
+		t.Fatalf("capability sources = %#v", sources)
+	}
+	assertNoSecret(t, entry.Metadata, "sk-")
+}
+
+// TestDeleteModelRejectsConfiguredDefault pins the M-07 guard: deleting the
+// model that is the configuration's default bypasses default-model validation,
+// so it is a typed 409 that tells the administrator to reassign first. A
+// successful delete records llm.model_deleted with the model metadata.
+func TestDeleteModelRejectsConfiguredDefault(t *testing.T) {
+	svc, repo, _, audit, _ := newTestService(t)
+	ctx := context.Background()
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	defaultModel, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "vision-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel default: %v", err)
+	}
+	other, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "other-llm", ContextWindow: 128000, MaxOutput: 8192, SupportsVision: true,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel other: %v", err)
+	}
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &defaultModel.ID}, 1); err != nil {
+		t.Fatalf("set default: %v", err)
+	}
+
+	err = svc.DeleteModel(ctx, defaultModel.ID, 7)
+	if err == nil {
+		t.Fatal("deleting the configured default model succeeded")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusConflict || apiErr.Code != "default_model_in_use" {
+		t.Fatalf("error = %#v, want 409 default_model_in_use", apiErr)
+	}
+	if apiErr.Details["config_id"] != formatID(cfg.ID) ||
+		apiErr.Details["config_name"] != cfg.Name ||
+		apiErr.Details["default_model_id"] != formatID(defaultModel.ID) {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+	if next, _ := apiErr.Details["next_action"].(string); next == "" {
+		t.Fatalf("details = %#v, want a reassign-first next_action", apiErr.Details)
+	}
+	if _, ok := repo.models[defaultModel.ID]; !ok {
+		t.Fatal("rejected delete removed the default model")
+	}
+
+	// Reassigning the default unlocks the delete.
+	if _, err := svc.UpdateConfig(ctx, cfg.ID, ConfigInput{DefaultModelID: &other.ID}, 1); err != nil {
+		t.Fatalf("reassign default: %v", err)
+	}
+	if err := svc.DeleteModel(ctx, defaultModel.ID, 7); err != nil {
+		t.Fatalf("DeleteModel after reassign: %v", err)
+	}
+	var entry *auditapp.Event
+	for i := range audit.events {
+		if audit.events[i].Action == "llm.model_deleted" {
+			entry = &audit.events[i]
+		}
+	}
+	if entry == nil {
+		t.Fatalf("audit actions = %#v, want llm.model_deleted", audit.events)
+	}
+	if entry.TargetID != formatID(defaultModel.ID) || entry.Metadata["model"] != "vision-llm" {
+		t.Fatalf("delete audit = %#v", entry)
+	}
+	if entry.ActorID == nil || *entry.ActorID != 7 {
+		t.Fatalf("delete audit actor = %v", entry.ActorID)
+	}
+}
+
 // TestRefreshPreservesManual pins R-A1-3: an upstream refresh only fills fields
 // whose source is catalog (or whose stored value is 0) and never overwrites an
 // administrator's value. The upstream snapshot is still refreshed so
@@ -1191,8 +1478,9 @@ func TestRefreshPreservesManual(t *testing.T) {
 // snapshot and flips both field sources back to catalog; a model without a
 // snapshot resets to 0 (unknown/auto).
 func TestResetParams(t *testing.T) {
-	svc, repo, _, _, _ := newTestService(t)
+	svc, repo, _, audit, _ := newTestService(t)
 	ctx := context.Background()
+	repo.configs[1] = chatTestConfig(1, false)
 	repo.models[2] = llm.Model{
 		ID: 2, ConfigID: 1, Model: "edited-model", DisplayName: "edited-model",
 		ContextWindow: 128000, MaxOutput: 8192,
@@ -1212,7 +1500,7 @@ func TestResetParams(t *testing.T) {
 		Capabilities: llm.Capabilities{ContextWindow: 64000},
 	}
 
-	got, err := svc.ResetModelParams(ctx, 1, 2)
+	got, err := svc.ResetModelParams(ctx, 1, 2, 7)
 	if err != nil {
 		t.Fatalf("ResetModelParams: %v", err)
 	}
@@ -1235,7 +1523,7 @@ func TestResetParams(t *testing.T) {
 		t.Fatalf("capabilities.context_window = %d, want 1000000", stored.Capabilities.ContextWindow)
 	}
 
-	empty, err := svc.ResetModelParams(ctx, 1, 3)
+	empty, err := svc.ResetModelParams(ctx, 1, 3, 7)
 	if err != nil {
 		t.Fatalf("ResetModelParams without snapshot: %v", err)
 	}
@@ -1249,10 +1537,31 @@ func TestResetParams(t *testing.T) {
 		t.Fatalf("max_input without snapshot = %d, want 123904 (128000-4096)", empty.MaxInput)
 	}
 
-	if _, err := svc.ResetModelParams(ctx, 1, 999); err == nil {
+	if _, err := svc.ResetModelParams(ctx, 1, 999, 7); err == nil {
 		t.Fatal("reset of an unknown model succeeded")
 	} else if apiErr := apiError(t, err); apiErr.Status != http.StatusNotFound {
 		t.Fatalf("unknown model status = %d, want 404", apiErr.Status)
+	}
+
+	var entry *auditapp.Event
+	for i := range audit.events {
+		if audit.events[i].Action == "llm.model_params_reset" && audit.events[i].TargetID == "2" {
+			entry = &audit.events[i]
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatalf("audit actions = %#v, want llm.model_params_reset for model 2", audit.events)
+	}
+	if entry.TargetKind != "llm_model" {
+		t.Fatalf("reset audit target = %#v", entry)
+	}
+	if entry.ActorID == nil || *entry.ActorID != 7 {
+		t.Fatalf("reset audit actor = %v", entry.ActorID)
+	}
+	changed, _ := entry.Metadata["changed_fields"].([]string)
+	if !containsString(changed, "context_window") || !containsString(changed, "max_output") {
+		t.Fatalf("reset changed fields = %#v", entry.Metadata["changed_fields"])
 	}
 }
 

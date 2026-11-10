@@ -90,6 +90,19 @@ export type LLMModelCapabilities = {
   supports_reasoning: boolean
   supports_prompt_cache: boolean
   context_window: number
+  /** Provenance mirrors (catalog|manual) exposed by the 0.2.3 DTO. */
+  supports_tools_source?: LLMModelSource
+  supports_vision_source?: LLMModelSource
+  supports_reasoning_source?: LLMModelSource
+  supports_prompt_cache_source?: LLMModelSource
+}
+
+/** M-07 configuration pre-check (`configDTO.health`). */
+export type LLMConfigHealth = {
+  default_model_valid: boolean
+  vision_ready: boolean
+  /** Stable detail code; empty when the configuration is fully ready. */
+  reason?: "" | "default_model_missing" | "default_model_disabled" | "default_model_not_vision"
 }
 
 export type LLMConfig = {
@@ -111,6 +124,8 @@ export type LLMConfig = {
   default_model_id?: string
   /** Embedded catalog rows (0.2.1 config DTO); the standalone list still exists. */
   models?: LLMModel[]
+  /** Optional for older/partial payloads and while creating a config. */
+  health?: LLMConfigHealth
   created_by?: string
   created_at: string
   updated_at: string
@@ -129,6 +144,11 @@ export type LLMModel = {
   max_input?: number
   supports_tools: boolean
   supports_vision: boolean
+  /** Provenance of each capability: `manual` values survive a catalog refresh. */
+  supports_tools_source?: LLMModelSource
+  supports_vision_source?: LLMModelSource
+  supports_reasoning_source?: LLMModelSource
+  supports_prompt_cache_source?: LLMModelSource
   /** 0.2.1 capability set; optional for older/partial payloads. */
   capabilities?: LLMModelCapabilities
   /** Deprecated catalog rows stay visible but are not selectable. */
@@ -562,6 +582,8 @@ export function resetUserPassword(id: string, password: string): Promise<void> {
 export type AuditLogEntry = {
   id: string
   actor_id?: string
+  /** Username joined by the backend (`LEFT JOIN app_user`); optional on old payloads. */
+  actor_name?: string
   action: string
   target_kind: string
   target_id: string

@@ -86,9 +86,13 @@ func newP6AgentRuntime(
 
 	profileSvc := agentapp.NewProfileAdminService(
 		runtimeRepo,
-		// P7 adds knowledge.propose so the admin catalog and allowed_tools
-		// validation know the frozen P7 tool set (S6 report §5.6).
-		tools.NewP7Registry(tools.Deps{}),
+		// The admin catalog is the metadata-only superset of the runtime
+		// registry: it exposes the v0.22 Host tools that a given run may not
+		// have wired (question.ask, plan.update, clarification.search,
+		// task.complete, tool_result.read, sut.database_list) so an
+		// administrator can add them to a backfilled legacy profile. Execute
+		// stays fail-closed; the catalog is never used to run a tool.
+		tools.AdminCatalogRegistry(),
 		llmSvc,
 		audit,
 	)

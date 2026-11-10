@@ -275,12 +275,17 @@ describe("SUTPanel", () => {
     )
   })
 
-  it("surfaces a 409 when a SUT cannot be deleted because a version references it", async () => {
+  it("renders the referenced-version details when a SUT cannot be deleted", async () => {
     vi.mocked(api.deleteSut).mockRejectedValue(
       new ApiError({
         status: 409,
-        code: "conflict",
+        code: "resource_referenced",
         message: "sut is referenced by a version binding",
+        details: {
+          kind: "sut",
+          referencing_versions: [{ id: "2001", title: "订单中心 v1" }],
+          resolution: "Delete the referencing versions.",
+        },
       }),
     )
     const { onRefresh } = renderPanel()
@@ -288,10 +293,40 @@ describe("SUTPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除 SUT 订单中心" }))
     fireEvent.click(screen.getByRole("button", { name: "删除 SUT" }))
 
-    expect(await screen.findByText(/sut is referenced by a version binding/)).toBeInTheDocument()
-    expect(screen.getByText(/操作冲突/)).toBeInTheDocument()
+    expect(await screen.findByText("该SUT已被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByRole("link", { name: "订单中心 v1" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=overview",
+    )
+    expect(screen.getByText(/请先在引用版本中改用其他 SUT/)).toBeVisible()
+    expect(screen.queryByText(/sut is referenced by a version binding/)).toBeNull()
+    expect(screen.queryByText(/名称\/键重复/)).toBeNull()
     expect(api.deleteSut).toHaveBeenCalledWith("1001")
     expect(onRefresh).not.toHaveBeenCalled()
     expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("uses the generic no-list copy when a referenced SUT has no version rows", async () => {
+    vi.mocked(api.deleteSut).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "sut is referenced by a version binding",
+        details: {
+          kind: "sut",
+          referencing_versions: [],
+          resolution: "Delete the referencing versions.",
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 SUT 订单中心" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除 SUT" }))
+
+    expect(await screen.findByText("该SUT被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByText(/请先在版本绑定中解除对该资源的引用后再删除/)).toBeVisible()
+    expect(screen.queryByText(/这些版本/)).toBeNull()
+    expect(screen.queryByRole("link")).toBeNull()
   })
 })

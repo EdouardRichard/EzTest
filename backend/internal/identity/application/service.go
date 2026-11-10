@@ -3,6 +3,7 @@ package identityapp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -138,7 +139,12 @@ func (s *Service) Login(ctx context.Context, username, password, requestID, ip, 
 	}
 	if !user.IsActive() {
 		s.recordLoginFailed(ctx, username, requestID, ip, ua, "disabled")
-		return Session{}, platform.Unauthenticated()
+		// The password was verified above, so distinguishing a disabled account
+		// does not leak whether a username exists: an unknown user or a wrong
+		// password still returns the generic 401. The message stays English and
+		// the frontend maps account_disabled to Chinese.
+		return Session{}, platform.NewError(
+			http.StatusForbidden, "account_disabled", "account is disabled")
 	}
 
 	rawToken, err := identity.NewTokenValue()

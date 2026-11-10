@@ -17,9 +17,10 @@ v0.22 additive 策略见下）。身份分两层：
   +1 schema），W2-7 追加 R-W2-3/API-28 的 report artifact export path/operation
   （+1 path / +1 operation / +1 schema），W2-11 追加 R-EX-6/API-41 的 discovery case
   rollback path/operation（+1 path / +1 operation / +1 schema），W2-14 追加 R-W2-6/API-31 的
-  质量趋势 path/operation（+1 path / +1 operation / +1 schema）。合计 **33 个
-  path item / 42 个 operation / 41 个 schema**。当前文件为
-  **214 paths / 264 operations / 322 schemas**。新增段在
+  质量趋势 path/operation（+1 path / +1 operation / +1 schema）。v0.2.3 追加 reset-params
+  与版本附件列表（+2 paths / +2 operations / +0 schemas）。合计 **35 个
+  path item / 44 个 operation / 41 个 schema**。当前文件为
+  **216 paths / 266 operations / 322 schemas**。新增段在
   `info.description` 的
   `### v0.22 W0 增量（Task 37，additive）`、`## v0.22 W1 增量（W1-13，additive）`、
   `## v0.22 W1 增量（W1-14A，additive）`、

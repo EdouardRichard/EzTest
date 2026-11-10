@@ -254,8 +254,11 @@ type StageWaveController interface {
 	ResumeVersionWaves(ctx context.Context, versionID int64) error
 }
 
-// StageReports ensures the version report exists before executing -> reporting
-// (R-B4-2 "报告已生成"). The composition root adapts ReportService.
+// StageReports is Deprecated: the executing -> reporting edge no longer ensures
+// the version report (R2-NEW-02). Report generation is owned by the reporting
+// stage-entry report.version job and the P4 report reconciler. The port and its
+// StageServiceDeps.Reports wiring are kept only for composition-root
+// compatibility; remove them in a dedicated cleanup.
 type StageReports interface {
 	EnsureVersionReport(ctx context.Context, versionID int64) error
 }

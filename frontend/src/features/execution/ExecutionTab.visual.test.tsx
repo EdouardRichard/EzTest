@@ -83,6 +83,7 @@ describe("ExecutionTab visual sub-view", () => {
         expect.stringMatching(
           /^\/versions\/2001\?tab=execution&wave=9201(&case_run=9301)?&view=visual$/,
         ),
+        { scroll: false },
       ),
     )
     expect(screen.getByTestId("visual-view-stub")).toBeInTheDocument()
@@ -91,6 +92,7 @@ describe("ExecutionTab visual sub-view", () => {
     await waitFor(() =>
       expect(navigation.replace).toHaveBeenLastCalledWith(
         expect.not.stringContaining("view=visual"),
+        { scroll: false },
       ),
     )
     expect(await screen.findByTestId("wave-list")).toBeInTheDocument()

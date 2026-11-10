@@ -1,16 +1,21 @@
-# Baseline EzTest 0.2 CI. It runs the Go, frontend and executor test gates that
-# the local `scripts/test.ps1` also runs. Playwright E2E and real-LLM acceptance
-# stay out of scope. The executor tests launch Chromium, so that job installs the
-# browser explicitly instead of relying on the runner image.
+# Baseline EzTest 0.2 CI. It runs the Go, frontend, executor and renderer test
+# gates that the local `scripts/test.ps1` also runs. Playwright E2E and real-LLM
+# acceptance stay out of scope. The executor and renderer tests launch Chromium,
+# so the workflow installs the browser explicitly (cached between runs) instead
+# of relying on the runner image or on `pnpm install` post-install scripts.
 #
 # The 0.2 static acceptance gate (`scripts/p8-static-check.ps1`) validates the
 # development docs/contracts tree, which is intentionally not part of the public
 # source tree, so it runs locally in the development workflow only and is not a
 # hosted CI job here.
+#
+# Action majors are pinned to the releases that run on Node 24; the runner image
+# is pinned to ubuntu-24.04 so a `ubuntu-latest` image migration cannot change
+# the toolchain underneath the gate.
 
 name: CI
 
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 
 permissions:
   contents: read
@@ -21,8 +26,8 @@ concurrency:
 
 jobs:
   test:
-    name: Go, frontend and executor tests
-    runs-on: ubuntu-latest
+    name: Go, frontend, executor and renderer tests
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -42,41 +47,50 @@ jobs:
       EZTEST_TEST_DATABASE_URL: postgres://eztest@127.0.0.1:5433/eztest_test?sslmode=disable
       # Skip the implicit browser download during `pnpm install`; the dedicated
       # "Install Playwright Chromium" step below installs exactly what the
-      # executor tests need.
+      # executor and renderer tests need.
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 11
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        # Node 22 is the documented baseline (README) and the hosted gate. The
+        # suite must also pass on newer Node majors that contributors run
+        # locally, so keep tests free of runtime-specific fetch/Blob interop.
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             executor/pnpm-lock.yaml
+            renderer/pnpm-lock.yaml
+
+      - name: Go vet
+        working-directory: backend
+        run: go vet ./...
 
       - name: Go unit tests
         working-directory: backend
         run: go test -count=1 ./...
 
-
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
+      # `pnpm lint` is the same Biome gate the local `scripts/test.ps1` runs; a
+      # failure here is almost always "run `pnpm lint:fix` in frontend/".
       - name: Frontend lint
         working-directory: frontend
         run: pnpm lint
@@ -93,10 +107,26 @@ jobs:
         working-directory: executor
         run: pnpm install --frozen-lockfile
 
+      - name: Install renderer dependencies
+        working-directory: renderer
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('executor/pnpm-lock.yaml', 'renderer/pnpm-lock.yaml') }}
+
+      # `--with-deps` still installs the OS libraries on a cache hit; only the
+      # ~100 MB browser download is skipped.
       - name: Install Playwright Chromium
         working-directory: executor
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Executor unit tests
         working-directory: executor
+        run: pnpm test
+
+      - name: Renderer unit tests
+        working-directory: renderer
         run: pnpm test

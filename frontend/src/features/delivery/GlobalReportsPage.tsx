@@ -12,6 +12,7 @@ import { Field } from "@/components/ui/Field"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Table, type TableColumn } from "@/components/ui/Table"
+import { revokeSoon } from "@/features/execution/EvidenceViewer"
 import { formatDateTime } from "@/lib/format"
 
 import { downloadHTML, getReport, getRevision } from "./api"
@@ -265,7 +266,9 @@ export function GlobalReportsPage() {
       const download = await downloadHTML(detail.version_id, detail.id, revision.revision)
       const objectUrl = URL.createObjectURL(download.blob)
       window.open(objectUrl, "_blank", "noopener,noreferrer")
-      URL.revokeObjectURL(objectUrl)
+      // X-05: the new tab may not have committed its navigation yet; revoking
+      // in the same tick races it and can surface ERR_FILE_NOT_FOUND.
+      revokeSoon(objectUrl)
     } catch (cause) {
       setActionError(cause)
     } finally {

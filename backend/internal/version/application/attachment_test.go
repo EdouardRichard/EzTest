@@ -32,6 +32,10 @@ type fakeAttachmentRepo struct {
 	pendingForIngest     []version.PendingAttachment
 	lastPendingLimit     int
 	createErr            error
+	// existingVersions backs the version existence probe of the version
+	// attachment list. A nil map keeps the legacy fixtures permissive (every
+	// version exists) so unrelated tests do not have to seed the version table.
+	existingVersions map[int64]bool
 }
 
 func newFakeAttachmentRepo() *fakeAttachmentRepo {
@@ -117,6 +121,25 @@ func (f *fakeAttachmentRepo) ListByVersion(_ context.Context, versionID int64) (
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items, nil
+}
+
+func (f *fakeAttachmentRepo) VersionExists(_ context.Context, versionID int64) (bool, error) {
+	if f.existingVersions == nil {
+		return true, nil
+	}
+	return f.existingVersions[versionID], nil
+}
+
+func (f *fakeAttachmentRepo) CountImagesByVersion(_ context.Context, versionID int64) (map[int64]int, error) {
+	counts := make(map[int64]int)
+	for _, image := range f.images {
+		attachment, ok := f.attachments[image.AttachmentID]
+		if !ok || attachment.VersionID != versionID {
+			continue
+		}
+		counts[image.AttachmentID]++
+	}
+	return counts, nil
 }
 
 func (f *fakeAttachmentRepo) ListUnlinkedByVersion(_ context.Context, versionID int64) ([]version.Attachment, error) {
@@ -743,9 +766,298 @@ func TestAttachmentImageRef(t *testing.T) {
 	if ref.SHA256 != strings.Repeat("b", 64) || ref.Name != "shot.png" || ref.MIME != "image/png" {
 		t.Fatalf("ref = %#v", ref)
 	}
+	// A standalone image upload is registered skipped and has no persisted
+	// attachment_image row (it is sent as an image part). That is metadata plus
+	// an explicit empty-payload note, not an error.
+	if len(ref.Images) != 0 {
+		t.Fatalf("standalone image images = %#v, want empty", ref.Images)
+	}
+	if strings.TrimSpace(ref.Note) == "" {
+		t.Fatalf("standalone image note = %q, want the explicit empty-caption note", ref.Note)
+	}
 	markdown := registerAttachment(t, env, strings.Repeat("a", 64), "spec.md", "text/markdown", []byte("# Spec"))
 	if _, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, markdown.ID); err == nil {
-		t.Fatal("image ref returned for a markdown attachment")
+		t.Fatal("image ref returned for a markdown attachment without persisted images")
+	}
+}
+
+// TestReadAttachmentTextReturnsImageCaptions pins C-01's primary exit: the
+// attachment-level read exposes the persisted image rows with their captions so
+// the Host can use the platform-generated analysis instead of a fact stream
+// that ranks captions last.
+func TestReadAttachmentTextReturnsImageCaptions(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("8", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	read, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	if len(read.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", read.Images)
+	}
+	image := read.Images[0]
+	if image.Seq != 1 || image.Status != version.AttachmentImageDone || image.Caption == "" {
+		t.Fatalf("image = %#v, want seq/status/caption", image)
+	}
+	if image.SHA256 == "" || image.MIME != "image/png" || image.Width != 8 || image.Height != 6 {
+		t.Fatalf("image metadata = %#v", image)
+	}
+	if read.ImageCount != 1 {
+		t.Fatalf("image count = %d, want 1", read.ImageCount)
+	}
+}
+
+// TestReadAttachmentTextPaginatesImages pins the C-01/M-07 paging contract: the
+// image payload is only attached to the first page. Later pages must not repeat
+// the captions, but still report image_count so the Host knows they exist.
+func TestReadAttachmentTextPaginatesImages(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("7", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	first, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 2)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if len(first.Images) != 1 || first.ImageCount != 1 {
+		t.Fatalf("first page images = %#v count = %d", first.Images, first.ImageCount)
+	}
+	if first.Text == "" || !first.Truncated {
+		t.Fatalf("first page = %#v, want a truncated text window", first)
+	}
+	second, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 2, 2)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second.Images) != 0 {
+		t.Fatalf("second page repeated images: %#v", second.Images)
+	}
+	if second.ImageCount != 1 {
+		t.Fatalf("second page image_count = %d, want 1", second.ImageCount)
+	}
+}
+
+// TestReadAttachmentTextReturnsAllImageCaptions pins R2-C-01's version-layer
+// exit: the caption budget/pagination now lives in the agent tools layer, so
+// ReadAttachmentText returns every persisted image row with its complete
+// caption on the first page. A 12-image document used to stop around image 10
+// with a caption cut in half; that made images 11/12 unreachable.
+func TestReadAttachmentTextReturnsAllImageCaptions(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("6", 64)
+	view := registerAttachment(t, env, sha, "many-images.docx", docxMIME, []byte("docx"))
+	const imageTotal = 12
+	for index := 1; index <= imageTotal; index++ {
+		env.repo.images[int64(9100+index)] = version.AttachmentImageRecord{
+			ID: int64(9100 + index), AttachmentID: view.ID, Seq: index,
+			MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+			Status: version.AttachmentImageDone, Caption: strings.Repeat("图", 800),
+		}
+	}
+
+	read, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 8000)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText: %v", err)
+	}
+	if read.ImageCount != imageTotal {
+		t.Fatalf("image_count = %d, want %d", read.ImageCount, imageTotal)
+	}
+	if len(read.Images) != imageTotal {
+		t.Fatalf("images = %d, want all %d captions (the version layer must not budget them)",
+			len(read.Images), imageTotal)
+	}
+	for index, image := range read.Images {
+		if got := len([]rune(image.Caption)); got != 800 {
+			t.Fatalf("image %d caption runes = %d, want 800 (caption was truncated at the version layer)",
+				index+1, got)
+		}
+	}
+	if read.Images[0].ID != 9101 || read.Images[imageTotal-1].ID != int64(9100+imageTotal) {
+		t.Fatalf("image ids = %d..%d, want 9101..%d",
+			read.Images[0].ID, read.Images[imageTotal-1].ID, 9100+imageTotal)
+	}
+
+	// Later text pages still do not repeat the image payload, but they keep
+	// reporting image_count so the Host knows images exist.
+	later, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 8000, 8000)
+	if err != nil {
+		t.Fatalf("later page: %v", err)
+	}
+	if len(later.Images) != 0 {
+		t.Fatalf("later page repeated %d image captions", len(later.Images))
+	}
+	if later.ImageCount != imageTotal {
+		t.Fatalf("later page image_count = %d, want %d", later.ImageCount, imageTotal)
+	}
+}
+
+// TestReadAttachmentTextToleratesNilStorage pins the graceful degradation for
+// partial services: a test (or degraded wiring) may construct the service with
+// no content store, and reading image rows must still return the persisted
+// metadata views with an empty SHA instead of panicking on the refs join.
+func TestReadAttachmentTextToleratesNilStorage(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("5", 64)
+	view := registerAttachment(t, env, sha, "with-images.docx", docxMIME, []byte("docx"))
+	env.repo.images[9101] = version.AttachmentImageRecord{
+		ID: 9101, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面",
+	}
+
+	svc := versionapp.NewAttachmentService(
+		env.repo, nil, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	read, err := svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText with nil storage: %v", err)
+	}
+	if read.ImageCount != 1 || len(read.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", read.Images)
+	}
+	if read.Images[0].SHA256 != "" {
+		t.Fatalf("sha256 = %q, want empty without a content store", read.Images[0].SHA256)
+	}
+	if read.Images[0].Seq != 1 || read.Images[0].Caption != "登录界面" {
+		t.Fatalf("image = %#v, want seq/caption preserved", read.Images[0])
+	}
+}
+
+// TestAttachmentImageRefToleratesNilStorage mirrors the ReadAttachmentText
+// degradation for the docx-with-images path: without a content store the
+// original SHA cannot be resolved, but the attachment metadata and persisted
+// image captions still return instead of panicking on the refs lookup.
+func TestAttachmentImageRefToleratesNilStorage(t *testing.T) {
+	env := newAttachmentEnv(t)
+	sha := strings.Repeat("6", 64)
+	view := registerAttachment(t, env, sha, "with-images.docx", docxMIME, []byte("docx"))
+	env.repo.images[9102] = version.AttachmentImageRecord{
+		ID: 9102, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面",
+	}
+
+	svc := versionapp.NewAttachmentService(
+		env.repo, nil, env.queue, env.extractor, attachments.NewImageProber(), env.events, &seqIDs{}, fixedClock{at: testTime})
+	ref, err := svc.AttachmentImageRef(requestContext(), env.versionID, 8001, view.ID)
+	if err != nil {
+		t.Fatalf("AttachmentImageRef with nil storage: %v", err)
+	}
+	if ref.SHA256 != "" {
+		t.Fatalf("sha256 = %q, want empty without a content store", ref.SHA256)
+	}
+	if ref.Name != "with-images.docx" || ref.MIME != docxMIME {
+		t.Fatalf("metadata = %#v, want the attachment name/MIME preserved", ref)
+	}
+	if len(ref.Images) != 1 || ref.Images[0].Caption != "登录界面" || ref.Images[0].Seq != 1 {
+		t.Fatalf("images = %#v, want the persisted image row", ref.Images)
+	}
+}
+
+// TestAttachmentImageRefIncludesPersistedCaption pins the second C-01 exit on
+// the real UAT path: a docx attachment whose embedded images were extracted and
+// analyzed returns those persisted rows/captions. The previous version of this
+// test fabricated a row on a standalone image, a state no upload can produce.
+func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
+	env := newParsingAttachmentEnv(t)
+	data := docxWithImageFixture(t)
+	sha := strings.Repeat("8", 64)
+	env.store.put(sha, data, docxMIME)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001,
+		attachmentPart(sha, "with-image.docx", docxMIME, int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if _, err := env.svc.Extract(requestContext(), view.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	ref, err := env.svc.AttachmentImageRef(requestContext(), env.versionID, 8001, view.ID)
+	if err != nil {
+		t.Fatalf("AttachmentImageRef: %v", err)
+	}
+	if len(ref.Images) != 1 {
+		t.Fatalf("images = %#v, want the persisted caption", ref.Images)
+	}
+	if ref.Images[0].Caption != "登录界面截图：手机号与验证码输入框" ||
+		ref.Images[0].Status != version.AttachmentImageDone || ref.Images[0].Seq != 1 {
+		t.Fatalf("image = %#v", ref.Images[0])
+	}
+	if ref.Images[0].SHA256 == "" || ref.Images[0].MIME != "image/png" {
+		t.Fatalf("image metadata = %#v", ref.Images[0])
+	}
+	if ref.Name != "with-image.docx" || ref.MIME != docxMIME || ref.SHA256 != sha {
+		t.Fatalf("attachment metadata = %#v", ref)
+	}
+	if ref.Note != "" {
+		t.Fatalf("note = %q, want empty for a document with persisted captions", ref.Note)
+	}
+}
+
+// TestAttachmentImageRefByImageResolvesParentAttachment pins R2-C-02: the image
+// id returned in attachment.read_text images[] (attachment_image.id) resolves
+// its parent attachment inside the same conversation. A foreign image id or an
+// image row reachable only through another conversation of the same version
+// stays not_found, so the image path cannot leak cross-conversation attachments.
+func TestAttachmentImageRefByImageResolvesParentAttachment(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.conversationMessages = map[int64]int64{7001: 8001}
+	env.repo.conversations = map[int64]int64{8001: env.versionID, 8002: env.versionID}
+	view := registerAttachment(t, env, strings.Repeat("a", 64), "with-image.docx", docxMIME, []byte("docx"))
+	env.repo.images[9301] = version.AttachmentImageRecord{
+		ID: 9301, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面截图",
+	}
+
+	ref, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8001, 9301)
+	if err != nil {
+		t.Fatalf("AttachmentImageRefByImage: %v", err)
+	}
+	if ref.AttachmentID != view.ID {
+		t.Fatalf("attachment id = %d, want the parent %d", ref.AttachmentID, view.ID)
+	}
+	if len(ref.Images) != 1 || ref.Images[0].ID != 9301 || ref.Images[0].Caption != "登录界面截图" {
+		t.Fatalf("images = %#v, want the persisted parent row/caption", ref.Images)
+	}
+	if ref.Images[0].Seq != 1 || ref.Images[0].Status != version.AttachmentImageDone {
+		t.Fatalf("image metadata = %#v", ref.Images[0])
+	}
+	if ref.Name != "with-image.docx" || ref.MIME != docxMIME {
+		t.Fatalf("metadata = %#v, want the parent attachment metadata", ref)
+	}
+
+	// Unknown image id: not_found, never an empty success.
+	if _, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8001, 999999); err == nil {
+		t.Fatal("unknown image id returned a reference")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("unknown image status = %d, want 404", apiError(t, err).Status)
+	}
+	// An image id owned by another conversation of the same version must stay
+	// invisible: the scan runs over ListByConversation only.
+	if _, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8002, 9301); err == nil {
+		t.Fatal("cross-conversation image id returned a reference")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("cross-conversation image status = %d, want 404", apiError(t, err).Status)
 	}
 }
 
@@ -1246,5 +1558,88 @@ func TestRetryBindsOnceWithoutLegacyIngestTask(t *testing.T) {
 	}
 	if tasks := h.ingestTasks(); len(tasks) != 0 {
 		t.Fatalf("idempotent retry enqueued a legacy ingest task: %#v", tasks)
+	}
+}
+
+// ---------- version attachment list (C-05) ----------
+
+// TestListVersionAttachments pins the version attachment panel read (C-05): the
+// rows are newest-first, carry the stable extraction error pair and the number
+// of extracted images, and attachments of another version are never listed.
+func TestListVersionAttachments(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.attachments[101] = version.Attachment{
+		ID: 101, VersionID: env.versionID, Name: "spec.pdf", MIME: "application/pdf", Size: 2048,
+		ExtractionStatus:    version.AttachmentFailed,
+		ExtractionErrorCode: version.AttachmentErrorExtraction,
+		ExtractionErrorText: "parser crashed",
+	}
+	env.repo.attachments[102] = version.Attachment{
+		ID: 102, VersionID: env.versionID, Name: "design.docx",
+		MIME: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		Size: 4096, ExtractionStatus: version.AttachmentDone,
+	}
+	// Another version's attachment must not leak into this version's panel.
+	env.repo.attachments[103] = version.Attachment{
+		ID: 103, VersionID: env.versionID + 1, Name: "foreign.txt", MIME: "text/plain",
+		Size: 64, ExtractionStatus: version.AttachmentDone,
+	}
+	for seq := 1; seq <= 2; seq++ {
+		env.repo.images[int64(200+seq)] = version.AttachmentImageRecord{
+			ID: int64(200 + seq), AttachmentID: 102, Seq: seq, ContentRefID: int64(300 + seq),
+			MIME: "image/png", SourceKind: version.AttachmentImageSourceEmbedded,
+			Status: version.AttachmentImageDone, CreatedAt: testTime, UpdatedAt: testTime,
+		}
+	}
+
+	views, err := env.svc.ListVersionAttachments(requestContext(), env.versionID)
+	if err != nil {
+		t.Fatalf("ListVersionAttachments: %v", err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("views = %#v, want the two rows of this version", views)
+	}
+	if views[0].ID != 102 || views[1].ID != 101 {
+		t.Fatalf("order = %d,%d, want newest (ID desc)", views[0].ID, views[1].ID)
+	}
+	done := views[0]
+	if done.Name != "design.docx" || done.MIME != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+		done.Size != 4096 || done.ExtractionStatus != version.AttachmentDone ||
+		done.ErrorCode != "" || done.ErrorText != "" || done.ImageCount != 2 {
+		t.Fatalf("done view = %#v", done)
+	}
+	failed := views[1]
+	if failed.Name != "spec.pdf" || failed.MIME != "application/pdf" || failed.Size != 2048 ||
+		failed.ExtractionStatus != version.AttachmentFailed ||
+		failed.ErrorCode != version.AttachmentErrorExtraction || failed.ErrorText != "parser crashed" ||
+		failed.ImageCount != 0 {
+		t.Fatalf("failed view = %#v", failed)
+	}
+}
+
+// TestListVersionAttachmentsEmptyAndUnknownVersion covers the empty panel (a
+// non-nil empty slice so JSON is [] not null), an unknown/foreign version (404,
+// matching the image route semantics) and an invalid ID (400).
+func TestListVersionAttachmentsEmptyAndUnknownVersion(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.existingVersions = map[int64]bool{env.versionID: true}
+
+	views, err := env.svc.ListVersionAttachments(requestContext(), env.versionID)
+	if err != nil {
+		t.Fatalf("ListVersionAttachments empty: %v", err)
+	}
+	if views == nil || len(views) != 0 {
+		t.Fatalf("empty list = %#v, want a non-nil empty slice", views)
+	}
+
+	if _, err := env.svc.ListVersionAttachments(requestContext(), env.versionID+1); err == nil {
+		t.Fatal("unknown version was listed")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("unknown version status = %d, want 404", apiError(t, err).Status)
+	}
+	if _, err := env.svc.ListVersionAttachments(requestContext(), 0); err == nil {
+		t.Fatal("invalid version id was accepted")
+	} else if apiError(t, err).Status != http.StatusBadRequest {
+		t.Fatalf("invalid id status = %d, want 400", apiError(t, err).Status)
 	}
 }

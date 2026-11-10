@@ -171,12 +171,17 @@ describe("DataAccessPanel", () => {
     )
   })
 
-  it("surfaces a 409 when an account cannot be deleted because a version references it", async () => {
+  it("renders referenced-version links when an account cannot be deleted", async () => {
     vi.mocked(api.deleteAccount).mockRejectedValue(
       new ApiError({
         status: 409,
-        code: "conflict",
+        code: "resource_referenced",
         message: "account is referenced by a version binding",
+        details: {
+          kind: "account",
+          referencing_versions: [{ id: "2001", title: "订单中心 v1" }],
+          resolution: "Disable this account in the referencing versions.",
+        },
       }),
     )
     const { onRefresh } = renderPanel()
@@ -184,11 +189,38 @@ describe("DataAccessPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除账号 buyer" }))
     fireEvent.click(screen.getByRole("button", { name: "删除账号" }))
 
-    expect(
-      await screen.findByText(/account is referenced by a version binding/),
-    ).toBeInTheDocument()
-    expect(screen.getByText(/操作冲突/)).toBeInTheDocument()
+    expect(await screen.findByText("该测试账号已被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByText(/从引用版本的账号绑定中移除该账号/)).toBeVisible()
+    expect(screen.getByRole("link", { name: "订单中心 v1" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=overview",
+    )
+    expect(screen.queryByText(/Disable this account/)).toBeNull()
+    expect(screen.queryByText(/名称\/键重复/)).toBeNull()
     expect(onRefresh).not.toHaveBeenCalled()
+  })
+
+  it("does not pretend an empty reference list is complete when deleting an account", async () => {
+    vi.mocked(api.deleteAccount).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "account is referenced by a version binding",
+        details: {
+          kind: "account",
+          referencing_versions: [],
+          resolution: "Disable this account in the referencing versions.",
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除账号 buyer" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除账号" }))
+
+    expect(await screen.findByText("该测试账号被版本绑定引用，无法删除")).toBeVisible()
+    expect(screen.getByText(/请先在版本绑定中解除对该账号的引用/)).toBeVisible()
+    expect(screen.queryByRole("link", { name: /订单中心 v1/ })).toBeNull()
   })
 
   it("prompts for an environment when the SUT has none", () => {

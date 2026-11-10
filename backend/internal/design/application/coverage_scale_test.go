@@ -121,11 +121,12 @@ func task79RequirementPriority(t *testing.T, refs []design.RequirementRef, requi
 // TestDesignCoversAllP0Requirements pins the 67-requirement scaling contract:
 // every confirmed requirement (P0 29/29 included) receives exactly one
 // traceable authoring task, P0 tasks are claimed before every lower priority,
-// the design.round authoring scope is bounded instead of asking one run to
-// propose 67 requirements, and convergence still requires real coverage for
-// every requirement. Before the fix all tasks shared priority 0 (FIFO by
-// requirement import order) and the round payload carried all 67 ids, so the
-// live round burned its budget on a scope no single run can serve.
+// no design.round work item is enqueued (D-04: its v0.22 runner profile is
+// gone, so it could only fail with invalid_work_type), and convergence still
+// requires real coverage for every requirement. Before the fix all tasks shared
+// priority 0 (FIFO by requirement import order) and the round payload carried
+// all 67 ids, so the live round burned its budget on a scope no single run can
+// serve.
 func TestDesignCoversAllP0Requirements(t *testing.T) {
 	planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
 	refs := task79RequirementRefs()
@@ -175,24 +176,10 @@ func TestDesignCoversAllP0Requirements(t *testing.T) {
 			byPriority["P0"], byPriority["P1"], byPriority["P2"])
 	}
 
-	// The round authoring run is one model run with a bounded budget: it must
-	// not be asked to read and propose 67 requirements. The truncated scope is
-	// the highest-priority prefix (all 29 P0 requirements come first).
-	const wantRoundScope = 3
-	roundTasks := enqueuer.byType(TaskTypeDesignRound)
-	if len(roundTasks) != 1 {
-		t.Fatalf("round tasks = %d", len(roundTasks))
-	}
-	roundIDs, _ := roundTasks[0].Payload["requirement_ids"].([]string)
-	if len(roundIDs) != wantRoundScope {
-		t.Fatalf("round authoring scope = %d requirements, want the bounded %d",
-			len(roundIDs), wantRoundScope)
-	}
-	for _, id := range roundIDs {
-		if priority := task79RequirementPriority(t, refs, id); priority != "P0" {
-			t.Fatalf("round scope includes non-P0 requirement %s (%s); the bounded round must start at P0", id, priority)
-		}
-	}
+	// D-04: the one-run design.round authoring item is gone with its v0.22
+	// runner profile. Every requirement is authored by its own
+	// design.requirement task above; a round item could only fail.
+	assertNoDesignRoundTasks(t, enqueuer)
 
 	// Convergence still requires real, traceable coverage for the whole scope.
 	converger := &fakeDesignConverger{}

@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"strings"
 
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
@@ -37,6 +38,85 @@ func docxFixture(paragraphs []string, table [][]string) []byte {
 	return zipFixture(map[string]string{
 		"[Content_Types].xml": `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`,
 		"word/document.xml":   document,
+	})
+}
+
+// docxBlock is one ordered block of the richer in-memory DOCX fixture builder:
+// either a heading/paragraph or a table.
+type docxBlock struct {
+	Style string
+	Text  string
+	Table [][]string
+}
+
+// docxBlockFixture builds a minimal OOXML document from ordered heading,
+// paragraph and table blocks. The extraction-layout fixture needs body headings
+// and multiple tables interleaved, which docxFixture cannot express. A Heading3
+// body requirement plus the 6.1/6.4 catalog tables is the C-03 UAT shape.
+func docxBlockFixture(blocks []docxBlock) []byte {
+	var body bytes.Buffer
+	for _, block := range blocks {
+		if len(block.Table) > 0 {
+			body.WriteString(`<w:tbl>`)
+			for _, row := range block.Table {
+				body.WriteString(`<w:tr>`)
+				for _, cell := range row {
+					fmt.Fprintf(&body, `<w:tc><w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p></w:tc>`, docxEscape(cell))
+				}
+				body.WriteString(`</w:tr>`)
+			}
+			body.WriteString(`</w:tbl>`)
+			continue
+		}
+		if block.Style != "" {
+			fmt.Fprintf(&body, `<w:p><w:pPr><w:pStyle w:val="%s"/></w:pPr><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>`,
+				block.Style, docxEscape(block.Text))
+			continue
+		}
+		fmt.Fprintf(&body, `<w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>`, docxEscape(block.Text))
+	}
+	document := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>` + body.String() + `</w:body></w:document>`
+	return zipFixture(map[string]string{
+		"[Content_Types].xml": `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>`,
+		"word/document.xml":   document,
+	})
+}
+
+// docxEscape escapes the XML metacharacters a table cell or paragraph may
+// contain; the fixtures use Chinese prose and Markdown pipes.
+func docxEscape(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return replacer.Replace(value)
+}
+
+// docxExtractionLayoutFixture reproduces the C-03 UAT layout in memory: an FR
+// Heading3 body with 需求描述 + 验收标准/场景 BDD text, then the 7-column 6.1
+// requirement list and the 6-column 6.4 catalog that previously overwrote the
+// body row. The 6.1 header uses the researched alias names
+// (docs/v0.2.3/research/extraction.md): 需求编号/需求名称/需求描述/优先级/
+// 需求类型/需求状态/所属功能; 当前系统状态 is only the 6.4 column.
+func docxExtractionLayoutFixture() []byte {
+	return docxBlockFixture([]docxBlock{
+		{Style: "Heading3", Text: "FR-101 账号密码登录"},
+		{Text: "需求编号：FR-101所属功能：账号优先级：P1"},
+		{Text: "需求描述：用户可以使用账号密码登录系统。"},
+		{Text: "验收标准："},
+		{Text: "场景 1：正确密码登录"},
+		{Text: "Given 已注册用户 When 输入正确密码 Then 登录成功"},
+		{Text: "场景 2：错误密码登录"},
+		{Text: "Given 已注册用户 When 输入错误密码 Then 提示密码错误"},
+		{Style: "Heading3", Text: "6.1 需求清单总表"},
+		{Table: [][]string{
+			{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "需求状态", "所属功能"},
+			{"FR-001", "账号密码登录", "用户使用账号密码登录", "P1", "功能需求", "已实现", "账号"},
+		}},
+		{Style: "Heading3", Text: "6.4 延展功能需求清单"},
+		{Table: [][]string{
+			{"需求编号", "需求名称", "所属功能", "优先级", "验收场景数", "当前系统状态"},
+			{"FR-131", "内容排期与工作量看板", "内容管理", "P2", "2", "不存在"},
+		}},
 	})
 }
 

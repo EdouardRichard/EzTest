@@ -197,6 +197,15 @@ type AttachmentRepository interface {
 	// document attachments of a version for the extraction start endpoint and
 	// the ingest auto-enqueue hook.
 	ListByVersion(ctx context.Context, versionID int64) ([]Attachment, error)
+	// VersionExists reports whether the version row exists. The C-05 version
+	// attachment list turns an unknown/foreign version into a 404 instead of
+	// returning an empty list, matching the version-scoped image routes.
+	VersionExists(ctx context.Context, versionID int64) (bool, error)
+	// CountImagesByVersion returns the attachment_image row count of every
+	// attachment of one version in a single grouped query, so the C-05 panel can
+	// show image_count without an N+1 read. Attachments without images are
+	// absent from the map.
+	CountImagesByVersion(ctx context.Context, versionID int64) (map[int64]int, error)
 	// ListByConversation returns rows bound to one of the conversation's
 	// messages plus unbound drafts pre-registered for this conversation
 	// (conversation_id matches). Drafts with no conversation_id (legacy rows)

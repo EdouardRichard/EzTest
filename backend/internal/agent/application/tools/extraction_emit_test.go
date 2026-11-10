@@ -107,9 +107,12 @@ func TestEmitAcceptsValidBatch(t *testing.T) {
 	if merged.Title != "手机号登录（补充）" || merged.Description != "补充：验证码只能使用一次" {
 		t.Fatalf("duplicate external_id was not merged: %+v", merged)
 	}
-	wantCriteria := []string{"手机号 11 位", "验证码正确", "验证码只能使用一次"}
+	// Replace mode uses the incoming acceptance criteria (never a union): a
+	// re-upload must be able to drop a scenario that was removed from the source
+	// document instead of append-only duplicating it.
+	wantCriteria := []string{"验证码只能使用一次"}
 	if !reflect.DeepEqual(merged.AcceptanceCriteria, wantCriteria) {
-		t.Fatalf("acceptance criteria = %#v, want the trimmed union %#v", merged.AcceptanceCriteria, wantCriteria)
+		t.Fatalf("acceptance criteria = %#v, want the later duplicate's %#v", merged.AcceptanceCriteria, wantCriteria)
 	}
 	if merged.Priority != "P0" || merged.Category != "functional" {
 		t.Fatalf("normalized priority/category = %q/%q", merged.Priority, merged.Category)
@@ -219,6 +222,8 @@ func TestEmitRejectsInvalidFields(t *testing.T) {
 		{"negative confidence", `{"requirements":[` + valid(`"confidence":-0.1`) + `]}`, "requirements[0].confidence", false},
 		{"empty external id", `{"requirements":[` + valid(`"external_id":" "`) + `]}`, "requirements[0].external_id", false},
 		{"empty title", `{"requirements":[` + valid(`"title":""`) + `]}`, "requirements[0].title", false},
+		{"pipe in title", `{"requirements":[` + valid(`"title":"手机号|登录"`) + `]}`, "requirements[0].title", false},
+		{"pipe in description", `{"requirements":[` + valid(`"description":"手机号|登录"`) + `]}`, "requirements[0].description", false},
 		{"empty source quote", `{"requirements":[` + valid(`"source_quote":""`) + `]}`, "requirements[0].source_quote", false},
 		{"constraints not an object", `{"requirements":[` + valid(`"constraints_json":[1]`) + `]}`, "requirements[0].constraints_json", false},
 		{"unknown requirement field", `{"requirements":[` + valid(`"bogus":1`) + `]}`, "parameters", false},
@@ -433,5 +438,104 @@ func TestEmitAllowsEmptyBatchWithoutCallingSink(t *testing.T) {
 	result, ok := value.(map[string]any)
 	if !ok || result["requirements"] != 0 || result["created"] != 0 || result["updated"] != 0 {
 		t.Fatalf("result = %#v", value)
+	}
+}
+
+// TestMergeExtractionRequirementFillEmpty covers the C-03 in-batch merge: a
+// catalog row merged into an already-emitted body row must only fill empty
+// fields, may replace the priority with a valid value, keeps the higher
+// confidence and merges constraints instead of replacing them.
+func TestMergeExtractionRequirementFillEmpty(t *testing.T) {
+	body := ExtractionRequirement{
+		ExternalID: "FR-131", Title: "内容排期与工作量看板", Description: "正文描述",
+		AcceptanceCriteria: []string{"场景 1"}, Priority: "P2",
+		SourceQuote: "正文来源", Confidence: 0.9,
+		ConstraintsJSON: json.RawMessage(`{"module":"内容管理"}`),
+		MergeMode:       ExtractionMergeReplace,
+	}
+	catalog := ExtractionRequirement{
+		ExternalID: "FR-131", Title: "目录标题", Description: "目录摘要",
+		AcceptanceCriteria: nil, Priority: "P1",
+		SourceQuote: "目录来源", Confidence: 0.6,
+		ConstraintsJSON: json.RawMessage(`{"ac_count":2}`),
+		MergeMode:       ExtractionMergeFillEmpty,
+	}
+	merged := MergeExtractionRequirement(body, catalog)
+	if merged.Title != body.Title || merged.Description != body.Description {
+		t.Fatalf("fill_empty downgraded title/description: %#v", merged)
+	}
+	if !reflect.DeepEqual(merged.AcceptanceCriteria, body.AcceptanceCriteria) {
+		t.Fatalf("fill_empty overwrote non-empty AC: %#v", merged.AcceptanceCriteria)
+	}
+	if merged.Priority != "P1" {
+		t.Fatalf("priority = %q, want the valid catalog P1", merged.Priority)
+	}
+	if merged.Confidence != 0.9 {
+		t.Fatalf("confidence = %v, want max(0.9, 0.6)", merged.Confidence)
+	}
+	var constraints map[string]any
+	if err := json.Unmarshal(merged.ConstraintsJSON, &constraints); err != nil {
+		t.Fatalf("constraints = %q: %v", merged.ConstraintsJSON, err)
+	}
+	if constraints["module"] != "内容管理" || constraints["ac_count"] != float64(2) {
+		t.Fatalf("constraints were not merged: %#v", constraints)
+	}
+}
+
+// TestMergeExtractionRequirementFillEmptyFillsBlankBody covers the other half:
+// a fill_empty row still fills a body row whose field is empty.
+func TestMergeExtractionRequirementFillEmptyFillsBlankBody(t *testing.T) {
+	body := ExtractionRequirement{ExternalID: "FR-131", Title: "正文标题", Priority: "P2"}
+	catalog := ExtractionRequirement{
+		ExternalID: "FR-131", Description: "目录摘要", AcceptanceCriteria: []string{"场景 1"},
+		Priority: "P1", MergeMode: ExtractionMergeFillEmpty,
+	}
+	merged := MergeExtractionRequirement(body, catalog)
+	if merged.Description != "目录摘要" || len(merged.AcceptanceCriteria) != 1 {
+		t.Fatalf("fill_empty did not fill blank body fields: %#v", merged)
+	}
+	if merged.Title != "正文标题" {
+		t.Fatalf("fill_empty replaced the non-empty title: %q", merged.Title)
+	}
+}
+
+// TestMergeExtractionRequirementReplaceAcceptanceCriteria pins the C-03
+// re-upload fix: replace mode takes the incoming multi-line acceptance criteria
+// verbatim (no union with the current criteria) and only keeps the current
+// criteria when the incoming list is empty. An omitted/zero confidence keeps the
+// current score, as the in-batch Emit path documents.
+func TestMergeExtractionRequirementReplaceAcceptanceCriteria(t *testing.T) {
+	current := ExtractionRequirement{
+		ExternalID: "FR-201", Title: "正文标题", Confidence: 0.9,
+		AcceptanceCriteria: []string{"场景 1\nGiven a\nWhen b\nThen c", "场景 2"},
+	}
+	incoming := current
+	incoming.Title = "正文标题（更新）"
+	incoming.AcceptanceCriteria = []string{"场景 1\nGiven a\nWhen b\nThen c"}
+	incoming.Confidence = 0
+	merged := MergeExtractionRequirement(current, incoming)
+	if !reflect.DeepEqual(merged.AcceptanceCriteria, incoming.AcceptanceCriteria) {
+		t.Fatalf("replace unioned acceptance criteria: %#v", merged.AcceptanceCriteria)
+	}
+	if merged.Confidence != current.Confidence {
+		t.Fatalf("omitted confidence = %v, want the current %v", merged.Confidence, current.Confidence)
+	}
+
+	// An explicit non-empty incoming list replaces an empty current one.
+	emptyCurrent := ExtractionRequirement{ExternalID: "FR-202"}
+	withCriteria := ExtractionRequirement{
+		ExternalID: "FR-202", AcceptanceCriteria: []string{"场景 1"},
+	}
+	// A blank incoming list never clears the current criteria.
+	blankIncoming := ExtractionRequirement{ExternalID: "FR-202", MergeMode: ExtractionMergeReplace}
+	kept := MergeExtractionRequirement(ExtractionRequirement{
+		ExternalID: "FR-202", AcceptanceCriteria: []string{"场景 1"},
+	}, blankIncoming)
+	if !reflect.DeepEqual(kept.AcceptanceCriteria, []string{"场景 1"}) {
+		t.Fatalf("blank incoming AC cleared the current criteria: %#v", kept.AcceptanceCriteria)
+	}
+	filled := MergeExtractionRequirement(emptyCurrent, withCriteria)
+	if !reflect.DeepEqual(filled.AcceptanceCriteria, withCriteria.AcceptanceCriteria) {
+		t.Fatalf("incoming AC not applied: %#v", filled.AcceptanceCriteria)
 	}
 }

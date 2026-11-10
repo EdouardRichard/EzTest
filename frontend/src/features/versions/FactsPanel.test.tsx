@@ -61,6 +61,16 @@ describe("FactsPanel", () => {
     expect(api.getVersionFacts).toHaveBeenCalledWith("2001", { includeSuperseded: true })
   })
 
+  it("keeps the fact list internally scrollable instead of stretching the page", async () => {
+    api.getVersionFacts.mockResolvedValue([pageFact, apiFact])
+
+    render(<FactsPanel versionId="2001" />)
+
+    const list = await screen.findByTestId("version-facts-list")
+    expect(list).toHaveClass("max-h-[36rem]")
+    expect(list).toHaveClass("overflow-y-auto")
+  })
+
   it("shows an explicit empty state when the version has no facts", async () => {
     api.getVersionFacts.mockResolvedValue([])
 

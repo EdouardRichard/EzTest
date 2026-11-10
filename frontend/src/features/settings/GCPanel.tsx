@@ -383,9 +383,7 @@ export function GCPanel({ retentionSettings = [] }: GCPanelProps) {
             <Badge tone="success">生效</Badge>
           </div>
           {retentionSettings.length === 0 ? (
-            <p className="text-[11px] text-muted-foreground">
-              设置中心暂未返回 retention.* 配置。
-            </p>
+            <p className="text-[11px] text-muted-foreground">设置中心暂未返回 retention.* 配置。</p>
           ) : (
             <dl className="grid gap-x-4 gap-y-1.5 text-[11px] sm:grid-cols-2 lg:grid-cols-3">
               {retentionSettings.map((setting) => {
@@ -405,8 +403,8 @@ export function GCPanel({ retentionSettings = [] }: GCPanelProps) {
             </dl>
           )}
           <p className="text-[11px] text-muted-foreground">
-            演练只记录候选；apply 在 retention.gc_grace_hours 后落 tombstone 并删除。容量控制（gc.max_bytes）在
-            v0.22 未实现（残余）。
+            演练只记录候选；apply 在 retention.gc_grace_hours 后落 tombstone
+            并删除。容量控制（gc.max_bytes）在 v0.22 未实现（残余）。
           </p>
         </section>
 

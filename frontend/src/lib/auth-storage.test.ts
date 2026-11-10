@@ -20,30 +20,96 @@ const user = {
   status: "active" as const,
 }
 
-describe("auth-storage", () => {
-  beforeEach(() => {
-    window.sessionStorage.clear()
-  })
+const TOKEN_KEY = "eztest.token"
+const USER_KEY = "eztest.user"
+const EXPIRES_KEY = "eztest.token_expires_at"
 
-  afterEach(() => {
-    window.sessionStorage.clear()
-  })
+function clearStorage(): void {
+  window.localStorage.clear()
+  window.sessionStorage.clear()
+}
+
+describe("auth-storage", () => {
+  beforeEach(clearStorage)
+
+  afterEach(clearStorage)
 
   it("returns null before a token is stored", () => {
     expect(getToken()).toBeNull()
     expect(getStoredUser()).toBeNull()
   })
 
-  it("stores and reads the bearer token", () => {
+  it("stores and reads the bearer token from localStorage", () => {
     setToken("ezt_abc")
+
     expect(getToken()).toBe("ezt_abc")
+    expect(window.localStorage.getItem(TOKEN_KEY)).toBe("ezt_abc")
+    expect(window.sessionStorage.getItem(TOKEN_KEY)).toBeNull()
   })
 
-  it("stores a complete session and reads the public user back", () => {
-    setSession("ezt_abc", user)
+  it("stores a complete session with its server expiry", () => {
+    setSession("ezt_abc", user, "2099-01-01T00:00:00Z")
 
     expect(getToken()).toBe("ezt_abc")
     expect(getStoredUser()).toEqual(user)
+    expect(window.localStorage.getItem(EXPIRES_KEY)).toBe("2099-01-01T00:00:00Z")
+  })
+
+  it("treats an expired session as signed out and clears it", () => {
+    setSession("ezt_old", user, "2020-01-01T00:00:00Z")
+
+    expect(getToken()).toBeNull()
+    expect(window.localStorage.getItem(TOKEN_KEY)).toBeNull()
+    expect(window.localStorage.getItem(USER_KEY)).toBeNull()
+    expect(window.localStorage.getItem(EXPIRES_KEY)).toBeNull()
+  })
+
+  it("fails closed when the stored expiry cannot be parsed", () => {
+    setSession("ezt_bad", user, "not-a-timestamp")
+
+    expect(getToken()).toBeNull()
+    expect(getStoredUser()).toBeNull()
+  })
+
+  it("clears the stored session when getStoredUser sees an expired session", () => {
+    setSession("ezt_old", user, "2020-01-01T00:00:00Z")
+
+    expect(getStoredUser()).toBeNull()
+    expect(window.localStorage.getItem(USER_KEY)).toBeNull()
+    expect(window.localStorage.getItem(TOKEN_KEY)).toBeNull()
+    expect(window.localStorage.getItem(EXPIRES_KEY)).toBeNull()
+    expect(getToken()).toBeNull()
+  })
+
+  it("does not treat a session without an expiry as expired", () => {
+    setSession("ezt_no_expiry", user)
+
+    expect(getToken()).toBe("ezt_no_expiry")
+  })
+
+  it("migrates a legacy sessionStorage session exactly once", () => {
+    window.sessionStorage.setItem(TOKEN_KEY, "ezt_legacy")
+    window.sessionStorage.setItem(USER_KEY, JSON.stringify(user))
+
+    expect(getToken()).toBe("ezt_legacy")
+    expect(getStoredUser()).toEqual(user)
+    expect(window.localStorage.getItem(TOKEN_KEY)).toBe("ezt_legacy")
+    expect(window.sessionStorage.getItem(TOKEN_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem(USER_KEY)).toBeNull()
+
+    // A second legacy write is discarded: the browser has already migrated and
+    // localStorage is the single source of truth.
+    window.sessionStorage.setItem(TOKEN_KEY, "ezt_second")
+    expect(getToken()).toBe("ezt_legacy")
+    expect(window.sessionStorage.getItem(TOKEN_KEY)).toBeNull()
+  })
+
+  it("keeps a newer localStorage session instead of a legacy copy", () => {
+    setSession("ezt_local", user)
+    window.sessionStorage.setItem(TOKEN_KEY, "ezt_stale")
+
+    expect(getToken()).toBe("ezt_local")
+    expect(window.sessionStorage.getItem(TOKEN_KEY)).toBeNull()
   })
 
   it("normalizes a numeric id to the decimal-string contract", () => {
@@ -52,40 +118,47 @@ describe("auth-storage", () => {
   })
 
   it("falls back to the username when display_name is missing", () => {
-    window.sessionStorage.setItem(
-      "eztest.user",
+    window.localStorage.setItem(
+      USER_KEY,
       JSON.stringify({ id: "9001", username: "admin", role: "user", status: "active" }),
     )
     expect(getStoredUser()?.display_name).toBe("admin")
   })
 
   it("rejects a stored user that is not a valid public account", () => {
-    window.sessionStorage.setItem("eztest.user", JSON.stringify({ id: "9001", username: "" }))
+    window.localStorage.setItem(USER_KEY, JSON.stringify({ id: "9001", username: "" }))
     expect(getStoredUser()).toBeNull()
 
-    window.sessionStorage.setItem("eztest.user", "not-json")
+    window.localStorage.setItem(USER_KEY, "not-json")
     expect(getStoredUser()).toBeNull()
   })
 
   it("clears the token and notifies listeners", () => {
     const listener = vi.fn()
     window.addEventListener(AUTH_CLEARED_EVENT, listener)
-    setToken("ezt_abc")
+    setSession("ezt_abc", user, "2099-01-01T00:00:00Z")
 
     clearToken()
 
     expect(getToken()).toBeNull()
+    expect(window.localStorage.getItem(EXPIRES_KEY)).toBeNull()
     expect(listener).toHaveBeenCalledTimes(1)
     window.removeEventListener(AUTH_CLEARED_EVENT, listener)
   })
 
-  it("clears both token and user for a full sign-out", () => {
-    setSession("ezt_abc", user)
+  it("clears both token and user from both storage areas for a full sign-out", () => {
+    setSession("ezt_abc", user, "2099-01-01T00:00:00Z")
+    window.sessionStorage.setItem(TOKEN_KEY, "ezt_legacy")
+    window.sessionStorage.setItem(USER_KEY, JSON.stringify(user))
+    window.sessionStorage.setItem(EXPIRES_KEY, "2099-01-01T00:00:00Z")
 
     clearSession()
 
-    expect(getToken()).toBeNull()
-    expect(getStoredUser()).toBeNull()
+    for (const storage of [window.localStorage, window.sessionStorage]) {
+      expect(storage.getItem(TOKEN_KEY)).toBeNull()
+      expect(storage.getItem(USER_KEY)).toBeNull()
+      expect(storage.getItem(EXPIRES_KEY)).toBeNull()
+    }
   })
 })
 

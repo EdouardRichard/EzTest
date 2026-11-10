@@ -317,7 +317,7 @@ func (s *Service) UpdateSUT(ctx context.Context, id int64, patch SUTPatch, actor
 
 // DeleteSUT deletes a SUT when no version binding references it.
 func (s *Service) DeleteSUT(ctx context.Context, id int64, actorID int64) error {
-	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) { return s.usage.SUTInUse(ctx, id) }, "sut"); err != nil {
+	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) { return s.usage.SUTInUse(ctx, id) }, "sut", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteSUT(ctx, id); err != nil {
@@ -434,7 +434,7 @@ func (s *Service) UpdateEnvironment(ctx context.Context, id int64, patch Environ
 func (s *Service) DeleteEnvironment(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.EnvironmentInUse(ctx, id)
-	}, "environment"); err != nil {
+	}, "environment", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteEnvironment(ctx, id); err != nil {
@@ -649,7 +649,7 @@ func (s *Service) UpdatePage(ctx context.Context, id int64, patch PagePatch, act
 func (s *Service) DeletePage(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.PageInUse(ctx, id)
-	}, "page"); err != nil {
+	}, "page", id); err != nil {
 		return err
 	}
 	page, err := s.repo.GetPage(ctx, id)
@@ -847,7 +847,7 @@ func (s *Service) UpdateAPI(ctx context.Context, id int64, patch APIPatch, actor
 func (s *Service) DeleteAPI(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.APIInUse(ctx, id)
-	}, "api"); err != nil {
+	}, "api", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteAPI(ctx, id); err != nil {
@@ -1332,7 +1332,7 @@ func (s *Service) UpdateDatabase(ctx context.Context, id int64, patch DatabasePa
 func (s *Service) DeleteDatabase(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.DatabaseInUse(ctx, id)
-	}, "database"); err != nil {
+	}, "database", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteDatabase(ctx, id); err != nil {
@@ -1453,7 +1453,7 @@ func (s *Service) UpdateAccount(ctx context.Context, id int64, patch AccountPatc
 func (s *Service) DeleteAccount(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.AccountInUse(ctx, id)
-	}, "account"); err != nil {
+	}, "account", id); err != nil {
 		return err
 	}
 	account, err := s.repo.GetAccount(ctx, id)
@@ -1613,7 +1613,7 @@ func (s *Service) UpdateRepository(ctx context.Context, id int64, patch Reposito
 func (s *Service) DeleteRepository(ctx context.Context, id int64, actorID int64) error {
 	if err := s.checkUsage(ctx, func(ctx context.Context) (bool, error) {
 		return s.usage.RepositoryInUse(ctx, id)
-	}, "repository"); err != nil {
+	}, "repository", id); err != nil {
 		return err
 	}
 	if err := s.repo.DeleteRepository(ctx, id); err != nil {
@@ -1763,8 +1763,15 @@ func (s *Service) record(ctx context.Context, actorID int64, action, kind, targe
 	}
 }
 
-// checkUsage runs a usage guard; a nil guard means "not referenced".
-func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (bool, error), kind string) error {
+// maxReferencingVersions caps the version list carried by a 409 conflict. The
+// most useful references come first (the version repository orders by ID), so a
+// long list never bloats the error envelope.
+const maxReferencingVersions = 20
+
+// checkUsage runs a usage guard; a nil guard means "not referenced". When the
+// resource is referenced, the version context resolves the referencing versions
+// so the 409 carries stable, actionable details instead of a bare conflict.
+func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (bool, error), kind string, id int64) error {
 	if s.usage == nil {
 		return nil
 	}
@@ -1772,10 +1779,101 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 	if err != nil {
 		return err
 	}
-	if inUse {
-		return platform.Conflict(kind + " is referenced by a version binding")
+	if !inUse {
+		return nil
 	}
-	return nil
+	refs, err := s.usage.ReferencingVersions(ctx, kind, id)
+	if err != nil {
+		return err
+	}
+	return resourceReferencedError(kind, id, refs)
+}
+
+// resourceReferencedError builds the stable 409 returned when a delete is
+// blocked by a version binding. The message stays English (clients localize by
+// code/details); referencing_versions is capped and de-duplicated by version ID,
+// and every entry carries the version status/stage plus whether the binding is
+// still editable so the client never suggests an impossible edit.
+func resourceReferencedError(kind string, id int64, refs []VersionRef) error {
+	apiErr := platform.NewError(http.StatusConflict, "resource_referenced", kind+" is referenced by a version binding")
+	apiErr.Details = map[string]any{
+		"kind":                 kind,
+		"resource_id":          platformid.Format(id),
+		"referencing_versions": referencingVersionDetails(refs),
+		"resolution":           resourceReferencedResolution(kind, refs),
+	}
+	return apiErr
+}
+
+// referencingVersionDetails projects the version references into JSON-ready
+// details: at most maxReferencingVersions entries, de-duplicated by version ID,
+// preserving the caller's order. An empty result is a non-nil empty slice so
+// the envelope always carries an array.
+func referencingVersionDetails(refs []VersionRef) []map[string]any {
+	out := make([]map[string]any, 0, maxReferencingVersions)
+	seen := make(map[int64]struct{}, len(refs))
+	for _, ref := range refs {
+		if len(out) >= maxReferencingVersions {
+			break
+		}
+		if _, duplicate := seen[ref.ID]; duplicate {
+			continue
+		}
+		seen[ref.ID] = struct{}{}
+		out = append(out, map[string]any{
+			"id":       platformid.Format(ref.ID),
+			"title":    ref.Title,
+			"status":   ref.Status,
+			"stage":    ref.Stage,
+			"editable": ref.Editable,
+		})
+	}
+	return out
+}
+
+// resourceReferencedResolution is the human-resolution hint for one resource
+// kind: what the operator can change so the delete is no longer blocked. Only
+// editable versions can exclude the resource in scope; executing/reporting/
+// completed versions are read-only, so the hint names the administrator/
+// operations path instead of suggesting an edit those versions reject.
+func resourceReferencedResolution(kind string, refs []VersionRef) string {
+	editable, terminal := 0, 0
+	for _, ref := range refs {
+		if ref.Editable {
+			editable++
+		} else {
+			terminal++
+		}
+	}
+
+	var hint string
+	switch kind {
+	case "sut":
+		hint = "Delete the referencing versions or bind a different SUT in editable versions."
+	case "environment":
+		hint = "Delete the referencing versions or select another environment in editable versions."
+	case "page":
+		hint = "Exclude this page from the scope of editable versions (created through case_review), or change their environment binding."
+	case "api":
+		hint = "Exclude this API from the scope of editable versions (created through case_review), or change their environment binding."
+	case "database":
+		hint = "Exclude this database from the scope of editable versions (created through case_review), deactivate it, or change their environment binding."
+	case "account":
+		hint = "Disable this account in editable versions."
+	case "repository":
+		hint = "Remove the SUT repository association or the version repository override in editable versions."
+	default:
+		hint = "Remove this resource from the bindings of editable versions."
+	}
+
+	if terminal == 0 {
+		return hint
+	}
+	if editable == 0 {
+		return "All referencing versions are read-only (executing, reporting or completed); removing this " +
+			kind + " from their scope requires an administrator or operations process."
+	}
+	return hint + " Executing, reporting and completed versions are read-only; terminal references require an administrator or operations process."
 }
 
 // removedStrings returns the trimmed values of before that are absent from

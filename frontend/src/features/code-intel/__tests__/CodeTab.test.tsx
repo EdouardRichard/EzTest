@@ -377,16 +377,24 @@ describe("CodeTab", () => {
     await renderLoaded()
 
     fireEvent.change(screen.getByLabelText("代码仓库"), { target: { value: "1301" } })
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&repo=1301")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&repo=1301", {
+      scroll: false,
+    })
 
     fireEvent.click(await screen.findByRole("button", { name: "定位影响候选 需求 6001" }))
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&candidate=8101")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&candidate=8101", {
+      scroll: false,
+    })
 
     fireEvent.click(await screen.findByRole("button", { name: "定位锚点 8201" }))
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&anchor=8201")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&anchor=8201", {
+      scroll: false,
+    })
 
     fireEvent.click(await screen.findByRole("button", { name: "查看事实 /refund" }))
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&fact=9101")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&fact=9101", {
+      scroll: false,
+    })
     expect(api.readFile).toHaveBeenCalledWith("1201", {
       commit: HEAD_COMMIT,
       path: "src/pages/RefundPage.tsx",
@@ -398,7 +406,9 @@ describe("CodeTab", () => {
     await waitFor(() =>
       expect(api.startAnalysis).toHaveBeenCalledWith("2001", { repoId: "1301", force: true }),
     )
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&analysis=7001")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=code&analysis=7001", {
+      scroll: false,
+    })
   })
 
   it("debounces code.* SSE events into a single snapshot reload", async () => {

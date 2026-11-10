@@ -16,19 +16,36 @@ const (
 // SupportsReasoning and SupportsPromptCache are stored in the capabilities
 // JSONB object. Readers merge both sources.
 //
+// The Supports*Source fields record where each boolean capability came from
+// (catalog refresh or an administrator edit, see S-02). They live in the same
+// JSONB object as the values, so no migration column is needed; a refresh keeps
+// a manual value and only updates a catalog-sourced one. Rows written before
+// these keys existed infer the source from Model.Source (manual rows read as
+// manual, catalog rows as catalog). That inference is a one-time compatibility
+// caveat: a pre-0.2.3 catalog row whose capability was edited by hand cannot be
+// distinguished from an untouched one and is treated as catalog on the next
+// refresh. Editing the capability through the 0.2.3 editor records the manual
+// source and is preserved from then on.
+//
 // CatalogContextWindow/CatalogMaxOutput keep the most recent upstream values of
 // the two numeric parameters inside the same JSONB object (A §4.4). They are
 // written on every catalog refresh so "reset to upstream" still works when an
 // administrator has overridden the legacy columns; no dedicated migration
 // columns are added (llm_0004 only carries the source markers).
 type Capabilities struct {
-	SupportsTools        bool `json:"supports_tools"`
-	SupportsVision       bool `json:"supports_vision"`
-	SupportsReasoning    bool `json:"supports_reasoning"`
-	SupportsPromptCache  bool `json:"supports_prompt_cache"`
-	ContextWindow        int  `json:"context_window"`
-	CatalogContextWindow int  `json:"catalog_context_window,omitempty"`
-	CatalogMaxOutput     int  `json:"catalog_max_output,omitempty"`
+	SupportsTools       bool `json:"supports_tools"`
+	SupportsVision      bool `json:"supports_vision"`
+	SupportsReasoning   bool `json:"supports_reasoning"`
+	SupportsPromptCache bool `json:"supports_prompt_cache"`
+	// Capability provenance. Values are SourceCatalog or SourceManual; empty
+	// values are normalized by EffectiveCapabilities.
+	SupportsToolsSource       string `json:"supports_tools_source,omitempty"`
+	SupportsVisionSource      string `json:"supports_vision_source,omitempty"`
+	SupportsReasoningSource   string `json:"supports_reasoning_source,omitempty"`
+	SupportsPromptCacheSource string `json:"supports_prompt_cache_source,omitempty"`
+	ContextWindow             int    `json:"context_window"`
+	CatalogContextWindow      int    `json:"catalog_context_window,omitempty"`
+	CatalogMaxOutput          int    `json:"catalog_max_output,omitempty"`
 }
 
 // Model is one model exposed by an LLM configuration. Catalog rows come from
@@ -70,7 +87,30 @@ func (m Model) EffectiveCapabilities() Capabilities {
 	if capabilities.ContextWindow <= 0 {
 		capabilities.ContextWindow = m.ContextWindow
 	}
+	// Legacy rows carry no capability source keys. A row that was created as a
+	// manual model is the only safe manual evidence we have; everything else
+	// reads as catalog (documented one-time caveat above).
+	capabilities.SupportsToolsSource = effectiveCapabilitySource(capabilities.SupportsToolsSource, m.Source)
+	capabilities.SupportsVisionSource = effectiveCapabilitySource(capabilities.SupportsVisionSource, m.Source)
+	capabilities.SupportsReasoningSource = effectiveCapabilitySource(capabilities.SupportsReasoningSource, m.Source)
+	capabilities.SupportsPromptCacheSource = effectiveCapabilitySource(capabilities.SupportsPromptCacheSource, m.Source)
 	return capabilities
+}
+
+// effectiveCapabilitySource normalizes a capability source marker. An explicit
+// catalog/manual value wins; a missing marker falls back to the model's origin
+// so pre-0.2.3 rows keep a sensible provenance.
+func effectiveCapabilitySource(source, modelSource string) string {
+	switch source {
+	case SourceManual:
+		return SourceManual
+	case SourceCatalog:
+		return SourceCatalog
+	}
+	if modelSource == SourceManual {
+		return SourceManual
+	}
+	return SourceCatalog
 }
 
 // EffectiveWindowSource returns the stored provenance of ContextWindow. Rows

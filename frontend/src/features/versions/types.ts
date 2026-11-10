@@ -153,6 +153,18 @@ export type Version = {
   pending_design_count?: number
   /** P2: current case versions by status; `superseded` history is excluded. */
   case_counts?: VersionCaseCounts
+  /**
+   * R3-E-01: requirement status counts of `GET /api/versions/{id}`. The
+   * reporting-stage completion panel reads them to explain the remaining work
+   * without depending on the requirement list request.
+   */
+  requirement_counts?: {
+    total: number
+    draft: number
+    clarified: number
+    closed: number
+    obsolete: number
+  }
   /** P4: set when status becomes `completed`; cleared on reopen. */
   closed_at?: string | null
   /** P4: close reason captured with `closed_at`; cleared on reopen. */

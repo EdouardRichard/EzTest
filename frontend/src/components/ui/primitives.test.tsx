@@ -10,7 +10,7 @@ import { Badge } from "./Badge"
 import { Button } from "./Button"
 import { Dialog } from "./Dialog"
 import { EmptyState } from "./EmptyState"
-import { ErrorState } from "./ErrorState"
+import { ErrorState, InlineError } from "./ErrorState"
 import { Field } from "./Field"
 import { Input } from "./Input"
 import { Select } from "./Select"
@@ -258,5 +258,79 @@ describe("EmptyState, ErrorState and Spinner", () => {
 
     render(<Spinner label="正在验证会话" />)
     expect(screen.getByRole("status", { name: "正在验证会话" })).toBeInTheDocument()
+  })
+})
+
+describe("localized error rendering", () => {
+  it("renders the Chinese catalog copy instead of the English API message", () => {
+    render(
+      <ErrorState
+        error={
+          new ApiError({
+            status: 401,
+            code: "unauthenticated",
+            message: "authentication required",
+            requestId: "req_login",
+          })
+        }
+      />,
+    )
+
+    expect(screen.getByText("登录状态已失效，请重新登录")).toBeInTheDocument()
+    expect(screen.queryByText("authentication required")).not.toBeInTheDocument()
+    expect(screen.getByText(/req_login/)).toBeInTheDocument()
+  })
+
+  it("lets InlineError override the main copy without dropping context", () => {
+    render(
+      <InlineError
+        error={
+          new ApiError({
+            status: 409,
+            code: "state_conflict",
+            message: "the requirement is closed",
+            requestId: "req_retest",
+            details: {
+              reason: "requirement_closed",
+              requirement_id: "6001",
+              next_action: "在「需求与澄清」页重新打开该需求，然后重试执行",
+            },
+          })
+        }
+        message="无法复测：请先重新打开需求"
+      >
+        <button type="button">前往重新打开需求</button>
+      </InlineError>,
+    )
+
+    const alert = screen.getByRole("alert")
+    expect(alert).toHaveTextContent("无法复测：请先重新打开需求")
+    expect(alert).not.toHaveTextContent("the requirement is closed")
+    expect(alert).toHaveTextContent("在「需求与澄清」页重新打开该需求，然后重试执行")
+    expect(alert).toHaveTextContent("req_retest")
+    expect(screen.getByRole("button", { name: "前往重新打开需求" })).toBeInTheDocument()
+  })
+
+  it("keeps a specific Chinese not-found message instead of the generic catalog copy", () => {
+    render(
+      <ErrorState
+        error={new ApiError({ status: 404, code: "not_found", message: "对话不存在" })}
+      />,
+    )
+
+    expect(screen.getByText("对话不存在")).toBeInTheDocument()
+    expect(screen.queryByText("资源不存在或已被删除")).not.toBeInTheDocument()
+  })
+
+  it("localizes InlineError when no override is given", () => {
+    render(
+      <InlineError
+        error={
+          new ApiError({ status: 403, code: "account_disabled", message: "account is disabled" })
+        }
+      />,
+    )
+
+    expect(screen.getByRole("alert")).toHaveTextContent("账号已被禁用，请联系管理员")
   })
 })

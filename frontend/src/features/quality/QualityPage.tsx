@@ -1,8 +1,8 @@
 "use client"
 
 import { useRouter } from "next/navigation"
-import { useCallback, useEffect, useState } from "react"
-
+import { useCallback, useEffect, useRef, useState } from "react"
+import { Alert } from "@/components/ui/Alert"
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -11,9 +11,10 @@ import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
-import { listVersions } from "@/features/versions/api"
+import { getVersion, listVersions } from "@/features/versions/api"
 import type { VersionSummary } from "@/features/versions/types"
 import { QualityMetricsPanel } from "@/features/visual/QualityMetricsPanel"
+import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { getQualityOverview, getQualityTrends, listEvalRuns, triggerSnapshot } from "./api"
@@ -43,6 +44,13 @@ export type QualityPageProps = {
 const EVAL_LIST_LIMIT = 20
 
 /**
+ * Deep-link validation result. The first `limit=100` version page is not the
+ * whole workspace, so the specific id is resolved with `GET /api/versions/{id}`
+ * instead of being searched for in the list.
+ */
+type VersionCheck = "idle" | "pending" | "valid" | "invalid" | "unknown"
+
+/**
  * P6 quality centre (spec §5.5/P6-D-02).
  *
  * Every logged-in user sees the seven server-derived operational metrics and
@@ -57,6 +65,16 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   const [versions, setVersions] = useState<VersionSummary[]>([])
   const [versionsError, setVersionsError] = useState<unknown>(null)
   const [versionId, setVersionId] = useState(initialVersionId ?? "")
+  const [versionCheck, setVersionCheck] = useState<VersionCheck>(
+    initialVersionId !== undefined && initialVersionId !== "" ? "pending" : "idle",
+  )
+  // The `getVersion` result for a deep link outside the first list page, kept
+  // so the controlled select can still render a labelled option for it.
+  const [resolvedVersion, setResolvedVersion] = useState<{ id: string; title: string } | null>(null)
+  // The last id we know to be valid (deep-link validation result or a dropdown
+  // selection). Re-validating it after `router.replace` would tear down the
+  // version-scoped queries and flash "正在确认版本…" again.
+  const confirmedVersionRef = useRef<string | null>(null)
 
   const [overview, setOverview] = useState<QualityOverview | null>(null)
   const [overviewLoading, setOverviewLoading] = useState(true)
@@ -78,27 +96,74 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   const [triggerError, setTriggerError] = useState<unknown>(null)
   const [triggerResult, setTriggerResult] = useState<EvalRun | null>(null)
 
+  // A deep-linked version must be resolved before any version-scoped query
+  // starts. Until that read settles the scope is unknown, so no request is
+  // sent; a 404 then falls back to the global scope (G-08) while any other
+  // failure keeps the requested deep link.
+  const pendingVersionResolution = versionCheck === "pending"
+  const invalidVersion = versionCheck === "invalid"
+  const effectiveVersionId = invalidVersion ? "" : versionId
+  const canScopeVersion = !pendingVersionResolution && effectiveVersionId.length > 0
+
   useEffect(() => {
     let cancelled = false
     setVersionsError(null)
     void listVersions()
       .then((items) => {
-        if (!cancelled) setVersions(items)
+        if (cancelled) return
+        setVersions(items)
       })
       .catch((cause: unknown) => {
-        if (!cancelled) setVersionsError(cause)
+        if (cancelled) return
+        setVersionsError(cause)
       })
     return () => {
       cancelled = true
     }
   }, [])
 
+  useEffect(() => {
+    if (initialVersionId === undefined || initialVersionId === "") return
+    // A version picked from the resolved list — or one already validated — must
+    // not be resolved again. The server re-renders this page with the selected
+    // `?version=` after `router.replace`, and re-running the effect would clear
+    // the scope, unmount the panels and re-fetch everything.
+    if (confirmedVersionRef.current === initialVersionId) {
+      setVersionCheck("valid")
+      return
+    }
+    let cancelled = false
+    setVersionCheck("pending")
+    void getVersion(initialVersionId)
+      .then((version) => {
+        if (cancelled) return
+        confirmedVersionRef.current = version.id
+        setResolvedVersion({ id: version.id, title: version.title })
+        setVersionCheck("valid")
+      })
+      .catch((cause: unknown) => {
+        if (cancelled) return
+        setVersionCheck(cause instanceof ApiError && cause.status === 404 ? "invalid" : "unknown")
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [initialVersionId])
+
+  useEffect(() => {
+    if (invalidVersion) router.replace("/quality")
+  }, [invalidVersion, router])
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: reload token re-runs the explicit refetch
   useEffect(() => {
+    if (pendingVersionResolution) {
+      setOverviewLoading(true)
+      return
+    }
     let cancelled = false
     setOverviewLoading(true)
     setOverviewError(null)
-    void getQualityOverview(versionId.length > 0 ? versionId : undefined)
+    void getQualityOverview(effectiveVersionId.length > 0 ? effectiveVersionId : undefined)
       .then((next) => {
         if (!cancelled) setOverview(next)
       })
@@ -114,7 +179,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
     return () => {
       cancelled = true
     }
-  }, [versionId, overviewReloadToken])
+  }, [effectiveVersionId, pendingVersionResolution, overviewReloadToken])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reload token re-runs the explicit refetch
   useEffect(() => {
@@ -147,7 +212,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reload token re-runs the explicit refetch
   useEffect(() => {
-    if (!isAdmin || versionId.length === 0) {
+    if (!isAdmin || !canScopeVersion) {
       setTrendPoints([])
       setTrendError(null)
       setTrendLoading(false)
@@ -156,7 +221,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
     let cancelled = false
     setTrendLoading(true)
     setTrendError(null)
-    void getQualityTrends({ versionId, metric: trendMetric })
+    void getQualityTrends({ versionId: effectiveVersionId, metric: trendMetric })
       .then((points) => {
         if (!cancelled) setTrendPoints(points)
       })
@@ -172,7 +237,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
     return () => {
       cancelled = true
     }
-  }, [isAdmin, versionId, trendMetric, evalReloadToken])
+  }, [isAdmin, effectiveVersionId, canScopeVersion, trendMetric, evalReloadToken])
 
   const refresh = useCallback(() => {
     setOverviewReloadToken((token) => token + 1)
@@ -180,11 +245,11 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
   }, [isAdmin])
 
   const runSnapshot = useCallback(async () => {
-    if (versionId.length === 0 || triggering) return
+    if (effectiveVersionId.length === 0 || triggering) return
     setTriggering(true)
     setTriggerError(null)
     try {
-      const run = await triggerSnapshot(versionId)
+      const run = await triggerSnapshot(effectiveVersionId)
       setTriggerResult(run)
       refresh()
     } catch (cause: unknown) {
@@ -193,12 +258,29 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
     } finally {
       setTriggering(false)
     }
-  }, [versionId, triggering, refresh])
+  }, [effectiveVersionId, triggering, refresh])
 
   function changeVersion(next: string): void {
+    // Remember the selection so the effect above skips re-validating the id the
+    // server will hand back after `router.replace`.
+    confirmedVersionRef.current = next.length > 0 ? next : null
     setVersionId(next)
+    // A value picked from the resolved list is valid by construction and must
+    // clear any deep-link fallback.
+    setVersionCheck("valid")
     router.replace(next.length > 0 ? `/quality?version=${encodeURIComponent(next)}` : "/quality")
   }
+
+  // A valid deep link outside the first `limit=100` list has no matching option
+  // in `versions`; synthesize one from the `getVersion` result so the
+  // controlled select is not blank.
+  const deepLinkedOption =
+    versionCheck === "valid" &&
+    resolvedVersion !== null &&
+    effectiveVersionId === resolvedVersion.id &&
+    !versions.some((version) => version.id === resolvedVersion.id)
+      ? resolvedVersion
+      : null
 
   return (
     <div data-testid="quality-page" className="space-y-5">
@@ -212,8 +294,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4
-            项指标）、真实 LLM run 与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
+            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4 项指标）、真实 LLM run
+            与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -221,7 +303,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             <span>版本</span>
             <Select
               aria-label="版本"
-              value={versionId}
+              value={effectiveVersionId}
               onChange={(event) => changeVersion(event.target.value)}
               className="h-8 w-52 text-xs"
             >
@@ -231,6 +313,11 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                   #{version.id} · {version.title}
                 </option>
               ))}
+              {deepLinkedOption !== null ? (
+                <option value={deepLinkedOption.id}>
+                  #{deepLinkedOption.id} · {deepLinkedOption.title}
+                </option>
+              ) : null}
             </Select>
           </div>
           <Button variant="secondary" size="sm" onClick={refresh}>
@@ -240,6 +327,12 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
       </header>
 
       {versionsError !== null ? <InlineError error={versionsError} /> : null}
+
+      {invalidVersion ? (
+        <div data-testid="quality-version-fallback">
+          <Alert tone="warning">版本 #{versionId} 不存在，已按全部版本展示。</Alert>
+        </div>
+      ) : null}
 
       <section aria-label="运营指标" className="surface-card space-y-3 p-4">
         <header>
@@ -276,7 +369,13 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             P5 视觉指标语义不变；未执行或未配置视觉断言时保持空态。
           </p>
         </header>
-        <QualityMetricsPanel versionId={versionId.length > 0 ? versionId : undefined} />
+        {pendingVersionResolution ? (
+          <LoadingCard label="正在确认版本…" />
+        ) : (
+          <QualityMetricsPanel
+            versionId={effectiveVersionId.length > 0 ? effectiveVersionId : undefined}
+          />
+        )}
       </section>
 
       <section
@@ -288,13 +387,14 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div>
             <h2 className="text-sm font-semibold text-foreground">评测看板</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
+              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM
+              run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
             </p>
           </div>
           {isAdmin ? <Badge tone="neutral">admin-only</Badge> : null}
         </header>
 
-        {isAdmin && versionId.length > 0 ? (
+        {isAdmin && canScopeVersion ? (
           <div className="flex flex-wrap items-center gap-2">
             <Button
               variant="secondary"
@@ -310,8 +410,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                 data-testid="quality-eval-trigger-result"
                 className="text-[11px] text-muted-foreground"
               >
-                快照评测已生成 #{triggerResult.id}（
-                {EVAL_STATUS_LABEL[triggerResult.status]}，{triggerResult.metrics.length} 项指标）
+                快照评测已生成 #{triggerResult.id}（{EVAL_STATUS_LABEL[triggerResult.status]}，
+                {triggerResult.metrics.length} 项指标）
               </p>
             ) : null}
             {triggerError !== null ? <InlineError error={triggerError} /> : null}
@@ -348,7 +448,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
         )}
       </section>
 
-      {isAdmin && versionId.length > 0 ? (
+      {isAdmin && canScopeVersion ? (
         <section
           data-testid="quality-trends"
           aria-label="指标趋势"
@@ -361,10 +461,13 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
                 同一版本的多次快照评测形成趋势；基线回归仅告警，不阻断阶段验收。
               </p>
             </div>
-            <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <label
+              htmlFor="quality-trend-metric"
+              className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
+            >
               <span>趋势指标</span>
               <Select
-                aria-label="趋势指标"
+                id="quality-trend-metric"
                 value={trendMetric}
                 onChange={(event) => setTrendMetric(event.target.value)}
                 className="h-8 w-44 text-xs"
@@ -394,8 +497,8 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
         </section>
       ) : null}
 
-      {isAdmin && versionId.length > 0 ? (
-        <EvalEventsBridge versionId={versionId} onEvalChanged={refresh} />
+      {isAdmin && canScopeVersion ? (
+        <EvalEventsBridge versionId={effectiveVersionId} onEvalChanged={refresh} />
       ) : null}
     </div>
   )

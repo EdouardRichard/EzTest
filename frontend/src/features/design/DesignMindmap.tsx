@@ -4,10 +4,13 @@ import {
   Background,
   BackgroundVariant,
   type Edge,
+  MiniMap,
   type Node,
+  type NodeChange,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
+  useStore,
 } from "@xyflow/react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
@@ -27,6 +30,7 @@ import {
   filterDesignLayout,
   matchDesignNodes,
 } from "./layout"
+import { mergeMeasuredDimensions, type NodeMeasurements } from "./measurements"
 import type { DesignNodeActions } from "./nodeActions"
 import { RequirementNode } from "./RequirementNode"
 import { ScenarioNode } from "./ScenarioNode"
@@ -68,6 +72,18 @@ const STATUS_NODE_CLASS: Record<Exclude<CaseVersionStatus, "superseded">, string
   stale: "case-status-stale [&>div]:border-warning/60 [&>div]:bg-warning/5",
 }
 
+/**
+ * D-09: below this zoom the node confirmation controls render too small to hit
+ * safely (React Flow scales the whole node), so they are hidden. Selection and
+ * navigation remain available at every zoom.
+ */
+export const MIN_ACTION_ZOOM = 0.5
+
+/** Pure threshold used by the canvas store selector and its unit test. */
+export function destructiveActionsDisabledForZoom(zoom: number): boolean {
+  return zoom < MIN_ACTION_ZOOM
+}
+
 /** Execution result is the card's left inset accent so it can coexist with the status. */
 const RESULT_NODE_CLASS: Record<CaseRunVerdict, string> = {
   passed: "case-result-passed [&>div]:shadow-[inset_4px_0_0_var(--color-success)]",
@@ -80,6 +96,7 @@ const RESULT_NODE_CLASS: Record<CaseRunVerdict, string> = {
 const SEARCH_HIT_CLASS = "mindmap-search-hit rounded-xl ring-2 ring-warning/70"
 
 const EMPTY_RESULTS: DesignExecutionResults = {}
+const EMPTY_MEASUREMENTS: NodeMeasurements = {}
 
 type FitState = {
   timer: ReturnType<typeof setTimeout> | null
@@ -117,6 +134,12 @@ export type DesignMindmapProps = {
    * new size, never against the stale pre-change box.
    */
   fitViewToken?: number
+  /**
+   * Short viewports (D-01): compact filters, no empty batch bar and the same
+   * node actions, so the canvas keeps its 180px floor. Defaults to false so the
+   * approved full layout (and isolated canvas tests) stay unchanged.
+   */
+  compact?: boolean
 }
 
 function MindmapCanvas({
@@ -134,11 +157,16 @@ function MindmapCanvas({
   onBatchExecuteCases,
   onRequestAiChange,
   fitViewToken = 0,
+  compact = false,
 }: DesignMindmapProps) {
   const { zoomIn, zoomOut, fitView } = useReactFlow()
   const [filters, setFilters] = useState<CaseFilterValues>(DEFAULT_CASE_FILTERS)
   const hasExecutionResults = Object.keys(executionResults).length > 0
   const selection = useSelection()
+  // D-09: hide the small, scale-sensitive confirm controls below 0.5 zoom.
+  const destructiveActionsDisabled = useStore((state) =>
+    destructiveActionsDisabledForZoom(state.transform[2]),
+  )
 
   // A result filter without execution data would hide every case behind the
   // no-match overlay, so it only becomes active once a caller passes verdicts.
@@ -292,6 +320,14 @@ function MindmapCanvas({
     )
   }, [])
 
+  // R2-D-03: the controlled `nodes` prop drops React Flow's dimensions changes,
+  // so `userNode.measured` never exists and the MiniMap renders no thumbnails.
+  // Feed the reported boxes back into the nodes instead.
+  const [measuredById, setMeasuredById] = useState<NodeMeasurements>(EMPTY_MEASUREMENTS)
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    setMeasuredById((current) => mergeMeasuredDimensions(current, changes))
+  }, [])
+
   const classesFor = useCallback(
     (node: DesignLayoutNode): string => {
       const classes: string[] = []
@@ -316,12 +352,27 @@ function MindmapCanvas({
           id: node.id,
           type: node.type,
           position: node.position,
+          measured: measuredById[node.id],
           className: classesFor(node),
           selected,
-          data: { ...node.data, actions, selected, batchSelected },
+          data: {
+            ...node.data,
+            actions,
+            selected,
+            batchSelected,
+            destructiveActionsDisabled,
+          },
         }
       }),
-    [filteredLayout, actions, selectedCaseId, selection.selectedIds, classesFor],
+    [
+      filteredLayout,
+      actions,
+      selectedCaseId,
+      selection.selectedIds,
+      classesFor,
+      destructiveActionsDisabled,
+      measuredById,
+    ],
   )
 
   const edges = useMemo<Edge[]>(
@@ -333,22 +384,23 @@ function MindmapCanvas({
     <section
       data-testid="design-mindmap"
       aria-label="用例脑图"
-      className="flex h-full w-full flex-col overflow-hidden rounded-xl border border-border bg-card"
+      className="flex h-full w-full flex-col overflow-auto rounded-xl border border-border bg-card"
     >
       <CaseFilters
         values={filters}
         requirementOptions={requirementOptions}
         scenarioOptions={scenarioOptions}
         resultFilterEnabled={hasExecutionResults}
+        compact={compact}
         onChange={handleFilterChange}
       />
 
-      {layout.nodes.length === 0 ? null : (
+      {layout.nodes.length === 0 || (compact && selection.selectedIds.length === 0) ? null : (
         <div
           data-testid="case-batch-bar"
           role="toolbar"
           aria-label="用例批量操作"
-          className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5"
+          className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5"
         >
           <span data-testid="case-selection-count" className="text-[11px] text-muted-foreground">
             已选 {selection.selectedIds.length} 条
@@ -399,7 +451,7 @@ function MindmapCanvas({
         </div>
       )}
 
-      <div className="relative min-h-0 flex-1">
+      <div data-testid="design-mindmap-canvas" className="relative min-h-[180px] flex-1">
         <div className="absolute right-3 top-3 z-10 flex items-center gap-1">
           <Button
             size="sm"
@@ -454,6 +506,7 @@ function MindmapCanvas({
               minZoom={0.2}
               nodesDraggable={false}
               nodesConnectable={false}
+              onNodesChange={handleNodesChange}
               proOptions={{ hideAttribution: true }}
               onNodeClick={(_event, node) => {
                 if (node.type === "case") {
@@ -462,6 +515,14 @@ function MindmapCanvas({
               }}
             >
               <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
+              {/* D-07: overview of the whole graph; the inline canvas only shows a slice. */}
+              <MiniMap
+                ariaLabel="脑图缩略图"
+                position="bottom-right"
+                pannable
+                zoomable
+                style={{ width: 160, height: 120 }}
+              />
             </ReactFlow>
             {filteredLayout.nodes.length === 0 ? (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">

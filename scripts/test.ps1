@@ -1,4 +1,6 @@
-# EzTest 0.2 P0 test gate: Go unit + integration, then frontend lint/typecheck/tests.
+# EzTest 0.2 test gate: Go unit + integration, then the frontend, executor and
+# renderer suites that hosted CI also runs. Keep the gates in sync with
+# .github/workflows/ci.yml.
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
@@ -32,31 +34,52 @@ try {
     Pop-Location
 }
 
-$frontend = Join-Path $repoRoot "frontend"
-if (Test-Path (Join-Path $frontend "node_modules")) {
-    Push-Location $frontend
+# Runs one pnpm gate in a package directory and exits the script on failure.
+# pnpm/Biome/tsc/node write progress to stderr; with ErrorActionPreference=Stop
+# Windows PowerShell 5.1 turns that into a NativeCommandError even when the
+# command succeeded. Judge each gate by $LASTEXITCODE instead.
+function Invoke-PnpmGate {
+    param(
+        [string]$Directory,
+        [string]$Label,
+        [string]$Command
+    )
+    $package = Split-Path -Leaf $Directory
+    if (-not (Test-Path (Join-Path $Directory "node_modules"))) {
+        Write-Host ("{0}/node_modules missing; skipping {1} (run pnpm install in {0}/ first)" -f $package, $Label)
+        return
+    }
     $previousErrorAction = $ErrorActionPreference
-    # pnpm/Biome/tsc write progress to stderr; with ErrorActionPreference=Stop
-    # Windows PowerShell 5.1 turns that into a NativeCommandError even when the
-    # command succeeded. Judge the gate by $LASTEXITCODE instead.
     $ErrorActionPreference = "Continue"
+    Push-Location $Directory
     try {
-        Write-Host "== frontend lint =="
-        & pnpm lint
-        $lintExit = $LASTEXITCODE
-        if ($lintExit -ne 0) { exit $lintExit }
-        Write-Host "== frontend typecheck =="
-        & pnpm typecheck
-        $typeExit = $LASTEXITCODE
-        if ($typeExit -ne 0) { exit $typeExit }
-        Write-Host "== frontend test =="
-        & pnpm test
-        $testExit = $LASTEXITCODE
-        if ($testExit -ne 0) { exit $testExit }
+        Write-Host ("== {0} ==" -f $Label)
+        & pnpm $Command
+        $gateExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorAction
         Pop-Location
     }
-} else {
-    Write-Host "frontend/node_modules missing; skipping frontend tests"
+    if ($gateExit -ne 0) {
+        if ($Command -eq "lint") {
+            Write-Host ("{0} lint failed; run 'cd {0}; pnpm lint:fix' to apply Biome's safe fixes, then re-run." -f $package) -ForegroundColor Yellow
+        }
+        exit $gateExit
+    }
 }
+
+$frontend = Join-Path $repoRoot "frontend"
+$executor = Join-Path $repoRoot "executor"
+$renderer = Join-Path $repoRoot "renderer"
+
+# A missing pnpm must fail loudly: `& pnpm` under Continue would not throw and
+# could leave $LASTEXITCODE pointing at the previous gate, hiding the failure.
+if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+    throw "pnpm is required (repo baseline: pnpm 11); install it before running the test gate."
+}
+
+Invoke-PnpmGate -Directory $frontend -Label "frontend lint" -Command "lint"
+Invoke-PnpmGate -Directory $frontend -Label "frontend typecheck" -Command "typecheck"
+Invoke-PnpmGate -Directory $frontend -Label "frontend test" -Command "test"
+Invoke-PnpmGate -Directory $executor -Label "executor test" -Command "test"
+Invoke-PnpmGate -Directory $renderer -Label "renderer test" -Command "test"

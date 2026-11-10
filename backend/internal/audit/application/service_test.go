@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 type fixedClock struct{ at time.Time }
@@ -177,5 +178,75 @@ func TestListPropagatesRepositoryError(t *testing.T) {
 	svc := newTestService(repo)
 	if _, _, err := svc.List(context.Background(), Filter{}, 10, nil); err == nil {
 		t.Fatal("List swallowed a repository error")
+	}
+}
+
+func TestRecordFallsBackToRequestMetadata(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
+	ctx := platform.WithRequestMeta(context.Background(), platform.RequestMeta{
+		IP:        "127.0.0.1",
+		UserAgent: "vitest-agent",
+	})
+
+	if err := svc.Record(ctx, Event{Action: "settings.updated"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	entry := repo.inserted[0]
+	if entry.IP != "127.0.0.1" {
+		t.Fatalf("ip = %q, want 127.0.0.1", entry.IP)
+	}
+	if entry.UserAgent != "vitest-agent" {
+		t.Fatalf("user agent = %q, want vitest-agent", entry.UserAgent)
+	}
+}
+
+func TestRecordPrefersExplicitEventMetadata(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
+	ctx := platform.WithRequestMeta(context.Background(), platform.RequestMeta{
+		IP:        "127.0.0.1",
+		UserAgent: "context-agent",
+	})
+
+	if err := svc.Record(ctx, Event{Action: "auth.login", IP: "192.0.2.9", UserAgent: "event-agent"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	entry := repo.inserted[0]
+	if entry.IP != "192.0.2.9" || entry.UserAgent != "event-agent" {
+		t.Fatalf("explicit metadata was overwritten: %#v", entry)
+	}
+}
+
+func TestActionCandidatesMirrorsCatalog(t *testing.T) {
+	candidates := ActionCandidates()
+	if len(candidates) != len(audit.Actions) {
+		t.Fatalf("candidates = %d, catalog = %d", len(candidates), len(audit.Actions))
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.Name == "settings.updated" {
+			found = true
+			if len(candidate.Aliases) == 0 || candidate.Aliases[0] != "setting.update" {
+				t.Fatalf("settings.updated aliases = %v", candidate.Aliases)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("candidates are missing settings.updated")
+	}
+}
+
+// TestActionCandidatesAreDeepCopied keeps callers from mutating the shared
+// catalog through the returned slice.
+func TestActionCandidatesAreDeepCopied(t *testing.T) {
+	candidates := ActionCandidates()
+	for i := range candidates {
+		if len(candidates[i].Aliases) > 0 {
+			candidates[i].Aliases[0] = "mutated.alias"
+		}
+	}
+	if got := audit.ResolveAlias("setting.update"); got != "settings.updated" {
+		t.Fatalf("ResolveAlias(setting.update) = %q after mutating candidates; catalog aliases were shared", got)
 	}
 }

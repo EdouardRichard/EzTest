@@ -82,7 +82,9 @@ function structuredToolError(part: ToolCallPart): StructuredToolError | null {
   const field = stringField(error, "field") || stringField(details, "field")
   const hint = stringField(error, "hint") || stringField(details, "hint")
   const allowed =
-    stringList(error, "allowed").length > 0 ? stringList(error, "allowed") : stringList(details, "allowed")
+    stringList(error, "allowed").length > 0
+      ? stringList(error, "allowed")
+      : stringList(details, "allowed")
   const code = stringField(error, "code")
   const message = stringField(error, "message")
   if (code === "" && message === "" && field === "") return null
@@ -120,9 +122,7 @@ function ToolErrorDetails({
           <code className="break-all font-mono text-foreground">{error.allowed.join(", ")}</code>
         </p>
       ) : null}
-      {error.hint !== "" ? (
-        <p className="text-[10px] text-muted-foreground">{error.hint}</p>
-      ) : null}
+      {error.hint !== "" ? <p className="text-[10px] text-muted-foreground">{error.hint}</p> : null}
       {error.retryable && onRetry !== undefined ? (
         <Button variant="secondary" size="sm" onClick={() => onRetry(part)}>
           重试
@@ -134,7 +134,9 @@ function ToolErrorDetails({
 
 function DatabaseListResult({ result }: { result: Record<string, unknown> }) {
   const databases = Array.isArray(result.databases)
-    ? result.databases.map(recordOf).filter((item): item is Record<string, unknown> => item !== undefined)
+    ? result.databases
+        .map(recordOf)
+        .filter((item): item is Record<string, unknown> => item !== undefined)
     : []
   if (databases.length === 0) {
     return <p className="text-[10px] text-muted-foreground">当前版本没有绑定可用的目标数据库。</p>
@@ -167,7 +169,13 @@ function DatabaseListResult({ result }: { result: Record<string, unknown> }) {
   )
 }
 
-function GraphProposeResult({ part, onRetry }: { part: ToolCallPart; onRetry?: (part: ToolCallPart) => void }) {
+function GraphProposeResult({
+  part,
+  onRetry,
+}: {
+  part: ToolCallPart
+  onRetry?: (part: ToolCallPart) => void
+}) {
   const error = structuredToolError(part)
   if (error) {
     return <ToolErrorDetails part={part} error={error} onRetry={onRetry} />

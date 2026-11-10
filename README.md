@@ -368,7 +368,7 @@ The executor and renderer tokens must match the database settings `execution.exe
 administrator settings). On Windows, set environment variables with `$env:NAME="value"`. Tests:
 
 ```bash
-pwsh scripts/test.ps1        # Go unit + integration, frontend lint / typecheck / Vitest
+pwsh scripts/test.ps1        # Go unit + integration, frontend lint / typecheck / Vitest, executor + renderer
 cd executor && pnpm test     # executor node:test suite
 cd renderer && node --test   # renderer node:test suite
 ```

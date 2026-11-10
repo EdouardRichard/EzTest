@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { CaseRunDetailView } from "./CaseRunDetail"
@@ -31,6 +31,22 @@ function incompleteDetail(overrides: Partial<CaseRunDetail["case_run"]> = {}): C
   }
 }
 
+function pendingTelemetryDetail(id: string): CaseRunDetail {
+  return {
+    ...caseRunDetailFixture,
+    case_run: {
+      ...caseRunDetailFixture.case_run,
+      id,
+      status: "passed",
+      failure_class: "",
+      // Usage is attached by Finalize after `case_run.finished`: right after
+      // the event the snapshot can still answer `usage: null`.
+      finished_at: new Date().toISOString(),
+      summary: { ...caseRunDetailFixture.case_run.summary, usage: null },
+    },
+  }
+}
+
 function blockedDetail(): CaseRunDetail {
   const base = caseRunDetailFixture
   return {
@@ -58,6 +74,21 @@ function blockedDetail(): CaseRunDetail {
 }
 
 afterEach(cleanup)
+
+function overrideSummary(
+  overrides: Partial<CaseRunDetail["case_run"]> = {},
+  summary: CaseRunDetail["case_run"]["summary"] = {},
+): CaseRunDetail {
+  const base = caseRunDetailFixture
+  return {
+    ...base,
+    case_run: {
+      ...base.case_run,
+      ...overrides,
+      summary: { ...base.case_run.summary, ...summary },
+    },
+  }
+}
 
 describe("CaseRunDetail incomplete cause", () => {
   it("explains an incomplete run with its concrete budget cause", () => {
@@ -218,5 +249,265 @@ describe("CaseRunDetail incomplete cause", () => {
     const usage = screen.getByTestId("case-run-usage")
     expect(usage).toHaveTextContent("180000")
     expect(usage).toHaveTextContent("12 轮")
+  })
+})
+
+describe("CaseRunDetail telemetry pending (R2-OBS-01)", () => {
+  it("marks telemetry pending and refetches at 5s then 15s for a just-finished run", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const onRetry = vi.fn()
+      const detail: CaseRunDetail = {
+        ...caseRunDetailFixture,
+        case_run: {
+          ...caseRunDetailFixture.case_run,
+          status: "passed",
+          failure_class: "",
+          // Usage is attached by Finalize after `case_run.finished`: right after
+          // the event the snapshot can still answer `usage: null`.
+          finished_at: new Date().toISOString(),
+          summary: { ...caseRunDetailFixture.case_run.summary, usage: null },
+        },
+      }
+
+      render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={detail}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      expect(screen.getByTestId("case-run-telemetry-pending")).toHaveTextContent("遥测写入中")
+      expect(screen.queryByTestId("case-run-telemetry-unavailable")).not.toBeInTheDocument()
+      expect(screen.queryByTestId("case-run-usage")).not.toBeInTheDocument()
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(1)
+
+      act(() => {
+        vi.advanceTimersByTime(15_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+
+      // One-shot: the delayed refetch never runs more than twice.
+      act(() => {
+        vi.advanceTimersByTime(60_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("restarts the 5s/15s retry budget when a different run is pending", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const onRetry = vi.fn()
+      const { rerender } = render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={pendingTelemetryDetail("9302")}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(1)
+
+      // Switching directly from one pending run to another used to keep the
+      // first run's retry count, leaving the second run a reduced budget.
+      rerender(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={pendingTelemetryDetail("9999")}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+
+      act(() => {
+        vi.advanceTimersByTime(15_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(3)
+
+      // Still one-shot per run: no further retries after the second one.
+      act(() => {
+        vi.advanceTimersByTime(60_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps telemetry unavailable once the write window has passed", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const detail = overrideSummary(
+        {
+          status: "passed",
+          failure_class: "",
+          finished_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+        },
+        { usage: null },
+      )
+
+      render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={detail}
+          loading={false}
+          error={null}
+          onRetry={() => {}}
+        />,
+      )
+
+      expect(screen.getByTestId("case-run-telemetry-unavailable")).toHaveTextContent("遥测不可用")
+      expect(screen.queryByTestId("case-run-telemetry-pending")).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe("CaseRunDetail cause labels (X-07)", () => {
+  it("localizes an executor_lost failure and never renders the raw enum", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "executor_lost" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_lost",
+            last_error: "executor_lost",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent("执行器失联")
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent("执行器失联")
+    expect(document.body.textContent).not.toContain("executor_lost")
+  })
+
+  it("localizes a legacy running row's raw verdict reason", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "running", failure_class: "" },
+          { verdict_reason: "executor_lost", last_error: "executor_lost" },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("执行中")
+    expect(screen.getByText(/执行器失联/)).toBeInTheDocument()
+    expect(document.body.textContent).not.toContain("executor_lost")
+  })
+
+  it.each([
+    ["executor_timeout", "执行器超时"],
+    ["executor_context_create_failed", "执行器上下文创建失败"],
+    ["executor_capability", "执行器能力不足"],
+  ])("maps the %s terminal cause to %s", (cause, label) => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: cause,
+            terminal_cause: cause,
+            last_error: cause,
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent(label)
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(label)
+    expect(document.body.textContent).not.toContain(cause)
+  })
+
+  it("localizes a last_error that carries a stable code prefix", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_timeout",
+            last_error: "executor_timeout: context creation exceeded its hard deadline",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-incomplete-detail")).toHaveTextContent(
+      "执行器超时: context creation exceeded its hard deadline",
+    )
+    expect(document.body.textContent).not.toContain("executor_timeout")
+  })
+
+  it("prefills the manual issue summary with the localized last_error", () => {
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={overrideSummary(
+          { status: "failed", failure_class: "timeout" },
+          {
+            verdict_reason: "agent_failure",
+            terminal_cause: "executor_timeout",
+            last_error: "executor_timeout: context creation exceeded its hard deadline",
+            next_action: "rerun",
+          },
+        )}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "创建问题" }))
+
+    const summary = screen.getByLabelText("摘要") as HTMLTextAreaElement
+    expect(summary.value).toBe("执行器超时: context creation exceeded its hard deadline")
+    expect(document.body.textContent).not.toContain("executor_timeout")
   })
 })

@@ -562,7 +562,9 @@ export function ExecutionTab({
       if (waveId !== null) params.set("wave", waveId)
       if (caseRunId !== null) params.set("case_run", caseRunId)
       if (nextView === "visual") params.set("view", "visual")
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )

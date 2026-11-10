@@ -139,6 +139,15 @@ export type MessagePart =
  */
 export type NewMessagePart = TextPart | AttachmentPart | CaseCardPart
 
+/**
+ * Extra send options. A stable `clientMessageId` makes every retry of the same
+ * message idempotent server-side (C-04): the composer mints it once per retry
+ * chain and `useConversation.send` puts it on the wire instead of a fresh id.
+ */
+export type SendOptions = {
+  clientMessageId?: string
+}
+
 export type ConversationMessage = {
   id: string
   conversation_id: string
@@ -225,6 +234,23 @@ export type AttachmentView = {
   extraction_status: ExtractionStatus
   extraction_error: { code: AttachmentErrorCode; message?: string } | null
   created_at: string
+}
+
+/**
+ * One `GET /api/versions/{id}/attachments` row (C-05): the read-only attachment
+ * panel entry. The extraction error is a flat code/text pair because the panel
+ * only needs the stable code plus the human-readable reason, and `image_count`
+ * tells it whether the existing image deep link has anything to show.
+ */
+export type VersionAttachment = {
+  id: string
+  name: string
+  mime: string
+  size: number
+  extraction_status: ExtractionStatus
+  error_code: string
+  error_text: string
+  image_count: number
 }
 
 /** `RequirementDetail` — summary + current/history versions + confirmations. */

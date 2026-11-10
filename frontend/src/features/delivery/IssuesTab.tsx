@@ -13,6 +13,10 @@ import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Table, type TableColumn } from "@/components/ui/Table"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import {
+  closedRequirementId,
+  requirementClosedMessage,
+} from "@/features/execution/closed-requirement"
 import { formatDateTime } from "@/lib/format"
 
 import { confirmIssue, dismissIssue, getIssue, listIssues, reopenIssue, retestIssue } from "./api"
@@ -213,7 +217,9 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
     (issueId: string | null) => {
       const params = new URLSearchParams({ tab: "issues" })
       if (issueId !== null) params.set("issue", issueId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )
@@ -231,6 +237,16 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
     setMerging(false)
     writeIssueUrl(null)
   }, [writeIssueUrl])
+
+  /** Deep link to the requirements tab on the closed requirement (reopen + retry). */
+  const openRequirement = useCallback(
+    (requirementId: string) => {
+      router.push(
+        `/versions/${encodeURIComponent(versionId)}?tab=requirements&requirement=${encodeURIComponent(requirementId)}`,
+      )
+    },
+    [router, versionId],
+  )
 
   /** Refetches the list and (when open) the selected detail after a write. */
   const refresh = useCallback(async () => {
@@ -347,6 +363,7 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
   }, [selectedIssueId, startRetest])
 
   const sortedIssues = useMemo(() => [...issues].sort(compareIssues), [issues])
+  const closedRetestRequirement = closedRequirementId(retestError)
 
   const sutOptions = useMemo(() => {
     const values = new Set<string>()
@@ -560,9 +577,25 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
       </section>
 
       {retestError !== null ? (
-        <InlineError error={retestError}>
-          <span className="ml-2 text-muted-foreground">（复测启动失败）</span>
-        </InlineError>
+        <div className="space-y-1">
+          <InlineError
+            error={retestError}
+            message={
+              closedRetestRequirement !== null ? requirementClosedMessage("retest") : undefined
+            }
+          >
+            <span className="ml-2 text-muted-foreground">（复测启动失败）</span>
+          </InlineError>
+          {closedRetestRequirement !== null ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => openRequirement(closedRetestRequirement)}
+            >
+              前往重新打开需求
+            </Button>
+          ) : null}
+        </div>
       ) : null}
 
       {retestNotice !== null ? (
@@ -627,6 +660,7 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
           onTransition={handleTransition}
           onMerge={() => setMerging(true)}
           onRetest={handleRetest}
+          onOpenRequirement={openRequirement}
         />
       ) : null}
 

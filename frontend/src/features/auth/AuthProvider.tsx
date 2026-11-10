@@ -1,6 +1,6 @@
 "use client"
 
-import { useRouter } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import type { ReactNode } from "react"
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
@@ -10,7 +10,9 @@ import {
   AUTH_CLEARED_EVENT,
   type AuthUser,
   clearSession,
+  getStoredUser,
   getToken,
+  isAuthStorageKey,
   setSession,
   toAuthUser,
 } from "@/lib/auth-storage"
@@ -37,16 +39,91 @@ function readUserPayload(payload: unknown): User | null {
   return toAuthUser(payload)
 }
 
-function readSessionPayload(payload: unknown): { token: string; user: User } | null {
+function readSessionPayload(
+  payload: unknown,
+): { token: string; user: User; expiresAt: string | null } | null {
   if (!isRecord(payload)) return null
   const token = typeof payload.token === "string" ? payload.token : ""
   const user = readUserPayload(payload)
   if (token.length === 0 || user === null) return null
-  return { token, user }
+  const expiresAt =
+    typeof payload.expires_at === "string" && payload.expires_at.length > 0
+      ? payload.expires_at
+      : null
+  return { token, user, expiresAt }
 }
 
 function invalidResponse(message: string): ApiError {
   return new ApiError({ status: 200, code: "invalid_response", message, retryable: false })
+}
+
+/** True for C0 controls, space and DEL, which URL parsers may strip/normalize. */
+function hasUnsafeControlChars(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code <= 0x20 || code === 0x7f) return true
+  }
+  return false
+}
+
+const SAFE_NEXT_BASE = "http://internal.invalid"
+
+/**
+ * True when `value` is a single-slash-rooted same-origin path. It must start
+ * with exactly one `/` (a leading scheme or `//` authority therefore cannot be
+ * interpreted), contain no backslash (URL parsers normalize `\` to `/`), and no
+ * control characters. Re-parsing proves the serialized form stays on our origin.
+ */
+function isSingleSlashRootedPath(value: string): boolean {
+  if (!value.startsWith("/") || value.startsWith("//")) return false
+  if (value.includes("\\")) return false
+  if (hasUnsafeControlChars(value)) return false
+  let reparsed: URL
+  try {
+    reparsed = new URL(value, SAFE_NEXT_BASE)
+  } catch {
+    return false
+  }
+  return reparsed.origin === SAFE_NEXT_BASE
+}
+
+/**
+ * Restricts a `next` redirect target to a same-origin path. Anything that could
+ * leave the app (absolute URL, protocol-relative `//`, backslash normalization,
+ * embedded ASCII control characters such as an encoded `%0A`) or loop back to
+ * /login falls back to the default landing page.
+ */
+export function safeNext(next: string | null | undefined): string {
+  const fallback = "/versions"
+  if (typeof next !== "string") return fallback
+  const candidate = next.trim()
+  if (candidate.length === 0) return fallback
+  // Decoded `%0A`/`%09`/`%0D` arrive as control characters; a URL parser would
+  // strip them and resolve the remainder (for example `//evil.example`).
+  if (hasUnsafeControlChars(candidate)) return fallback
+  if (!candidate.startsWith("/")) return fallback
+  if (candidate.startsWith("//")) return fallback
+  if (candidate.includes("\\")) return fallback
+
+  let resolved: URL
+  try {
+    resolved = new URL(candidate, SAFE_NEXT_BASE)
+  } catch {
+    return fallback
+  }
+  // Normalization (dot segments, backslashes, scheme-relative forms) must not
+  // move the target off the internal origin.
+  if (resolved.origin !== SAFE_NEXT_BASE) return fallback
+  // Dot segments can collapse into a protocol-relative pathname while keeping
+  // the internal origin: `/..//evil.example` resolves to `//evil.example`,
+  // which Next treats as `https://evil.example/`.
+  if (resolved.pathname.startsWith("//")) return fallback
+  if (resolved.pathname.includes("\\")) return fallback
+  if (resolved.pathname === "/login" || resolved.pathname.startsWith("/login/")) return fallback
+  const serialized = `${resolved.pathname}${resolved.search}${resolved.hash}`
+  // Re-check what is actually returned to the router, not just the input.
+  if (!isSingleSlashRootedPath(serialized)) return fallback
+  return serialized
 }
 
 /**
@@ -101,12 +178,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener(AUTH_CLEARED_EVENT, onCleared)
   }, [])
 
+  // localStorage is shared by every tab: adopt a login/logout performed in
+  // another tab instead of waiting for the next reload or API 401.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return
+      if (!isAuthStorageKey(event.key)) return
+      const nextToken = getToken()
+      setToken(nextToken)
+      if (nextToken === null) {
+        setUser(null)
+        setLoading(false)
+        return
+      }
+      setUser(getStoredUser())
+    }
+    window.addEventListener("storage", onStorage)
+    return () => window.removeEventListener("storage", onStorage)
+  }, [])
+
   const login = useCallback(async (username: string, password: string) => {
     const payload = await apiPost<unknown>("/api/auth/login", { username, password })
     const session = readSessionPayload(payload)
     if (session === null) throw invalidResponse("登录响应缺少令牌或用户信息")
 
-    setSession(session.token, session.user)
+    setSession(session.token, session.user, session.expiresAt)
     setToken(session.token)
     setUser(session.user)
   }, [])
@@ -148,10 +244,15 @@ export function useAuth(): AuthContextValue {
 export function RequireAuth({ children }: { children: ReactNode }) {
   const { loading, token } = useAuth()
   const router = useRouter()
+  const pathname = usePathname()
 
   useEffect(() => {
-    if (!loading && token === null) router.replace("/login")
-  }, [loading, token, router])
+    if (loading || token !== null) return
+    // Keep the deep link so login can return the visitor to where they were.
+    const search = typeof window === "undefined" ? "" : window.location.search
+    const target = `${pathname}${search}`
+    router.replace(`/login?next=${encodeURIComponent(target)}`)
+  }, [loading, token, router, pathname])
 
   if (loading) {
     return (

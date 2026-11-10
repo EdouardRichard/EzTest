@@ -10,6 +10,7 @@ import {
   createRequirement,
   dedupeRequirements,
   deleteRequirement,
+  getAttachmentPendingDetails,
   getConversation,
   getRequirement,
   getRequirementExtraction,
@@ -19,6 +20,7 @@ import {
   listQuestions,
   listRequirementRelations,
   listRequirements,
+  listVersionAttachments,
   mergeRequirements,
   pauseRequirementExtraction,
   postMessage,
@@ -575,6 +577,83 @@ describe("clarification api", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ data: progress }))
     await retryRequirementExtraction("2001", "9001", 2)
     expect(readBody(fetchMock.mock.calls[5][1])).toEqual({ segment_seq: 2 })
+  })
+
+  it("lists the version attachments for the overview panel (C-05)", async () => {
+    const rows = [
+      {
+        id: "55",
+        name: "需求文档.docx",
+        mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        size: 2048,
+        extraction_status: "done" as const,
+        error_code: "",
+        error_text: "",
+        image_count: 3,
+      },
+    ]
+    fetchMock.mockResolvedValue(jsonResponse({ data: rows }))
+
+    await expect(listVersionAttachments("2001")).resolves.toEqual(rows)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001/attachments")
+    expect(init?.method).toBe("GET")
+  })
+
+  it("reads the typed 409 attachment_pending progress details (C-04)", () => {
+    const pending = new ApiError({
+      status: 409,
+      code: "attachment_pending",
+      message: "附件解析中，可重试",
+      retryable: true,
+      details: {
+        attachment_id: "55",
+        name: "spec.md",
+        stage: "analyzing_images",
+        images_total: 12,
+        images_done: 3,
+        images_failed: 1,
+        images_skipped: 1,
+        percent: 41,
+        eta_seconds: 60,
+        retry_after_seconds: 2,
+        error: "",
+      },
+    })
+
+    expect(getAttachmentPendingDetails(pending)).toEqual({
+      attachmentId: "55",
+      name: "spec.md",
+      stage: "analyzing_images",
+      imagesTotal: 12,
+      imagesDone: 3,
+      imagesFailed: 1,
+      imagesSkipped: 1,
+      percent: 41,
+      etaSeconds: 60,
+      retryAfterSeconds: 2,
+      error: "",
+    })
+
+    // Old servers only send {attachment_id,name}: the UI still auto-retries but
+    // has no stage/percent to show. Non-pending errors never enter that path.
+    const legacy = new ApiError({
+      status: 409,
+      code: "attachment_pending",
+      message: "附件解析中，可重试",
+      details: { attachment_id: "55", name: "spec.md" },
+    })
+    expect(getAttachmentPendingDetails(legacy)).toMatchObject({
+      attachmentId: "55",
+      stage: null,
+      retryAfterSeconds: 3,
+    })
+    expect(
+      getAttachmentPendingDetails(
+        new ApiError({ status: 503, code: "ai_unavailable", message: "AI 暂不可用" }),
+      ),
+    ).toBeNull()
+    expect(getAttachmentPendingDetails(new Error("boom"))).toBeNull()
   })
 })
 

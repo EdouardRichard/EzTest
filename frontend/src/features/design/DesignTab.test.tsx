@@ -36,6 +36,7 @@ const clarificationApi = vi.hoisted(() => ({
   getTeamRoom: vi.fn(),
   uploadContent: vi.fn(),
   rollbackRequirement: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("@/features/clarification/api", () => clarificationApi)
 
@@ -245,6 +246,7 @@ describe("DesignTab", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=design&conversation=4009&case=7001",
+      { scroll: false },
     )
     expect(await screen.findByText("退款 T+1 到账")).toBeInTheDocument()
     expect(api.getDesignCase).toHaveBeenCalledWith("2001", "7001", undefined)
@@ -268,6 +270,7 @@ describe("DesignTab", () => {
     await waitFor(() =>
       expect(navigation.replace).toHaveBeenCalledWith(
         "/versions/2001?tab=design&conversation=4010",
+        { scroll: false },
       ),
     )
   })

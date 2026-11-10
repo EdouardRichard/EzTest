@@ -446,8 +446,8 @@ function Check-CiWorkflow {
     $testBlock = Get-CiJobBlock -Lines $lines -JobName 'test'
     if ($null -eq $testBlock) {
         $problems.Add('the Ubuntu test job is missing')
-    } elseif ($testBlock -notmatch 'runs-on:[ \t]*ubuntu-latest') {
-        $problems.Add('the test job no longer runs on ubuntu-latest')
+    } elseif ($testBlock -notmatch 'runs-on:[ \t]*ubuntu-(latest|24\.04)') {
+        $problems.Add('the test job no longer runs on an Ubuntu runner (ubuntu-latest or ubuntu-24.04)')
     }
 
     $staticBlock = Get-CiJobBlock -Lines $lines -JobName 'static-acceptance'

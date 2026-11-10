@@ -15,7 +15,6 @@ import { listHumanRequests } from "@/features/execution/api"
 import { formatDateTime } from "@/lib/format"
 
 import { reopenVersion } from "./api"
-import { StageAdvanceAction } from "./StageAdvanceAction"
 import { StageRejectAction } from "./StageRejectAction"
 import { stageLabel } from "./stage"
 import type { Version, VersionStatus } from "./types"
@@ -26,10 +25,17 @@ export type VersionHeaderProps = {
   stage?: StageView | null
   /** Called with the server projection after a successful manual reopen. */
   onReopened?: (version: Version) => void
-  /** Called with the new stage projection after advance/reject. */
+  /** Called with the new stage projection after a reject. */
   onStageChanged?: (view: StageView) => void
   /** Opens the shared topbar/page todo drawer. */
   onOpenTodo?: () => void
+  /**
+   * Short design viewports keep only the title/status/stage row so the inline
+   * workspace gets the height back (R2-D-01). The SUT/created row, the action
+   * buttons and the closed-info paragraph are hidden; every other tab renders
+   * the full header again.
+   */
+  compact?: boolean
 }
 
 const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
@@ -50,6 +56,7 @@ export function VersionHeader({
   onReopened,
   onStageChanged,
   onOpenTodo,
+  compact = false,
 }: VersionHeaderProps) {
   const [openTodoCount, setOpenTodoCount] = useState<number | null>(null)
   const [reopenOpen, setReopenOpen] = useState(false)
@@ -97,7 +104,11 @@ export function VersionHeader({
   }
 
   return (
-    <header data-testid="version-header" className="space-y-3">
+    <header
+      data-testid="version-header"
+      data-compact={compact ? "true" : "false"}
+      className="space-y-3"
+    >
       <div className="flex flex-wrap items-center gap-2">
         <h1 className="text-xl font-semibold text-foreground">{version.title}</h1>
         <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
@@ -112,70 +123,74 @@ export function VersionHeader({
         {version.auto_design_new_requirements ? <Badge tone="info">新需求自动设计</Badge> : null}
       </div>
 
-      <fieldset className="flex flex-wrap items-center gap-2">
-        <legend className="sr-only">版本 SUT</legend>
-        {version.bindings.map((binding) => (
-          <Badge key={binding.id} tone="info">
-            {binding.sut.name}
-          </Badge>
-        ))}
-        <span className="text-[11px] text-muted-foreground">
-          创建于 {formatDateTime(version.created_at)}
-        </span>
-      </fieldset>
+      {compact ? null : (
+        <fieldset className="flex flex-wrap items-center gap-2">
+          <legend className="sr-only">版本 SUT</legend>
+          {version.bindings.map((binding) => (
+            <Badge key={binding.id} tone="info">
+              {binding.sut.name}
+            </Badge>
+          ))}
+          <span className="text-[11px] text-muted-foreground">
+            创建于 {formatDateTime(version.created_at)}
+          </span>
+        </fieldset>
+      )}
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" variant="secondary" data-testid="version-todo-entry" onClick={onOpenTodo}>
-          待办{openTodoCount === null ? "" : ` ${openTodoCount}`}
-        </Button>
-
-        <Link
-          href={`/versions/${encodeURIComponent(version.id)}?tab=chain`}
-          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          查看探索链路
-          <ExternalLink className="size-3.5" aria-hidden="true" />
-        </Link>
-
-        {pendingDesignCount > 0 ? (
-          <Link
-            href={`/versions/${encodeURIComponent(version.id)}?tab=design`}
-            data-testid="version-pending-design"
-            className="inline-flex h-8 items-center rounded-md border border-warning/40 bg-warning/10 px-3 text-xs font-medium text-warning transition-colors hover:bg-warning/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {pendingDesignCount} 条待设计
-          </Link>
-        ) : null}
-
-        <StageAdvanceAction
-          versionId={version.id}
-          stage={stage?.stage ?? null}
-          onAdvanced={onStageChanged}
-        />
-        <StageRejectAction
-          versionId={version.id}
-          stage={stage?.stage ?? null}
-          onRejected={onStageChanged}
-        />
-
-        {completed ? (
+      {compact ? null : (
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant="secondary"
-            data-testid="version-reopen"
-            onClick={() => {
-              setReason("")
-              setError(null)
-              setReopenOpen(true)
-            }}
+            data-testid="version-todo-entry"
+            onClick={onOpenTodo}
           >
-            <RotateCcw className="size-3.5" aria-hidden="true" />
-            重新打开
+            待办{openTodoCount === null ? "" : ` ${openTodoCount}`}
           </Button>
-        ) : null}
-      </div>
 
-      {completed ? (
+          <Link
+            href={`/versions/${encodeURIComponent(version.id)}?tab=chain`}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            查看探索链路
+            <ExternalLink className="size-3.5" aria-hidden="true" />
+          </Link>
+
+          {pendingDesignCount > 0 ? (
+            <Link
+              href={`/versions/${encodeURIComponent(version.id)}?tab=design`}
+              data-testid="version-pending-design"
+              className="inline-flex h-8 items-center rounded-md border border-warning/40 bg-warning/10 px-3 text-xs font-medium text-warning transition-colors hover:bg-warning/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {pendingDesignCount} 条待设计
+            </Link>
+          ) : null}
+
+          <StageRejectAction
+            versionId={version.id}
+            stage={stage?.stage ?? null}
+            onRejected={onStageChanged}
+          />
+
+          {completed ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="version-reopen"
+              onClick={() => {
+                setReason("")
+                setError(null)
+                setReopenOpen(true)
+              }}
+            >
+              <RotateCcw className="size-3.5" aria-hidden="true" />
+              重新打开
+            </Button>
+          ) : null}
+        </div>
+      )}
+
+      {completed && !compact ? (
         <p
           data-testid="version-closed-info"
           className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground"

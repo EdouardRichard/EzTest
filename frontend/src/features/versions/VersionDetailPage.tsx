@@ -16,10 +16,12 @@ import {
   isClarificationQuestionBatch,
   isHumanDecisionKind,
   listQuestions,
+  listVersionAttachments,
   type QuestionBatch,
 } from "@/features/clarification/api"
 import { QuestionCard } from "@/features/clarification/QuestionCard"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import type { VersionAttachment } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { CodeTab } from "@/features/code-intel/CodeTab"
 import { ContextPacketCard } from "@/features/conversation/ContextPacketCard"
@@ -48,6 +50,7 @@ import { formatDateTime } from "@/lib/format"
 import { getVersion, getVersionStage, parseStageBlocker } from "./api"
 import { BindingOverview } from "./BindingOverview"
 import { BlockerPanel } from "./BlockerPanel"
+import { CompletionBlockersPanel } from "./CompletionBlockersPanel"
 import { CoveragePanel } from "./CoveragePanel"
 import { DiscoveryPanel } from "./DiscoveryPanel"
 import { FactsPanel } from "./FactsPanel"
@@ -55,6 +58,7 @@ import { PlanPanel } from "./PlanPanel"
 import { StageBar } from "./StageBar"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
+import { useShortViewport } from "./useShortViewport"
 import { VersionHeader } from "./VersionHeader"
 import { WorkItemsPanel } from "./WorkItemsPanel"
 
@@ -223,6 +227,135 @@ function VersionOverview({
   )
 }
 
+const ATTACHMENT_STATUS_LABEL: Record<string, string> = {
+  pending: "待解析",
+  processing: "解析中",
+  done: "已解析",
+  failed: "解析失败",
+  skipped: "已跳过",
+}
+
+function attachmentStatusTone(
+  status: string,
+): "neutral" | "info" | "success" | "warning" | "danger" {
+  if (status === "done") return "success"
+  if (status === "failed") return "danger"
+  if (status === "processing") return "info"
+  if (status === "skipped") return "warning"
+  return "neutral"
+}
+
+const IMAGE_STATUS_LABEL: Record<string, string> = {
+  pending: "待分析",
+  processing: "分析中",
+  done: "成功",
+  failed: "失败",
+  skipped: "跳过",
+}
+
+function imageStatusTone(status: string): "neutral" | "info" | "success" | "warning" | "danger" {
+  if (status === "done") return "success"
+  if (status === "failed") return "danger"
+  if (status === "skipped") return "warning"
+  if (status === "processing") return "info"
+  return "neutral"
+}
+
+/**
+ * C-05 version attachment panel entry: a read-only list of the version's
+ * attachments (status + image count + extraction reason). Every row links into
+ * the existing `?tab=overview&attachment={id}` image panel, so the user can see
+ * captions without guessing an attachment ID.
+ */
+function VersionAttachmentsSection({
+  versionId,
+  refreshKey,
+  onSelect,
+}: {
+  versionId: string
+  refreshKey: number
+  onSelect: (attachmentId: string) => void
+}) {
+  const [attachments, setAttachments] = useState<VersionAttachment[] | null>(null)
+  const [error, setError] = useState<unknown>(null)
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is the SSE nonce.
+  useEffect(() => {
+    let cancelled = false
+    setError(null)
+    void listVersionAttachments(versionId).then(
+      (rows) => {
+        if (!cancelled) setAttachments(rows)
+      },
+      (cause) => {
+        if (cancelled) return
+        setAttachments(null)
+        setError(cause)
+      },
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [versionId, refreshKey])
+
+  return (
+    <section
+      data-testid="version-attachments"
+      aria-label="版本附件"
+      className="surface-card space-y-2 px-3 py-2.5"
+    >
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">附件</h2>
+          <p className="text-[11px] text-muted-foreground">
+            版本上传的文档与截图；点击查看图片分析结果与 caption（只读）
+          </p>
+        </div>
+        <span className="text-[11px] text-muted-foreground">
+          {attachments === null ? "—" : `${attachments.length} 个附件`}
+        </span>
+      </header>
+      {error !== null ? <InlineError error={error} /> : null}
+      {attachments === null && error === null ? (
+        <LoadingCard label="正在加载版本附件…" />
+      ) : attachments !== null && attachments.length === 0 ? (
+        <p data-testid="version-attachments-empty" className="text-[11px] text-muted-foreground">
+          该版本暂无附件
+        </p>
+      ) : (
+        <ul className="divide-y divide-border">
+          {(attachments ?? []).map((attachment) => (
+            <li key={attachment.id} data-testid={`version-attachment-${attachment.id}`}>
+              <a
+                href={`/versions/${encodeURIComponent(versionId)}?tab=overview&attachment=${encodeURIComponent(attachment.id)}`}
+                onClick={(event) => {
+                  event.preventDefault()
+                  onSelect(attachment.id)
+                }}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 py-2 text-[11px] text-foreground hover:text-primary"
+              >
+                <span className="font-medium">{attachment.name}</span>
+                <span className="text-muted-foreground">#{attachment.id}</span>
+                <Badge tone={attachmentStatusTone(attachment.extraction_status)}>
+                  {ATTACHMENT_STATUS_LABEL[attachment.extraction_status] ??
+                    attachment.extraction_status}
+                </Badge>
+                <span className="text-muted-foreground">{attachment.image_count} 张图片</span>
+                {attachment.error_text !== "" ? (
+                  <span className="text-destructive">{attachment.error_text}</span>
+                ) : null}
+                {attachment.image_count > 0 ? (
+                  <span className="ml-auto text-muted-foreground">查看图片 →</span>
+                ) : null}
+              </a>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
 type AttachmentImageRow = {
   id: string
   attachment_id: string
@@ -235,6 +368,8 @@ type AttachmentImageRow = {
   status: string
   caption: string
   error: string
+  created_at?: string
+  updated_at?: string
 }
 
 /**
@@ -302,6 +437,7 @@ function AttachmentImagesPanel({
 }) {
   const [images, setImages] = useState<AttachmentImageRow[] | null>(null)
   const [error, setError] = useState<unknown>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(async () => {
@@ -325,11 +461,29 @@ function AttachmentImagesPanel({
   async function reanalyze(): Promise<void> {
     setBusy(true)
     setError(null)
+    setNotice(null)
     try {
-      await apiPost(
+      const rows = await apiPost<AttachmentImageRow[]>(
         `/api/versions/${encodeURIComponent(versionId)}/attachments/${encodeURIComponent(attachmentId)}/reanalyze`,
       )
-      await load()
+      if (!Array.isArray(rows)) {
+        await load()
+        return
+      }
+      setImages(rows)
+      // C-08: the POST response is the refreshed image list, so the summary and
+      // the per-row statuses/time update without a second read.
+      const done = rows.filter((image) => image.status === "done").length
+      const failed = rows.filter((image) => image.status === "failed").length
+      const skipped = rows.filter((image) => image.status === "skipped").length
+      const latest = rows.reduce<string | undefined>((newest, image) => {
+        if (image.updated_at === undefined || image.updated_at === "") return newest
+        if (newest === undefined) return image.updated_at
+        return Date.parse(image.updated_at) > Date.parse(newest) ? image.updated_at : newest
+      }, undefined)
+      setNotice(
+        `已重新分析：${done} 成功 / ${failed} 失败 / ${skipped} 跳过（最近更新 ${formatDateTime(latest)}）`,
+      )
     } catch (cause) {
       setError(cause)
     } finally {
@@ -361,6 +515,15 @@ function AttachmentImagesPanel({
           {busy ? "分析中…" : "重新分析图片"}
         </button>
       </header>
+      {notice !== null ? (
+        <p
+          data-testid="attachment-reanalyze-notice"
+          role="status"
+          className="text-[11px] text-success"
+        >
+          {notice}
+        </p>
+      ) : null}
       {error !== null ? <InlineError error={error} /> : null}
       {images === null && error === null ? (
         <LoadingCard label="正在加载附件图片…" />
@@ -369,21 +532,34 @@ function AttachmentImagesPanel({
       ) : (
         <ul className="grid gap-2 sm:grid-cols-2">
           {(images ?? []).map((image) => (
-            <li key={image.id} className="rounded-lg border border-border bg-card p-2 text-[11px]">
+            <li
+              key={image.id}
+              data-testid={`attachment-image-${image.id}`}
+              className="rounded-lg border border-border bg-card p-2 text-[11px]"
+            >
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="font-medium text-foreground">#{image.seq}</span>
-                <Badge tone={image.status === "done" ? "success" : "warning"}>{image.status}</Badge>
+                <Badge tone={imageStatusTone(image.status)}>
+                  {IMAGE_STATUS_LABEL[image.status] ?? image.status}
+                </Badge>
                 <span className="text-muted-foreground">{image.mime}</span>
                 {image.width !== undefined && image.height !== undefined ? (
                   <span className="text-muted-foreground">
                     {image.width}×{image.height}
                   </span>
                 ) : null}
+                <span className="ml-auto text-muted-foreground">
+                  更新于 {formatDateTime(image.updated_at)}
+                </span>
               </div>
               <p className="mt-1 text-foreground">
                 {image.caption !== "" ? image.caption : "暂无 caption"}
               </p>
-              {image.error !== "" ? <p className="mt-1 text-destructive">{image.error}</p> : null}
+              {image.error !== "" ? (
+                <p className="mt-1 text-destructive">
+                  {image.status === "skipped" ? "跳过原因" : "失败原因"}：{image.error}
+                </p>
+              ) : null}
               {image.sha256 !== "" ? <AttachmentImageLink sha256={image.sha256} /> : null}
             </li>
           ))}
@@ -419,6 +595,10 @@ export function VersionDetailPage({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
+  // R2-D-01: on a short viewport the design tab is the only tab that needs the
+  // version chrome compressed; every other tab keeps the approved full header.
+  const shortViewport = useShortViewport()
+  const compactDesignChrome = activeTab === "design" && shortViewport
   const [issueCount, setIssueCount] = useState<number | undefined>(undefined)
   const [reportRevision, setReportRevision] = useState<number | undefined>(undefined)
   const [todoOpen, setTodoOpen] = useState(false)
@@ -456,6 +636,12 @@ export function VersionDetailPage({
   const executionEvidenceId = searchParams.get("evidence") ?? undefined
   // H7: attachment images are only loaded for an explicitly selected attachment.
   const attachmentId = searchParams.get("attachment") ?? undefined
+  // C-05: selecting a row opens the same in-page panel without a full navigation;
+  // the URL is kept in sync so the deep link still works after a reload.
+  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | undefined>(attachmentId)
+  useEffect(() => {
+    setSelectedAttachmentId(attachmentId)
+  }, [attachmentId])
   // W1-4A: work-item and fact deep links inside the overview data blocks.
   const versionWorkItemId = searchParams.get("work_item") ?? undefined
   const versionFactId =
@@ -812,6 +998,23 @@ export function VersionDetailPage({
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
+  /** C-05: open one attachment's image panel from the overview list. */
+  function selectAttachment(id: string): void {
+    setSelectedAttachmentId(id)
+    // Same style as `handleTabChange`: start from the tab URL and keep every
+    // unrelated workspace param (conversation/requirement/…) instead of
+    // dropping it when the image panel opens.
+    const params = new URLSearchParams({ tab: "overview" })
+    for (const [key, value] of searchParams.entries()) {
+      if (key === "tab" || key === "attachment") continue
+      params.set(key, value)
+    }
+    params.set("attachment", id)
+    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+      scroll: false,
+    })
+  }
+
   if (loading) {
     return (
       <div className="space-y-4">
@@ -855,6 +1058,7 @@ export function VersionDetailPage({
       <VersionHeader
         version={version}
         stage={stage}
+        compact={compactDesignChrome}
         onOpenTodo={() => setTodoOpen(true)}
         onReopened={(next) => setVersion(next)}
         onStageChanged={(view) => {
@@ -869,6 +1073,7 @@ export function VersionDetailPage({
             versionId={versionId}
             stage={stage.stage}
             stageEnteredAt={stage.stage_entered_at}
+            compact={compactDesignChrome}
             blocker={parseStageBlocker(stage.blocker)}
             pausedReason={stage.stage === "paused" ? stage.blocker : null}
             disabled={loading}
@@ -890,6 +1095,14 @@ export function VersionDetailPage({
               setStage(view)
               refreshVersionAndCounts()
             }}
+          />
+          {/* R3-E-01: name the open completion conditions while reporting. */}
+          <CompletionBlockersPanel
+            version={version}
+            stage={stage.stage}
+            pendingQuestions={pendingQuestions.length}
+            pendingDecisions={pendingDecisions.length}
+            refreshKey={`${version.updated_at}|${reportRevision ?? ""}`}
           />
         </div>
       ) : null}
@@ -921,7 +1134,10 @@ export function VersionDetailPage({
                     事实 · 作业与任务单 · 上下文包（只读投影）
                   </span>
                 </div>
-                <div className="grid gap-3 lg:grid-cols-2">
+                <div
+                  data-testid="version-data-grid"
+                  className="grid items-start gap-3 lg:grid-cols-2"
+                >
                   <FactsPanel
                     versionId={versionId}
                     initialFactId={versionFactId}
@@ -1008,10 +1224,15 @@ export function VersionDetailPage({
             </>
           ) : null}
           <VersionOverview version={version} showBindings={stage === null} />
-          {attachmentId !== undefined ? (
+          <VersionAttachmentsSection
+            versionId={versionId}
+            refreshKey={attachmentRefreshKey}
+            onSelect={selectAttachment}
+          />
+          {selectedAttachmentId !== undefined ? (
             <AttachmentImagesPanel
               versionId={versionId}
-              attachmentId={attachmentId}
+              attachmentId={selectedAttachmentId}
               refreshKey={attachmentRefreshKey}
             />
           ) : null}

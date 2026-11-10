@@ -110,9 +110,21 @@ type configDTO struct {
 	ReasoningEffort string            `json:"reasoning_effort"`
 	DefaultModelID  string            `json:"default_model_id,omitempty"`
 	Models          []modelDTO        `json:"models"`
+	Health          configHealthDTO   `json:"health"`
 	CreatedBy       string            `json:"created_by,omitempty"`
 	CreatedAt       string            `json:"created_at"`
 	UpdatedAt       string            `json:"updated_at"`
+}
+
+// configHealthDTO is the M-07 configuration pre-check. default_model_valid is
+// false when the configured default model is missing or not selectable;
+// vision_ready is true only when that model can also analyze images. reason is
+// a stable, detail-only code the admin UI localizes; it is empty when the
+// configuration is fully ready.
+type configHealthDTO struct {
+	DefaultModelValid bool   `json:"default_model_valid"`
+	VisionReady       bool   `json:"vision_ready"`
+	Reason            string `json:"reason"`
 }
 
 // toConfigDTO maps one config plus its catalog rows. Protocol is the stored
@@ -143,6 +155,7 @@ func toConfigDTO(cfg llm.Config, models []llm.Model) configDTO {
 		ThinkingType:    cfg.EffectiveThinkingType(),
 		ReasoningEffort: cfg.EffectiveReasoningEffort(),
 		Models:          items,
+		Health:          configHealth(cfg, models),
 		CreatedAt:       formatTime(cfg.CreatedAt),
 		UpdatedAt:       formatTime(cfg.UpdatedAt),
 	}
@@ -155,43 +168,77 @@ func toConfigDTO(cfg llm.Config, models []llm.Model) configDTO {
 	return dto
 }
 
+// configHealth evaluates the persisted default model against the catalog. A
+// configuration with no configured default, or whose default row disappeared,
+// reports default_model_missing; a deprecated/disabled default reports
+// default_model_disabled; a selectable non-vision default is valid but not
+// vision_ready. The reason values are stable detail codes (the message stays
+// English), localized by the admin UI.
+func configHealth(cfg llm.Config, models []llm.Model) configHealthDTO {
+	if cfg.DefaultModelID <= 0 {
+		return configHealthDTO{Reason: "default_model_missing"}
+	}
+	for _, model := range models {
+		if model.ID != cfg.DefaultModelID {
+			continue
+		}
+		if !model.Selectable() {
+			return configHealthDTO{Reason: "default_model_disabled"}
+		}
+		capabilities := model.EffectiveCapabilities()
+		if !capabilities.SupportsVision {
+			return configHealthDTO{DefaultModelValid: true, Reason: "default_model_not_vision"}
+		}
+		return configHealthDTO{DefaultModelValid: true, VisionReady: true}
+	}
+	return configHealthDTO{Reason: "default_model_missing"}
+}
+
 type modelDTO struct {
-	ID             string           `json:"id"`
-	ConfigID       string           `json:"config_id"`
-	Model          string           `json:"model"`
-	DisplayName    string           `json:"display_name"`
-	ContextWindow  int              `json:"context_window"`
-	MaxOutput      int              `json:"max_output"`
-	MaxInput       int64            `json:"max_input"`
-	SupportsTools  bool             `json:"supports_tools"`
-	SupportsVision bool             `json:"supports_vision"`
-	Capabilities   llm.Capabilities `json:"capabilities"`
-	Deprecated     bool             `json:"deprecated"`
-	Source         string           `json:"source"`
-	WindowSource   string           `json:"window_source"`
-	OutputSource   string           `json:"output_source"`
-	Status         string           `json:"status"`
-	CreatedAt      string           `json:"created_at"`
-	UpdatedAt      string           `json:"updated_at"`
+	ID                        string           `json:"id"`
+	ConfigID                  string           `json:"config_id"`
+	Model                     string           `json:"model"`
+	DisplayName               string           `json:"display_name"`
+	ContextWindow             int              `json:"context_window"`
+	MaxOutput                 int              `json:"max_output"`
+	MaxInput                  int64            `json:"max_input"`
+	SupportsTools             bool             `json:"supports_tools"`
+	SupportsVision            bool             `json:"supports_vision"`
+	SupportsToolsSource       string           `json:"supports_tools_source"`
+	SupportsVisionSource      string           `json:"supports_vision_source"`
+	SupportsReasoningSource   string           `json:"supports_reasoning_source"`
+	SupportsPromptCacheSource string           `json:"supports_prompt_cache_source"`
+	Capabilities              llm.Capabilities `json:"capabilities"`
+	Deprecated                bool             `json:"deprecated"`
+	Source                    string           `json:"source"`
+	WindowSource              string           `json:"window_source"`
+	OutputSource              string           `json:"output_source"`
+	Status                    string           `json:"status"`
+	CreatedAt                 string           `json:"created_at"`
+	UpdatedAt                 string           `json:"updated_at"`
 }
 
 // publicModelDTO is the login-user model catalog item (OpenAPI
 // PublicModelView). It deliberately omits api_key/base_url/headers and the
 // internal catalog metadata: only what a model picker needs.
 type publicModelDTO struct {
-	ID            string           `json:"id"`
-	ConfigID      string           `json:"config_id"`
-	ConfigName    string           `json:"config_name"`
-	Model         string           `json:"model"`
-	DisplayName   string           `json:"display_name"`
-	ContextWindow int              `json:"context_window"`
-	MaxOutput     int              `json:"max_output"`
-	MaxInput      int64            `json:"max_input"`
-	WindowSource  string           `json:"window_source"`
-	OutputSource  string           `json:"output_source"`
-	Capabilities  llm.Capabilities `json:"capabilities"`
-	Default       bool             `json:"default"`
-	Deprecated    bool             `json:"deprecated"`
+	ID                        string           `json:"id"`
+	ConfigID                  string           `json:"config_id"`
+	ConfigName                string           `json:"config_name"`
+	Model                     string           `json:"model"`
+	DisplayName               string           `json:"display_name"`
+	ContextWindow             int              `json:"context_window"`
+	MaxOutput                 int              `json:"max_output"`
+	MaxInput                  int64            `json:"max_input"`
+	WindowSource              string           `json:"window_source"`
+	OutputSource              string           `json:"output_source"`
+	SupportsToolsSource       string           `json:"supports_tools_source"`
+	SupportsVisionSource      string           `json:"supports_vision_source"`
+	SupportsReasoningSource   string           `json:"supports_reasoning_source"`
+	SupportsPromptCacheSource string           `json:"supports_prompt_cache_source"`
+	Capabilities              llm.Capabilities `json:"capabilities"`
+	Default                   bool             `json:"default"`
+	Deprecated                bool             `json:"deprecated"`
 }
 
 // apiCapabilities returns the capability set exposed over HTTP. The catalog_*
@@ -213,41 +260,50 @@ func apiCapabilities(model llm.Model) llm.Capabilities {
 func toPublicModelDTO(model llm.Model, cfg llm.Config) publicModelDTO {
 	capabilities := apiCapabilities(model)
 	return publicModelDTO{
-		ID:            strconv.FormatInt(model.ID, 10),
-		ConfigID:      strconv.FormatInt(model.ConfigID, 10),
-		ConfigName:    cfg.Name,
-		Model:         model.Model,
-		DisplayName:   model.DisplayName,
-		ContextWindow: capabilities.ContextWindow,
-		MaxOutput:     model.MaxOutput,
-		MaxInput:      llmapp.MaxInput(model),
-		WindowSource:  model.EffectiveWindowSource(),
-		OutputSource:  model.EffectiveOutputSource(),
-		Capabilities:  capabilities,
-		Default:       cfg.DefaultModelID == model.ID,
-		Deprecated:    model.Deprecated,
+		ID:                        strconv.FormatInt(model.ID, 10),
+		ConfigID:                  strconv.FormatInt(model.ConfigID, 10),
+		ConfigName:                cfg.Name,
+		Model:                     model.Model,
+		DisplayName:               model.DisplayName,
+		ContextWindow:             capabilities.ContextWindow,
+		MaxOutput:                 model.MaxOutput,
+		MaxInput:                  llmapp.MaxInput(model),
+		WindowSource:              model.EffectiveWindowSource(),
+		OutputSource:              model.EffectiveOutputSource(),
+		SupportsToolsSource:       capabilities.SupportsToolsSource,
+		SupportsVisionSource:      capabilities.SupportsVisionSource,
+		SupportsReasoningSource:   capabilities.SupportsReasoningSource,
+		SupportsPromptCacheSource: capabilities.SupportsPromptCacheSource,
+		Capabilities:              capabilities,
+		Default:                   cfg.DefaultModelID == model.ID,
+		Deprecated:                model.Deprecated,
 	}
 }
 
 func toModelDTO(model llm.Model) modelDTO {
+	capabilities := apiCapabilities(model)
 	return modelDTO{
-		ID:             strconv.FormatInt(model.ID, 10),
-		ConfigID:       strconv.FormatInt(model.ConfigID, 10),
-		Model:          model.Model,
-		DisplayName:    model.DisplayName,
-		ContextWindow:  model.ContextWindow,
-		MaxOutput:      model.MaxOutput,
-		MaxInput:       llmapp.MaxInput(model),
-		SupportsTools:  model.SupportsTools,
-		SupportsVision: model.SupportsVision,
-		Capabilities:   apiCapabilities(model),
-		Deprecated:     model.Deprecated,
-		Source:         model.Source,
-		WindowSource:   model.EffectiveWindowSource(),
-		OutputSource:   model.EffectiveOutputSource(),
-		Status:         model.Status,
-		CreatedAt:      formatTime(model.CreatedAt),
-		UpdatedAt:      formatTime(model.UpdatedAt),
+		ID:                        strconv.FormatInt(model.ID, 10),
+		ConfigID:                  strconv.FormatInt(model.ConfigID, 10),
+		Model:                     model.Model,
+		DisplayName:               model.DisplayName,
+		ContextWindow:             model.ContextWindow,
+		MaxOutput:                 model.MaxOutput,
+		MaxInput:                  llmapp.MaxInput(model),
+		SupportsTools:             capabilities.SupportsTools,
+		SupportsVision:            capabilities.SupportsVision,
+		SupportsToolsSource:       capabilities.SupportsToolsSource,
+		SupportsVisionSource:      capabilities.SupportsVisionSource,
+		SupportsReasoningSource:   capabilities.SupportsReasoningSource,
+		SupportsPromptCacheSource: capabilities.SupportsPromptCacheSource,
+		Capabilities:              capabilities,
+		Deprecated:                model.Deprecated,
+		Source:                    model.Source,
+		WindowSource:              model.EffectiveWindowSource(),
+		OutputSource:              model.EffectiveOutputSource(),
+		Status:                    model.Status,
+		CreatedAt:                 formatTime(model.CreatedAt),
+		UpdatedAt:                 formatTime(model.UpdatedAt),
 	}
 }
 
