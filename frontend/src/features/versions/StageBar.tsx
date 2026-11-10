@@ -51,6 +51,12 @@ export type StageBarProps = {
   onStageSelect?: (stage: VersionStage) => void
   /** Disables every write control (for example while the page projection is loading). */
   disabled?: boolean
+  /**
+   * Short design viewports hide the "版本阶段 / 进入于" header row only; the
+   * stage pills, blocked/paused overlays and write actions stay available
+   * (R2-D-01).
+   */
+  compact?: boolean
 }
 
 /**
@@ -74,6 +80,7 @@ export function StageBar({
   onStageChanged,
   onStageSelect,
   disabled = false,
+  compact = false,
 }: StageBarProps) {
   const [local, setLocal] = useState<{ signature: string; view: StageView } | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -132,20 +139,23 @@ export function StageBar({
   return (
     <section
       data-testid="stage-bar"
+      data-compact={compact ? "true" : "false"}
       aria-label="版本阶段"
       className="space-y-2 rounded-xl border border-border bg-card px-3 py-2"
     >
-      <header className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <h3 className="text-sm font-semibold text-foreground">版本阶段</h3>
-          <Badge tone={blocked ? "danger" : paused ? "warning" : "info"}>
-            {stageLabel(activeStage)}
-          </Badge>
-        </div>
-        <span data-testid="stage-entered-at" className="text-[11px] text-muted-foreground">
-          进入于 {formatDateTime(activeEnteredAt)}
-        </span>
-      </header>
+      {compact ? null : (
+        <header className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <h3 className="text-sm font-semibold text-foreground">版本阶段</h3>
+            <Badge tone={blocked ? "danger" : paused ? "warning" : "info"}>
+              {stageLabel(activeStage)}
+            </Badge>
+          </div>
+          <span data-testid="stage-entered-at" className="text-[11px] text-muted-foreground">
+            进入于 {formatDateTime(activeEnteredAt)}
+          </span>
+        </header>
+      )}
 
       <ol aria-label="阶段流转" className="flex flex-wrap items-center gap-1">
         {WORKFLOW_STAGES.map((item, index) => {

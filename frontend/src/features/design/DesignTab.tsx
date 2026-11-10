@@ -23,6 +23,7 @@ import {
   designActionsAllowed,
   designStageGuidance,
 } from "@/features/versions/stage"
+import { useShortViewport } from "@/features/versions/useShortViewport"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
@@ -224,6 +225,10 @@ export function DesignTab({
 
   const [chatCollapsed, setChatCollapsed] = useState(false)
   const [shortViewport, setShortViewport] = useState(false)
+  // R2-D-02: the page chrome is compacted from the same media query, so the
+  // workspace may reclaim the reserved .app-content bottom inset on short
+  // viewports and contain the page instead of scrolling it.
+  const shortMediaViewport = useShortViewport()
   const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
   /** Graph + detail enlarged together in the 90vw×90vh floating dialog (R-D2-3). */
   const [focusOpen, setFocusOpen] = useState(false)
@@ -715,8 +720,13 @@ export function DesignTab({
       const workspace = workspaceRef.current
       if (workspace === null) return
       const top = workspace.getBoundingClientRect().top
-      const available = Math.max(0, window.innerHeight - top - PAGE_BOTTOM_INSET)
-      setWorkspaceHeight(`${Math.round(available)}px`)
+      // Short viewports get compact page chrome, so the reserved 48px
+      // app-content inset is reclaimed below the workspace and compensated by
+      // the negative margin on the root. The document still ends at the
+      // viewport bottom (R2-D-02).
+      const bottomInset = shortMediaViewport ? 0 : PAGE_BOTTOM_INSET
+      const available = Math.max(0, window.innerHeight - top - bottomInset)
+      setWorkspaceHeight(`${Math.floor(available)}px`)
       const isShort =
         available < SHORT_WORKSPACE_HEIGHT || window.innerWidth < NARROW_WORKSPACE_WIDTH
       setShortViewport(isShort)
@@ -740,7 +750,7 @@ export function DesignTab({
       window.removeEventListener("resize", updateHeight)
       observer?.disconnect()
     }
-  }, [loading, graph, stage])
+  }, [loading, graph, stage, shortMediaViewport])
 
   if (loading) {
     return (
@@ -900,8 +910,15 @@ export function DesignTab({
       data-testid="design-scroll"
       data-short-viewport={shortViewport ? "true" : "false"}
       data-compact={compact ? "true" : "false"}
-      className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
-      style={{ height: workspaceHeight, overflow: "hidden" }}
+      className="relative flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
+      style={{
+        height: workspaceHeight,
+        overflow: "hidden",
+        // The workspace ends at the viewport bottom on short viewports; pull
+        // the .app-content bottom padding back under it so the document does
+        // not gain 48px of scroll height (R2-D-02).
+        marginBottom: shortMediaViewport ? -PAGE_BOTTOM_INSET : undefined,
+      }}
     >
       <header
         data-testid="design-header"

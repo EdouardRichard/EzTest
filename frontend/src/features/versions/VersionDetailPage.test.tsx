@@ -193,6 +193,33 @@ const completedVersion: Version = {
   close_reason: "需求全部闭环，报告已发布",
 }
 
+/**
+ * `vitest.setup.ts` stubs matchMedia as a static false query. The short-viewport
+ * chrome rule reads the real media query, so page tests opt into a deterministic
+ * match here.
+ */
+function mockViewportMedia(matches: boolean): void {
+  vi.spyOn(window, "matchMedia").mockReturnValue({
+    matches,
+    media: "(max-height: 840px)",
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(() => false),
+  } as unknown as MediaQueryList)
+}
+
+function stageProjection(stage: "designing" | "executing") {
+  return {
+    version_id: "2001",
+    stage,
+    stage_entered_at: "2026-11-01T09:00:00Z",
+    blocker: null,
+  }
+}
+
 describe("VersionDetailPage", () => {
   beforeEach(() => {
     api.getVersion.mockReset()
@@ -571,6 +598,39 @@ describe("VersionDetailPage", () => {
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
     expect(screen.getByTestId("design-workspace")).toHaveAttribute("data-export-id", "9001")
     expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("compacts the version chrome on the design tab only in a short viewport", async () => {
+    mockViewportMedia(true)
+    api.getVersionStage.mockResolvedValue(stageProjection("designing"))
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    await waitFor(() =>
+      expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "true"),
+    )
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "true")
+    expect(screen.getByTestId("design-workspace")).toBeInTheDocument()
+
+    // Leaving the design tab restores the full chrome again.
+    fireEvent.click(screen.getByRole("tab", { name: "总览" }))
+    await waitFor(() =>
+      expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "false"),
+    )
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "false")
+  })
+
+  it("keeps the full version chrome on a tall design viewport", async () => {
+    mockViewportMedia(false)
+    api.getVersionStage.mockResolvedValue(stageProjection("designing"))
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByText("订单中心")).toBeInTheDocument()
   })
 
   it("mounts the clarification workspace when the requirements tab is selected", async () => {

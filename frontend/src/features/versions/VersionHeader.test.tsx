@@ -80,6 +80,48 @@ describe("VersionHeader", () => {
     expect(screen.getByTestId("version-stage")).toHaveTextContent("阶段 · 用例待确认")
   })
 
+  it("keeps only the title/status/stage row in compact mode", () => {
+    render(
+      <VersionHeader
+        version={completedVersion}
+        compact
+        stage={{
+          version_id: "2001",
+          stage: "completed",
+          stage_entered_at: "2026-11-01T03:00:00Z",
+          blocker: null,
+        }}
+      />,
+    )
+
+    const header = screen.getByTestId("version-header")
+    expect(header).toHaveAttribute("data-compact", "true")
+    // Required identity/state survives.
+    expect(screen.getByRole("heading", { name: completedVersion.title })).toBeInTheDocument()
+    expect(screen.getByText("已完成")).toBeInTheDocument()
+    expect(screen.getByTestId("version-stage")).toHaveTextContent("阶段 · 已完成")
+    // Secondary rows are removed: SUT/created, action buttons and closed info.
+    expect(screen.queryByText("订单中心")).not.toBeInTheDocument()
+    expect(screen.queryByText("支付网关")).not.toBeInTheDocument()
+    expect(screen.queryByText(/创建于/)).not.toBeInTheDocument()
+    expect(screen.queryByTestId("version-todo-entry")).not.toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: "查看探索链路" })).not.toBeInTheDocument()
+    expect(screen.queryByTestId("version-pending-design")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "重新打开" })).not.toBeInTheDocument()
+    expect(screen.queryByTestId("version-closed-info")).not.toBeInTheDocument()
+  })
+
+  it("renders every row without the compact flag", () => {
+    render(<VersionHeader version={runningVersion} />)
+
+    expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByText("订单中心")).toBeInTheDocument()
+    expect(screen.getByText(/创建于/)).toBeInTheDocument()
+    expect(screen.getByTestId("version-todo-entry")).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "查看探索链路" })).toBeInTheDocument()
+    expect(screen.getByTestId("version-pending-design")).toBeInTheDocument()
+  })
+
   it("offers no manual stage advance entry", () => {
     render(
       <VersionHeader

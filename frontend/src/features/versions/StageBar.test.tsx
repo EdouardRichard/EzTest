@@ -68,6 +68,31 @@ describe("StageBar", () => {
     expect(transition).toHaveTextContent("host")
   })
 
+  it("keeps only the stage pills and write actions in compact mode", () => {
+    render(
+      <StageBar versionId="2001" stage="executing" stageEnteredAt="2026-11-01T09:00:00Z" compact />,
+    )
+
+    const bar = screen.getByTestId("stage-bar")
+    expect(bar).toHaveAttribute("data-compact", "true")
+    // The header row (title + entered-at) is gone.
+    expect(screen.queryByText("版本阶段")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("stage-entered-at")).not.toBeInTheDocument()
+    // Pills and action buttons survive.
+    expect(screen.getByTestId("stage-item-executing")).toHaveAttribute("aria-current", "step")
+    expect(screen.getByTestId("stage-item-created")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "暂停版本" })).toBeInTheDocument()
+  })
+
+  it("keeps the header row and data-compact=false without the flag", () => {
+    render(<StageBar versionId="2001" stage="executing" stageEnteredAt="2026-11-01T09:00:00Z" />)
+
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByText("版本阶段")).toBeInTheDocument()
+    expect(screen.getByTestId("stage-entered-at")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "暂停版本" })).toBeInTheDocument()
+  })
+
   it("offers no manual stage advance control in any workflow stage", () => {
     const { rerender } = render(
       <StageBar versionId="2001" stage="clarifying" stageEnteredAt="2026-11-01T06:00:00Z" />,

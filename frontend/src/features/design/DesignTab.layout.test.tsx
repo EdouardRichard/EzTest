@@ -156,6 +156,23 @@ function mockViewportRects(rects: Record<string, Partial<DOMRect>>): void {
   })
 }
 
+/**
+ * jsdom's matchMedia is a static false stub (vitest.setup.ts). The short-viewport
+ * inset rule reads the real media query, so layout tests opt into a fixed match.
+ */
+function mockViewportMedia(matches: boolean): void {
+  vi.spyOn(window, "matchMedia").mockReturnValue({
+    matches,
+    media: "(max-height: 840px)",
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(() => false),
+  } as unknown as MediaQueryList)
+}
+
 describe("DesignTab split layout (R-D2)", () => {
   beforeEach(() => {
     for (const fn of Object.values(designApi)) fn.mockReset()
@@ -458,5 +475,57 @@ describe("DesignTab split layout (R-D2)", () => {
     expect(mainTop.style.minHeight).toBe("420px")
     expect(screen.getByTestId("design-split-main-bottom").style.minHeight).toBe("200px")
     expect(screen.getByTestId("design-split-main")).toHaveClass("overflow-y-auto")
+  })
+
+  it("uses the full remaining viewport height and contains page scroll on a short viewport", async () => {
+    // R2-D-01/D-02: compact chrome + inset 0 gives the workspace the whole
+    // remainder; the negative margin absorbs the .app-content bottom padding so
+    // the document still ends exactly at the viewport bottom.
+    mockViewportMedia(true)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(800)
+    mockViewportRects({ "design-scroll": { top: 371, height: 429, bottom: 800 } })
+
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-mindmap")
+
+    const root = screen.getByTestId("design-scroll")
+    await waitFor(() => expect(root.style.height).toBe("429px"))
+    expect(root.style.marginBottom).toBe("-48px")
+    // The positioning containing block clips the absolutely positioned sr-only
+    // controls instead of letting them stretch the document (R2-D-02).
+    expect(root).toHaveClass("relative", "overflow-hidden")
+    expect(root.style.overflow).toBe("hidden")
+  })
+
+  it("keeps the approved 48px inset on a tall viewport", async () => {
+    mockViewportMedia(false)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(900)
+    mockViewportRects({ "design-scroll": { top: 400, height: 452, bottom: 852 } })
+
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-mindmap")
+
+    const root = screen.getByTestId("design-scroll")
+    await waitFor(() => expect(root.style.height).toBe("452px"))
+    expect(root.style.marginBottom).toBe("")
+    expect(root).toHaveClass("relative")
+  })
+
+  it("floors a fractional workspace height instead of rounding the document taller", async () => {
+    // 1440x900: a fractional `top` (521.5) leaves 330.5px below the version
+    // chrome once the 48px inset is reserved. Rounding up would set 331px and
+    // make documentElement.scrollHeight 901 vs clientHeight 900; the inline
+    // height must floor so the document never grows past the viewport.
+    mockViewportMedia(false)
+    vi.spyOn(window, "innerHeight", "get").mockReturnValue(900)
+    mockViewportRects({ "design-scroll": { top: 521.5, height: 330.5, bottom: 852 } })
+
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-mindmap")
+
+    const root = screen.getByTestId("design-scroll")
+    await waitFor(() => expect(root.style.height).toBe("330px"))
+    // Pins the direction: 330.5 must not become 331.
+    expect(root.style.height).not.toBe("331px")
   })
 })

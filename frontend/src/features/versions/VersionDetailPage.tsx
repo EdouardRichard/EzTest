@@ -57,6 +57,7 @@ import { PlanPanel } from "./PlanPanel"
 import { StageBar } from "./StageBar"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
+import { useShortViewport } from "./useShortViewport"
 import { VersionHeader } from "./VersionHeader"
 import { WorkItemsPanel } from "./WorkItemsPanel"
 
@@ -593,6 +594,10 @@ export function VersionDetailPage({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
+  // R2-D-01: on a short viewport the design tab is the only tab that needs the
+  // version chrome compressed; every other tab keeps the approved full header.
+  const shortViewport = useShortViewport()
+  const compactDesignChrome = activeTab === "design" && shortViewport
   const [issueCount, setIssueCount] = useState<number | undefined>(undefined)
   const [reportRevision, setReportRevision] = useState<number | undefined>(undefined)
   const [todoOpen, setTodoOpen] = useState(false)
@@ -1050,6 +1055,7 @@ export function VersionDetailPage({
       <VersionHeader
         version={version}
         stage={stage}
+        compact={compactDesignChrome}
         onOpenTodo={() => setTodoOpen(true)}
         onReopened={(next) => setVersion(next)}
         onStageChanged={(view) => {
@@ -1064,6 +1070,7 @@ export function VersionDetailPage({
             versionId={versionId}
             stage={stage.stage}
             stageEnteredAt={stage.stage_entered_at}
+            compact={compactDesignChrome}
             blocker={parseStageBlocker(stage.blocker)}
             pausedReason={stage.stage === "paused" ? stage.blocker : null}
             disabled={loading}
