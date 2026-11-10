@@ -309,7 +309,9 @@ describe("ReportsTab", () => {
     fireEvent.click(await screen.findByTestId("report-8102"))
 
     await waitFor(() => expect(api.getReport).toHaveBeenCalledWith("2001", "8102"))
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=reports&report=8102")
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=reports&report=8102", {
+      scroll: false,
+    })
     expect(await within(detailPanel()).findByRole("heading", { level: 2 })).toHaveTextContent(
       "波次 #9201",
     )
@@ -327,6 +329,7 @@ describe("ReportsTab", () => {
     )
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=reports&report=8101&revision=1",
+      { scroll: false },
     )
   })
 
@@ -390,6 +393,7 @@ describe("ReportsTab", () => {
     expect(within(detailPanel()).getByText(/2026-10-31/)).toHaveTextContent("2026-10-31")
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=reports&report=8101&revision=1",
+      { scroll: false },
     )
     expect(sse.calls).toBe(1)
   })

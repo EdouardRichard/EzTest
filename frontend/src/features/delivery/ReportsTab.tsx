@@ -403,7 +403,9 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       const params = new URLSearchParams({ tab: "reports" })
       if (reportId !== null) params.set("report", reportId)
       if (revisionNumber !== null) params.set("revision", String(revisionNumber))
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )

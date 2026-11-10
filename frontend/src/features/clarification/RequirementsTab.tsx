@@ -438,6 +438,15 @@ export function RequirementsTab({
   // `extraction.*` SSE events can arrive once per segment; coalesce them into a
   // single progress read instead of one GET per event.
   const extractionEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /**
+   * The in-page URL sync about to run can remount the chat panel for one frame
+   * while the RSC transition settles; the document then clamps to the top and
+   * the requirement list loses its offset. Remember both offsets before the
+   * selection and restore them once the transition has painted (the jump is a
+   * UX regression only — the selection itself keeps the URL contract).
+   */
+  const pendingScrollRestore = useRef<{ windowY: number; listTop: number } | null>(null)
+  const requirementListRef = useRef<HTMLDivElement | null>(null)
 
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
@@ -599,6 +608,35 @@ export function RequirementsTab({
     onExtractionChanged: scheduleExtractionRefresh,
   })
 
+  // Restore the pre-selection scroll offsets after the in-page URL transition.
+  // The first timer covers a same-tick clamp, the second one the RSC remount
+  // window; a later restore only runs while the page is still at the top.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the selection ids are the re-run trigger; the saved offsets live in a ref.
+  useEffect(() => {
+    const saved = pendingScrollRestore.current
+    if (saved === null) return undefined
+    let cancelled = false
+    const restore = () => {
+      if (cancelled) return
+      if (saved.windowY > 0 && window.scrollY === 0) window.scrollTo(0, saved.windowY)
+      const list = requirementListRef.current
+      if (list !== null && saved.listTop > 0 && list.scrollTop === 0) {
+        list.scrollTop = saved.listTop
+      }
+    }
+    const firstFrame = setTimeout(restore, 0)
+    const afterTransition = setTimeout(restore, 150)
+    const clear = setTimeout(() => {
+      pendingScrollRestore.current = null
+    }, 900)
+    return () => {
+      cancelled = true
+      clearTimeout(firstFrame)
+      clearTimeout(afterTransition)
+      clearTimeout(clear)
+    }
+  }, [selectedRequirementId, activeConversationId])
+
   const targetOptions = useMemo<TargetOptions>(() => {
     if (version === null) return { suts: [], pages: [], apis: [] }
     const suts = new Map<string, string>()
@@ -633,17 +671,30 @@ export function RequirementsTab({
   const stats = version as (Version & Partial<VersionClarificationStats>) | null
   const pendingDesignCount = stats?.pending_design_count ?? clarifiedCount
 
+  function rememberScrollPosition(): void {
+    pendingScrollRestore.current = {
+      windowY: window.scrollY,
+      listTop: requirementListRef.current?.scrollTop ?? 0,
+    }
+  }
+
   function selectRequirement(requirementId: string): void {
+    rememberScrollPosition()
     setSelectedRequirementId(requirementId)
     setBulkNotice(null)
     setEditorNotice(null)
-    router.replace(buildWorkspaceUrl(versionId, activeConversationId, requirementId))
+    router.replace(buildWorkspaceUrl(versionId, activeConversationId, requirementId), {
+      scroll: false,
+    })
   }
 
   function selectConversation(conversationId: string): void {
+    rememberScrollPosition()
     setActiveConversationId(conversationId)
     setActivity(null)
-    router.replace(buildWorkspaceUrl(versionId, conversationId, selectedRequirementId))
+    router.replace(buildWorkspaceUrl(versionId, conversationId, selectedRequirementId), {
+      scroll: false,
+    })
   }
 
   async function createNewConversation(): Promise<void> {
@@ -660,7 +711,7 @@ export function RequirementsTab({
       setDetail(null)
       setLiveMessages([])
       setActivity(null)
-      router.replace(buildWorkspaceUrl(versionId, conversation.id, null))
+      router.replace(buildWorkspaceUrl(versionId, conversation.id, null), { scroll: false })
     } catch (cause) {
       setCreateError(cause)
     } finally {
@@ -736,7 +787,7 @@ export function RequirementsTab({
       if (selectedRequirementId !== null && deleted.includes(selectedRequirementId)) {
         setSelectedRequirementId(null)
         setDetail(null)
-        router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, null), { scroll: false })
       }
     } catch (cause) {
       setCleanupError(failure ?? cause)
@@ -761,7 +812,9 @@ export function RequirementsTab({
       if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
         setSelectedRequirementId(targetRequirementId)
         setDetailToken((token) => token + 1)
-        router.replace(buildWorkspaceUrl(versionId, activeConversationId, targetRequirementId))
+        router.replace(buildWorkspaceUrl(versionId, activeConversationId, targetRequirementId), {
+          scroll: false,
+        })
       } else if (selectedRequirementId === targetRequirementId) {
         setDetailToken((token) => token + 1)
       }
@@ -787,7 +840,9 @@ export function RequirementsTab({
         if (selectedRequirementId !== null && retired.has(selectedRequirementId)) {
           setSelectedRequirementId(null)
           setDetail(null)
-          router.replace(buildWorkspaceUrl(versionId, activeConversationId, null))
+          router.replace(buildWorkspaceUrl(versionId, activeConversationId, null), {
+            scroll: false,
+          })
         }
       }
       await Promise.all([loadRequirements(), loadVersion()])
@@ -985,6 +1040,7 @@ export function RequirementsTab({
           {detailError !== null ? <InlineError error={detailError} /> : null}
 
           <RequirementSidebar
+            listRef={requirementListRef}
             requirements={requirements}
             targetOptions={targetOptions}
             filter={filter}

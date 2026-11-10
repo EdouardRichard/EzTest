@@ -342,7 +342,9 @@ describe("IssuesTab", () => {
 
     expect(api.getIssue).toHaveBeenCalledWith("2001", "9101")
     expect(within(sheet).getByText("点击提交后未跳转到支付页")).toBeInTheDocument()
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=issues&issue=9101")
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=issues&issue=9101", {
+      scroll: false,
+    })
   })
 
   it("closes the detail sheet and removes ?issue= from the URL", async () => {
@@ -354,7 +356,9 @@ describe("IssuesTab", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "问题详情" })).not.toBeInTheDocument()
     })
-    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=issues")
+    expect(navigation.replace).toHaveBeenLastCalledWith("/versions/2001?tab=issues", {
+      scroll: false,
+    })
   })
 
   it("opens the deep-linked ?issue= detail without rewriting the URL", async () => {

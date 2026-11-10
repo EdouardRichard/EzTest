@@ -1,6 +1,6 @@
 "use client"
 
-import type { ReactNode } from "react"
+import type { ReactNode, RefObject } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { cn } from "@/components/ui/cn"
@@ -26,6 +26,8 @@ export type RequirementSidebarProps = {
   bulk?: ReactNode
   /** Requirement editor rendered under the list. */
   editor?: ReactNode
+  /** Scroll container ref: the parent restores its offset after a selection. */
+  listRef?: RefObject<HTMLDivElement | null>
 }
 
 type FilterItem = {
@@ -60,6 +62,7 @@ export function RequirementSidebar({
   onSelectRequirement,
   bulk,
   editor,
+  listRef,
 }: RequirementSidebarProps) {
   const counts = {
     all: requirements.length,
@@ -124,7 +127,11 @@ export function RequirementSidebar({
 
       {bulk}
 
-      <div className="max-h-[340px] space-y-1 overflow-y-auto px-2.5 py-2.5">
+      <div
+        ref={listRef}
+        data-testid="requirement-list"
+        className="max-h-[340px] space-y-1 overflow-y-auto px-2.5 py-2.5"
+      >
         {visible.length === 0 ? (
           <EmptyState
             title="暂无需求"

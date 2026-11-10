@@ -1010,7 +1010,9 @@ export function VersionDetailPage({
       params.set(key, value)
     }
     params.set("attachment", id)
-    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+      scroll: false,
+    })
   }
 
   if (loading) {

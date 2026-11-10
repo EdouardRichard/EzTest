@@ -217,7 +217,9 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
     (issueId: string | null) => {
       const params = new URLSearchParams({ tab: "issues" })
       if (issueId !== null) params.set("issue", issueId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )

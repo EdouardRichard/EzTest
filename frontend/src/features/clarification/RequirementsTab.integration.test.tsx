@@ -196,8 +196,30 @@ describe("RequirementsTab integration", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4001&requirement=6001",
+      { scroll: false },
     )
     expect(await screen.findByTestId("requirement-editor")).toHaveTextContent("退款到账时效")
+  })
+
+  it("restores the page and requirement-list scroll after selecting a requirement", async () => {
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => {})
+    let pageScrollY = 400
+    vi.spyOn(window, "scrollY", "get").mockImplementation(() => pageScrollY)
+
+    render(<RequirementsTab versionId="2001" />)
+    await screen.findByTestId("requirements-tab")
+
+    const list = screen.getByTestId("requirement-list")
+    list.scrollTop = 120
+
+    fireEvent.click(screen.getByRole("button", { name: "退款到账时效" }))
+
+    // The RSC transition clamps both offsets to the top before the restore runs.
+    pageScrollY = 0
+    list.scrollTop = 0
+
+    await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 400), { timeout: 1000 })
+    expect(list.scrollTop).toBe(120)
   })
 
   it("switches conversations from the history dropdown and writes the URL", async () => {
@@ -209,6 +231,7 @@ describe("RequirementsTab integration", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4002",
+      { scroll: false },
     )
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4002"))
     expect(screen.getByText(conversationSecondFixture.title)).toBeInTheDocument()
@@ -227,6 +250,7 @@ describe("RequirementsTab integration", () => {
     )
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4003",
+      { scroll: false },
     )
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4003"))
   })

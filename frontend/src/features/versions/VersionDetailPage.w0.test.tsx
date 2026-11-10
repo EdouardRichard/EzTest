@@ -663,6 +663,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     expect(fetchMock).toHaveBeenCalled()
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=overview&conversation=4001&requirement=6001&attachment=55",
+      { scroll: false },
     )
   })
 
