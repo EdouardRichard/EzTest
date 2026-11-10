@@ -56,9 +56,33 @@ const drainingInstance: Instance = {
   draining_at: "2026-11-01T05:59:30Z",
 }
 
+const offlineInstance: Instance = {
+  ...activeInstance,
+  id: "5003",
+  instance_key: "host-5003",
+  hostname: "api-host-3",
+  pid: 4444,
+  api_port: 13335,
+  node_id: 3,
+  status: "offline",
+  heartbeat_at: "2026-10-30T05:00:00Z",
+  last_error: "heartbeat expired",
+}
+
+const stoppedInstance: Instance = {
+  ...offlineInstance,
+  id: "5004",
+  instance_key: "host-5004",
+  hostname: "api-host-4",
+  pid: 4545,
+  api_port: 13336,
+  status: "stopped",
+  stopped_at: "2026-10-30T05:30:00Z",
+}
+
 function mockApi(): void {
   api.listInstances.mockResolvedValue({
-    items: [activeInstance, drainingInstance],
+    items: [activeInstance, drainingInstance, offlineInstance, stoppedInstance],
     nextCursor: "",
     hasMore: false,
   })
@@ -127,6 +151,19 @@ describe("InstancePanel", () => {
     fireEvent.click(within(rowOf("5002")).getByRole("button", { name: "激活" }))
 
     await waitFor(() => expect(api.activateInstance).toHaveBeenCalledWith("5002"))
+  })
+
+  it("marks offline and stopped instances as historical and offers no activate action", async () => {
+    render(<InstancePanel />)
+    await screen.findByRole("table", { name: "API 实例列表" })
+
+    for (const id of ["5003", "5004"]) {
+      const row = rowOf(id)
+      expect(within(row).getByText("历史实例（已失效）")).toBeVisible()
+      expect(within(row).queryByRole("button", { name: "激活" })).toBeNull()
+    }
+    expect(within(rowOf("5002")).getByRole("button", { name: "激活" })).toBeVisible()
+    expect(api.activateInstance).not.toHaveBeenCalled()
   })
 
   it("disables the drain button while the request is running", async () => {

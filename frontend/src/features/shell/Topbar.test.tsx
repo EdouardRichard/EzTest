@@ -15,15 +15,31 @@ vi.mock("next/navigation", () => ({
   }),
 }))
 
+type TestUser = {
+  id: string
+  username: string
+  display_name: string
+  role: "admin" | "user"
+  status: "active" | "disabled"
+}
+
+const signedInUser: TestUser = {
+  id: "9001",
+  username: "admin",
+  display_name: "管理员",
+  role: "admin",
+  status: "active",
+}
+
 const auth = vi.hoisted(() => ({
   user: {
     id: "9001",
     username: "admin",
     display_name: "管理员",
-    role: "admin" as const,
-    status: "active" as const,
-  },
-  token: "ezt_token",
+    role: "admin",
+    status: "active",
+  } as TestUser | null,
+  token: "ezt_token" as string | null,
   loading: false,
   login: vi.fn(),
   logout: vi.fn(),
@@ -83,6 +99,8 @@ describe("Topbar", () => {
   beforeEach(() => {
     sse.calls = []
     sse.cleanup.mockReset()
+    auth.user = signedInUser
+    auth.token = "ezt_token"
     auth.logout.mockReset()
     auth.logout.mockResolvedValue(undefined)
     auth.changePassword.mockReset()
@@ -183,5 +201,16 @@ describe("Topbar", () => {
 
     fireEvent.click(trigger)
     expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
+  })
+
+  it("does not render the todo entry or request /api/todos for a signed-out visitor", () => {
+    auth.user = null
+    auth.token = null
+
+    render(<Topbar />)
+
+    expect(screen.queryByTestId("todo-drawer-trigger")).not.toBeInTheDocument()
+    expect(api.apiGet).not.toHaveBeenCalled()
+    expect(sse.calls).toHaveLength(0)
   })
 })

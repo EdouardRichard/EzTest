@@ -265,14 +265,24 @@ func TestExtractionAPIProgress(t *testing.T) {
 		t.Fatalf("latest args = %d/%d, want 7/8001", svc.lastVersionID, svc.lastAttachmentID)
 	}
 
-	// Missing run -> typed 404.
+	// Default "latest for the version" with no run is an empty read: 200 with
+	// a null data body (G-09), so the browser network layer records no 404.
 	svc.runs = nil
 	recorder = call(t, mux, http.MethodGet, "/api/versions/7/requirements/extractions", "", actor())
-	if recorder.Code != http.StatusNotFound {
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("empty GET status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if code := errorBody(t, recorder)["code"]; code != "not_found" {
-		t.Fatalf("empty GET code = %#v", code)
+	var empty struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("decode empty GET body %q: %v", recorder.Body.String(), err)
+	}
+	if string(empty.Data) != "null" {
+		t.Fatalf("empty GET data = %s, want null", string(empty.Data))
+	}
+	if svc.lastVersionID != 7 || len(svc.calls) == 0 || svc.calls[len(svc.calls)-1] != "list_runs" {
+		t.Fatalf("empty GET calls = %v, version = %d; want the default list path", svc.calls, svc.lastVersionID)
 	}
 }
 
@@ -298,6 +308,15 @@ func TestExtractionAPIRejectsBadRequests(t *testing.T) {
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("foreign run status = %d body=%s", recorder.Code, recorder.Body.String())
 	}
+
+	// Explicit selection of an unknown run stays a typed 404 (only the default
+	// "latest for the version" branch is 200 + null).
+	svc.runErr = versionapp.ErrExtractionRunNotFound
+	recorder = call(t, mux, http.MethodGet, "/api/versions/7/requirements/extractions?run_id=9999", "", actor())
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown explicit run status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	svc.runErr = nil
 
 	svc.latestErr = versionapp.ErrExtractionRunNotFound
 	recorder = call(t, mux, http.MethodGet,

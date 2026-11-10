@@ -175,7 +175,9 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
   const syncUrl = useCallback(
     (nextFilters: ChainFilterValues, nodeId: string | null) => {
       const params = chainFiltersToParams(nextFilters, nodeId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )

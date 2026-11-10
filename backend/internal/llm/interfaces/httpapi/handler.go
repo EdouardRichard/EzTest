@@ -30,7 +30,7 @@ type Service interface {
 	RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error)
 	AddModel(ctx context.Context, configID int64, input llmapp.ModelInput, actorID int64) (llm.Model, error)
 	UpdateModel(ctx context.Context, configID, modelID int64, patch llmapp.ModelPatch, actorID int64) (llm.Model, error)
-	ResetModelParams(ctx context.Context, configID, modelID int64) (llm.Model, error)
+	ResetModelParams(ctx context.Context, configID, modelID, actorID int64) (llm.Model, error)
 	DeleteModel(ctx context.Context, modelID int64, actorID int64) error
 	ListModels(ctx context.Context) ([]llm.Model, error)
 }
@@ -277,7 +277,8 @@ func (h *Handler) UpdateModel(w http.ResponseWriter, r *http.Request) {
 // §4.3/R-A1-4). Route mounting is owned by the server task; the handler is
 // unit-tested directly.
 func (h *Handler) ResetModelParams(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireActor(w, r); !ok {
+	actorID, ok := requireActor(w, r)
+	if !ok {
 		return
 	}
 	configID, err := pathID(r, "id", "id")
@@ -290,7 +291,7 @@ func (h *Handler) ResetModelParams(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	model, err := h.svc.ResetModelParams(r.Context(), configID, modelID)
+	model, err := h.svc.ResetModelParams(r.Context(), configID, modelID, actorID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

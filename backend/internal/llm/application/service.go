@@ -148,9 +148,12 @@ func (s *Service) TestConfig(ctx context.Context, id int64) (TestResult, error) 
 // RefreshModels pulls the upstream model catalog and merges it into the stored
 // catalog. For an existing model only parameters whose field source is catalog
 // (or whose stored value is 0/unknown) are updated: an administrator's manual
-// window/output survives every refresh (A §4.4/R-A1-3). The latest upstream
-// values are still persisted inside capabilities so reset-params can restore
-// them. Capability booleans keep following the upstream as before.
+// window/output survives every refresh (A §4.4/R-A1-3). The same field-level
+// rule now applies to the four boolean capabilities: a manually corrected
+// capability keeps its value and provenance while catalog-sourced capabilities
+// follow the upstream (S-02). The latest upstream values are still persisted
+// inside capabilities so reset-params can restore them, and a successful
+// refresh emits llm.config_refreshed with the merge counts (S-05).
 func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error) {
 	cfg, err := s.repo.GetConfig(ctx, id)
 	if err != nil {
@@ -181,22 +184,38 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 		windowSource := llm.SourceCatalog
 		outputSource := llm.SourceCatalog
 		source := llm.SourceCatalog
-		if previous, ok := byName[name]; ok {
-			// Manual values are never overwritten. A 0 stored value means
-			// unknown/auto and may be filled from the upstream even when the
-			// source marker says manual.
-			windowSource = previous.EffectiveWindowSource()
-			outputSource = previous.EffectiveOutputSource()
-			if windowSource != llm.SourceCatalog && previous.ContextWindow != 0 {
-				window = previous.ContextWindow
+		var previous *llm.Model
+		if stored, ok := byName[name]; ok {
+			previous = &stored
+			// Manual numeric values are never overwritten. A 0 stored value
+			// means unknown/auto and may be filled from the upstream even when
+			// the source marker says manual.
+			windowSource = stored.EffectiveWindowSource()
+			outputSource = stored.EffectiveOutputSource()
+			if windowSource != llm.SourceCatalog && stored.ContextWindow != 0 {
+				window = stored.ContextWindow
 			}
-			if outputSource != llm.SourceCatalog && previous.MaxOutput != 0 {
-				output = previous.MaxOutput
+			if outputSource != llm.SourceCatalog && stored.MaxOutput != 0 {
+				output = stored.MaxOutput
 			}
-			if previous.Source != "" {
-				source = previous.Source
+			if stored.Source != "" {
+				source = stored.Source
 			}
 		}
+		// Capability booleans merge per field: an administrator's manual value
+		// survives the refresh, a catalog-sourced one follows the upstream
+		// (S-02). The numeric parameters keep their own existing merge above.
+		capabilities := mergeRefreshedCapabilities(previous, llm.Capabilities{
+			SupportsTools:       item.SupportsTools,
+			SupportsVision:      item.SupportsVision,
+			SupportsReasoning:   item.SupportsReasoning,
+			SupportsPromptCache: item.SupportsPromptCache,
+		})
+		// Legacy mirrors stay in sync with the effective values, while the
+		// catalog_* keys keep the raw upstream values for reset.
+		capabilities.ContextWindow = window
+		capabilities.CatalogContextWindow = item.ContextWindow
+		capabilities.CatalogMaxOutput = item.MaxOutput
 		models = append(models, llm.Model{
 			ID:             s.ids.Next(),
 			ConfigID:       id,
@@ -204,25 +223,15 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 			DisplayName:    name,
 			ContextWindow:  window,
 			MaxOutput:      output,
-			SupportsTools:  item.SupportsTools,
-			SupportsVision: item.SupportsVision,
-			Capabilities: llm.Capabilities{
-				SupportsTools:       item.SupportsTools,
-				SupportsVision:      item.SupportsVision,
-				SupportsReasoning:   item.SupportsReasoning,
-				SupportsPromptCache: item.SupportsPromptCache,
-				// Legacy mirror stays in sync with the effective column, while
-				// the catalog_* keys keep the raw upstream values for reset.
-				ContextWindow:        window,
-				CatalogContextWindow: item.ContextWindow,
-				CatalogMaxOutput:     item.MaxOutput,
-			},
-			Source:       source,
-			WindowSource: windowSource,
-			OutputSource: outputSource,
-			Status:       llm.ModelStatusActive,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			SupportsTools:  capabilities.SupportsTools,
+			SupportsVision: capabilities.SupportsVision,
+			Capabilities:   capabilities,
+			Source:         source,
+			WindowSource:   windowSource,
+			OutputSource:   outputSource,
+			Status:         llm.ModelStatusActive,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		})
 	}
 
@@ -247,6 +256,7 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	if err != nil {
 		return nil, mapRepositoryError(err)
 	}
+	s.recordConfigRefreshed(ctx, cfg, existing, models, len(upserted), actorID)
 	for i := range upserted {
 		upserted[i] = withModelView(upserted[i])
 	}
@@ -256,7 +266,8 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 // AddModel inserts a manually configured model. Every 0.2.1 capability is
 // accepted because a gateway's /models response may not describe them.
 func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput, actorID int64) (llm.Model, error) {
-	if _, err := s.repo.GetConfig(ctx, configID); err != nil {
+	cfg, err := s.repo.GetConfig(ctx, configID)
+	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
 	name := strings.TrimSpace(input.Model)
@@ -284,11 +295,15 @@ func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput
 		SupportsTools:  input.SupportsTools,
 		SupportsVision: input.SupportsVision,
 		Capabilities: llm.Capabilities{
-			SupportsTools:       input.SupportsTools,
-			SupportsVision:      input.SupportsVision,
-			SupportsReasoning:   input.SupportsReasoning,
-			SupportsPromptCache: input.SupportsPromptCache,
-			ContextWindow:       input.ContextWindow,
+			SupportsTools:             input.SupportsTools,
+			SupportsVision:            input.SupportsVision,
+			SupportsReasoning:         input.SupportsReasoning,
+			SupportsPromptCache:       input.SupportsPromptCache,
+			SupportsToolsSource:       llm.SourceManual,
+			SupportsVisionSource:      llm.SourceManual,
+			SupportsReasoningSource:   llm.SourceManual,
+			SupportsPromptCacheSource: llm.SourceManual,
+			ContextWindow:             input.ContextWindow,
 		},
 		Source: llm.SourceManual,
 		// A manually added model's numeric parameters are administrator input,
@@ -304,6 +319,17 @@ func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
+	capabilities := stored.EffectiveCapabilities()
+	s.recordModelAudit(ctx, "llm.model_added", cfg.ID, cfg.Name, stored.ID, actorID, map[string]any{
+		"model":              stored.Model,
+		"display_name":       stored.DisplayName,
+		"source":             stored.Source,
+		"context_window":     stored.ContextWindow,
+		"max_output":         stored.MaxOutput,
+		"window_source":      stored.EffectiveWindowSource(),
+		"output_source":      stored.EffectiveOutputSource(),
+		"capability_sources": capabilitySources(capabilities),
+	})
 	return withModelView(stored), nil
 }
 
@@ -328,6 +354,7 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 	if target == nil {
 		return llm.Model{}, platform.NotFound("llm model")
 	}
+	before := *target
 
 	window := int64(target.ContextWindow)
 	output := int64(target.MaxOutput)
@@ -374,11 +401,21 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 	capabilities := target.EffectiveCapabilities()
 	capabilities.SupportsTools = target.SupportsTools
 	capabilities.SupportsVision = target.SupportsVision
+	// Only the capability fields the administrator actually supplied become
+	// manual; omitted fields keep their previous provenance (S-02).
+	if patch.SupportsTools != nil {
+		capabilities.SupportsToolsSource = llm.SourceManual
+	}
+	if patch.SupportsVision != nil {
+		capabilities.SupportsVisionSource = llm.SourceManual
+	}
 	if patch.SupportsReasoning != nil {
 		capabilities.SupportsReasoning = *patch.SupportsReasoning
+		capabilities.SupportsReasoningSource = llm.SourceManual
 	}
 	if patch.SupportsPromptCache != nil {
 		capabilities.SupportsPromptCache = *patch.SupportsPromptCache
+		capabilities.SupportsPromptCacheSource = llm.SourceManual
 	}
 	if patch.ContextWindow != nil {
 		capabilities.ContextWindow = target.ContextWindow
@@ -407,6 +444,16 @@ func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patc
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
+	changed, oldValues, newValues := changedModelFields(before, stored)
+	s.recordModelAudit(ctx, "llm.model_updated", configID, s.configName(ctx, configID), stored.ID, actorID, map[string]any{
+		"model":              stored.Model,
+		"changed_fields":     changed,
+		"old_values":         oldValues,
+		"new_values":         newValues,
+		"capability_sources": capabilitySources(stored.EffectiveCapabilities()),
+		"window_source":      stored.EffectiveWindowSource(),
+		"output_source":      stored.EffectiveOutputSource(),
+	})
 	return withModelView(stored), nil
 }
 
@@ -430,7 +477,7 @@ func (s *Service) UpdateModelParams(ctx context.Context, configID, modelID int64
 // upstream values recorded during a catalog refresh and flips both field
 // sources back to catalog (A §4.3/R-A1-4). A model without an upstream snapshot
 // resets to 0 (unknown/auto).
-func (s *Service) ResetModelParams(ctx context.Context, configID, modelID int64) (llm.Model, error) {
+func (s *Service) ResetModelParams(ctx context.Context, configID, modelID, actorID int64) (llm.Model, error) {
 	models, err := s.repo.ListModelsByConfig(ctx, configID)
 	if err != nil {
 		return llm.Model{}, err
@@ -445,6 +492,7 @@ func (s *Service) ResetModelParams(ctx context.Context, configID, modelID int64)
 	if target == nil {
 		return llm.Model{}, platform.NotFound("llm model")
 	}
+	before := *target
 
 	capabilities := target.EffectiveCapabilities()
 	target.ContextWindow = capabilities.CatalogContextWindow
@@ -459,14 +507,58 @@ func (s *Service) ResetModelParams(ctx context.Context, configID, modelID int64)
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
+	changed, oldValues, newValues := changedModelFields(before, stored)
+	s.recordModelAudit(ctx, "llm.model_params_reset", configID, s.configName(ctx, configID), stored.ID, actorID, map[string]any{
+		"model":              stored.Model,
+		"changed_fields":     changed,
+		"old_values":         oldValues,
+		"new_values":         newValues,
+		"capability_sources": capabilitySources(stored.EffectiveCapabilities()),
+		"window_source":      stored.EffectiveWindowSource(),
+		"output_source":      stored.EffectiveOutputSource(),
+	})
 	return withModelView(stored), nil
 }
 
-// DeleteModel removes one catalog row.
+// DeleteModel removes one catalog row. A model that is currently the
+// configuration's explicit default_model_id cannot be deleted: the delete would
+// bypass default-model validation and silently leave a configuration that can
+// never resolve a model (M-07). The administrator must reassign first.
 func (s *Service) DeleteModel(ctx context.Context, modelID int64, actorID int64) error {
+	models, err := s.repo.ListModels(ctx)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	var target *llm.Model
+	for i := range models {
+		if models[i].ID == modelID {
+			target = &models[i]
+			break
+		}
+	}
+	if target == nil {
+		return platform.NotFound("llm model")
+	}
+	configs, err := s.repo.ListConfigs(ctx)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	for _, cfg := range configs {
+		if cfg.DefaultModelID == target.ID {
+			return defaultModelInUseError(cfg, *target)
+		}
+	}
 	if err := s.repo.DeleteModel(ctx, modelID); err != nil {
 		return mapRepositoryError(err)
 	}
+	s.recordModelAudit(ctx, "llm.model_deleted", target.ConfigID, s.configName(ctx, target.ConfigID), target.ID, actorID, map[string]any{
+		"model":              target.Model,
+		"display_name":       target.DisplayName,
+		"source":             target.Source,
+		"context_window":     target.ContextWindow,
+		"max_output":         target.MaxOutput,
+		"capability_sources": capabilitySources(target.EffectiveCapabilities()),
+	})
 	return nil
 }
 
@@ -506,26 +598,26 @@ func (s *Service) ResolveSelectableModel(ctx context.Context, modelOverride stri
 	name := strings.TrimSpace(modelOverride)
 	if name == "" {
 		if cfg.DefaultModelID <= 0 {
-			return llm.Model{}, &platform.Error{
+			return llm.Model{}, withResolveDetails(&platform.Error{
 				Status:  400,
 				Code:    CodeLLMConfigInvalid,
 				Message: "llm config has no default model; set default_model_id before selecting a model (models[0] is never used)",
 				Details: map[string]any{"field": "default_model_id"},
-			}
+			}, cfg)
 		}
 		for i := range models {
 			if models[i].ID != cfg.DefaultModelID {
 				continue
 			}
 			if !models[i].Selectable() {
-				return llm.Model{}, llmConfigError(fmt.Sprintf(
-					"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model))
+				return llm.Model{}, withResolveDetails(llmConfigError(fmt.Sprintf(
+					"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model)), cfg)
 			}
 			return models[i], nil
 		}
-		return llm.Model{}, llmConfigError(fmt.Sprintf(
+		return llm.Model{}, withResolveDetails(llmConfigError(fmt.Sprintf(
 			"default model %d is not in the catalog of llm config %q; refresh the model catalog or set default_model_id",
-			cfg.DefaultModelID, cfg.Name))
+			cfg.DefaultModelID, cfg.Name)), cfg)
 	}
 
 	for i := range models {
@@ -680,16 +772,60 @@ func validateRefreshedDefaultModel(cfg llm.Config, existing, refreshed []llm.Mod
 	if defaultName == "" {
 		return nil
 	}
+	var previous *llm.Model
+	for i := range existing {
+		if existing[i].Model == defaultName {
+			previous = &existing[i]
+			break
+		}
+	}
 	for _, model := range refreshed {
 		if model.Model != defaultName {
 			continue
 		}
-		if !model.EffectiveCapabilities().SupportsVision {
+		// Evaluate the merged capability set, not the raw upstream one: a
+		// manual supports_vision correction must keep the default valid even
+		// when the provider's /models response omits the capability (S-02).
+		merged := mergeRefreshedCapabilities(previous, model.EffectiveCapabilities())
+		if !merged.SupportsVision {
 			return invalidVisionDefaultModelError("default_model_id", model.Model, "upstream_catalog_lost_vision")
 		}
 		return nil
 	}
 	return nil
+}
+
+// mergeRefreshedCapabilities merges one upstream capability set into the stored
+// row: manual-sourced booleans keep the administrator's value, every other
+// field follows the upstream and is recorded as catalog. previous is nil for a
+// brand-new model.
+func mergeRefreshedCapabilities(previous *llm.Model, upstream llm.Capabilities) llm.Capabilities {
+	merged := upstream
+	merged.SupportsToolsSource = llm.SourceCatalog
+	merged.SupportsVisionSource = llm.SourceCatalog
+	merged.SupportsReasoningSource = llm.SourceCatalog
+	merged.SupportsPromptCacheSource = llm.SourceCatalog
+	if previous == nil {
+		return merged
+	}
+	stored := previous.EffectiveCapabilities()
+	if stored.SupportsToolsSource == llm.SourceManual {
+		merged.SupportsTools = stored.SupportsTools
+		merged.SupportsToolsSource = llm.SourceManual
+	}
+	if stored.SupportsVisionSource == llm.SourceManual {
+		merged.SupportsVision = stored.SupportsVision
+		merged.SupportsVisionSource = llm.SourceManual
+	}
+	if stored.SupportsReasoningSource == llm.SourceManual {
+		merged.SupportsReasoning = stored.SupportsReasoning
+		merged.SupportsReasoningSource = llm.SourceManual
+	}
+	if stored.SupportsPromptCacheSource == llm.SourceManual {
+		merged.SupportsPromptCache = stored.SupportsPromptCache
+		merged.SupportsPromptCacheSource = llm.SourceManual
+	}
+	return merged
 }
 
 // invalidVisionDefaultModelError is the typed 400 for a non-vision default
@@ -775,6 +911,177 @@ func (s *Service) recordConfigChange(ctx context.Context, verb string, cfg llm.C
 			ActorID:   &actor,
 			RequestID: requestID,
 		})
+	}
+}
+
+// configName returns the stored configuration name for audit metadata. It is
+// best effort: a repository fixture without a configuration row still records
+// the config ID, and a failed read never fails the business operation.
+func (s *Service) configName(ctx context.Context, configID int64) string {
+	cfg, err := s.repo.GetConfig(ctx, configID)
+	if err != nil {
+		return ""
+	}
+	return cfg.Name
+}
+
+// recordModelAudit emits one model-level audit entry (S-05). targetKind selects
+// llm_model for catalog mutations and llm_config for a catalog refresh. Audit
+// delivery is best effort and never fails the business operation.
+func (s *Service) recordModelAudit(ctx context.Context, action string, configID int64, configName string, modelID, actorID int64, metadata map[string]any) {
+	if s.audit == nil {
+		return
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata["config_id"] = id.Format(configID)
+	if configName != "" {
+		metadata["config_name"] = configName
+	}
+	targetKind := "llm_model"
+	targetID := ""
+	if modelID > 0 {
+		targetID = id.Format(modelID)
+	} else {
+		targetKind = "llm_config"
+		targetID = id.Format(configID)
+	}
+	var actor *int64
+	if actorID > 0 {
+		actor = &actorID
+	}
+	_ = s.audit.Record(ctx, auditapp.Event{
+		ActorID:    actor,
+		Action:     action,
+		TargetKind: targetKind,
+		TargetID:   targetID,
+		RequestID:  requestid.From(ctx),
+		Metadata:   metadata,
+	})
+}
+
+// recordConfigRefreshed audits a successful catalog refresh with the merge
+// counts and the manual capabilities that were preserved (S-02/S-05).
+func (s *Service) recordConfigRefreshed(ctx context.Context, cfg llm.Config, existing, refreshed []llm.Model, total int, actorID int64) {
+	if s.audit == nil {
+		return
+	}
+	previousByName := make(map[string]llm.Model, len(existing))
+	for _, model := range existing {
+		previousByName[model.Model] = model
+	}
+	present := make(map[string]bool, len(refreshed))
+	added, updated := 0, 0
+	for _, model := range refreshed {
+		present[model.Model] = true
+		if _, ok := previousByName[model.Model]; ok {
+			updated++
+		} else {
+			added++
+		}
+	}
+	deprecated := 0
+	for _, model := range existing {
+		if model.Source != llm.SourceManual && !present[model.Model] {
+			deprecated++
+		}
+	}
+	manual := make(map[string][]string)
+	for _, model := range refreshed {
+		if fields := manualCapabilityFields(model); len(fields) > 0 {
+			manual[model.Model] = fields
+		}
+	}
+	s.recordModelAudit(ctx, "llm.config_refreshed", cfg.ID, cfg.Name, 0, actorID, map[string]any{
+		"added":               added,
+		"updated":             updated,
+		"deprecated":          deprecated,
+		"total":               total,
+		"manual_capabilities": manual,
+	})
+}
+
+// manualCapabilityFields lists the boolean capabilities whose stored value is
+// administrator-sourced and therefore preserved across a refresh.
+func manualCapabilityFields(model llm.Model) []string {
+	capabilities := model.EffectiveCapabilities()
+	fields := make([]string, 0, 4)
+	if capabilities.SupportsToolsSource == llm.SourceManual {
+		fields = append(fields, "supports_tools")
+	}
+	if capabilities.SupportsVisionSource == llm.SourceManual {
+		fields = append(fields, "supports_vision")
+	}
+	if capabilities.SupportsReasoningSource == llm.SourceManual {
+		fields = append(fields, "supports_reasoning")
+	}
+	if capabilities.SupportsPromptCacheSource == llm.SourceManual {
+		fields = append(fields, "supports_prompt_cache")
+	}
+	return fields
+}
+
+// capabilitySources flattens the four capability provenance markers into the
+// audit metadata shape.
+func capabilitySources(capabilities llm.Capabilities) map[string]any {
+	return map[string]any{
+		"supports_tools":        capabilities.SupportsToolsSource,
+		"supports_vision":       capabilities.SupportsVisionSource,
+		"supports_reasoning":    capabilities.SupportsReasoningSource,
+		"supports_prompt_cache": capabilities.SupportsPromptCacheSource,
+	}
+}
+
+// changedModelFields diffs the audit-relevant model fields (capabilities,
+// parameters, provenance and deprecation) into old/new metadata. Model rows
+// carry no secrets, so every listed field is safe to audit.
+func changedModelFields(before, after llm.Model) ([]string, map[string]any, map[string]any) {
+	fields := make([]string, 0, 12)
+	oldValues := make(map[string]any)
+	newValues := make(map[string]any)
+	add := func(name string, oldValue, newValue any) {
+		if oldValue != newValue {
+			fields = append(fields, name)
+			oldValues[name] = oldValue
+			newValues[name] = newValue
+		}
+	}
+	add("context_window", before.ContextWindow, after.ContextWindow)
+	add("max_output", before.MaxOutput, after.MaxOutput)
+	add("deprecated", before.Deprecated, after.Deprecated)
+	add("window_source", before.EffectiveWindowSource(), after.EffectiveWindowSource())
+	add("output_source", before.EffectiveOutputSource(), after.EffectiveOutputSource())
+
+	beforeCapabilities := before.EffectiveCapabilities()
+	afterCapabilities := after.EffectiveCapabilities()
+	add("supports_tools", beforeCapabilities.SupportsTools, afterCapabilities.SupportsTools)
+	add("supports_vision", beforeCapabilities.SupportsVision, afterCapabilities.SupportsVision)
+	add("supports_reasoning", beforeCapabilities.SupportsReasoning, afterCapabilities.SupportsReasoning)
+	add("supports_prompt_cache", beforeCapabilities.SupportsPromptCache, afterCapabilities.SupportsPromptCache)
+	add("supports_tools_source", beforeCapabilities.SupportsToolsSource, afterCapabilities.SupportsToolsSource)
+	add("supports_vision_source", beforeCapabilities.SupportsVisionSource, afterCapabilities.SupportsVisionSource)
+	add("supports_reasoning_source", beforeCapabilities.SupportsReasoningSource, afterCapabilities.SupportsReasoningSource)
+	add("supports_prompt_cache_source", beforeCapabilities.SupportsPromptCacheSource, afterCapabilities.SupportsPromptCacheSource)
+	return fields, oldValues, newValues
+}
+
+// defaultModelInUseError is the typed 409 for deleting the configured default
+// model. Its details point at the configuration and the reassign-first
+// resolution instead of only restating the conflict.
+func defaultModelInUseError(cfg llm.Config, model llm.Model) *platform.Error {
+	return &platform.Error{
+		Status: http.StatusConflict,
+		Code:   CodeDefaultModelInUse,
+		Message: fmt.Sprintf("model %q is the default model of llm config %q; set default_model_id to another model before deleting it",
+			model.Model, cfg.Name),
+		Details: map[string]any{
+			"config_id":        id.Format(cfg.ID),
+			"config_name":      cfg.Name,
+			"default_model_id": id.Format(model.ID),
+			"field":            "default_model_id",
+			"next_action":      "choose another model as default_model_id, then delete this model",
+		},
 	}
 }
 

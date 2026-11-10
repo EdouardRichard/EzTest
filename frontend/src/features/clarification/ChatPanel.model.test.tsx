@@ -13,6 +13,7 @@ const clarificationApi = vi.hoisted(() => ({
   getTeamRoom: vi.fn(),
   rollbackRequirement: vi.fn(),
   uploadContent: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("@/features/clarification/api", () => clarificationApi)
 

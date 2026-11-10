@@ -6,7 +6,7 @@ import { ApiError } from "@/lib/api-client"
 
 import { teamRoomFixture } from "./test-fixtures"
 
-const api = vi.hoisted(() => ({ getTeamRoom: vi.fn() }))
+const api = vi.hoisted(() => ({ getTeamRoom: vi.fn(), getAttachmentPendingDetails: vi.fn() }))
 vi.mock("./api", () => api)
 
 import { TeamRoomPanel } from "./TeamRoomPanel"

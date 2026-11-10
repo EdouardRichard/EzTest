@@ -875,8 +875,9 @@ func (s *IssueService) ScanFailures(ctx context.Context, versionID int64) (int, 
 	var failures []error
 	for _, snapshot := range snapshots {
 		// The execution read port already filters, but the reconciler stays
-		// defensive: only application failures become issues (spec §5.1).
-		if snapshot.FailureClass != "application" {
+		// defensive: only application failures become issues (spec §5.1), and an
+		// executor capability limitation never becomes a SUT issue (X-02).
+		if snapshot.FailureClass != "application" || snapshot.ExecutorCapability {
 			continue
 		}
 		if snapshot.ID <= 0 {
@@ -927,6 +928,11 @@ func (s *IssueService) IngestCandidate(ctx context.Context, caseRunID int64) (de
 	}
 	if snapshot.ID <= 0 {
 		snapshot.ID = caseRunID
+	}
+	// An executor capability limitation is a blocked environment condition, not
+	// a SUT defect: never ingest it as an issue candidate (v0.2.3 X-02).
+	if snapshot.ExecutorCapability {
+		return delivery.Issue{}, false, nil
 	}
 	return s.ingestSnapshot(ctx, snapshot)
 }

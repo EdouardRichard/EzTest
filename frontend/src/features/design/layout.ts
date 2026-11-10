@@ -278,21 +278,19 @@ export function matchDesignNodes(layout: DesignLayout, query: string): DesignLay
 /* ------------------------------ split preferences --------------------------- */
 
 /**
- * Persisted split ratios (R-D2-2). Keys are versioned so the three-layer
- * 35/40/25 draft from v0.2.1 can never be misread as the new 40/60 layout.
+ * Persisted split ratios (R-D2-2). Only the workbench graph/detail split is
+ * draggable now; the chat/workbench columns are a fixed grid and store nothing.
+ * Keys are versioned so the three-layer 35/40/25 draft from v0.2.1 can never be
+ * misread as the approved workbench ratio.
  */
 export const DESIGN_SPLIT_STORAGE_KEYS = {
-  chat: "eztest.design.chat-split",
   workbench: "eztest.design.workbench-split",
 } as const
 
-/** Approved defaults: chat 40% / workbench 60%, graph 65% / detail 35%. */
-export const DEFAULT_CHAT_SPLIT = 40
+/** Approved default: graph 65% / detail 35%. */
 export const DEFAULT_WORKBENCH_SPLIT = 65
 
-/** Clamps keep every pane usable and the divider within its own pair. */
-export const MIN_CHAT_SPLIT = 20
-export const MAX_CHAT_SPLIT = 80
+/** Clamps keep the graph pane usable and the divider within its pair. */
 export const MIN_GRAPH_SPLIT = 25
 export const MAX_GRAPH_SPLIT = 85
 

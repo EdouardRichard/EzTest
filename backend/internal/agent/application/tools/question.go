@@ -160,6 +160,12 @@ func (t *QuestionAskTool) Parameters() json.RawMessage {
 			"description": "1-5 个问题；关键歧义建议单题，其余批量 3-5 题。",
 			"items":       questionSchema,
 		},
+		"source_refs": map[string]any{
+			"type":        "array",
+			"maxItems":    maxAskSourceRefs,
+			"description": "批次级共享来源引用（附件/需求等），会合并进每个问题的 source_refs；题目可用自身 source_refs 追加。",
+			"items":       map[string]any{"type": "string"},
+		},
 		"batch_id": map[string]any{
 			"type":        "string",
 			"description": "批次 ID（可选；缺省由服务端生成）。",
@@ -174,9 +180,10 @@ func (t *QuestionAskTool) Parameters() json.RawMessage {
 
 // questionAskParams is the strict model parameter shape.
 type questionAskParams struct {
-	Questions []QuestionItem `json:"questions"`
-	BatchID   string         `json:"batch_id"`
-	ExpiresAt *string        `json:"expires_at"`
+	Questions  []QuestionItem `json:"questions"`
+	SourceRefs []string       `json:"source_refs"`
+	BatchID    string         `json:"batch_id"`
+	ExpiresAt  *string        `json:"expires_at"`
 }
 
 // Execute implements Tool.
@@ -222,6 +229,10 @@ func validateQuestionAskParams(params questionAskParams) (QuestionAskInput, *Err
 	batchID := strings.TrimSpace(params.BatchID)
 	if len(batchID) > maxAskBatchIDLength {
 		return QuestionAskInput{}, planInvalid("batch_id", "must be at most 64 characters")
+	}
+	batchRefs, batchErr := validateBatchSourceRefs(params.SourceRefs)
+	if batchErr != nil {
+		return QuestionAskInput{}, batchErr
 	}
 	seenQuestionIDs := map[string]struct{}{}
 	questions := make([]QuestionItem, 0, len(params.Questions))
@@ -275,6 +286,11 @@ func validateQuestionAskParams(params questionAskParams) (QuestionAskInput, *Err
 			}
 			sourceRefs = append(sourceRefs, trimmed)
 		}
+		sourceRefs = mergeSourceRefs(sourceRefs, batchRefs)
+		if len(sourceRefs) > maxAskSourceRefs {
+			return QuestionAskInput{}, planInvalid(field+".source_refs",
+				"must contain at most 10 refs after merging batch source_refs")
+		}
 		questions = append(questions, QuestionItem{
 			ID:            id,
 			Text:          text,
@@ -294,6 +310,41 @@ func validateQuestionAskParams(params questionAskParams) (QuestionAskInput, *Err
 		input.ExpiresAt = &expiresAt
 	}
 	return input, nil
+}
+
+// validateBatchSourceRefs trims and validates the batch-level refs shared by
+// every question in the ask: at most 10 refs, each non-empty within 500 chars.
+func validateBatchSourceRefs(refs []string) ([]string, *Error) {
+	if len(refs) > maxAskSourceRefs {
+		return nil, planInvalid("source_refs", "must contain at most 10 refs")
+	}
+	trimmed := make([]string, 0, len(refs))
+	for index, ref := range refs {
+		value := strings.TrimSpace(ref)
+		if value == "" || len(value) > maxAskSourceRefLength {
+			return nil, planInvalid(fmt.Sprintf("source_refs[%d]", index),
+				"must be non-empty and at most 500 characters")
+		}
+		trimmed = append(trimmed, value)
+	}
+	return trimmed, nil
+}
+
+// mergeSourceRefs appends the batch-level refs to the question's own refs,
+// dropping duplicates while preserving first-seen order.
+func mergeSourceRefs(own, batch []string) []string {
+	merged := make([]string, 0, len(own)+len(batch))
+	seen := make(map[string]struct{}, len(own)+len(batch))
+	for _, refs := range [][]string{own, batch} {
+		for _, ref := range refs {
+			if _, duplicate := seen[ref]; duplicate {
+				continue
+			}
+			seen[ref] = struct{}{}
+			merged = append(merged, ref)
+		}
+	}
+	return merged
 }
 
 // mapQuestionAskError turns question-service failures into model-visible tool

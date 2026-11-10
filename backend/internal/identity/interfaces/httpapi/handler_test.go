@@ -261,6 +261,39 @@ func TestLoginRejectsInvalidBodyAndMapsUnauthenticated(t *testing.T) {
 	}
 }
 
+// TestLoginMapsAccountDisabled pins the wire contract of a correct password on
+// a disabled account: the application error is rendered unchanged as 403
+// account_disabled with the English message (the frontend localizes it), and
+// the response is not a 401 challenge.
+func TestLoginMapsAccountDisabled(t *testing.T) {
+	handler, svc := newTestHandler()
+	svc.loginErr = platform.NewError(http.StatusForbidden, "account_disabled", "account is disabled")
+
+	rec := httptest.NewRecorder()
+	handler.Login(rec, postJSON(t, "/api/auth/login", `{"username":"qa01","password":"`+handlerTestPassword+`"}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+	if envelope.Error.Code != "account_disabled" {
+		t.Fatalf("code = %q", envelope.Error.Code)
+	}
+	if envelope.Error.Message != "account is disabled" {
+		t.Fatalf("message = %q, want the stable English message", envelope.Error.Message)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+		t.Fatalf("WWW-Authenticate = %q, want none for a disabled account", got)
+	}
+}
+
 func TestMeReturnsCurrentUser(t *testing.T) {
 	handler, svc := newTestHandler()
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)

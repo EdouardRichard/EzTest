@@ -11,8 +11,9 @@ import (
 // The runtime repository is the concrete implementation of both P6 ports; the
 // assertions keep the assembly-root wiring honest.
 var (
-	_ agentapp.PromptRevisionSeeder   = (*RuntimeRepository)(nil)
-	_ agentapp.ProfileAdminRepository = (*RuntimeRepository)(nil)
+	_ agentapp.PromptRevisionSeeder      = (*RuntimeRepository)(nil)
+	_ agentapp.ProfileAdminRepository    = (*RuntimeRepository)(nil)
+	_ agentapp.ProfileBackfillRepository = (*RuntimeRepository)(nil)
 )
 
 const promptRevisionColumns = `id, profile_key, version, system_prompt, note, source, actor_id, created_at`

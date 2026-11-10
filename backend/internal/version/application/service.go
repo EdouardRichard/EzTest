@@ -1368,6 +1368,39 @@ func (s *Service) RepositoryInUse(ctx context.Context, id int64) (bool, error) {
 	return s.repo.RepositoryInUse(ctx, id)
 }
 
+// ReferencingVersions lists the versions whose binding references the resource
+// of one kind, carrying the version title plus the lifecycle status, effective
+// stage and binding editability for the resource delete conflict details. The
+// resource context only understands its own VersionRef shape, so this adapter
+// converts the version-domain rows.
+func (s *Service) ReferencingVersions(ctx context.Context, kind string, id int64) ([]resourceapp.VersionRef, error) {
+	refs, err := s.repo.ReferencingVersions(ctx, kind, id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]resourceapp.VersionRef, 0, len(refs))
+	for _, ref := range refs {
+		// A completed version is terminal even when its persisted stage lags
+		// behind; a suspended version uses the stage it was suspended from, so
+		// a version suspended out of executing stays read-only.
+		effectiveStage := ref.Stage
+		if ref.Status == version.StatusCompleted {
+			effectiveStage = version.StageCompleted
+		} else if effectiveStage.IsSuspended() && ref.SuspendedFrom != nil {
+			effectiveStage = *ref.SuspendedFrom
+		}
+		editable := ref.Status != version.StatusCompleted && version.BindingEditable(effectiveStage)
+		out = append(out, resourceapp.VersionRef{
+			ID:       ref.ID,
+			Title:    ref.Title,
+			Status:   ref.Status,
+			Stage:    string(effectiveStage),
+			Editable: editable,
+		})
+	}
+	return out, nil
+}
+
 var _ resourceapp.UsageChecker = (*Service)(nil)
 
 // ---------- events, audit and errors ----------

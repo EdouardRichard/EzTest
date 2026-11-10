@@ -1596,7 +1596,10 @@ func TestReportGateRequiresAllWavesTerminal(t *testing.T) {
 		{"paused wave", func(s *delivery.ReportSnapshot) { s.Waves[1].Status = "paused" }, false},
 		{"unknown wave status is not terminal", func(s *delivery.ReportSnapshot) { s.Waves[1].Status = "bogus" }, false},
 		{"terminal waves without case runs", func(s *delivery.ReportSnapshot) { s.CaseRuns = nil }, false},
-		{"open requirement", func(s *delivery.ReportSnapshot) { s.Requirements[0].Status = "clarified" }, false},
+		{"open requirement without settled execution", func(s *delivery.ReportSnapshot) {
+			s.Requirements[0].Status = "clarified"
+			s.Requirements[0].ExecutionSettled = false
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1642,6 +1645,74 @@ func TestReportGateRequiresAllWavesTerminal(t *testing.T) {
 			t.Fatalf("report jobs = %v, want none", fixture.tasks.calls)
 		}
 	})
+}
+
+// TestReportGateSettlesExecutedOpenRequirement pins the R2-NEW-02 report due
+// gate: an open requirement whose execution is settled (every executable case
+// has a terminal latest run, blocked/inconclusive included) no longer blocks the
+// version report. The requirement status deliberately stays "clarified": the
+// report projects the failure and a later closure operation regenerates it
+// through the fingerprint change.
+func TestReportGateSettlesExecutedOpenRequirement(t *testing.T) {
+	snapshot := reportGateSnapshot(7)
+	snapshot.Requirements[0] = delivery.RequirementSnapshot{
+		ID: 101, VersionID: 7, Status: "clarified", ExecutionSettled: true,
+	}
+	if !versionReportDue(snapshot) {
+		t.Fatalf("versionReportDue = false, want true (reason=%q)", versionReportGateReason(snapshot))
+	}
+	if reason := versionReportGateReason(snapshot); reason != "" {
+		t.Fatalf("versionReportGateReason = %q, want the gate open", reason)
+	}
+}
+
+// TestReportGateStillBlocksUnexecutedRequirement is the safety half: an open
+// requirement whose execution never settled keeps the report gate closed with
+// the stable requirements_open reason, so an unexecuted requirement can never be
+// silently reported as done.
+func TestReportGateStillBlocksUnexecutedRequirement(t *testing.T) {
+	snapshot := reportGateSnapshot(7)
+	snapshot.Requirements[0] = delivery.RequirementSnapshot{
+		ID: 101, VersionID: 7, Status: "clarified", ExecutionSettled: false,
+	}
+	if versionReportDue(snapshot) {
+		t.Fatal("versionReportDue = true for an unexecuted open requirement")
+	}
+	if reason := versionReportGateReason(snapshot); reason != "requirements_open" {
+		t.Fatalf("versionReportGateReason = %q, want requirements_open", reason)
+	}
+
+	fixture := newReportFixture(t)
+	fixture.data.version[7] = snapshot
+	if _, err := fixture.svc.EnsureVersionReport(context.Background(), 7); !errors.Is(err, ErrVersionReportNotDue) {
+		t.Fatalf("EnsureVersionReport error = %v, want ErrVersionReportNotDue", err)
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("report jobs = %v, want none", fixture.tasks.calls)
+	}
+}
+
+// TestEnsureVersionReportDueForSettledOpenRequirement pins the production path:
+// a settled-but-open requirement makes EnsureVersionReport create the version
+// report and its report.version work item instead of failing the due gate.
+func TestEnsureVersionReportDueForSettledOpenRequirement(t *testing.T) {
+	fixture := newReportFixture(t)
+	snapshot := reportGateSnapshot(7)
+	snapshot.Requirements[0] = delivery.RequirementSnapshot{
+		ID: 101, VersionID: 7, Status: "clarified", ExecutionSettled: true,
+	}
+	fixture.data.version[7] = snapshot
+
+	report, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("EnsureVersionReport: %v", err)
+	}
+	if report.Kind != delivery.ReportKindVersion || report.VersionID != 7 {
+		t.Fatalf("report = %+v, want a version report for version 7", report)
+	}
+	if len(fixture.tasks.calls) != 1 || fixture.tasks.calls[0] != fmt.Sprintf("task:%d:1", report.ID) {
+		t.Fatalf("report jobs = %v, want one task for report %d revision 1", fixture.tasks.calls, report.ID)
+	}
 }
 
 // TestOnWaveTerminalEnqueuesReportOnce pins wave-terminal idempotency: repeated

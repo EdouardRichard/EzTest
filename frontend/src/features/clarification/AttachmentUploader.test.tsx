@@ -7,7 +7,7 @@ import { ApiError } from "@/lib/api-client"
 
 import type { UploadedAttachment } from "./types"
 
-const api = vi.hoisted(() => ({ uploadContent: vi.fn() }))
+const api = vi.hoisted(() => ({ uploadContent: vi.fn(), getAttachmentPendingDetails: vi.fn() }))
 vi.mock("./api", () => api)
 
 import { AttachmentUploader } from "./AttachmentUploader"

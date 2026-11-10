@@ -1161,6 +1161,32 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/models/{modelId}/reset-params:
+    post:
+      tags: [AdminLLM]
+      operationId: resetLLMModelParams
+      summary: 恢复模型上游参数（admin）
+      description: 将手工覆盖的窗口/输出恢复为最近一次刷新记录的上游值；无快照时回到 0=自动。写审计。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/ModelID'
+      responses:
+        '200':
+          description: 恢复后的模型
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMModel'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/Internal'}
   /api/admin/llm/models:
     get:
       tags: [AdminLLM]
@@ -8836,6 +8862,56 @@ paths:
         '503': {$ref: '#/components/responses/Unavailable'}
         '500': {$ref: '#/components/responses/Internal'}
 
+  /api/versions/{id}/attachments:
+    get:
+      tags: [Requirements]
+      operationId: listVersionAttachments
+      summary: 版本附件列表（C-05，登录用户，按版本限定）
+      description: 只读列表；最新在前；image_count 为该附件持久化的图片行数。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 版本附件行
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          required: [id, name, mime, size, extraction_status, image_count]
+                          properties:
+                            id:
+                              type: string
+                              pattern: '^[0-9]+$'
+                            name:
+                              type: string
+                            mime:
+                              type: string
+                            size:
+                              type: integer
+                              minimum: 0
+                            extraction_status:
+                              type: string
+                              enum: [pending, processing, done, failed, skipped]
+                            error_code:
+                              type: string
+                            error_text:
+                              type: string
+                            image_count:
+                              type: integer
+                              minimum: 0
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '500': {$ref: '#/components/responses/Internal'}
+
   /api/versions/{id}/attachments/{attachmentId}/images:
     get:
       tags: [Requirements]
@@ -9320,6 +9396,8 @@ paths:
       tags: [Versions]
       operationId: advanceVersionStage
       summary: 推进到下一个工作流阶段（登录用户）
+      description: 门禁满足时推进；版本页不提供手动推进 UI（FE-5/R-B4-6），仅供 API/自动化使用（x-api-only）。
+      x-api-only: true
       parameters:
         - $ref: '#/components/parameters/ID'
       responses:
@@ -10710,6 +10788,18 @@ components:
           maximum: 10
         is_default:
           type: boolean
+        health:
+          type: object
+          description: 0.2.3 配置完整性提示（默认模型是否可解析、是否支持视觉）；reason 为空表示健康
+          required: [default_model_valid, vision_ready, reason]
+          properties:
+            default_model_valid:
+              type: boolean
+            vision_ready:
+              type: boolean
+            reason:
+              type: string
+              enum: ['', default_model_missing, default_model_disabled, default_model_not_vision]
         status:
           type: string
           enum: [active, disabled]
@@ -10760,6 +10850,18 @@ components:
               minimum: 0
             supports_prompt_cache:
               type: boolean
+        supports_tools_source:
+          type: string
+          enum: [catalog, manual]
+        supports_vision_source:
+          type: string
+          enum: [catalog, manual]
+        supports_reasoning_source:
+          type: string
+          enum: [catalog, manual]
+        supports_prompt_cache_source:
+          type: string
+          enum: [catalog, manual]
         deprecated:
           type: boolean
           description: 已下线模型保留展示并标 true；不参与默认模型解析/派发（0.2.1 刷新不静默删除）
@@ -10816,6 +10918,9 @@ components:
           type: string
         actor_id:
           type: string
+        actor_name:
+          type: string
+          description: 0.2.3 操作者用户名（审计列表 LEFT JOIN app_user；登录/系统事件可能为空）
         action:
           type: string
         target_kind:

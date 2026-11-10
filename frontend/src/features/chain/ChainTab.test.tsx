@@ -508,7 +508,9 @@ describe("ChainTab", () => {
       "href",
       "/versions/2001?tab=issues&issue=9101",
     )
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=chain&node=issue%3A9101")
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=chain&node=issue%3A9101", {
+      scroll: false,
+    })
   })
 
   it("restores a ?node= deep link, keeps focus_node on the request and does not rewrite the URL", async () => {
@@ -657,6 +659,7 @@ describe("ChainTab", () => {
     )
     expect(navigation.replace).toHaveBeenLastCalledWith(
       expect.stringContaining("q=%E9%80%80%E6%AC%BE"),
+      { scroll: false },
     )
 
     fireEvent.click(screen.getByTestId("chain-filter-abnormal"))

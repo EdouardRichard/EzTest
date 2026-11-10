@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	executorinfra "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/executor"
@@ -45,21 +47,40 @@ func NewBrowserAdapterWithRouter(router *ExecutorRouter) *BrowserAdapter {
 var _ executionapp.BrowserExecutor = (*BrowserAdapter)(nil)
 
 func (a *BrowserAdapter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
+	client, _, err := a.clientForDiagnostics(ctx, executorID)
+	return client, err
+}
+
+// clientForDiagnostics also returns the routing provenance merged into the
+// client's structured error details/log line.
+func (a *BrowserAdapter) clientForDiagnostics(ctx context.Context, executorID int64) (executorinfra.Client, executorinfra.CallDiagnostics, error) {
+	diagnostics := executorinfra.CallDiagnostics{OwnerExecutorID: executorID}
 	if a.router != nil {
-		return a.router.clientFor(ctx, executorID)
+		client, route, err := a.router.clientForDiagnostics(ctx, executorID)
+		if err != nil {
+			return nil, diagnostics, err
+		}
+		registryHit := route.RegistryHit
+		diagnostics.RegistryHit = &registryHit
+		return client, diagnostics, nil
 	}
 	if a.client == nil {
-		return nil, errNotConfigured("executor client")
+		return nil, diagnostics, errNotConfigured("executor client")
 	}
-	return a.client, nil
+	return a.client, diagnostics, nil
 }
 
 // CreateContext creates one executor browser context and returns its id.
 func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.BrowserContextSpec) (string, error) {
-	client, err := a.clientFor(ctx, spec.ExecutorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, spec.ExecutorID)
 	if err != nil {
 		return "", err
 	}
+	// The create metadata is the only place the adapter can recover the
+	// case_run correlation without adding a new port field.
+	diagnostics.CaseRunID = caseRunIDFromMetadata(spec.Metadata)
+	diagnostics.Attempt = attemptFromMetadata(spec.Metadata)
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	info, err := client.CreateContext(ctx, executorinfra.CreateContextInput{
 		Key:          spec.Key,
 		AllowedHosts: spec.AllowedHosts,
@@ -72,12 +93,17 @@ func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.Br
 	return info.ID, nil
 }
 
-// Action runs one executor action and maps its envelope.
+// Action runs one executor action and maps its envelope. Only context_id (plus
+// the route provenance) is attached here: case_run_id/attempt are stamped on
+// the create metadata, so an Action (or Cancel/Close) transport failure carries
+// context_id but no attempt until a caller plumbs it.
 func (a *BrowserAdapter) Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return executionapp.BrowserActionResult{}, err
 	}
+	diagnostics.ContextID = contextID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	result, err := client.Action(ctx, contextID, action, args)
 	if err != nil {
 		return executionapp.BrowserActionResult{}, err
@@ -106,10 +132,12 @@ func (a *BrowserAdapter) Action(ctx context.Context, executorID int64, contextID
 
 // Cancel aborts the in-flight action of one context (best-effort).
 func (a *BrowserAdapter) Cancel(ctx context.Context, executorID int64, contextID string) error {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
+	diagnostics.ContextID = contextID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	_, err = client.Cancel(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
@@ -119,10 +147,12 @@ func (a *BrowserAdapter) Cancel(ctx context.Context, executorID int64, contextID
 
 // Close deletes one context (best-effort: a missing context is already gone).
 func (a *BrowserAdapter) Close(ctx context.Context, executorID int64, contextID string) error {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
+	diagnostics.ContextID = contextID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	err = client.Close(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
@@ -132,10 +162,11 @@ func (a *BrowserAdapter) Close(ctx context.Context, executorID int64, contextID 
 
 // ListContexts lists the executor contexts (orphan reconciliation).
 func (a *BrowserAdapter) ListContexts(ctx context.Context, executorID int64) ([]executionapp.BrowserContextRef, error) {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return nil, err
 	}
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	contexts, err := client.ListContexts(ctx)
 	if err != nil {
 		return nil, err
@@ -170,12 +201,14 @@ func (a *ExecutorProbeAdapter) Health(ctx context.Context) (executionapp.Executo
 		return executionapp.ExecutorHealth{}, err
 	}
 	return executionapp.ExecutorHealth{
-		Status:         health.Status,
-		Version:        health.Version,
-		Contexts:       health.Contexts,
-		MaxContexts:    health.MaxContexts,
-		BrowserVersion: health.BrowserVersion,
-		Error:          health.Error,
+		Status:                 health.Status,
+		Version:                health.Version,
+		Contexts:               health.Contexts,
+		MaxContexts:            health.MaxContexts,
+		BrowserVersion:         health.BrowserVersion,
+		Error:                  health.Error,
+		Creating:               health.Creating,
+		LastContextCreateError: health.LastContextCreateError,
 	}, nil
 }
 
@@ -207,21 +240,35 @@ func NewExecutorControlWithRouter(router *ExecutorRouter) *ExecutorControlAdapte
 var _ executionapp.ExecutorControl = (*ExecutorControlAdapter)(nil)
 
 func (a *ExecutorControlAdapter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
+	client, _, err := a.clientForDiagnostics(ctx, executorID)
+	return client, err
+}
+
+func (a *ExecutorControlAdapter) clientForDiagnostics(ctx context.Context, executorID int64) (executorinfra.Client, executorinfra.CallDiagnostics, error) {
+	diagnostics := executorinfra.CallDiagnostics{OwnerExecutorID: executorID}
 	if a.router != nil {
-		return a.router.clientFor(ctx, executorID)
+		client, route, err := a.router.clientForDiagnostics(ctx, executorID)
+		if err != nil {
+			return nil, diagnostics, err
+		}
+		registryHit := route.RegistryHit
+		diagnostics.RegistryHit = &registryHit
+		return client, diagnostics, nil
 	}
 	if a.client == nil {
-		return nil, errNotConfigured("executor client")
+		return nil, diagnostics, errNotConfigured("executor client")
 	}
-	return a.client, nil
+	return a.client, diagnostics, nil
 }
 
 // CancelContext aborts an in-flight action; a missing context is a no-op.
 func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, executorID int64, contextID string) error {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
+	diagnostics.ContextID = contextID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	_, err = client.Cancel(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
@@ -231,10 +278,12 @@ func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, executorID i
 
 // DeleteContext closes one executor context; a missing context is a no-op.
 func (a *ExecutorControlAdapter) DeleteContext(ctx context.Context, executorID int64, contextID string) error {
-	client, err := a.clientFor(ctx, executorID)
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
+	diagnostics.ContextID = contextID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
 	err = client.Close(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
@@ -260,7 +309,8 @@ func (a *ExecutorControlAdapter) ListContexts(ctx context.Context) ([]executiona
 	}
 	refs := make([]executionapp.ExecutorContext, 0)
 	for _, routed := range clients {
-		contexts, err := routed.Client.ListContexts(ctx)
+		callCtx := executorinfra.WithCallDiagnostics(ctx, executorinfra.CallDiagnostics{OwnerExecutorID: routed.ExecutorID})
+		contexts, err := routed.Client.ListContexts(callCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -278,4 +328,50 @@ func (a *ExecutorControlAdapter) ListContexts(ctx context.Context) ([]executiona
 func isContextNotFound(err error) bool {
 	var apiErr *platform.Error
 	return errors.As(err, &apiErr) && apiErr.Code == "context_not_found"
+}
+
+// caseRunIDFromMetadata recovers the case_run correlation that the API stamps
+// in every browser context metadata (identity format string, but a numeric
+// value is accepted for direct callers/tests).
+func caseRunIDFromMetadata(metadata map[string]any) int64 {
+	return int64FromMetadata(metadata, "case_run_id")
+}
+
+// attemptFromMetadata reads the dispatch attempt when the caller stamps it in
+// the browser context metadata.
+func attemptFromMetadata(metadata map[string]any) int {
+	return int(int64FromMetadata(metadata, "attempt"))
+}
+
+func int64FromMetadata(metadata map[string]any, key string) int64 {
+	if metadata == nil {
+		return 0
+	}
+	switch value := metadata[key].(type) {
+	case string:
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err == nil && parsed > 0 {
+			return parsed
+		}
+	case json.Number:
+		parsed, err := value.Int64()
+		if err == nil && parsed > 0 {
+			return parsed
+		}
+	case int64:
+		if value > 0 {
+			return value
+		}
+	case int:
+		if value > 0 {
+			return int64(value)
+		}
+	case float64:
+		// Only a positive integral value is a valid id: truncating 42.9 or a
+		// negative/non-finite number would invent a misleading correlation.
+		if value > 0 && value <= math.MaxInt64 && value == math.Trunc(value) {
+			return int64(value)
+		}
+	}
+	return 0
 }

@@ -1240,6 +1240,15 @@ func TestPostUserMessageBlocksPendingAttachment(t *testing.T) {
 	if !apiErr.Retryable || !strings.Contains(apiErr.Message, "解析中") {
 		t.Fatalf("error = %#v, want a retryable parsing message", apiErr)
 	}
+	if apiErr.Details["stage"] != "queued" {
+		t.Fatalf("details.stage = %#v, want queued", apiErr.Details["stage"])
+	}
+	if apiErr.Details["images_total"] != 0 {
+		t.Fatalf("details.images_total = %#v, want 0", apiErr.Details["images_total"])
+	}
+	if apiErr.Details["retry_after_seconds"] != 2 {
+		t.Fatalf("details.retry_after_seconds = %#v, want 2", apiErr.Details["retry_after_seconds"])
+	}
 	if len(env.repo.messages[env.conversation.ID]) != 0 {
 		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
 	}
@@ -1256,6 +1265,74 @@ func TestPostUserMessageBlocksPendingAttachment(t *testing.T) {
 	}
 	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment {
 		t.Fatalf("parts = %#v", message.Parts)
+	}
+}
+
+// TestPostUserMessagePendingAttachmentReportsImageProgress covers the C-04
+// 409 details while the attachment is analyzing embedded images: the client
+// gets the stage, image counters, percent and a measured ETA from the first
+// completed images.
+func TestPostUserMessagePendingAttachmentReportsImageProgress(t *testing.T) {
+	env := newImageConversationEnv(t)
+	env.attachments.repo.conversationMessages = map[int64]int64{7001: env.conversation.ID}
+	env.attachments.repo.conversations = map[int64]int64{env.conversation.ID: env.versionID}
+	data := []byte("# 需求")
+	sha := strings.Repeat("b", 64)
+	env.attachments.store.put(sha, data, "text/markdown")
+	pending, err := env.attachments.svc.RegisterFromMessage(requestContext(), env.versionID,
+		env.conversation.ID, 7001, attachmentPart(sha, "spec.md", "text/markdown", int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	row, ok := env.attachments.repo.attachments[pending.ID]
+	if !ok {
+		t.Fatalf("attachment row %d missing", pending.ID)
+	}
+	row.ExtractionStatus = version.AttachmentProcessing
+	env.attachments.repo.attachments[pending.ID] = row
+	for seq := 1; seq <= 12; seq++ {
+		image := version.AttachmentImageRecord{
+			ID: int64(1000 + seq), AttachmentID: pending.ID, Seq: seq,
+			ContentRefID: int64(2000 + seq), MIME: "image/png",
+			SourceKind: version.AttachmentImageSourceEmbedded,
+			Status:     version.AttachmentImageExtracted,
+			CreatedAt:  testTime.Add(-time.Minute), UpdatedAt: testTime.Add(-time.Minute),
+		}
+		if seq <= 4 {
+			image.Status = version.AttachmentImageDone
+			image.Caption = "图"
+			image.UpdatedAt = testTime
+		}
+		env.attachments.repo.images[image.ID] = image
+	}
+
+	referencing := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请再看一下附件"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "spec.md", MIME: "text/markdown", Size: int64(len(data))},
+	}
+	_, err = env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, referencing, "", 42)
+	if err == nil {
+		t.Fatal("message referencing an analyzing attachment was accepted")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Code != versionapp.AttachmentPendingCode || apiErr.Details == nil {
+		t.Fatalf("error = %#v", apiErr)
+	}
+	if apiErr.Details["stage"] != "analyzing_images" {
+		t.Fatalf("details.stage = %#v, want analyzing_images", apiErr.Details["stage"])
+	}
+	if apiErr.Details["images_total"] != 12 || apiErr.Details["images_done"] != 4 {
+		t.Fatalf("details images = %#v", apiErr.Details)
+	}
+	if apiErr.Details["percent"] != 33 {
+		t.Fatalf("details.percent = %#v, want 33", apiErr.Details["percent"])
+	}
+	eta, ok := apiErr.Details["eta_seconds"].(int)
+	if !ok || eta <= 0 {
+		t.Fatalf("details.eta_seconds = %#v, want a positive ETA after the first image", apiErr.Details["eta_seconds"])
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
 	}
 }
 

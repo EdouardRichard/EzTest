@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -234,8 +235,12 @@ func TestSchedulerWaveTerminalCallbackAdvancesStage(t *testing.T) {
 	if got := repo.currentStage(); got != version.StageReporting {
 		t.Fatalf("stage after wave terminal = %q, want reporting", got)
 	}
-	if len(reports.versions) != 1 || reports.versions[0] != 100 {
-		t.Fatalf("report ensure calls = %v, want [100]", reports.versions)
+	// R2-NEW-02: the executing -> reporting edge only checks that every wave is
+	// terminal. Generating the version report is the reporting stage's own job
+	// (report.version stage-entry job / P4 reconciler), so the edge must not call
+	// EnsureVersionReport itself.
+	if len(reports.versions) != 0 {
+		t.Fatalf("the executing->reporting edge ensured the report itself: %v", reports.versions)
 	}
 
 	// report.published is the second production callback; Task 25's delivery
@@ -356,6 +361,7 @@ func TestSchedulerRetriesFailedWaveTerminalCallback(t *testing.T) {
 	// A later tick retries through StageService.Reconcile. The reconcile itself
 	// can still fail (report not ready); the retry stays pending.
 	reconciler.err = errors.New("report is not ready yet")
+	f.clock.now = f.clock.now.Add(stageRetryBaseDelay)
 	if err := f.scheduler.Reconcile(ctx); err != nil {
 		t.Fatalf("retry tick with failing reconcile: %v", err)
 	}
@@ -364,6 +370,7 @@ func TestSchedulerRetriesFailedWaveTerminalCallback(t *testing.T) {
 	}
 
 	// The next tick retries again and the success clears the pending entry.
+	f.clock.now = f.clock.now.Add(stageRetryDelay(2))
 	reconciler.err = nil
 	if err := f.scheduler.Reconcile(ctx); err != nil {
 		t.Fatalf("successful retry tick: %v", err)
@@ -378,6 +385,101 @@ func TestSchedulerRetriesFailedWaveTerminalCallback(t *testing.T) {
 	}
 	if calls := reconciler.calls(); len(calls) != 2 {
 		t.Fatalf("reconciler ran after the retry was cleared: %v", calls)
+	}
+}
+
+// TestStageReconcileRetriesBackOff: a failed wave-terminal callback is retried
+// with exponential backoff (1s, 2s, 4s, ... capped at 60s) instead of on every
+// 1s scheduler tick, and a success clears the schedule immediately.
+func TestStageReconcileRetriesBackOff(t *testing.T) {
+	f := newTask6Fixture(t)
+	ctx := context.Background()
+	notifier := &recordingWaveStageNotifier{err: errors.New("transient stage callback failure")}
+	reconciler := &recordingStageReconciler{err: errors.New("stage gate still closed")}
+	f.scheduler.stageNotifier = notifier
+	f.scheduler.stageReconciler = reconciler
+	logs := captureSchedulerSlog(t)
+
+	f.scheduler.notifyStageWaveTerminal(ctx, 100, 9001)
+	if calls := reconciler.calls(); len(calls) != 0 {
+		t.Fatalf("reconciler ran before its first backoff window: %v", calls)
+	}
+
+	// Not due yet: the first retry waits one second.
+	f.scheduler.Reconcile(ctx)
+	f.clock.now = f.clock.now.Add(500 * time.Millisecond)
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 0 {
+		t.Fatalf("reconciler ran inside the 1s backoff window: %v", calls)
+	}
+
+	f.clock.now = f.clock.now.Add(500 * time.Millisecond) // t0 + 1s
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 1 {
+		t.Fatalf("reconcile calls after the first backoff = %v, want one", calls)
+	}
+
+	// The second failure doubles the delay to 2s.
+	f.clock.now = f.clock.now.Add(time.Second)
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 1 {
+		t.Fatalf("reconciler ran inside the 2s backoff window: %v", calls)
+	}
+	f.clock.now = f.clock.now.Add(time.Second) // retry + 2s
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 2 {
+		t.Fatalf("reconcile calls after the 2s backoff = %v, want two", calls)
+	}
+
+	// A success clears the schedule immediately: no later tick re-drives it.
+	reconciler.err = nil
+	f.clock.now = f.clock.now.Add(stageRetryMaxDelay)
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 3 {
+		t.Fatalf("reconcile calls after recovery = %v, want three", calls)
+	}
+	f.scheduler.Reconcile(ctx)
+	if calls := reconciler.calls(); len(calls) != 3 {
+		t.Fatalf("a cleared version was retried again: %v", calls)
+	}
+
+	// Logging grows sublinearly with the ticks: only the two failed retries warn,
+	// and the entries explain the backoff.
+	logged := logs.String()
+	if !strings.Contains(logged, "attempt=2") || !strings.Contains(logged, "retry_in=") {
+		t.Fatalf("retry log is missing attempt/retry_in: %s", logged)
+	}
+	if got := strings.Count(logged, "stage reconcile retry failed"); got != 2 {
+		t.Fatalf("stage retry WARN lines = %d, want 2 (one per failed retry, not per tick): %s", got, logged)
+	}
+}
+
+// TestStageRetryDelayCapsAt60s pins the exponential schedule of a failed
+// wave-terminal stage callback: 1s, 2s, 4s, 8s, 16s, 32s and then the 60s (not
+// 64s) cap, including attempt counts so large that a naive shift would
+// overflow.
+func TestStageRetryDelayCapsAt60s(t *testing.T) {
+	if stageRetryMaxDelay != 60*time.Second {
+		t.Fatalf("stage retry max delay = %v, want the 60s cap", stageRetryMaxDelay)
+	}
+	cases := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{attempts: 0, want: time.Second},
+		{attempts: 1, want: time.Second},
+		{attempts: 2, want: 2 * time.Second},
+		{attempts: 3, want: 4 * time.Second},
+		{attempts: 5, want: 16 * time.Second},
+		{attempts: 6, want: 32 * time.Second},
+		{attempts: 7, want: 60 * time.Second},
+		{attempts: 64, want: 60 * time.Second},
+		{attempts: 1000, want: 60 * time.Second},
+	}
+	for _, testCase := range cases {
+		if got := stageRetryDelay(testCase.attempts); got != testCase.want {
+			t.Fatalf("stageRetryDelay(%d) = %v, want %v", testCase.attempts, got, testCase.want)
+		}
 	}
 }
 

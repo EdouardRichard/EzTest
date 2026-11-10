@@ -6,11 +6,11 @@ import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { InlineError } from "@/components/ui/ErrorState"
-import { ApiError } from "@/lib/api-client"
 import { formatDuration } from "@/lib/format"
 
 import { createIntent } from "./api"
 import { CaseRunDetailView } from "./CaseRunDetail"
+import { closedRequirementId, requirementClosedMessage } from "./closed-requirement"
 import { rerunPurpose } from "./intent-purpose"
 import {
   CASE_RUN_STATUS_LABEL,
@@ -44,19 +44,6 @@ export type ResultsPanelProps = {
 const PINNED_ORDER: Partial<Record<CaseRun["status"], number>> = {
   failed: 0,
   blocked: 1,
-}
-
-/**
- * The retest 409 for a closed requirement carries a stable
- * `details.reason=requirement_closed` plus the requirement ID. That is the one
- * error the UI can turn into a real recovery action instead of a dead end.
- */
-function closedRequirementId(error: unknown): string | null {
-  if (!(error instanceof ApiError) || error.details.reason !== "requirement_closed") {
-    return null
-  }
-  const requirementId = error.details.requirement_id
-  return typeof requirementId === "string" && requirementId.length > 0 ? requirementId : null
 }
 
 function pinOrder(status: CaseRun["status"]): number {
@@ -138,21 +125,21 @@ export function ResultsPanel({
 
       {rerunError !== null ? (
         <div className="border-b border-border px-3 py-2">
-          <InlineError error={rerunError} />
-          {closedRetestRequirement !== null ? (
+          <InlineError
+            error={rerunError}
+            message={
+              closedRetestRequirement !== null ? requirementClosedMessage("rerun") : undefined
+            }
+          />
+          {closedRetestRequirement !== null && onOpenRequirement !== undefined ? (
             <div className="mt-1 flex flex-wrap items-center gap-2">
-              <span className="text-[11px] text-muted-foreground">
-                该用例所属需求已闭环，重跑前需先重新打开该需求。
-              </span>
-              {onOpenRequirement !== undefined ? (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => onOpenRequirement(closedRetestRequirement)}
-                >
-                  前往重新打开需求
-                </Button>
-              ) : null}
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => onOpenRequirement(closedRetestRequirement)}
+              >
+                前往重新打开需求
+              </Button>
             </div>
           ) : null}
         </div>

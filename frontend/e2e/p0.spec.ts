@@ -155,8 +155,9 @@ test("P0 admin journey: login, versions, detail, resources, settings", async ({ 
   page.on("pageerror", (error) => pageErrors.push(String(error)))
 
   await page.goto("/login")
-  await expect(page.getByText("初始管理员密码")).toBeVisible()
-  await expect(page.getByText(/EZTEST_INITIAL_ADMIN_PASSWORD/)).toBeVisible()
+  await expect(page.getByRole("heading", { name: "登录 EzTest" })).toBeVisible()
+  await expect(page.getByText("初始管理员密码")).toHaveCount(0)
+  await expect(page.getByText(/EZTEST_INITIAL_ADMIN_PASSWORD/)).toHaveCount(0)
   await expect(page.getByText("admin123")).toHaveCount(0)
 
   await page.fill("#username", ADMIN_USERNAME)
@@ -209,4 +210,34 @@ test("P0 admin journey: login, versions, detail, resources, settings", async ({ 
   await page.screenshot({ path: path.join(screenshotDir, "settings.png"), fullPage: true })
 
   expect(pageErrors).toEqual([])
+})
+
+test("serves the app icon on a fresh context without a favicon 404", async ({ page }) => {
+  const missing: string[] = []
+  page.on("response", (response) => {
+    if (response.status() === 404) missing.push(new URL(response.url()).pathname)
+  })
+
+  await page.goto("/login")
+  await expect(page.getByRole("heading", { name: "登录 EzTest" })).toBeVisible()
+  await page.waitForLoadState("networkidle")
+
+  expect(missing).not.toContain("/favicon.ico")
+
+  const icon = await page.request.get("/icon.svg")
+  expect(icon.status()).toBe(200)
+  expect(icon.headers()["content-type"] ?? "").toContain("image/svg+xml")
+})
+
+test("renders the Chinese product 404 with the application shell", async ({ page }) => {
+  const response = await page.goto(`/__eztest_missing_route_${suffix}`)
+
+  expect(response?.status()).toBe(404)
+  await expect(page.getByRole("heading", { name: "页面不存在" })).toBeVisible()
+  await expect(page.getByText("404")).toBeVisible()
+  await expect(page.getByRole("navigation", { name: "主导航" })).toBeVisible()
+  await expect(page.getByRole("link", { name: /返回版本列表/ })).toHaveAttribute(
+    "href",
+    "/versions",
+  )
 })

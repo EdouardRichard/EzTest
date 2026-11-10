@@ -10,6 +10,8 @@ import type { DesignNodeActions } from "./nodeActions"
 
 type ScenarioData = Extract<DesignNodeData, { kind: "scenario" }> & {
   actions: DesignNodeActions
+  /** D-09: hidden below the minimum action zoom (React Flow scales the node). */
+  destructiveActionsDisabled?: boolean
 }
 
 /** Scenario node: name, case count, target SUTs and "确认场景". */
@@ -34,7 +36,8 @@ export function ScenarioNode({ data }: NodeProps) {
       <p className="mt-1 text-[11px] text-muted-foreground">
         SUT {scenario.version_sut_ids.length} 个 · 页面 {scenario.page_ids.length} 个
       </p>
-      {node.actions.caseReviewEnabled === false ? null : (
+      {node.actions.caseReviewEnabled === false ||
+      node.destructiveActionsDisabled === true ? null : (
         <Button
           size="sm"
           variant="secondary"

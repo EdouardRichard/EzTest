@@ -46,6 +46,11 @@ type ExecutorHealth struct {
 	MaxContexts    int
 	BrowserVersion string
 	Error          string
+	// Creating is the number of in-flight context creations and
+	// LastContextCreateError the last failed creation's sanitized diagnostic
+	// (v0.2.3 X-01); both come from the executor's unauthenticated /healthz.
+	Creating               int
+	LastContextCreateError string
 }
 
 // ExecutorContextRef is one executor-side browser context as listed by

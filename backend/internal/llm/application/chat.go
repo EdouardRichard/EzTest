@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
@@ -35,6 +36,11 @@ const (
 	// CodeLLMCapabilityMismatch marks a non-retryable capability error: the
 	// resolved model cannot serve the role (tools/vision/reasoning).
 	CodeLLMCapabilityMismatch = "llm_capability_mismatch"
+	// CodeDefaultModelInUse marks the conflict returned when an administrator
+	// tries to delete the model that is the configuration's default. The delete
+	// would bypass default-model validation, so the model must be reassigned
+	// first.
+	CodeDefaultModelInUse = "default_model_in_use"
 )
 
 // ErrContextOverflow marks an upstream rejection caused by the request
@@ -255,7 +261,7 @@ func (s *Service) resolveModelTarget(ctx context.Context, cfgID int64, modelID s
 	}
 	requirements := append([]ModelRequirements(nil), required...)
 	if err := validateThinkingSettings(cfg); err != nil {
-		return llm.Config{}, llm.Model{}, err
+		return llm.Config{}, llm.Model{}, withResolveDetails(err, cfg)
 	}
 	// Both adapters forward any non-none reasoning effort, independent of the
 	// thinking mode, so an explicit effort also requires a reasoning-capable
@@ -265,7 +271,7 @@ func (s *Service) resolveModelTarget(ctx context.Context, cfgID int64, modelID s
 		requirements = append(requirements, ModelRequirements{Reasoning: true})
 	}
 	if err := validateModelCapabilities(chosen, requirements...); err != nil {
-		return llm.Config{}, llm.Model{}, err
+		return llm.Config{}, llm.Model{}, withResolveDetails(err, cfg)
 	}
 	return cfg, chosen, nil
 }
@@ -351,8 +357,8 @@ func (s *Service) resolveChatTarget(ctx context.Context, cfgID int64, model stri
 				continue
 			}
 			if !models[i].Selectable() {
-				return llm.Config{}, llm.Model{}, llmConfigError(
-					fmt.Sprintf("llm model %q is deprecated or disabled; choose another model", name))
+				return llm.Config{}, llm.Model{}, withResolveDetails(llmConfigError(
+					fmt.Sprintf("llm model %q is deprecated or disabled; choose another model", name)), cfg)
 			}
 			return cfg, models[i], nil
 		}
@@ -362,26 +368,26 @@ func (s *Service) resolveChatTarget(ctx context.Context, cfgID int64, model stri
 	// The spec forbids deriving the target from models[0]: a config without an
 	// explicit default_model_id is a configuration error, not a silent pick.
 	if cfg.DefaultModelID <= 0 {
-		return llm.Config{}, llm.Model{}, &platform.Error{
+		return llm.Config{}, llm.Model{}, withResolveDetails(&platform.Error{
 			Status:  400,
 			Code:    CodeLLMConfigInvalid,
 			Message: "llm config has no default model; set default_model_id before running agents (models[0] is never used)",
 			Details: map[string]any{"field": "default_model_id"},
-		}
+		}, cfg)
 	}
 	for i := range models {
 		if models[i].ID != cfg.DefaultModelID {
 			continue
 		}
 		if !models[i].Selectable() {
-			return llm.Config{}, llm.Model{}, llmConfigError(fmt.Sprintf(
-				"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model))
+			return llm.Config{}, llm.Model{}, withResolveDetails(llmConfigError(fmt.Sprintf(
+				"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model)), cfg)
 		}
 		return cfg, models[i], nil
 	}
-	return llm.Config{}, llm.Model{}, llmConfigError(fmt.Sprintf(
+	return llm.Config{}, llm.Model{}, withResolveDetails(llmConfigError(fmt.Sprintf(
 		"default model %d is not in the catalog of llm config %q; refresh the model catalog or set default_model_id",
-		cfg.DefaultModelID, cfg.Name))
+		cfg.DefaultModelID, cfg.Name)), cfg)
 }
 
 // selectConfig loads the explicitly requested configuration, or the unique
@@ -463,6 +469,32 @@ func llmConfigError(message string) *platform.Error {
 		Code:    CodeLLMConfigInvalid,
 		Message: message,
 	}
+}
+
+// withResolveDetails attaches the configuration identity to the two
+// non-retryable resolve errors (M-07). Callers such as the vision availability
+// probe and the admin UI need the config/model identity to explain which
+// setting is broken instead of collapsing every failure into "no vision
+// model". Other error codes are returned unchanged.
+func withResolveDetails(err error, cfg llm.Config) error {
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	if apiErr.Code != CodeLLMConfigInvalid && apiErr.Code != CodeLLMCapabilityMismatch {
+		return err
+	}
+	if apiErr.Details == nil {
+		apiErr.Details = map[string]any{}
+	}
+	defaultModelID := ""
+	if cfg.DefaultModelID > 0 {
+		defaultModelID = strconv.FormatInt(cfg.DefaultModelID, 10)
+	}
+	apiErr.Details["config_id"] = strconv.FormatInt(cfg.ID, 10)
+	apiErr.Details["config_name"] = cfg.Name
+	apiErr.Details["default_model_id"] = defaultModelID
+	return apiErr
 }
 
 // aiUnavailable builds the stable 503 used when no usable model target exists.

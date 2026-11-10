@@ -4,6 +4,8 @@ import (
 	"context"
 	"sort"
 	"time"
+
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // Report input size caps (spec §6.1). A report never includes more than these
@@ -40,6 +42,15 @@ const (
 	// "application" and not "automation": the run is neither a product defect
 	// nor flaky automation noise; it needs a rerun to produce a conclusion.
 	FailureClassExpectedFailure = "expected_failure"
+	// FailureClassBlocked is the report-visible failure class of a run blocked
+	// by an executor capability limitation (v0.2.3 X-02). It stays blocked: the
+	// executor could not perform the action, so it is never a SUT defect.
+	FailureClassBlocked = "blocked"
+	// TerminalCauseExecutorCapability is the shared stable cause of a run blocked
+	// by an executor capability limitation. Execution, issue candidates and the
+	// report/triage vocabulary use the same code (no DB enum/migration); the
+	// execution domain owns the constant.
+	TerminalCauseExecutorCapability = execution.TerminalCauseExecutorCapability
 	// CoverageGapExecutionFlaky explains an uncovered case version whose latest
 	// run failed but the platform triage classified that failure as flaky. It
 	// is a flaky gap, not a product coverage failure.
@@ -190,6 +201,16 @@ type RequirementSnapshot struct {
 	CloseRound       int32
 	ReopenCount      int
 	UpdatedAt        time.Time
+	// ExecutionSettled is derived execution metadata: true when the requirement
+	// has at least one current+confirmed case version and every such case
+	// version's latest non-superseded case_run is terminal (blocked,
+	// inconclusive and skipped count as terminal). It is deliberately NOT part of
+	// the canonical fingerprint payload (report_fingerprint.go): adding it there
+	// would change every stored fingerprint and mass-mark published reports
+	// stale. The report due gate uses it so a requirement whose closure predicate
+	// can never pass (blocked/inconclusive case, failed case without an issue
+	// yet) does not block the version report forever (R2-NEW-02).
+	ExecutionSettled bool
 }
 
 // WaveSnapshot is one wave projection of a report. Counts are fixed fields (no
@@ -250,6 +271,11 @@ type CaseRunSnapshot struct {
 	VersionSUTIDs []int64
 	Status        string
 	FailureClass  string
+	// TerminalCause is the execution-persisted stable cause of the run
+	// (case_run.summary.terminal_cause). The report/triage vocabulary shares it
+	// with execution: executor_capability marks a run blocked by an executor
+	// capability limitation, never a SUT defect (v0.2.3 X-02).
+	TerminalCause string
 	// TriageClassification is the latest finished platform triage
 	// classification of the issue that references this run (empty when none).
 	// A flaky classification overrides the report-visible classification; the
@@ -276,6 +302,11 @@ type CaseRunSnapshot struct {
 // budget/no-judgment, needs a rerun). Neither triage classification is a
 // product/application defect (Task 118, Task 122).
 func (row CaseRunSnapshot) EffectiveFailureClass() string {
+	if row.ExecutorCapabilityBlocked() {
+		// An executor capability block is not a product defect and no triage
+		// classification may turn it into one (X-02).
+		return FailureClassBlocked
+	}
 	switch row.TriageClassification {
 	case TriageClassificationFlaky:
 		return FailureClassAutomation
@@ -283,6 +314,13 @@ func (row CaseRunSnapshot) EffectiveFailureClass() string {
 		return FailureClassExpectedFailure
 	}
 	return row.FailureClass
+}
+
+// ExecutorCapabilityBlocked reports whether the run was blocked by an executor
+// capability limitation rather than a SUT defect. Execution and the issue
+// candidate gate share the same terminal cause vocabulary (v0.2.3 X-02).
+func (row CaseRunSnapshot) ExecutorCapabilityBlocked() bool {
+	return row.TerminalCause == TerminalCauseExecutorCapability
 }
 
 // ExpectedFailureTriage reports whether the latest finished issue triage

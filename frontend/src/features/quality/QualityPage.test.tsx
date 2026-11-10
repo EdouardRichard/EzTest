@@ -13,7 +13,7 @@ vi.mock("./api", () => qualityApi)
 const versionEvents = vi.hoisted(() => ({ useVersionEvents: vi.fn(() => "open") }))
 vi.mock("@/features/clarification/useVersionEvents", () => versionEvents)
 
-const versionsApi = vi.hoisted(() => ({ listVersions: vi.fn() }))
+const versionsApi = vi.hoisted(() => ({ listVersions: vi.fn(), getVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
 const visualApi = vi.hoisted(() => ({ getVisualMetrics: vi.fn() }))
@@ -25,8 +25,9 @@ vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin })
 const navigation = vi.hoisted(() => ({ replace: vi.fn() }))
 vi.mock("next/navigation", () => ({ useRouter: () => navigation }))
 
-import { versionSummaryFixture } from "@/features/versions/test-fixtures"
+import { versionFixture, versionSummaryFixture } from "@/features/versions/test-fixtures"
 import { visualMetricsFixture } from "@/features/visual/test-fixtures"
+import { ApiError } from "@/lib/api-client"
 
 import { QualityPage } from "./QualityPage"
 import type { EvalRun, QualityOverview, TrendPoint } from "./types"
@@ -182,9 +183,12 @@ describe("QualityPage", () => {
     qualityApi.triggerSnapshot.mockReset()
     qualityApi.getQualityTrends.mockReset()
     versionsApi.listVersions.mockReset()
+    versionsApi.getVersion.mockReset()
     visualApi.getVisualMetrics.mockReset()
     navigation.replace.mockReset()
     versionEvents.useVersionEvents.mockClear()
+
+    versionsApi.getVersion.mockResolvedValue(versionFixture)
 
     qualityApi.getQualityOverview.mockResolvedValue(overviewFixture)
     qualityApi.listEvalRuns.mockResolvedValue([evalRunFixture])
@@ -285,6 +289,102 @@ describe("QualityPage", () => {
     fireEvent.change(selector, { target: { value: "2002" } })
     await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenLastCalledWith("2002"))
     expect(navigation.replace).toHaveBeenCalledWith("/quality?version=2002")
+  })
+
+  it("does not re-validate a version picked from the list after a server re-render", async () => {
+    const { rerender } = render(<QualityPage initialVersionId="2001" />)
+
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
+    expect(versionsApi.getVersion).toHaveBeenCalledTimes(1)
+
+    const selector = await screen.findByLabelText("版本")
+    fireEvent.change(selector, { target: { value: "2002" } })
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenLastCalledWith("2002"))
+    await waitFor(() => expect(visualApi.getVisualMetrics).toHaveBeenLastCalledWith("2002"))
+    const overviewCalls = qualityApi.getQualityOverview.mock.calls.length
+
+    // `router.replace` re-renders the server component with the selected id.
+    rerender(<QualityPage initialVersionId="2002" />)
+
+    // The already-resolved id must not be validated again: re-running the
+    // effect would tear down the overview/trends/SSE and re-fetch them.
+    await waitFor(() => expect(versionsApi.getVersion).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText("正在确认版本…")).not.toBeInTheDocument()
+    expect(qualityApi.getQualityOverview).toHaveBeenCalledTimes(overviewCalls)
+    expect(visualApi.getVisualMetrics).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps a valid deep-linked version outside the first list page selectable", async () => {
+    const deepLinkedVersion = {
+      ...versionFixture,
+      id: "2003",
+      title: "订单中心 · 2026 Q1 归档",
+    }
+    versionsApi.listVersions.mockResolvedValue([versionSummaryFixture])
+    versionsApi.getVersion.mockResolvedValue(deepLinkedVersion)
+
+    render(<QualityPage initialVersionId="2003" />)
+
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
+    const selector = await screen.findByLabelText("版本")
+    await waitFor(() => expect(selector).toHaveValue("2003"))
+    expect(screen.getByRole("option", { name: "#2003 · 订单中心 · 2026 Q1 归档" })).toBeVisible()
+    expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("2003")
+  })
+
+  it("falls back to all versions for an unknown ?version= deep link", async () => {
+    auth.isAdmin = true
+    versionsApi.getVersion.mockRejectedValue(
+      new ApiError({ status: 404, code: "not_found", message: "版本不存在" }),
+    )
+    render(<QualityPage initialVersionId="9999" />)
+
+    expect(await screen.findByTestId("quality-version-fallback")).toHaveTextContent(
+      "版本 #9999 不存在，已按全部版本展示",
+    )
+    expect(versionsApi.getVersion).toHaveBeenCalledWith("9999")
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith(undefined))
+    expect(qualityApi.getQualityOverview).not.toHaveBeenCalledWith("9999")
+    expect(qualityApi.getQualityTrends).not.toHaveBeenCalled()
+    expect(versionEvents.useVersionEvents).not.toHaveBeenCalled()
+    expect(navigation.replace).toHaveBeenCalledWith("/quality")
+    expect(await screen.findByLabelText("版本")).toHaveValue("")
+    expect(screen.queryByRole("button", { name: "触发快照评测" })).not.toBeInTheDocument()
+  })
+
+  it("does not issue version-scoped requests or open the SSE bridge before the deep link resolves", async () => {
+    auth.isAdmin = true
+    let resolveVersion: (value: unknown) => void = () => {}
+    versionsApi.getVersion.mockReturnValue(
+      new Promise((resolve) => {
+        resolveVersion = resolve
+      }),
+    )
+
+    render(<QualityPage initialVersionId="2001" />)
+
+    expect(await screen.findByText("正在确认版本…")).toBeInTheDocument()
+    expect(qualityApi.getQualityOverview).not.toHaveBeenCalled()
+    expect(qualityApi.getQualityTrends).not.toHaveBeenCalled()
+    expect(visualApi.getVisualMetrics).not.toHaveBeenCalled()
+    expect(versionEvents.useVersionEvents).not.toHaveBeenCalled()
+
+    resolveVersion(versionFixture)
+
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("2001"))
+    expect(await screen.findByTestId("quality-metrics-panel")).toBeInTheDocument()
+    expect(versionEvents.useVersionEvents).toHaveBeenCalledWith("2001", expect.anything())
+  })
+
+  it("does not treat a failed version list as an unknown version", async () => {
+    versionsApi.listVersions.mockRejectedValue(new Error("版本列表不可用"))
+
+    render(<QualityPage initialVersionId="9999" />)
+
+    await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("9999"))
+    expect(versionsApi.getVersion).toHaveBeenCalledWith("9999")
+    expect(screen.queryByTestId("quality-version-fallback")).not.toBeInTheDocument()
+    expect(navigation.replace).not.toHaveBeenCalledWith("/quality")
   })
 
   // W2-14 (R-W2-6): admin triggers one server-derived snapshot eval and the

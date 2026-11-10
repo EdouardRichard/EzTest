@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
@@ -42,20 +43,39 @@ func (r *Repository) Insert(ctx context.Context, entry audit.Entry) error {
 	return nil
 }
 
-// List returns up to limit entries older than beforeID, newest first.
+// likePrefixPattern escapes LIKE metacharacters so a user-supplied action
+// prefix is matched literally, then appends the wildcard for prefix matching.
+// NewReplacer does a single pass, so the backslashes it inserts are not escaped
+// again.
+func likePrefixPattern(prefix string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(prefix) + "%"
+}
+
+// List returns up to limit entries older than beforeID, newest first. The
+// action filter is a case-insensitive prefix match; historical aliases resolve
+// to their canonical action. LIKE metacharacters in the prefix are escaped, so
+// a filter of "%" searches for a literal percent instead of matching every
+// row. The actor name is joined from app_user so the UI can show who acted
+// without a second query.
 func (r *Repository) List(ctx context.Context, filter audit.Filter, limit int, beforeID *int64) ([]audit.Entry, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("list audit entries: limit must be positive")
 	}
+	alias := audit.ResolveAlias(filter.Action)
+	pattern := likePrefixPattern(filter.Action)
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, actor_id, action, target_kind, target_id, request_id, ip, user_agent, metadata, created_at
-		FROM audit_log
-		WHERE ($1::BIGINT IS NULL OR id < $1)
-		  AND ($2 = '' OR action = $2)
-		  AND ($3::BIGINT IS NULL OR actor_id = $3)
-		ORDER BY id DESC
-		LIMIT $4
-	`, beforeID, filter.Action, filter.ActorID, limit)
+		SELECT a.id, a.actor_id, COALESCE(u.username, '') AS actor_name,
+		       a.action, a.target_kind, a.target_id, a.request_id, a.ip,
+		       a.user_agent, a.metadata, a.created_at
+		FROM audit_log a
+		LEFT JOIN app_user u ON u.id = a.actor_id
+		WHERE ($1::BIGINT IS NULL OR a.id < $1)
+		  AND ($2 = '' OR a.action ILIKE $5 ESCAPE '\' OR a.action = $4)
+		  AND ($3::BIGINT IS NULL OR a.actor_id = $3)
+		ORDER BY a.id DESC
+		LIMIT $6
+	`, beforeID, filter.Action, filter.ActorID, alias, pattern, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list audit entries: %w", err)
 	}
@@ -66,8 +86,9 @@ func (r *Repository) List(ctx context.Context, filter audit.Filter, limit int, b
 		var entry audit.Entry
 		var metadata []byte
 		if err := rows.Scan(
-			&entry.ID, &entry.ActorID, &entry.Action, &entry.TargetKind, &entry.TargetID,
-			&entry.RequestID, &entry.IP, &entry.UserAgent, &metadata, &entry.CreatedAt,
+			&entry.ID, &entry.ActorID, &entry.ActorName, &entry.Action, &entry.TargetKind,
+			&entry.TargetID, &entry.RequestID, &entry.IP, &entry.UserAgent, &metadata,
+			&entry.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan audit entry: %w", err)
 		}

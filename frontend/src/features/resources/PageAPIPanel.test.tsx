@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -218,12 +218,17 @@ describe("PageAPIPanel", () => {
     )
   })
 
-  it("surfaces the API 409 guard when a page cannot be deleted", async () => {
+  it("renders the referenced-version details when a page cannot be deleted", async () => {
     vi.mocked(api.deletePage).mockRejectedValue(
       new ApiError({
         status: 409,
-        code: "conflict",
-        message: "page is referenced by a version scope",
+        code: "resource_referenced",
+        message: "page is referenced by a version binding",
+        details: {
+          kind: "page",
+          referencing_versions: [{ id: "2001", title: "订单中心 v1" }],
+          resolution: "Exclude this page from the version scope.",
+        },
       }),
     )
     const { onRefresh } = renderPanel()
@@ -231,10 +236,119 @@ describe("PageAPIPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除页面 订单列表" }))
     fireEvent.click(screen.getByRole("button", { name: "删除页面" }))
 
-    expect(await screen.findByText(/page is referenced by a version scope/)).toBeInTheDocument()
-    expect(screen.getByText(/操作冲突/)).toBeInTheDocument()
+    expect(await screen.findByText("该页面已被版本绑定引用，无法删除")).toBeVisible()
+    const link = screen.getByRole("link", { name: "订单中心 v1" })
+    expect(link).toHaveAttribute("href", "/versions/2001?tab=overview")
+    expect(screen.getByText(/resource_referenced/)).toBeVisible()
+    expect(screen.queryByText(/page is referenced by a version binding/)).toBeNull()
+    expect(screen.queryByText(/名称\/键重复/)).toBeNull()
     expect(api.deletePage).toHaveBeenCalledWith("1301")
     expect(onRefresh).not.toHaveBeenCalled()
+  })
+
+  it("separates editable and terminal referencing versions and avoids an impossible suggestion", async () => {
+    vi.mocked(api.deletePage).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "page is referenced by a version binding",
+        details: {
+          kind: "page",
+          resource_id: "1301",
+          referencing_versions: [
+            {
+              id: "2001",
+              title: "设计中的版本",
+              status: "running",
+              stage: "designing",
+              editable: true,
+            },
+            {
+              id: "2002",
+              title: "已完成版本",
+              status: "completed",
+              stage: "completed",
+              editable: false,
+            },
+          ],
+          resolution: "Exclude this page from the scope of editable versions.",
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除页面 订单列表" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除页面" }))
+
+    expect(await screen.findByText("该页面已被版本绑定引用，无法删除")).toBeVisible()
+
+    const editableGroup = screen.getByTestId("resource-editable-versions")
+    expect(within(editableGroup).getByRole("link", { name: "设计中的版本" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=overview",
+    )
+    expect(within(editableGroup).getByText(/请先在引用版本的页面范围中排除该页面/)).toBeVisible()
+
+    const terminalGroup = screen.getByTestId("resource-terminal-versions")
+    expect(within(terminalGroup).getByRole("link", { name: "已完成版本" })).toHaveAttribute(
+      "href",
+      "/versions/2002?tab=overview",
+    )
+    expect(within(terminalGroup).getByText(/终态版本只读，需管理员\/运维处理/)).toBeVisible()
+    // The terminal group must never suggest the impossible scope edit.
+    expect(within(terminalGroup).queryByText(/排除/)).toBeNull()
+  })
+
+  it("keeps the legacy resolution copy when the backend omits editable", async () => {
+    vi.mocked(api.deletePage).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "resource_referenced",
+        message: "page is referenced by a version binding",
+        details: {
+          kind: "page",
+          referencing_versions: [{ id: "2001", title: "订单中心 v1" }],
+          resolution: "Exclude this page from the version scope.",
+        },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除页面 订单列表" }))
+    fireEvent.click(screen.getByRole("button", { name: "删除页面" }))
+
+    expect(await screen.findByText("该页面已被版本绑定引用，无法删除")).toBeVisible()
+    expect(
+      screen.getByText(/请先在引用版本的页面范围中排除该页面，或调整版本的环境绑定。/),
+    ).toBeVisible()
+    expect(screen.queryByTestId("resource-editable-versions")).toBeNull()
+    expect(screen.queryByTestId("resource-terminal-versions")).toBeNull()
+    expect(screen.queryByText(/终态版本只读/)).toBeNull()
+  })
+
+  it("keeps the page-url duplicate conflict separate from version references", async () => {
+    vi.mocked(api.createPage).mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "page_url_exists",
+        message: "page url already exists in this environment",
+        details: { field: "url" },
+      }),
+    )
+    renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "新建页面" }))
+    fireEvent.change(screen.getByLabelText("页面名称"), { target: { value: "订单详情" } })
+    fireEvent.change(screen.getByLabelText("页面 URL"), {
+      target: { value: "https://order.test/orders" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "创建页面" }))
+
+    expect(await screen.findByText("该页面 URL 在当前环境下已存在")).toBeVisible()
+    expect(screen.getByText(/请修改页面 URL/)).toBeVisible()
+    expect(screen.getByText(/page_url_exists/)).toBeVisible()
+    expect(screen.queryByText(/page url already exists/)).toBeNull()
+    expect(screen.queryByText(/版本绑定引用/)).toBeNull()
   })
 
   it("shows a detail loading state while the SUT aggregate is loading", () => {

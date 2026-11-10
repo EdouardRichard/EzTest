@@ -1,5 +1,8 @@
 "use client"
 
+import type { ReactNode } from "react"
+
+import { cn } from "@/components/ui/cn"
 import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
@@ -19,6 +22,43 @@ export type CaseFiltersProps = {
   /** Result filtering needs execution verdicts; without them the select is disabled. */
   resultFilterEnabled: boolean
   onChange: (key: CaseFilterKey, value: string) => void
+  /**
+   * Short viewports (D-01): keep all five controls on one compact row, move
+   * the labels to screen-reader-only and shorten the controls to `h-8`.
+   * Defaults to false so the approved full layout is unchanged.
+   */
+  compact?: boolean
+}
+
+type FilterFieldProps = {
+  id: string
+  label: string
+  className?: string
+  compact: boolean
+  children: ReactNode
+}
+
+/**
+ * Wraps a filter control. The non-compact branch is the approved `Field`
+ * layout; the compact branch keeps the same accessible name (sr-only label)
+ * without spending a label row per control.
+ */
+function FilterField({ id, label, className, compact, children }: FilterFieldProps) {
+  if (!compact) {
+    return (
+      <Field id={id} label={label} className={className}>
+        {children}
+      </Field>
+    )
+  }
+  return (
+    <div className={cn("flex min-w-0 items-center [&_input]:h-8 [&_select]:h-8", className)}>
+      <label htmlFor={id} className="sr-only">
+        {label}
+      </label>
+      {children}
+    </div>
+  )
 }
 
 /** A graph case is never `superseded`, so that status has no filter option. */
@@ -56,14 +96,23 @@ export function CaseFilters({
   scenarioOptions,
   resultFilterEnabled,
   onChange,
+  compact = false,
 }: CaseFiltersProps) {
   return (
     <section
       data-testid="design-case-filters"
       aria-label="用例筛选"
-      className="flex shrink-0 flex-wrap items-end gap-2 border-b border-border bg-card px-3 py-2"
+      className={cn(
+        "flex shrink-0 flex-wrap border-b border-border bg-card",
+        compact ? "items-center gap-1.5 px-2 py-1" : "items-end gap-2 px-3 py-2",
+      )}
     >
-      <Field id="design-search-field" label="搜索" className="min-w-[10rem] flex-1">
+      <FilterField
+        id="design-search-field"
+        label="搜索"
+        compact={compact}
+        className="min-w-[10rem] flex-1"
+      >
         <Input
           id="design-search-field"
           data-testid="design-search"
@@ -73,9 +122,14 @@ export function CaseFilters({
           placeholder="需求 / 场景 / 用例标题"
           onChange={(event) => onChange("query", event.target.value)}
         />
-      </Field>
+      </FilterField>
 
-      <Field id="design-filter-requirement-field" label="需求" className="w-44">
+      <FilterField
+        id="design-filter-requirement-field"
+        label="需求"
+        compact={compact}
+        className="w-44"
+      >
         <Select
           id="design-filter-requirement-field"
           data-testid="design-filter-requirement"
@@ -93,9 +147,14 @@ export function CaseFilters({
             </option>
           ))}
         </Select>
-      </Field>
+      </FilterField>
 
-      <Field id="design-filter-scenario-field" label="场景" className="w-44">
+      <FilterField
+        id="design-filter-scenario-field"
+        label="场景"
+        compact={compact}
+        className="w-44"
+      >
         <Select
           id="design-filter-scenario-field"
           data-testid="design-filter-scenario"
@@ -113,9 +172,9 @@ export function CaseFilters({
             </option>
           ))}
         </Select>
-      </Field>
+      </FilterField>
 
-      <Field id="design-filter-status-field" label="状态" className="w-32">
+      <FilterField id="design-filter-status-field" label="状态" compact={compact} className="w-32">
         <Select
           id="design-filter-status-field"
           data-testid="design-filter-status"
@@ -128,9 +187,14 @@ export function CaseFilters({
             </option>
           ))}
         </Select>
-      </Field>
+      </FilterField>
 
-      <Field id="design-filter-result-field" label="执行结果" className="w-32">
+      <FilterField
+        id="design-filter-result-field"
+        label="执行结果"
+        compact={compact}
+        className="w-32"
+      >
         <Select
           id="design-filter-result-field"
           data-testid="design-filter-result"
@@ -145,7 +209,7 @@ export function CaseFilters({
             </option>
           ))}
         </Select>
-      </Field>
+      </FilterField>
     </section>
   )
 }

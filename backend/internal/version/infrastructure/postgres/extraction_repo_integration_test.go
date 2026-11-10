@@ -11,6 +11,7 @@ package versionpg_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -250,6 +251,288 @@ func TestExtractionRepositoryIntegration(t *testing.T) {
 	// Missing run is a typed not-found.
 	if _, err := repo.GetRun(ctx, ids.Next()); !errors.Is(err, versionapp.ErrExtractionRunNotFound) {
 		t.Fatalf("GetRun missing err=%v, want ErrExtractionRunNotFound", err)
+	}
+}
+
+// TestExtractionUpsertNoDowngradeIntegration pins the C-03 SQL upsert: a
+// fill_empty catalog row only fills empty fields, a valid priority may replace,
+// confidence takes the max, constraints merge and a non-draft requirement is
+// skipped (reported through the counts) instead of being overwritten.
+func TestExtractionUpsertNoDowngradeIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	run := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("9", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	created, err := repo.CreateRun(ctx, run, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	source := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: created.ID, SegmentSeq: 1,
+	}
+	body := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "内容排期与工作量看板", Description: "正文描述",
+		AcceptanceCriteria: []string{"场景 1", "场景 2"}, Priority: "P2",
+		Category: "functional", SourceQuote: "FR-131 内容排期与工作量看板", Confidence: 0.9,
+		ConstraintsJSON: []byte(`{"module":"内容管理"}`),
+		MergeMode:       versionapp.ExtractionMergeReplace,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{body}, now); err != nil {
+		t.Fatalf("Upsert body: %v", err)
+	}
+	catalog := versionapp.ExtractionRequirement{
+		ExternalID: "FR-131", Title: "目录标题", Description: "目录摘要",
+		Priority: "P1", Category: "planned", SourceQuote: "| FR-131 | 目录标题 |",
+		Confidence: 0.6, ConstraintsJSON: []byte(`{"ac_count":2}`),
+		MergeMode: versionapp.ExtractionMergeFillEmpty,
+	}
+	counts, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{catalog}, now)
+	if err != nil {
+		t.Fatalf("Upsert catalog: %v", err)
+	}
+	if counts.Updated != 1 {
+		t.Fatalf("catalog upsert counts=%+v, want one update", counts)
+	}
+	var title, description, acceptance, priority, constraintsJSON string
+	var confidence float64
+	if err := pool.QueryRow(ctx, `
+		SELECT v.title, v.description, v.acceptance_criteria, v.priority,
+		       v.constraints::text, r.confidence
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-131'
+	`, versionID).Scan(&title, &description, &acceptance, &priority, &constraintsJSON, &confidence); err != nil {
+		t.Fatalf("read merged requirement: %v", err)
+	}
+	if title != body.Title || description != body.Description {
+		t.Fatalf("catalog row downgraded title/description: %q / %q", title, description)
+	}
+	if acceptance != "场景 1\n场景 2" {
+		t.Fatalf("catalog row downgraded AC: %q", acceptance)
+	}
+	if priority != "P1" {
+		t.Fatalf("priority = %q, want P1", priority)
+	}
+	if confidence != 0.9 {
+		t.Fatalf("confidence = %v, want max(0.9, 0.6)", confidence)
+	}
+	var constraints map[string]any
+	if err := json.Unmarshal([]byte(constraintsJSON), &constraints); err != nil {
+		t.Fatalf("constraints = %q: %v", constraintsJSON, err)
+	}
+	if constraints["module"] != "内容管理" || constraints["ac_count"] != float64(2) {
+		t.Fatalf("constraints were not merged: %#v", constraints)
+	}
+
+	// A clarified requirement is not an extraction draft anymore: the default
+	// policy skips it and reports the skip instead of overwriting user work.
+	if _, err := pool.Exec(ctx, `
+		UPDATE requirement SET status = 'clarified' WHERE version_id = $1 AND external_id = 'FR-131'
+	`, versionID); err != nil {
+		t.Fatalf("clarify requirement: %v", err)
+	}
+	overwrite := body
+	overwrite.Title = "抽取覆盖已澄清需求"
+	overwrite.MergeMode = versionapp.ExtractionMergeReplace
+	counts, err = repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{overwrite}, now)
+	if err != nil {
+		t.Fatalf("Upsert non-draft: %v", err)
+	}
+	if counts.Skipped != 1 || counts.Updated != 0 {
+		t.Fatalf("non-draft counts=%+v, want one skipped", counts)
+	}
+	var storedTitle string
+	if err := pool.QueryRow(ctx, `
+		SELECT v.title
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-131'
+	`, versionID).Scan(&storedTitle); err != nil {
+		t.Fatalf("read clarified requirement: %v", err)
+	}
+	if storedTitle == overwrite.Title {
+		t.Fatalf("non-draft requirement was overwritten: %q", storedTitle)
+	}
+}
+
+// TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration is the C-03
+// re-upload regression: an acceptance criterion containing newlines is stored
+// newline-joined, then re-read and split on the next upsert. Replace mode must
+// take the incoming criteria instead of unioning them with the current ones, so
+// a second identical emit keeps the same content hash and creates no revision.
+func TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	run := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("c", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	created, err := repo.CreateRun(ctx, run, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	source := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: created.ID, SegmentSeq: 1,
+	}
+	requirement := versionapp.ExtractionRequirement{
+		ExternalID: "FR-211", Title: "多行验收标准", Description: "正文描述",
+		AcceptanceCriteria: []string{
+			"场景 1：正确密码登录\nGiven 已注册用户\nWhen 输入正确密码\nThen 登录成功",
+			"场景 2：错误密码登录",
+		},
+		Priority: "P1", Category: "functional", SourceQuote: "FR-211 多行验收标准",
+		Confidence: 0.9, MergeMode: versionapp.ExtractionMergeReplace,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement}, now); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	var firstHash string
+	var firstRevision int
+	if err := pool.QueryRow(ctx, `
+		SELECT v.content_hash, v.revision
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-211'
+	`, versionID).Scan(&firstHash, &firstRevision); err != nil {
+		t.Fatalf("read first revision: %v", err)
+	}
+
+	counts, err := repo.UpsertExtractedRequirements(ctx, source, []versionapp.ExtractionRequirement{requirement}, now)
+	if err != nil {
+		t.Fatalf("second identical upsert: %v", err)
+	}
+	if counts.Skipped != 0 || counts.Created != 0 || counts.Updated != 1 {
+		t.Fatalf("second upsert counts=%+v, want one update", counts)
+	}
+
+	var secondHash, acceptance string
+	var revisionCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT v.content_hash, v.acceptance_criteria
+		FROM requirement r
+		JOIN requirement_version v ON v.id = r.current_version_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-211'
+	`, versionID).Scan(&secondHash, &acceptance); err != nil {
+		t.Fatalf("read current revision: %v", err)
+	}
+	if secondHash != firstHash {
+		t.Fatalf("content hash changed on identical re-upload: %q -> %q", firstHash, secondHash)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_version v
+		JOIN requirement r ON r.id = v.requirement_id
+		WHERE r.version_id = $1 AND r.external_id = 'FR-211'
+	`, versionID).Scan(&revisionCount); err != nil {
+		t.Fatalf("count revisions: %v", err)
+	}
+	if revisionCount != firstRevision {
+		t.Fatalf("revision count = %d, want the unchanged %d (multi-line AC duplicated)", revisionCount, firstRevision)
+	}
+	if acceptance != "场景 1：正确密码登录\nGiven 已注册用户\nWhen 输入正确密码\nThen 登录成功\n场景 2：错误密码登录" {
+		t.Fatalf("acceptance criteria = %q", acceptance)
+	}
+}
+
+// TestExtractionNonDraftSkipReportedIntegration is spec D's "跳过并在报告中
+// 列出": a declared id the sink skipped because the requirement is already
+// non-draft must land in skipped_ids/skipped and never in missing_ids, and the
+// report must persist on the run.
+func TestExtractionNonDraftSkipReportedIntegration(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	versionID := ids.Next()
+	createVersion(t, pool, versionID)
+	attachmentID := createExtractionAttachment(t, pool, ids, versionID)
+	repo := versionpg.NewExtractionRepository(pool, ids)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	firstRun := versionapp.ExtractionRun{
+		VersionID: versionID, AttachmentID: attachmentID,
+		InputSHA256: strings.Repeat("d", 64), Status: versionapp.ExtractionRunPending,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	first, err := repo.CreateRun(ctx, firstRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun first: %v", err)
+	}
+	firstSource := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: first.ID, SegmentSeq: 1,
+	}
+	if _, err := repo.UpsertExtractedRequirements(ctx, firstSource, []versionapp.ExtractionRequirement{{
+		ExternalID: "FR-221", Title: "登录", Description: "已有需求",
+		AcceptanceCriteria: []string{"场景 1"}, Priority: "P1", Category: "functional",
+		SourceQuote: "FR-221 登录", Confidence: 0.9,
+	}}, now); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE requirement SET status = 'clarified' WHERE version_id = $1 AND external_id = 'FR-221'
+	`, versionID); err != nil {
+		t.Fatalf("clarify requirement: %v", err)
+	}
+
+	secondRun := firstRun
+	secondRun.InputSHA256 = strings.Repeat("e", 64)
+	second, err := repo.CreateRun(ctx, secondRun, extractionSegments())
+	if err != nil {
+		t.Fatalf("CreateRun second: %v", err)
+	}
+	secondSource := versionapp.ExtractionSource{
+		VersionID: versionID, AttachmentID: attachmentID, RunID: second.ID, SegmentSeq: 1,
+	}
+	counts, err := repo.UpsertExtractedRequirements(ctx, secondSource, []versionapp.ExtractionRequirement{
+		{ExternalID: "FR-221", Title: "登录（新）", AcceptanceCriteria: []string{"场景 1"}, Priority: "P1", Confidence: 0.9},
+		{ExternalID: "FR-222", Title: "下单", AcceptanceCriteria: []string{"场景 1"}, Priority: "P2", Confidence: 0.8},
+	}, now)
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if counts.Skipped != 1 || counts.Created != 1 {
+		t.Fatalf("second upsert counts=%+v, want one skip and one create", counts)
+	}
+
+	service := versionapp.NewExtractionService(repo, nil, nil, nil)
+	report, err := service.Reconcile(ctx, second.ID, "FR-221 登录\nFR-222 下单\n", 0)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if report.Expected != 2 || report.Extracted != 1 || report.Skipped != 1 || report.Missing != 0 {
+		t.Fatalf("report = %+v, want expected=2 extracted=1 skipped=1 missing=0", report)
+	}
+	if len(report.SkippedIDs) != 1 || report.SkippedIDs[0] != "FR-221" {
+		t.Fatalf("skipped_ids = %#v, want [FR-221]", report.SkippedIDs)
+	}
+	if len(report.MissingIDs) != 0 {
+		t.Fatalf("missing_ids = %#v, want none (non-draft skip is not missing)", report.MissingIDs)
+	}
+
+	stored, err := repo.GetRun(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if stored.Report == nil || stored.Report.Skipped != 1 ||
+		len(stored.Report.SkippedIDs) != 1 || stored.Report.SkippedIDs[0] != "FR-221" {
+		t.Fatalf("persisted report = %+v, want skipped FR-221", stored.Report)
 	}
 }
 

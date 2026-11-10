@@ -199,6 +199,10 @@ type assembledRun struct {
 	// product behavior (QA Q1) or a failed/blocked step observing a missing
 	// required control/feature (Task 110).
 	hasRequirementDeviation bool
+	// hasExecutorLimitation reports whether a failed/blocked step carries the
+	// structured executor capability limitation marker (v0.2.3 X-02). Such a
+	// run is a blocked executor condition, never a SUT issue candidate.
+	hasExecutorLimitation bool
 }
 
 // caseRunsOfVersion returns every case_run of a version ordered by ID, reached
@@ -351,12 +355,24 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 	result.hasFailedAssertion = firstFailed != nil
 	var deviationStep *execution.StepResult
 	for index := range steps {
-		if execution.StepShowsApplicationDeviation(steps[index]) {
+		switch steps[index].Status {
+		case execution.StepFailed, execution.StepBlocked:
+			if _, limited := execution.StepExecutorLimitation(steps[index]); limited {
+				result.hasExecutorLimitation = true
+				continue
+			}
+		}
+		if deviationStep == nil && execution.StepShowsApplicationDeviation(steps[index]) {
 			deviationStep = &steps[index]
-			break
 		}
 	}
 	result.hasRequirementDeviation = deviationStep != nil
+	// Legacy rows may only carry the capability conclusion in
+	// summary.terminal_cause (no structured step marker); it is the same
+	// authoritative block and must keep the run out of the issue scan.
+	if run.Summary.TerminalCause == execution.TerminalCauseExecutorCapability {
+		result.hasExecutorLimitation = true
+	}
 
 	evidenceRows := make([]execution.Evidence, 0)
 	if m.deps.Evidence != nil {
@@ -494,10 +510,12 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		RequirementID: info.requirementID, CaseTitle: info.title,
 		VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
-		Summary:         failureSummary,
-		StepCount:       stepCount,
-		StepFailedCount: stepFailedCount,
-		AssertionCount:  assertionCount, AssertionFailedCount: assertionFailedCount,
+		ExecutorCapability: result.hasExecutorLimitation,
+		TerminalCause:      run.Summary.TerminalCause,
+		Summary:            failureSummary,
+		StepCount:          stepCount,
+		StepFailedCount:    stepFailedCount,
+		AssertionCount:     assertionCount, AssertionFailedCount: assertionFailedCount,
 		FailedStepSeq: failedStepSeq, FailedAssertionSeq: failedAssertionSeq,
 		FailedStepResultID: failedStepResultID, FailedAssertionResultIDs: failedAssertionIDs,
 		FailedExpected: failedExpected, FailedActual: failedActual, FailedReason: failedReason,
@@ -509,6 +527,7 @@ func (m *readModel) buildCaseRun(ctx context.Context, versionID int64, run execu
 		RequirementID: info.requirementID,
 		CaseTitle:     info.title, VersionSUTID: versionSUTID, VersionSUTIDs: runVersionSUTIDs,
 		Status: string(run.Status), FailureClass: string(run.FailureClass),
+		TerminalCause:   run.Summary.TerminalCause,
 		Summary:         failureSummary,
 		StepCount:       stepCount,
 		StepFailedCount: stepFailedCount,
@@ -541,6 +560,11 @@ func (r *ExecutionReader) ListFailedApplicationCaseRuns(ctx context.Context, ver
 		assembled, err := r.model.buildCaseRun(ctx, versionID, run, index[run.CaseVersionID], true)
 		if err != nil {
 			return nil, err
+		}
+		// An executor capability limitation is a blocked executor condition, not
+		// a SUT defect: never a failed(application) issue candidate (X-02).
+		if assembled.hasExecutorLimitation {
+			continue
 		}
 		// P3 emits an issue candidate only for a failed(application) run with
 		// failed assertion evidence, or (QA Q1) with a failed step whose
@@ -649,7 +673,10 @@ func (m *readModel) waveModel(ctx context.Context, versionID, waveID int64) (del
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
-	coverage, err := m.coverage(ctx, versionID, requirementViews, versionRuns, flakyRunSet(runTriage))
+	// A wave report has no requirement rows, so the settled projection is only
+	// consumed by the version model; requirements/case execution are version
+	// level facts shared by both snapshots.
+	coverage, _, err := m.coverage(ctx, versionID, requirementViews, versionRuns, flakyRunSet(runTriage))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
 	}
@@ -704,9 +731,12 @@ func (m *readModel) versionModel(ctx context.Context, versionID int64) (delivery
 		return delivery.ReportSnapshot{}, err
 	}
 	applyRunTriage(modelRuns, runTriage)
-	coverage, err := m.coverage(ctx, versionID, requirementViews, runs, flakyRunSet(runTriage))
+	coverage, settledRequirements, err := m.coverage(ctx, versionID, requirementViews, runs, flakyRunSet(runTriage))
 	if err != nil {
 		return delivery.ReportSnapshot{}, err
+	}
+	for index := range requirements {
+		requirements[index].ExecutionSettled = settledRequirements[requirements[index].ID]
 	}
 	waveSnapshots := make([]delivery.WaveSnapshot, 0, len(waves))
 	for _, wave := range waves {
@@ -825,17 +855,42 @@ func coverageLatestRuns(runs []execution.CaseRun) map[int64]execution.CaseRun {
 	return latest
 }
 
+// requirementExecutionSettled reports, per requirement ID, whether the
+// requirement's execution is settled: the requirement has at least one
+// executable case and every executable case version's latest non-superseded run
+// is terminal (passed/failed/blocked/inconclusive/skipped). A requirement
+// without executable cases is never settled, and a pending/running/interrupted/
+// paused run or a missing run leaves the requirement unsettled, so an unexecuted
+// requirement can never satisfy the report due gate (R2-NEW-02).
+func requirementExecutionSettled(cases []designapp.ExecutableCaseView, latest map[int64]execution.CaseRun) map[int64]bool {
+	hasCase := make(map[int64]bool, len(cases))
+	unsettled := make(map[int64]bool, len(cases))
+	for _, item := range cases {
+		hasCase[item.RequirementID] = true
+		run, ok := latest[item.CaseVersionID]
+		if !ok || !run.Status.Terminal() {
+			unsettled[item.RequirementID] = true
+		}
+	}
+	settled := make(map[int64]bool, len(hasCase))
+	for requirementID := range hasCase {
+		settled[requirementID] = !unsettled[requirementID]
+	}
+	return settled
+}
+
 // coverage computes the P3 execution coverage projection: every current+
 // confirmed case whose latest non-superseded run did not pass is a gap. The
 // projection is derived from the version's own case_run snapshot, not from a
 // separate newest-row query, so a cancelled wave that merely supersedes runs
 // cannot overwrite a result the report already counted. A failed run whose
 // issue triage is flaky is a flaky gap (never a pass, but not a product
-// coverage failure).
-func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView, runs []execution.CaseRun, flakyRuns map[int64]bool) (delivery.CoverageSnapshot, error) {
+// coverage failure). It also returns the derived per-requirement execution
+// settled projection the report due gate consumes.
+func (m *readModel) coverage(ctx context.Context, versionID int64, requirements []versionapp.RequirementView, runs []execution.CaseRun, flakyRuns map[int64]bool) (delivery.CoverageSnapshot, map[int64]bool, error) {
 	cases, err := m.deps.Design.ListExecutable(ctx, versionID)
 	if err != nil {
-		return delivery.CoverageSnapshot{}, fmt.Errorf("list executable cases: %w", err)
+		return delivery.CoverageSnapshot{}, nil, fmt.Errorf("list executable cases: %w", err)
 	}
 	latest := coverageLatestRuns(runs)
 	coverage := delivery.CoverageSnapshot{
@@ -877,7 +932,7 @@ func (m *readModel) coverage(ctx context.Context, versionID int64, requirements 
 		})
 	}
 	coverage.ByRequirement = requirementCoverageRows(requirements, cases, latest, flakyRuns)
-	return coverage, nil
+	return coverage, requirementExecutionSettled(cases, latest), nil
 }
 
 // requirementCoverageRows derives the per-requirement coverage projection from
@@ -1311,6 +1366,7 @@ func (m *readModel) appWaveSnapshot(model delivery.ReportSnapshot) deliveryapp.W
 			ID: run.ID, VersionID: run.VersionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
 			CaseTitle: run.CaseTitle, VersionSUTID: run.VersionSUTID, VersionSUTIDs: run.VersionSUTIDs,
 			Status: run.Status, FailureClass: run.FailureClass, Summary: run.Summary,
+			ExecutorCapability: run.ExecutorCapabilityBlocked(), TerminalCause: run.TerminalCause,
 			StepCount: run.StepCount, StepFailedCount: run.StepFailedCount,
 			AssertionCount: run.AssertionCount, AssertionFailedCount: run.AssertionFailedCount,
 			FailedStepSeq: run.FailedStepSeq, FailedAssertionSeq: run.FailedAssertionSeq,
@@ -1345,6 +1401,7 @@ func (m *readModel) appVersionSnapshot(model delivery.ReportSnapshot, view versi
 			Status: requirement.Status, ClosureID: requirement.ClosureID,
 			ClosedAt: requirement.ClosedAt, CloseRound: requirement.CloseRound,
 			ReopenCount: requirement.ReopenCount, UpdatedAt: requirement.UpdatedAt,
+			ExecutionSettled: requirement.ExecutionSettled,
 		})
 	}
 	for _, sut := range model.VersionSUTs {
@@ -1363,6 +1420,7 @@ func (m *readModel) appVersionSnapshot(model delivery.ReportSnapshot, view versi
 			ID: run.ID, VersionID: run.VersionID, WaveID: run.WaveID, CaseVersionID: run.CaseVersionID,
 			CaseTitle: run.CaseTitle, VersionSUTID: run.VersionSUTID, VersionSUTIDs: run.VersionSUTIDs,
 			Status: run.Status, FailureClass: run.FailureClass, Summary: run.Summary,
+			ExecutorCapability: run.ExecutorCapabilityBlocked(), TerminalCause: run.TerminalCause,
 			StepCount: run.StepCount, StepFailedCount: run.StepFailedCount,
 			AssertionCount: run.AssertionCount, AssertionFailedCount: run.AssertionFailedCount,
 			FailedStepSeq: run.FailedStepSeq, FailedAssertionSeq: run.FailedAssertionSeq,

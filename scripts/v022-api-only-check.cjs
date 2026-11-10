@@ -347,8 +347,8 @@ for (const item of routes) {
 
 // The plan card is the only baseline: exactly 16 business routes, 4 + 12.
 if (routes.length !== 16) fail("registry must hold exactly 16 business routes (got " + routes.length + ")")
-if (counts["x-api-only"] !== 4) fail("registry must hold exactly 4 x-api-only routes (got " + counts["x-api-only"] + ")")
-if (counts.ui !== 12) fail("registry must hold exactly 12 ui routes (got " + counts.ui + ")")
+if (counts["x-api-only"] !== 5) fail("registry must hold exactly 5 x-api-only routes (got " + counts["x-api-only"] + ")")
+if (counts.ui !== 11) fail("registry must hold exactly 11 ui routes (got " + counts.ui + ")")
 
 // No other operation may be marked x-api-only, and every registry marker must
 // exist in the spec (the reverse is reported per entry above).
@@ -363,7 +363,7 @@ for (const [route, operations] of Object.entries(spec.paths || {})) {
 for (const label of specApiOnly) {
   if (!seen.has(label)) fail("unknown x-api-only operation in OpenAPI: " + label)
 }
-if (specApiOnly.size !== 4) fail("OpenAPI must mark exactly 4 operations x-api-only (got " + specApiOnly.size + ")")
+if (specApiOnly.size !== 5) fail("OpenAPI must mark exactly 5 operations x-api-only (got " + specApiOnly.size + ")")
 
 // Infrastructure routes are registered for completeness only; they never count
 // toward the 16 business routes.
@@ -388,7 +388,7 @@ if (problems.length) {
 }
 
 console.log(
-  "\nok: registry holds 16 business routes (4 x-api-only, 12 ui) + 4 infra-exempt" +
+  "\nok: registry holds 16 business routes (5 x-api-only, 11 ui) + 4 infra-exempt" +
     (strict
       ? "; strict ui entry: file + export + call-site present"
       : "; non-strict (run --strict after W1-4)"),

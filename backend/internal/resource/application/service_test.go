@@ -41,11 +41,15 @@ func (f *fakeEvents) Publish(_ context.Context, event eventingapp.Event) error {
 	return nil
 }
 
-// fakeUsage answers the version-binding usage checks.
+// fakeUsage answers the version-binding usage checks and the referencing-version
+// lookup used to build the delete conflict details.
 type fakeUsage struct {
-	inUse map[string]bool
-	err   error
-	calls []string
+	inUse    map[string]bool
+	refs     map[string][]VersionRef
+	err      error
+	refErr   error
+	calls    []string
+	refCalls []string
 }
 
 func (f *fakeUsage) check(kind string) (bool, error) {
@@ -54,6 +58,14 @@ func (f *fakeUsage) check(kind string) (bool, error) {
 		return false, f.err
 	}
 	return f.inUse[kind], nil
+}
+
+func (f *fakeUsage) ReferencingVersions(_ context.Context, kind string, _ int64) ([]VersionRef, error) {
+	f.refCalls = append(f.refCalls, kind)
+	if f.refErr != nil {
+		return nil, f.refErr
+	}
+	return f.refs[kind], nil
 }
 
 func (f *fakeUsage) SUTInUse(context.Context, int64) (bool, error) { return f.check("sut") }
@@ -639,7 +651,7 @@ type harness struct {
 
 func newHarness() *harness {
 	repo := &fakeRepo{}
-	usage := &fakeUsage{inUse: map[string]bool{}}
+	usage := &fakeUsage{inUse: map[string]bool{}, refs: map[string][]VersionRef{}}
 	audit := &fakeAudit{}
 	events := &fakeEvents{}
 	svc := New(repo, &seqIDs{next: 1000}, fixedClock{at: testNow}, usage, audit, events)
@@ -1510,16 +1522,38 @@ func TestDeleteGuardsUsageForEveryResource(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.kind, func(t *testing.T) {
 			h.usage.inUse[tc.kind] = true
+			h.usage.refs[tc.kind] = []VersionRef{{ID: 501, Title: "Q4 orders"}}
+			refCallsBefore := len(h.usage.refCalls)
 			err := tc.delete()
-			apiErr := assertAPIError(t, err, 409, "conflict")
-			if !strings.Contains(apiErr.Message, tc.kind) {
+			apiErr := assertAPIError(t, err, 409, "resource_referenced")
+			if apiErr.Status != 409 {
+				t.Fatalf("status = %d", apiErr.Status)
+			}
+			if !strings.Contains(apiErr.Message, "referenced") {
 				t.Fatalf("message = %q", apiErr.Message)
+			}
+			if apiErr.Details["kind"] != tc.kind {
+				t.Fatalf("details kind = %#v", apiErr.Details["kind"])
+			}
+			versions, ok := apiErr.Details["referencing_versions"].([]map[string]any)
+			if !ok || len(versions) != 1 {
+				t.Fatalf("referencing_versions = %#v", apiErr.Details["referencing_versions"])
+			}
+			if versions[0]["id"] != "501" || versions[0]["title"] != "Q4 orders" {
+				t.Fatalf("referencing version = %#v", versions[0])
+			}
+			if resolution, _ := apiErr.Details["resolution"].(string); resolution == "" {
+				t.Fatalf("details resolution = %#v", apiErr.Details["resolution"])
 			}
 			if !strings.Contains(strings.Join(h.usage.calls, ","), tc.kind) {
 				t.Fatalf("usage calls = %#v", h.usage.calls)
 			}
+			if len(h.usage.refCalls) != refCallsBefore+1 || h.usage.refCalls[len(h.usage.refCalls)-1] != tc.kind {
+				t.Fatalf("reference lookup calls = %#v", h.usage.refCalls)
+			}
 
 			h.usage.inUse[tc.kind] = false
+			delete(h.usage.refs, tc.kind)
 			if err := tc.delete(); err != nil {
 				t.Fatalf("delete after clearing usage: %v", err)
 			}
@@ -1528,6 +1562,149 @@ func TestDeleteGuardsUsageForEveryResource(t *testing.T) {
 
 	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.sut.deleted" {
 		t.Fatalf("last event = %q", got)
+	}
+}
+
+func TestDeleteConflictCapsAndDedupesReferencingVersions(t *testing.T) {
+	h := newHarness()
+	h.usage.inUse["page"] = true
+	refs := []VersionRef{
+		{ID: 7001, Title: "first"},
+		{ID: 7001, Title: "duplicate id"},
+	}
+	for i := int64(1); i <= 25; i++ {
+		refs = append(refs, VersionRef{ID: i, Title: "v" + strconv.FormatInt(i, 10)})
+	}
+	h.usage.refs["page"] = refs
+
+	apiErr := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+	versions, ok := apiErr.Details["referencing_versions"].([]map[string]any)
+	if !ok {
+		t.Fatalf("referencing_versions = %#v", apiErr.Details["referencing_versions"])
+	}
+	if len(versions) != 20 {
+		t.Fatalf("referencing versions = %d, want 20", len(versions))
+	}
+	seen := make(map[any]struct{}, len(versions))
+	for _, item := range versions {
+		if _, duplicate := seen[item["id"]]; duplicate {
+			t.Fatalf("duplicate referencing version %#v", item)
+		}
+		seen[item["id"]] = struct{}{}
+	}
+	// The duplicated 7001 entry keeps its first title and the 20-item cap stops
+	// after v19.
+	if versions[0]["id"] != "7001" || versions[0]["title"] != "first" {
+		t.Fatalf("first referencing version = %#v", versions[0])
+	}
+	if last := versions[len(versions)-1]; last["id"] != "19" || last["title"] != "v19" {
+		t.Fatalf("last referencing version = %#v", last)
+	}
+}
+
+// TestDeleteConflictDetailsCarryVersionStatusAndEditable pins R2-S-02: the 409
+// must let the client tell an editable version from a read-only terminal one so
+// it never suggests an impossible binding edit on executing/completed versions.
+func TestDeleteConflictDetailsCarryVersionStatusAndEditable(t *testing.T) {
+	h := newHarness()
+	h.usage.inUse["page"] = true
+
+	terminal := []VersionRef{
+		{ID: 9001, Title: "执行中版本", Status: "running", Stage: "executing", Editable: false},
+		{ID: 9002, Title: "已完成版本", Status: "completed", Stage: "completed", Editable: false},
+	}
+	designing := VersionRef{ID: 9003, Title: "设计中的版本", Status: "running", Stage: "designing", Editable: true}
+
+	t.Run("mixed editable and terminal", func(t *testing.T) {
+		h.usage.refs["page"] = append(append([]VersionRef{}, terminal...), designing)
+
+		apiErr := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+		if got := apiErr.Details["resource_id"]; got != "1003" {
+			t.Fatalf("details.resource_id = %#v, want 1003", got)
+		}
+		if got := apiErr.Details["kind"]; got != "page" {
+			t.Fatalf("details.kind = %#v, want page", got)
+		}
+		versions, ok := apiErr.Details["referencing_versions"].([]map[string]any)
+		if !ok || len(versions) != 3 {
+			t.Fatalf("referencing_versions = %#v", apiErr.Details["referencing_versions"])
+		}
+		want := map[string]struct {
+			status   string
+			stage    string
+			editable bool
+		}{
+			"9001": {"running", "executing", false},
+			"9002": {"completed", "completed", false},
+			"9003": {"running", "designing", true},
+		}
+		for _, item := range versions {
+			id, _ := item["id"].(string)
+			expected, present := want[id]
+			if !present {
+				t.Fatalf("unexpected referencing version %#v", item)
+			}
+			if item["status"] != expected.status || item["stage"] != expected.stage || item["editable"] != expected.editable {
+				t.Fatalf("referencing version %s = %#v", id, item)
+			}
+		}
+		resolution, _ := apiErr.Details["resolution"].(string)
+		if !strings.Contains(resolution, "read-only") || !strings.Contains(resolution, "administrator") {
+			t.Fatalf("resolution must flag the read-only terminal path: %q", resolution)
+		}
+	})
+
+	t.Run("terminal only", func(t *testing.T) {
+		h.usage.refs["page"] = terminal
+
+		apiErr := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+		resolution, _ := apiErr.Details["resolution"].(string)
+		if strings.Contains(resolution, "Exclude this page from the version scope") {
+			t.Fatalf("resolution suggests an impossible scope edit on terminal versions: %q", resolution)
+		}
+		if !strings.Contains(resolution, "read-only") || !strings.Contains(resolution, "administrator") {
+			t.Fatalf("resolution must name the administrator/operations path: %q", resolution)
+		}
+	})
+}
+
+func TestDeleteReferencedConflictIsDistinctFromPageURLDuplicate(t *testing.T) {
+	h := newHarness()
+	newPageEnv(t, h)
+	if _, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+		Name: "orders", URL: "https://app.example.com/orders",
+	}, 42); err != nil {
+		t.Fatalf("CreatePage: %v", err)
+	}
+	_, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+		Name: "orders dup", URL: "https://app.example.com/orders?x=1",
+	}, 42)
+	duplicate := assertAPIError(t, err, 409, "page_url_exists")
+	if duplicate.Details["field"] != "url" {
+		t.Fatalf("duplicate details = %#v", duplicate.Details)
+	}
+	if _, exists := duplicate.Details["referencing_versions"]; exists {
+		t.Fatalf("url duplicate must not carry referencing_versions: %#v", duplicate.Details)
+	}
+
+	h.usage.inUse["page"] = true
+	h.usage.refs["page"] = []VersionRef{{ID: 42, Title: "Q4 orders"}}
+	referenced := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+	if _, exists := referenced.Details["field"]; exists {
+		t.Fatalf("referenced conflict must not carry a field: %#v", referenced.Details)
+	}
+	if referenced.Details["kind"] != "page" {
+		t.Fatalf("referenced details = %#v", referenced.Details)
+	}
+}
+
+func TestDeleteUsageReferenceLookupErrorPropagates(t *testing.T) {
+	h := newHarness()
+	h.usage.inUse["page"] = true
+	h.usage.refErr = errors.New("referencing lookup failed")
+	err := h.svc.DeletePage(context.Background(), 1003, 42)
+	if err == nil || !strings.Contains(err.Error(), "referencing lookup failed") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

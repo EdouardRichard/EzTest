@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { AUTH_CLEARED_EVENT, getToken, setToken } from "./auth-storage"
+import { AUTH_CLEARED_EVENT, getStoredUser, getToken, setSession, setToken } from "./auth-storage"
 import { connectSSE, type SSEEvent, type SSEStatus } from "./sse-client"
+
+const user = {
+  id: "9001",
+  username: "admin",
+  display_name: "管理员",
+  role: "admin" as const,
+  status: "active" as const,
+}
 
 type StreamHandle = {
   response: Response
@@ -66,6 +74,7 @@ describe("connectSSE", () => {
   const fetchMock = vi.fn<typeof fetch>()
 
   beforeEach(() => {
+    window.localStorage.clear()
     window.sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
@@ -204,6 +213,25 @@ describe("connectSSE", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     window.removeEventListener(AUTH_CLEARED_EVENT, cleared)
+    harness.cleanup()
+  })
+
+  it("clears the cached user as well as the token on 401", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "unauthenticated" } }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    setSession("ezt_expired", user, "2099-01-01T00:00:00Z")
+
+    const harness = start(fetchMock, { token: "ezt_expired" })
+    await flush()
+
+    expect(getToken()).toBeNull()
+    expect(getStoredUser()).toBeNull()
+    expect(window.localStorage.getItem("eztest.user")).toBeNull()
+
     harness.cleanup()
   })
 

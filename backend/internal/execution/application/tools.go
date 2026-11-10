@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -85,6 +86,10 @@ func (s *CaseRunner) Browser(ctx context.Context, scope tools.Scope, action stri
 		if result.Error.Code == "context_not_found" {
 			s.markSUTContext(ctx, caseRun.ID, versionSUTID, in.AccountRole, execution.SUTContextFailed)
 		}
+		// A structured executor capability code (closed allowlist) is remembered
+		// for the step record this failed action belongs to; it is the
+		// structured producer of the X-02 marker.
+		s.rememberExecutorLimitation(caseRun.ID, result.Error.Code)
 		return nil, &tools.Error{Code: result.Error.Code, Message: result.Error.Message}
 	}
 	evidenceIDs, err := s.storeBrowserEvidence(ctx, caseRun, versionSUTID, action, result, scope.AgentRunID)
@@ -144,6 +149,7 @@ func (s *CaseRunner) ensureBrowserContext(ctx context.Context, caseRun execution
 		ExecutorID:   caseRunExecutorID(caseRun),
 		Metadata: map[string]any{
 			"case_run_id":    platformid.Format(caseRun.ID),
+			"attempt":        caseRun.Attempts,
 			"version_sut_id": platformid.Format(binding.VersionSUTID),
 			"account_role":   role,
 			"dispatch_epoch": platformid.Format(caseRun.DispatchEpoch),
@@ -691,6 +697,23 @@ func (s *CaseRunner) CoverageRead(ctx context.Context, scope tools.Scope) (any, 
 	return map[string]any{"version_id": platformid.Format(scope.VersionID), "requirements": entries}, nil
 }
 
+// executorCapabilityEscalationError returns a state_conflict when a run carrying
+// the structured executor limitation marker is classified as an application (SUT)
+// defect. It is shared by the production CaseRunner.FailureSubmit and
+// AnalysisService.SubmitFailure so both analyst entry points enforce the X-02
+// no-escalation rule.
+func executorCapabilityEscalationError(steps []execution.StepResult) error {
+	step, code, limited := execution.ExecutorLimitationStep(steps)
+	if !limited {
+		return nil
+	}
+	reason := "executor capability limitation"
+	if code != "" {
+		reason = "executor capability limitation " + code
+	}
+	return platform.StateConflict(fmt.Sprintf("%s on step %d cannot be classified as an application defect", reason, step.Seq))
+}
+
 // FailureSubmit validates and persists one failure analysis candidate. Only
 // failed(application) is a P4 issue candidate; the analyst may refine but may
 // upgrade a non-application class into application only when the stored step
@@ -711,35 +734,57 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 		return nil, platform.StateConflict("failure analysis requires a finished failed/blocked/inconclusive case_run")
 	}
 	class := execution.FailureClass(in.FailureClass)
-	if class == execution.FailureClassApplication && caseRun.FailureClass != execution.FailureClassApplication {
-		// QA Q1: a stored observed requirement deviation is evidence the
-		// deterministic fallback may have missed; allow application only for
-		// that evidence.
-		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+	if !class.Valid() || class == "" {
+		return nil, platform.Invalid("failure_class", "unsupported failure class")
+	}
+	var steps []execution.StepResult
+	stepsLoaded := false
+	loadSteps := func() ([]execution.StepResult, error) {
+		if stepsLoaded {
+			return steps, nil
+		}
+		loaded, err := s.results.ListSteps(ctx, caseRun.ID)
 		if err != nil {
 			return nil, mapExecutionError(err, "step_result")
 		}
-		hasDeviation := false
-		for _, step := range steps {
-			if execution.StepShowsApplicationDeviation(step) {
-				hasDeviation = true
-				break
+		steps, stepsLoaded = loaded, true
+		return steps, nil
+	}
+	if class == execution.FailureClassApplication {
+		// v0.2.3 X-02: a run limited by the executor's own capability is an
+		// execution-environment condition, never a SUT application defect. The
+		// analyst cannot escalate it, even with another unmarked deviation or a
+		// failed assertion.
+		steps, err = loadSteps()
+		if err != nil {
+			return nil, err
+		}
+		if err := executorCapabilityEscalationError(steps); err != nil {
+			return nil, err
+		}
+		if caseRun.FailureClass != execution.FailureClassApplication {
+			// QA Q1: a stored observed requirement deviation is evidence the
+			// deterministic fallback may have missed; allow application only for
+			// that evidence.
+			hasDeviation := false
+			for _, step := range steps {
+				if execution.StepShowsApplicationDeviation(step) {
+					hasDeviation = true
+					break
+				}
+			}
+			if !hasDeviation {
+				return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application without observed requirement deviation evidence")
 			}
 		}
-		if !hasDeviation {
-			return nil, platform.Invalid("failure_class", "a non-application failure cannot be upgraded to application without observed requirement deviation evidence")
-		}
-	}
-	if !class.Valid() || class == "" {
-		return nil, platform.Invalid("failure_class", "unsupported failure class")
 	}
 	if class == execution.FailureClassAutomation && caseRun.FailureClass == execution.FailureClassApplication {
 		// QA Q1: a real requirement deviation recorded on a failed step is
 		// product evidence; the analyst must not be able to dismiss it as a
 		// script/automation problem and suppress the issue candidate.
-		steps, err := s.results.ListSteps(ctx, caseRun.ID)
+		steps, err = loadSteps()
 		if err != nil {
-			return nil, mapExecutionError(err, "step_result")
+			return nil, err
 		}
 		for _, step := range steps {
 			if execution.StepShowsApplicationDeviation(step) {
@@ -757,7 +802,7 @@ func (s *CaseRunner) FailureSubmit(ctx context.Context, scope tools.Scope, in to
 		return nil, mapExecutionError(err, "case_run")
 	}
 	dedupe := in.DedupeHint
-	steps, _ := s.results.ListSteps(ctx, caseRun.ID)
+	steps, _ = loadSteps()
 	assertions, _ := s.results.ListAssertions(ctx, caseRun.ID)
 	if dedupe == "" {
 		// Align with the deterministic §8.1 fallback so P4 sees one stable

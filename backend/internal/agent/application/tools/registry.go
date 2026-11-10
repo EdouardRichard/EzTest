@@ -433,7 +433,11 @@ type AttachmentMeta struct {
 
 // AttachmentText is one page of extracted attachment text plus the structured
 // parse status. A non-done status is data, never a tool error: the model is
-// told "解析中，可重试" or the concrete parse failure reason (§8.5).
+// told "解析中，可重试" or the concrete parse failure reason (§8.5). Images
+// carries every persisted image row and its platform-generated caption on the
+// first page (offset 0); the tools layer pages them for the Host (R2-C-01), so
+// the port itself never truncates a caption. ImageCount reports the total rows
+// on every page.
 type AttachmentText struct {
 	AttachmentID int64
 	Name         string
@@ -445,14 +449,36 @@ type AttachmentText struct {
 	Truncated    bool
 	Error        string
 	Retryable    bool
+	Images       []AttachmentImageDetail
+	ImageCount   int
 }
 
-// AttachmentImage is image metadata; P1 performs no vision understanding.
+// AttachmentImageDetail is one persisted attachment_image row plus its
+// platform-generated caption. The image bytes stay in the content ledger; only
+// the SHA-256 reference is exposed.
+type AttachmentImageDetail struct {
+	ID      int64
+	Seq     int
+	SHA256  string
+	MIME    string
+	Width   int
+	Height  int
+	Status  string
+	Caption string
+	Error   string
+}
+
+// AttachmentImage is image/document metadata plus the persisted image
+// rows/captions. The platform generates captions; image_ref never re-runs the
+// analysis. Note explains an intentionally empty Images payload (a standalone
+// image upload has no persisted analysis row).
 type AttachmentImage struct {
 	AttachmentID int64
 	SHA256       string
 	URL          string
 	MIME         string
+	Images       []AttachmentImageDetail
+	Note         string
 }
 
 // AttachmentPort is the version context's attachment application surface.
@@ -460,6 +486,10 @@ type AttachmentPort interface {
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]AttachmentMeta, error)
 	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (AttachmentText, error)
 	AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (AttachmentImage, error)
+	// AttachmentImageRefByImage resolves an attachment_image.id (the
+	// read_text images[].image_id) to its parent attachment inside the same
+	// conversation (R2-C-02).
+	AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (AttachmentImage, error)
 }
 
 // SUTSummary is one version-SUT binding shown to the model.

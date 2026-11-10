@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
@@ -287,4 +288,142 @@ func TestCaseRunSummaryViewCarriesVisualCounts(t *testing.T) {
 		view.Summary.VisualInconclusive != 3 || view.Summary.VisualSkipped != 0 {
 		t.Fatalf("summary view = %+v", view.Summary)
 	}
+}
+
+// v0.2.3 X-07: the case_run view exposes the dispatch snapshot and a stable
+// terminal cause, and never surfaces a raw failure enum as the human reason
+// when a mapped cause exists.
+func TestCaseRunSummaryViewExposesDispatchAndStableCause(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunFailed, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			LastError:     "executor_lost",
+			RetryReason:   execution.TerminalCauseExecutorTimeout,
+			Dispatch: &execution.CaseRunDispatchDiagnostic{
+				OwnerExecutorID: 7,
+				Endpoint:        "http://127.0.0.1:13336",
+				ExecutorStatus:  "active",
+				RegistryHit:     true,
+				DispatchAt:      "2026-11-01T01:00:00Z",
+				Attempt:         2,
+			},
+		},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["terminal_cause"] != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal_cause = %v, want executor_lost", summary["terminal_cause"])
+	}
+	if summary["last_error"] != "" {
+		t.Fatalf("raw failure enum leaked as last_error: %v", summary["last_error"])
+	}
+	dispatch, ok := summary["dispatch"].(map[string]any)
+	if !ok {
+		t.Fatalf("summary.dispatch missing: %+v", summary)
+	}
+	if dispatch["owner_executor_id"] != "7" || dispatch["endpoint"] != "http://127.0.0.1:13336" {
+		t.Fatalf("dispatch = %+v", dispatch)
+	}
+	if dispatch["registry_hit"] != true || dispatch["attempt"] != float64(2) {
+		t.Fatalf("dispatch route/attempt = %+v", dispatch)
+	}
+	if summary["retry_reason"] != execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("retry_reason = %v, want executor_timeout", summary["retry_reason"])
+	}
+
+	// A non-terminal running row must not expose a terminal verdict reason even
+	// when an older deployment persisted one (X-07 running-row fallback).
+	running := toCaseRunView(execution.CaseRun{
+		ID: 3002, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunRunning, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			LastError:     "executor_lost",
+		},
+	}, caseMeta{}, nil, 0)
+	runningPayload := viewJSON(t, running)
+	runningSummary := runningPayload["summary"].(map[string]any)
+	if runningSummary["verdict_reason"] != "" {
+		t.Fatalf("running row exposes verdict_reason %v", runningSummary["verdict_reason"])
+	}
+	if runningPayload["failure_class"] != "" {
+		t.Fatalf("running row exposes failure_class %v", runningPayload["failure_class"])
+	}
+	if runningSummary["last_error"] != "" {
+		t.Fatalf("running row exposes raw last_error %v", runningSummary["last_error"])
+	}
+}
+
+// TestCaseRunViewBlanksLegacyRawVerdictReason: legacy recovery rows stored the
+// raw executor_lost enum in verdict_reason; the view must not surface a failure
+// class as the human verdict reason (X-07).
+func TestCaseRunViewBlanksLegacyRawVerdictReason(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3003, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunFailed, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{VerdictReason: "executor_lost", LastError: "executor_lost"},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["verdict_reason"] != "" {
+		t.Fatalf("legacy raw verdict_reason leaked: %v", summary["verdict_reason"])
+	}
+	if summary["last_error"] != "" {
+		t.Fatalf("raw failure enum leaked as last_error: %v", summary["last_error"])
+	}
+}
+
+// TestCaseRunViewKeepsBlockedVerdictReason: "blocked" is both a failure class
+// and a legitimate verdict reason, so the legacy raw-enum filter must not blank
+// a settled blocked row's verdict_reason.
+func TestCaseRunViewKeepsBlockedVerdictReason(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3005, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunBlocked, FailureClass: execution.FailureClassBlocked,
+		Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonBlocked},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if summary["verdict_reason"] != execution.VerdictReasonBlocked {
+		t.Fatalf("blocked verdict_reason = %v, want %q", summary["verdict_reason"], execution.VerdictReasonBlocked)
+	}
+}
+
+// TestCaseRunViewInterruptedIsNonTerminal: interrupted runs can be redispatched
+// (Finished() true, Terminal() false); the view must not expose terminal
+// verdict/class/cause for them.
+func TestCaseRunViewInterruptedIsNonTerminal(t *testing.T) {
+	view := toCaseRunView(execution.CaseRun{
+		ID: 3004, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
+		Status: execution.CaseRunInterrupted, FailureClass: execution.FailureClassExecutorLost,
+		Summary: execution.CaseRunSummary{
+			VerdictReason: execution.VerdictReasonAgentFailure,
+			TerminalCause: execution.TerminalCauseExecutorTimeout,
+			NextAction:    execution.NextActionRerun,
+			LastError:     "executor_lost",
+		},
+	}, caseMeta{}, nil, 0)
+	payload := viewJSON(t, view)
+	summary := payload["summary"].(map[string]any)
+	if payload["failure_class"] != "" {
+		t.Fatalf("interrupted row exposes failure_class %v", payload["failure_class"])
+	}
+	if summary["verdict_reason"] != "" || summary["terminal_cause"] != "" || summary["next_action"] != "" {
+		t.Fatalf("interrupted row exposes terminal semantics: %+v", summary)
+	}
+}
+
+func viewJSON(t *testing.T, view CaseRunView) map[string]any {
+	t.Helper()
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("marshal view: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatalf("decode view: %v", err)
+	}
+	return payload
 }

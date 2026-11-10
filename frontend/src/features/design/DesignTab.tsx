@@ -5,11 +5,13 @@ import { useRouter } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Button } from "@/components/ui/Button"
+import { cn } from "@/components/ui/cn"
 import { Dialog } from "@/components/ui/Dialog"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { activityText } from "@/features/clarification/activity"
 import { SSE_STATUS_LABEL } from "@/features/clarification/labels"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
@@ -21,6 +23,7 @@ import {
   designActionsAllowed,
   designStageGuidance,
 } from "@/features/versions/stage"
+import { useShortViewport } from "@/features/versions/useShortViewport"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
@@ -44,13 +47,10 @@ import { ExportCasesDialog } from "./ExportCasesDialog"
 import { ExportDetailPanel } from "./ExportDetailPanel"
 import { HandoffPanel } from "./HandoffPanel"
 import {
-  DEFAULT_CHAT_SPLIT,
   DEFAULT_WORKBENCH_SPLIT,
   DESIGN_SPLIT_STORAGE_KEYS,
   type DesignExecutionResults,
-  MAX_CHAT_SPLIT,
   MAX_GRAPH_SPLIT,
-  MIN_CHAT_SPLIT,
   MIN_GRAPH_SPLIT,
 } from "./layout"
 import { PendingDesignCTA } from "./PendingDesignCTA"
@@ -84,43 +84,58 @@ export type DesignTabProps = {
 
 const EMPTY_REQUIREMENTS_COPY = "暂无已澄清需求，请先在需求与澄清中确认需求"
 
-function activityText(payload: Record<string, unknown>): string | null {
-  const status = typeof payload.status === "string" ? payload.status : ""
-  if (status === "finished" || status === "failed" || status === "done") return null
-  if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
-  if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
-  return "AI 正在处理…"
+/**
+ * One live activity of an agent run (D-06). Design can run several agents at
+ * the same time (round author, per-requirement author, critic), so the text is
+ * keyed by run instead of being a single string: a terminal event only removes
+ * its own run and a late frame cannot resurrect a finished one.
+ */
+type AgentActivity = {
+  runId: string
+  /** Empty when the frame carried no conversation; such a frame is unscoped. */
+  conversationId: string
+  text: string
 }
 
 /** `.app-content` bottom padding, reserved so the page itself never scrolls. */
 const PAGE_BOTTOM_INSET = 48
-const MIN_WORKSPACE_HEIGHT = 320
 /**
  * Below this available height (viewport minus the version header/tabs) the
- * design chat folds into its title bar so the graph and detail stay usable
- * (R-D2-4). The user can expand it again from the bar.
+ * design chrome compacts (R-D2-4). Height only squeezes the header now: the
+ * chat stays inline as the left column.
  */
 const SHORT_WORKSPACE_HEIGHT = 620
-/** Narrow viewports get the same collapse: the workbench is prioritised. */
+/**
+ * Below this width the chat folds into its title bar so the workbench keeps a
+ * usable canvas; the user can expand it again from the bar.
+ */
 const NARROW_WORKSPACE_WIDTH = 960
+const GRAPH_PANE_MIN_HEIGHT = 220
+const DETAIL_PANE_MIN_HEIGHT = 180
 
 /**
  * Collapsed chat title bar (R-D2-4). It replaces the full DesignChat on a
- * short/narrow viewport or after the user collapses it; one click restores the
+ * narrow viewport or after the user collapses it; one click restores the
  * inline thread and composer. Kept deliberately thin (header row only) so the
  * graph + detail workbench keeps the available height.
  */
 function ChatTitleBar({
   conversationTitle,
   onExpand,
+  compact = false,
 }: {
   conversationTitle: string | null
   onExpand: () => void
+  /** Short viewports spend the pixels on the graph instead of this bar. */
+  compact?: boolean
 }) {
   return (
     <div
       data-testid="design-chat-titlebar"
-      className="surface-card flex min-w-0 shrink-0 items-center gap-2 overflow-hidden border border-border px-3 py-2"
+      className={cn(
+        "surface-card flex min-w-0 shrink-0 items-center gap-2 overflow-hidden border border-border px-3",
+        compact ? "py-1" : "py-2",
+      )}
     >
       <h2 className="shrink-0 text-sm font-semibold text-foreground">设计对话</h2>
       <p className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
@@ -143,11 +158,11 @@ function ChatTitleBar({
 }
 
 /**
- * D-2 design workspace: page header + a vertical split with the design chat on
- * top (40%) and the case workbench below (60%). The workbench itself splits
- * into the graph (65%) over the case detail (35%); both dividers drag, reset on
- * double-click and persist their ratio. The page never scrolls — each panel
- * scrolls internally (R-D2-1..R-D2-6).
+ * D-2 design workspace: page header + a fixed left/right layout with the design
+ * chat as the 40% left column and the case workbench as the 60% right column.
+ * The workbench itself splits into the graph (65%) over the case detail (35%);
+ * only that divider drags, resets on double-click and persists its ratio. The
+ * page never scrolls — each panel scrolls internally (R-D2-1..R-D2-6).
  *
  * The URL is the deep-link source of truth and the `version:{id}` SSE channel
  * drives debounced snapshot refreshes; node positions stay local (`layout.ts`)
@@ -186,7 +201,7 @@ export function DesignTab({
   const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
   const [handoffOpen, setHandoffOpen] = useState(false)
-  const [activity, setActivity] = useState<string | null>(null)
+  const [activities, setActivities] = useState<AgentActivity[]>([])
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
   /** Latest EV-12 discovery revision (auto-confirm or rollback replacement). */
@@ -195,6 +210,10 @@ export function DesignTab({
 
   const [chatCollapsed, setChatCollapsed] = useState(false)
   const [shortViewport, setShortViewport] = useState(false)
+  // R2-D-02: the page chrome is compacted from the same media query, so the
+  // workspace may reclaim the reserved .app-content bottom inset on short
+  // viewports and contain the page instead of scrolling it.
+  const shortMediaViewport = useShortViewport()
   const [workspaceHeight, setWorkspaceHeight] = useState("calc(100dvh - 19rem)")
   /** Graph + detail enlarged together in the 90vw×90vh floating dialog (R-D2-3). */
   const [focusOpen, setFocusOpen] = useState(false)
@@ -223,10 +242,24 @@ export function DesignTab({
     return results
   }, [graph])
 
+  /**
+   * The bubble shows the newest active run of the open conversation. Runs of
+   * another conversation stay in the map (their own terminal event still clears
+   * them) but never leak into this thread (D-06).
+   */
+  const activity = useMemo(() => {
+    const conversationId = activeConversationId ?? ""
+    for (let index = activities.length - 1; index >= 0; index -= 1) {
+      const entry = activities[index]
+      if (entry.conversationId === "" || entry.conversationId === conversationId) return entry.text
+    }
+    return null
+  }, [activities, activeConversationId])
+
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const workspaceRef = useRef<HTMLDivElement>(null)
-  /** Previous short/narrow state so crossing the threshold collapses the chat. */
-  const wasShortViewport = useRef(false)
+  /** Previous narrow state so crossing the width threshold folds the chat. */
+  const wasNarrowViewport = useRef(false)
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true)
@@ -305,13 +338,46 @@ export function DesignTab({
 
   const sseStatus = useVersionEvents(versionId, {
     onConversationMessage: (message) => {
-      setActivity(null)
+      // A completed message is the authoritative end of the turn: drop the
+      // activities of that conversation instead of waiting for a terminal run
+      // event that may be lost with a stream reconnect.
+      setActivities((current) =>
+        current.filter(
+          (entry) =>
+            entry.conversationId !== "" && entry.conversationId !== message.conversation_id,
+        ),
+      )
       setLiveMessages((current) => {
         if (current.some((existing) => existing.id === message.id)) return current
         return [...current, message].slice(-200)
       })
     },
-    onAgentActivity: (payload) => setActivity(activityText(payload)),
+    onAgentActivity: (payload) => {
+      const text = activityText(payload)
+      if (text === null) return
+      const runId = typeof payload.run_id === "string" ? payload.run_id : ""
+      const conversationId =
+        typeof payload.conversation_id === "string" ? payload.conversation_id : ""
+      // Keep the entries in arrival order so the last one is the newest active
+      // run; an update of the same run moves to the end.
+      setActivities((current) => [
+        ...current.filter((entry) => entry.runId !== runId),
+        { runId, conversationId, text },
+      ])
+    },
+    onAgentRunChanged: (event) => {
+      if (event.type !== "agent.run.finished" && event.type !== "agent.run.failed") return
+      const runId =
+        typeof event.payload.run_id === "string"
+          ? event.payload.run_id
+          : typeof event.scope.agent_run_id === "string"
+            ? event.scope.agent_run_id
+            : ""
+      if (runId === "") return
+      // Terminal event: the bubble must disappear even though the backend never
+      // publishes a terminal `agent.activity` frame (D-06).
+      setActivities((current) => current.filter((entry) => entry.runId !== runId))
+    },
     onTeamRoomChanged: () => setTeamRoomToken((token) => token + 1),
     onDesignGraphChanged: () => scheduleGraphRefresh(),
     onDesignCaseChanged: (event) => {
@@ -345,7 +411,9 @@ export function DesignTab({
       const params = new URLSearchParams({ tab: "design" })
       if (conversationId !== null) params.set("conversation", conversationId)
       if (caseId !== null) params.set("case", caseId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, versionId],
   )
@@ -362,7 +430,6 @@ export function DesignTab({
     (conversationId: string) => {
       setActiveConversationId(conversationId)
       setStaleNotice(null)
-      setActivity(null)
       updateUrl(selectedCaseId, conversationId)
     },
     [updateUrl, selectedCaseId],
@@ -630,27 +697,48 @@ export function DesignTab({
 
   // The version page is not a flex column, so the workspace measures the space
   // left below its own top edge and caps itself to the viewport. That keeps the
-  // document from growing: only the three panes (and their panels) scroll.
+  // document from growing: only the panes (and their panels) scroll.
+  // D-03: the old hard 320px minimum pushed a 1280x800 page 75px tall, so the
+  // workspace now takes exactly `innerHeight - top - bottom inset` (0 at worst).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stage changes move the chrome above the workspace without a resize event
   useEffect(() => {
     if (loading || graph === null) return undefined
     const updateHeight = () => {
       const workspace = workspaceRef.current
       if (workspace === null) return
       const top = workspace.getBoundingClientRect().top
-      const available = Math.max(MIN_WORKSPACE_HEIGHT, window.innerHeight - top - PAGE_BOTTOM_INSET)
-      setWorkspaceHeight(`${Math.round(available)}px`)
-      const isShort =
-        available < SHORT_WORKSPACE_HEIGHT || window.innerWidth < NARROW_WORKSPACE_WIDTH
-      setShortViewport(isShort)
-      // Collapse when the workspace *enters* the short/narrow band. Resizes
-      // while already short never override the user's explicit expand.
-      if (isShort && !wasShortViewport.current) setChatCollapsed(true)
-      wasShortViewport.current = isShort
+      // Short viewports get compact page chrome, so the reserved 48px
+      // app-content inset is reclaimed below the workspace and compensated by
+      // the negative margin on the root. The document still ends at the
+      // viewport bottom (R2-D-02).
+      const bottomInset = shortMediaViewport ? 0 : PAGE_BOTTOM_INSET
+      const available = Math.max(0, window.innerHeight - top - bottomInset)
+      setWorkspaceHeight(`${Math.floor(available)}px`)
+      // Short height only compacts the page chrome; only a narrow width may
+      // fold the chat so the workbench keeps a usable canvas.
+      const isNarrow = window.innerWidth < NARROW_WORKSPACE_WIDTH
+      setShortViewport(available < SHORT_WORKSPACE_HEIGHT || isNarrow)
+      // Collapse when the window *enters* the narrow band. Resizes while
+      // already narrow never override the user's explicit expand.
+      if (isNarrow && !wasNarrowViewport.current) setChatCollapsed(true)
+      wasNarrowViewport.current = isNarrow
     }
     updateHeight()
     window.addEventListener("resize", updateHeight)
-    return () => window.removeEventListener("resize", updateHeight)
-  }, [loading, graph])
+    // Stage notices / blocker panels change the chrome above the workspace and
+    // move its top edge without firing `resize`; observe the parent so the
+    // height follows the new available space (D-03).
+    const parent = workspaceRef.current?.parentElement ?? null
+    const observer =
+      parent !== null && typeof ResizeObserver === "function"
+        ? new ResizeObserver(updateHeight)
+        : null
+    observer?.observe(parent as Element)
+    return () => {
+      window.removeEventListener("resize", updateHeight)
+      observer?.disconnect()
+    }
+  }, [loading, graph, stage, shortMediaViewport])
 
   if (loading) {
     return (
@@ -675,6 +763,8 @@ export function DesignTab({
   }
 
   const stats = graph.stats
+  /** Short/narrow viewports compress the chrome so the graph keeps its floor. */
+  const compact = shortViewport
   const autoDesign = overview?.auto_design_new_requirements ?? graph.auto_design_new_requirements
   const roundTitle = overview?.active_round
     ? `设计轮次 #${overview.active_round.round_no}`
@@ -698,10 +788,17 @@ export function DesignTab({
     >
       <header
         data-testid="design-workbench-toolbar"
-        className="flex shrink-0 flex-wrap items-center gap-2 px-1 pb-1"
+        className={cn(
+          "flex shrink-0 flex-wrap items-center gap-2 px-1",
+          compact ? "pb-0.5" : "pb-1",
+        )}
       >
         <h2 className="text-sm font-semibold text-foreground">用例工作区</h2>
-        <span className="text-[10px] text-muted-foreground">图在上 · 详情紧接在下 · 内部滚动</span>
+        {compact ? null : (
+          <span className="text-[10px] text-muted-foreground">
+            图在上 · 详情紧接在下 · 内部滚动
+          </span>
+        )}
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <span data-testid="design-workbench-live" className="text-[10px] text-muted-foreground">
             {sseLabel}
@@ -737,6 +834,9 @@ export function DesignTab({
         ariaLabel="调整用例图与用例详情高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
         topOverflow="auto"
         bottomOverflow="auto"
+        topMinHeightPx={GRAPH_PANE_MIN_HEIGHT}
+        bottomMinHeightPx={DETAIL_PANE_MIN_HEIGHT}
+        scrollOnOverflow
         className="min-h-0 flex-1"
         topClassName="[&>section]:min-h-0 [&>section]:flex-1"
         top={
@@ -756,6 +856,7 @@ export function DesignTab({
           ) : (
             <DesignMindmap
               graph={graph}
+              compact={compact}
               selectedCaseId={selectedCaseId}
               confirmingKey={confirmingKey}
               executionResults={executionResults}
@@ -796,10 +897,24 @@ export function DesignTab({
       ref={workspaceRef}
       data-testid="design-scroll"
       data-short-viewport={shortViewport ? "true" : "false"}
-      className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
-      style={{ height: workspaceHeight, overflow: "hidden" }}
+      data-compact={compact ? "true" : "false"}
+      className="relative flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden"
+      style={{
+        height: workspaceHeight,
+        overflow: "hidden",
+        // The workspace ends at the viewport bottom on short viewports; pull
+        // the .app-content bottom padding back under it so the document does
+        // not gain 48px of scroll height (R2-D-02).
+        marginBottom: shortMediaViewport ? -PAGE_BOTTOM_INSET : undefined,
+      }}
     >
-      <header data-testid="design-header" className="flex shrink-0 flex-wrap items-start gap-2">
+      <header
+        data-testid="design-header"
+        className={cn(
+          "flex shrink-0 flex-wrap",
+          compact ? "items-center gap-1" : "items-start gap-2",
+        )}
+      >
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span
@@ -810,18 +925,22 @@ export function DesignTab({
             </span>
             <span className="text-[10px] text-muted-foreground">用例设计</span>
             <h1 className="text-lg font-semibold text-foreground">用例脑图 · {roundTitle}</h1>
-            <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
-              Design Host 单写者 · 事件通道：{sseLabel}
-            </span>
+            {compact ? null : (
+              <span data-testid="design-header-host" className="text-[10px] text-muted-foreground">
+                Design Host 单写者 · 事件通道：{sseLabel}
+              </span>
+            )}
             <span data-testid="design-stats" className="text-[11px] text-muted-foreground">
               需求 {stats.requirements} · 场景 {stats.scenarios} · 用例 {stats.cases} · draft{" "}
               {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
             </span>
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
-            <span data-testid="design-header-context">上下文水位 —</span>
-            <span data-testid="design-header-model">模型 {effectiveModel}</span>
-          </div>
+          {compact ? null : (
+            <div className="mt-0.5 flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground">
+              <span data-testid="design-header-context">上下文水位 —</span>
+              <span data-testid="design-header-model">模型 {effectiveModel}</span>
+            </div>
+          )}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <Button
@@ -914,58 +1033,70 @@ export function DesignTab({
         />
       ) : null}
 
-      {/* R-D2-1/2: chat above the workbench (40/60), each pane owns its scroll. */}
-      <DesignSplitPane
-        testId="design-split-main"
-        defaultPercent={DEFAULT_CHAT_SPLIT}
-        minPercent={MIN_CHAT_SPLIT}
-        maxPercent={MAX_CHAT_SPLIT}
-        storageKey={DESIGN_SPLIT_STORAGE_KEYS.chat}
-        ariaLabel="调整设计对话与用例工作区高度（↑↓ ±5%，Home 最小，End 最大，双击复位）"
-        topCollapsed={chatCollapsed}
-        topOverflow="hidden"
-        bottomOverflow="hidden"
-        className="min-h-0 flex-1"
-        top={
-          chatCollapsed ? (
-            <ChatTitleBar conversationTitle={chatTitle} onExpand={toggleChatCollapsed} />
-          ) : (
-            <div
-              data-testid="design-chat-pane"
-              className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
-              style={{ overflow: "hidden" }}
-            >
-              <DesignChat
-                versionId={versionId}
-                conversations={conversations}
-                activeConversationId={activeConversationId}
-                onSelectConversation={selectConversation}
-                onCreateConversation={createConversation}
-                creatingConversation={creatingConversation}
-                liveMessages={liveMessages}
-                activity={activity}
-                sseStatus={sseStatus}
-                staleNotice={staleNotice}
-                draftText={chatDraft}
-                onDraftTextChange={setChatDraft}
-                refreshToken={teamRoomToken}
-                collapsed={false}
-                onToggleCollapsed={toggleChatCollapsed}
-                onConversationModelChanged={applyConversationModel}
-                caseReferences={chatCaseReferences}
-                onCaseReferencesChange={setChatCaseReferences}
-                onCaseSelect={selectCase}
-              />
-            </div>
-          )
-        }
-        bottom={
-          // R-D2-3: graph + detail move together into the 90vw×90vh dialog.
+      {/*
+       * R-D2-1/2: fixed left/right layout — chat 40% (left) and the workbench
+       * 60% (right). The workbench keeps its own draggable 65/35 graph/detail
+       * split; the outer columns are fixed and never dragged. A narrow window
+       * folds the chat into a full-width title bar above the workbench.
+       */}
+      <div
+        data-testid="design-split-main"
+        data-collapsed={chatCollapsed ? "true" : "false"}
+        className={cn(
+          "min-h-0 min-w-0 flex-1 gap-3",
+          chatCollapsed
+            ? "flex flex-col"
+            : "grid grid-rows-1 grid-cols-[minmax(0,2fr)_minmax(0,3fr)]",
+        )}
+      >
+        {chatCollapsed ? (
+          <ChatTitleBar
+            conversationTitle={chatTitle}
+            onExpand={toggleChatCollapsed}
+            compact={compact}
+          />
+        ) : (
+          <div
+            data-testid="design-chat-pane"
+            className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+            style={{ overflow: "hidden" }}
+          >
+            <DesignChat
+              versionId={versionId}
+              conversations={conversations}
+              activeConversationId={activeConversationId}
+              onSelectConversation={selectConversation}
+              onCreateConversation={createConversation}
+              creatingConversation={creatingConversation}
+              liveMessages={liveMessages}
+              activity={activity}
+              sseStatus={sseStatus}
+              staleNotice={staleNotice}
+              draftText={chatDraft}
+              onDraftTextChange={setChatDraft}
+              refreshToken={teamRoomToken}
+              collapsed={false}
+              onToggleCollapsed={toggleChatCollapsed}
+              onConversationModelChanged={applyConversationModel}
+              caseReferences={chatCaseReferences}
+              onCaseReferencesChange={setChatCaseReferences}
+              onCaseSelect={selectCase}
+            />
+          </div>
+        )}
+
+        {/* R-D2-3: graph + detail move together into the 90vw×90vh dialog.
+            `flex-1` fills the remaining height when collapsed into the stacked
+            form; in grid mode the flex property is ignored by the grid item. */}
+        <div
+          data-testid="design-workbench-slot"
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+        >
           <DesignFocusDialog open={focusOpen} onClose={closeFocus}>
             {workbench}
           </DesignFocusDialog>
-        }
-      />
+        </div>
+      </div>
 
       <ExportCasesDialog
         versionId={versionId}

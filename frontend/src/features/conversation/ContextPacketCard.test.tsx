@@ -60,6 +60,33 @@ describe("ContextPacketCard", () => {
     expect(api.getLatestContextPacket).toHaveBeenCalledWith("2001")
   })
 
+  it("renders duplicate history segments without a duplicate React key warning", async () => {
+    const segment = packet.segments[1]
+    api.getLatestContextPacket.mockResolvedValue({
+      ...packet,
+      segments: [segment, { ...segment }],
+    })
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
+
+    render(<ContextPacketCard versionId="2001" />)
+
+    expect(await screen.findByText(/2 段/)).toBeInTheDocument()
+    const duplicateKeyWarning = consoleError.mock.calls.some((call) =>
+      String(call[0]).includes("same key"),
+    )
+    expect(duplicateKeyWarning).toBe(false)
+    consoleError.mockRestore()
+  })
+
+  it("renders the empty state for a 200 response with a null packet", async () => {
+    api.getLatestContextPacket.mockResolvedValue(null)
+
+    render(<ContextPacketCard versionId="2001" />)
+
+    expect(await screen.findByText("该版本暂无上下文包")).toBeInTheDocument()
+    expect(screen.queryByText("正在加载上下文包…")).not.toBeInTheDocument()
+  })
+
   it("never requests the packet for a non-admin and shows the admin-only notice", async () => {
     auth.isAdmin = false
 

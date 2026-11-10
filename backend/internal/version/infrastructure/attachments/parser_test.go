@@ -749,6 +749,44 @@ func TestXLSXThreadedCommentReportedAsSkipped(t *testing.T) {
 	}
 }
 
+// TestDOCXExtractionLayoutTablesAndFRBody pins the C-03 fixture shape: the
+// Heading3 FR body and its BDD scenes survive, and both catalog tables keep
+// their exact cells (the deterministic processor depends on the column order,
+// not on a flattened sentence).
+func TestDOCXExtractionLayoutTablesAndFRBody(t *testing.T) {
+	result, err := extractResult(t, "requirements.docx", "", docxExtractionLayoutFixture())
+	if err != nil {
+		t.Fatalf("docx: %v", err)
+	}
+	if !findElement(result.Elements, "heading", "FR-101 账号密码登录") {
+		t.Fatalf("FR body heading missing: %+v", result.Elements)
+	}
+	for _, want := range []string{"需求描述：用户可以使用账号密码登录系统。", "场景 1：正确密码登录", "场景 2：错误密码登录"} {
+		if !strings.Contains(result.Text, want) {
+			t.Fatalf("body text %q missing:\n%s", want, result.Text)
+		}
+	}
+	listHeader := []string{"需求编号", "需求名称", "需求描述", "优先级", "需求类型", "需求状态", "所属功能"}
+	listRow := []string{"FR-001", "账号密码登录", "用户使用账号密码登录", "P1", "功能需求", "已实现", "账号"}
+	if !findTableRow(result.Elements, "6.1 需求清单总表", listHeader) {
+		t.Fatalf("6.1 header row missing/wrong: %+v", result.Elements)
+	}
+	if !findTableRow(result.Elements, "6.1 需求清单总表", listRow) {
+		t.Fatalf("6.1 data row missing/wrong: %+v", result.Elements)
+	}
+	catalogHeader := []string{"需求编号", "需求名称", "所属功能", "优先级", "验收场景数", "当前系统状态"}
+	catalogRow := []string{"FR-131", "内容排期与工作量看板", "内容管理", "P2", "2", "不存在"}
+	if !findTableRow(result.Elements, "6.4 延展功能需求清单", catalogHeader) {
+		t.Fatalf("6.4 header row missing/wrong: %+v", result.Elements)
+	}
+	if !findTableRow(result.Elements, "6.4 延展功能需求清单", catalogRow) {
+		t.Fatalf("6.4 data row missing/wrong: %+v", result.Elements)
+	}
+	if !strings.Contains(result.Text, "| FR-131 | 内容排期与工作量看板 | 内容管理 | P2 | 2 | 不存在 |") {
+		t.Fatalf("6.4 markdown row missing:\n%s", result.Text)
+	}
+}
+
 // xlsxFixture builds a minimal spreadsheet with two worksheets: shared strings
 // (including a rich-text run), an inline string, numeric, boolean and formula
 // cells on the first sheet, and a numeric cell on the second. Worksheet files

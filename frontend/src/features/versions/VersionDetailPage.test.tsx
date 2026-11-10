@@ -9,18 +9,18 @@ import type { Version } from "./types"
 const api = vi.hoisted(() => ({
   listVersions: vi.fn(),
   getVersion: vi.fn(),
+  getVersionStage: vi.fn(),
   createVersion: vi.fn(),
   getResourceCatalog: vi.fn(),
   reopenVersion: vi.fn(),
 }))
-// Partial mock: the W1-4A panels import other helpers from this module, but they
-// stay unmounted without a stage projection. The stage read rejects so the page
-// keeps exercising the pre-existing stage-less overview path.
+// Partial mock: the W1-4A panels import other helpers from this module. The
+// stage read rejects by default so the page keeps exercising the pre-existing
+// stage-less overview path; the G-04 grid test opts into a real stage.
 vi.mock(import("./api"), async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>()
   return {
     ...actual,
-    getVersionStage: () => Promise.reject(new Error("stage projection unavailable")),
     ...api,
   }
 })
@@ -30,6 +30,17 @@ const deliveryApi = vi.hoisted(() => ({
   listReports: vi.fn(),
 }))
 vi.mock("@/features/delivery/api", () => deliveryApi)
+
+// The overview mounts `VersionAttachmentsSection`, which fetches on mount; this
+// test has no API server, so keep the read local and empty.
+const clarificationApi = vi.hoisted(() => ({
+  listVersionAttachments: vi.fn(),
+  listRequirements: vi.fn(),
+}))
+vi.mock("@/features/clarification/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/features/clarification/api")>()
+  return { ...actual, ...clarificationApi }
+})
 
 const executionApi = vi.hoisted(() => ({
   listHumanRequests: vi.fn(),
@@ -185,10 +196,39 @@ const completedVersion: Version = {
   close_reason: "需求全部闭环，报告已发布",
 }
 
+/**
+ * `vitest.setup.ts` stubs matchMedia as a static false query. The short-viewport
+ * chrome rule reads the real media query, so page tests opt into a deterministic
+ * match here.
+ */
+function mockViewportMedia(matches: boolean): void {
+  vi.spyOn(window, "matchMedia").mockReturnValue({
+    matches,
+    media: "(max-height: 840px)",
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(() => false),
+  } as unknown as MediaQueryList)
+}
+
+function stageProjection(stage: "designing" | "executing") {
+  return {
+    version_id: "2001",
+    stage,
+    stage_entered_at: "2026-11-01T09:00:00Z",
+    blocker: null,
+  }
+}
+
 describe("VersionDetailPage", () => {
   beforeEach(() => {
     api.getVersion.mockReset()
     api.getVersion.mockResolvedValue(versionFixture)
+    api.getVersionStage.mockReset()
+    api.getVersionStage.mockRejectedValue(new Error("stage projection unavailable"))
     api.reopenVersion.mockReset()
     deliveryApi.listIssues.mockReset()
     deliveryApi.listIssues.mockResolvedValue([])
@@ -197,6 +237,10 @@ describe("VersionDetailPage", () => {
     executionApi.listHumanRequests.mockReset()
     executionApi.listHumanRequests.mockResolvedValue([])
     executionApi.resolveHumanRequest.mockReset()
+    clarificationApi.listVersionAttachments.mockReset()
+    clarificationApi.listVersionAttachments.mockResolvedValue([])
+    clarificationApi.listRequirements.mockReset()
+    clarificationApi.listRequirements.mockResolvedValue([])
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
@@ -232,6 +276,20 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("未绑定代码仓")
   })
 
+  it("lays out the version data grid with items-start (G-04)", async () => {
+    api.getVersionStage.mockResolvedValue({
+      version_id: "2001",
+      stage: "clarifying",
+      stage_entered_at: "2026-11-05T01:00:00Z",
+      blocker: null,
+    })
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    const grid = await screen.findByTestId("version-data-grid")
+    expect(grid).toHaveClass("items-start")
+  })
+
   it("guides the user to resources when the version has no bound pages", async () => {
     api.getVersion.mockResolvedValue({
       ...versionFixture,
@@ -250,6 +308,49 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("link", { name: /前往资源页/ })).toHaveAttribute(
       "href",
       "/resources?tab=pages",
+    )
+  })
+
+  it("shows the completion readiness panel while a running version is reporting (R3-E-01)", async () => {
+    api.getVersion.mockResolvedValue({
+      ...versionFixture,
+      requirement_counts: { total: 12, draft: 0, clarified: 1, closed: 11, obsolete: 0 },
+    })
+    api.getVersionStage.mockResolvedValue({
+      version_id: "2001",
+      stage: "reporting",
+      stage_entered_at: "2026-11-10T12:00:00Z",
+      blocker: null,
+    })
+    deliveryApi.listReports.mockResolvedValue([
+      {
+        id: "8101",
+        kind: "version",
+        status: "published",
+        current_revision: { revision: 1, pdf_status: "done" },
+      },
+    ])
+    clarificationApi.listRequirements.mockImplementation(
+      (_versionId: string, options: { status?: string }) =>
+        Promise.resolve(
+          options.status === "clarified"
+            ? [{ id: "6001", title: "素材上传与光标插入", status: "clarified" }]
+            : [],
+        ),
+    )
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    const panel = await screen.findByTestId("completion-readiness")
+    expect(panel).toHaveTextContent("完成条件")
+    await waitFor(() => expect(panel).toHaveTextContent("等待需求闭环"))
+    await waitFor(() =>
+      expect(screen.getByTestId("completion-report")).toHaveTextContent(
+        "已发布（版本总结 v1，PDF 已生成）",
+      ),
+    )
+    expect(await screen.findByTestId("completion-unclosed-requirement")).toHaveTextContent(
+      "素材上传与光标插入",
     )
   })
 
@@ -545,6 +646,39 @@ describe("VersionDetailPage", () => {
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
     expect(screen.getByTestId("design-workspace")).toHaveAttribute("data-export-id", "9001")
     expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("compacts the version chrome on the design tab only in a short viewport", async () => {
+    mockViewportMedia(true)
+    api.getVersionStage.mockResolvedValue(stageProjection("designing"))
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    await waitFor(() =>
+      expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "true"),
+    )
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "true")
+    expect(screen.getByTestId("design-workspace")).toBeInTheDocument()
+
+    // Leaving the design tab restores the full chrome again.
+    fireEvent.click(screen.getByRole("tab", { name: "总览" }))
+    await waitFor(() =>
+      expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "false"),
+    )
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "false")
+  })
+
+  it("keeps the full version chrome on a tall design viewport", async () => {
+    mockViewportMedia(false)
+    api.getVersionStage.mockResolvedValue(stageProjection("designing"))
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    expect(screen.getByTestId("version-header")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByTestId("stage-bar")).toHaveAttribute("data-compact", "false")
+    expect(screen.getByText("订单中心")).toBeInTheDocument()
   })
 
   it("mounts the clarification workspace when the requirements tab is selected", async () => {

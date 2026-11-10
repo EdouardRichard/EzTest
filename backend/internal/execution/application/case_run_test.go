@@ -19,6 +19,7 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	executorexec "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/executor"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
 type caseRunnerFixture struct {
@@ -52,8 +53,8 @@ type caseRunnerFixture struct {
 	// discovery records the terminal-state discovery observation batches. It is
 	// nil in the default fixture (the port is optional in W1-10).
 	discovery *fakeDiscoveryWriter
-	runCtx           context.Context
-	runCancel        context.CancelFunc
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 func int64ptr(value int64) *int64 { return &value }
@@ -268,6 +269,51 @@ func TestPrepareSetsRunningLeaseAndSnapshot(t *testing.T) {
 	if !started {
 		t.Fatalf("expected a case_run.started event, got %v", fixture.events.types())
 	}
+}
+
+// TestPrepareMarksDispatchClaimed: an agent worker claiming the work item is the
+// only proof the run left the queue. Prepare stamps summary.dispatch.claimed_at
+// so Recovery can tell a queue stall (dispatch_timeout) from an execution lease
+// expiry instead of always reporting lease_expired/environment.
+func TestPrepareMarksDispatchClaimed(t *testing.T) {
+	t.Run("existing dispatch snapshot is preserved and marked", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		row := fixture.caseRuns.rows[3001]
+		row.Summary.Dispatch = &execution.CaseRunDispatchDiagnostic{
+			OwnerExecutorID: 7,
+			Endpoint:        "http://127.0.0.1:13336",
+			DispatchAt:      "2026-11-01T00:59:00Z",
+			Attempt:         1,
+		}
+		fixture.caseRuns.rows[3001] = row
+		prepareCaseRun(t, fixture)
+
+		stored := fixture.caseRuns.get(t, 3001)
+		if stored.Summary.Dispatch == nil {
+			t.Fatal("Prepare dropped the dispatch snapshot")
+		}
+		if stored.Summary.Dispatch.ClaimedAt == "" {
+			t.Fatal("Prepare did not mark the dispatch as claimed")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, stored.Summary.Dispatch.ClaimedAt); err != nil {
+			t.Fatalf("claimed_at = %q, want RFC3339Nano: %v", stored.Summary.Dispatch.ClaimedAt, err)
+		}
+		if stored.Summary.Dispatch.Attempt != 1 ||
+			stored.Summary.Dispatch.OwnerExecutorID != 7 ||
+			stored.Summary.Dispatch.DispatchAt != "2026-11-01T00:59:00Z" {
+			t.Fatalf("Prepare rewrote the dispatch snapshot: %+v", stored.Summary.Dispatch)
+		}
+	})
+
+	t.Run("missing dispatch snapshot is created", func(t *testing.T) {
+		fixture := newCaseRunnerFixture(t)
+		prepareCaseRun(t, fixture)
+
+		stored := fixture.caseRuns.get(t, 3001)
+		if stored.Summary.Dispatch == nil || stored.Summary.Dispatch.ClaimedAt == "" {
+			t.Fatalf("dispatch snapshot = %+v, want a claimed marker", stored.Summary.Dispatch)
+		}
+	})
 }
 
 func TestPrepareRejectsNonCurrentCase(t *testing.T) {
@@ -669,6 +715,14 @@ func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
 	}
 	if fixture.browser.lastSpec.ExecutorID != 7 {
 		t.Fatalf("context spec executor = %d, want 7", fixture.browser.lastSpec.ExecutorID)
+	}
+	// X-01 review: the create metadata is the only producer that correlates a
+	// browser context with its dispatch attempt, so it must stamp both ids.
+	if got, _ := fixture.browser.lastSpec.Metadata["case_run_id"].(string); got != platformid.Format(caseRow.ID) {
+		t.Fatalf("context metadata case_run_id = %v, want %s", fixture.browser.lastSpec.Metadata["case_run_id"], platformid.Format(caseRow.ID))
+	}
+	if got, ok := fixture.browser.lastSpec.Metadata["attempt"].(int); !ok || got != caseRow.Attempts {
+		t.Fatalf("context metadata attempt = %v, want %d", fixture.browser.lastSpec.Metadata["attempt"], caseRow.Attempts)
 	}
 	row, ok := fixture.sutContext.row(7, "admin")
 	if !ok || row.Status != execution.SUTContextActive || row.BrowserContextID != "ctx_1" {
@@ -1223,6 +1277,85 @@ func TestNoExecutorEmitsBlocked(t *testing.T) {
 	}
 }
 
+// TestDispatchPersistsExecutorSnapshotInSummary pins v0.2.3 X-01: every dispatch
+// stamps the chosen executor (owner/endpoint/status/heartbeat/version/route) in
+// case_run.summary["dispatch"] so a later failure can be attributed without a
+// new table or migration.
+func TestDispatchPersistsExecutorSnapshotInSummary(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	heartbeat := fixture.clock.Now().Add(-2 * time.Second)
+	executor := &execution.ExecutorInstance{
+		ID: 7, Endpoint: "http://127.0.0.1:13336", Capacity: 8,
+		Status: execution.ExecutorActive, Version: "0.2.0-p3",
+		LastHeartbeat: &heartbeat,
+	}
+	scheduler, queue := newDispatchScheduler(fixture, executor)
+
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	row := fixture.caseRuns.get(t, 3001)
+	if row.Status != execution.CaseRunRunning {
+		t.Fatalf("run status = %q, want running", row.Status)
+	}
+	if queue.count() != 1 {
+		t.Fatalf("work items = %d, want 1", queue.count())
+	}
+	dispatch := row.Summary.Dispatch
+	if dispatch == nil {
+		t.Fatalf("case_run.summary.dispatch is nil: %+v", row.Summary)
+	}
+	if dispatch.OwnerExecutorID != 7 || dispatch.Endpoint != "http://127.0.0.1:13336" {
+		t.Fatalf("dispatch owner/endpoint = %+v", dispatch)
+	}
+	if dispatch.ExecutorStatus != string(execution.ExecutorActive) || dispatch.ExecutorVersion != "0.2.0-p3" {
+		t.Fatalf("dispatch executor status/version = %+v", dispatch)
+	}
+	if dispatch.LastHeartbeat != heartbeat.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("dispatch last_heartbeat = %q, want %q", dispatch.LastHeartbeat, heartbeat.UTC().Format(time.RFC3339Nano))
+	}
+	if !dispatch.RegistryHit {
+		t.Fatalf("dispatch registry_hit = false, want true for a selected row")
+	}
+	if dispatch.DispatchAt == "" {
+		t.Fatalf("dispatch_at is empty: %+v", dispatch)
+	}
+	if dispatch.Attempt != row.Attempts {
+		t.Fatalf("dispatch attempt = %d, want %d", dispatch.Attempt, row.Attempts)
+	}
+}
+
+// TestTerminalSummaryPreservesDispatchSnapshot proves the terminal verdict write
+// does not drop the dispatch snapshot assembled at dispatch time.
+func TestTerminalSummaryPreservesDispatchSnapshot(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	snapshot := &execution.CaseRunDispatchDiagnostic{
+		OwnerExecutorID: 7,
+		Endpoint:        "http://127.0.0.1:13336",
+		ExecutorStatus:  string(execution.ExecutorActive),
+		RegistryHit:     true,
+		DispatchAt:      "2026-11-01T01:00:00Z",
+	}
+	run := fixture.caseRuns.rows[3001]
+	run.Summary.Dispatch = snapshot
+	fixture.caseRuns.rows[3001] = run
+	prepareCaseRun(t, fixture)
+	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+		Seq: 1, Status: "passed", Observed: "ok",
+	}); err != nil {
+		t.Fatalf("StepRecord: %v", err)
+	}
+	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+		Verdict: execution.CaseRunPassed,
+	}); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Summary.Dispatch == nil || stored.Summary.Dispatch.OwnerExecutorID != 7 {
+		t.Fatalf("terminal summary dropped the dispatch snapshot: %+v", stored.Summary)
+	}
+}
+
 // TestLeaseHeartbeatRetriesTransientStoreError: one transient ClaimLease error
 // must not permanently disable renewal — the timer retries while the run context
 // is alive, so a later slow action cannot be misread as executor_lost.
@@ -1267,8 +1400,8 @@ func TestDispatchLeaseSurvivesDelayedClaim(t *testing.T) {
 	if dispatched.LeaseUntil == nil {
 		t.Fatal("dispatch did not stamp a case_run lease")
 	}
-	if lease := dispatched.LeaseUntil.Sub(fixture.clock.Now()); lease < 90*time.Second {
-		t.Fatalf("dispatch lease = %v, want at least the 90s agent lease", lease)
+	if lease := dispatched.LeaseUntil.Sub(fixture.clock.Now()); lease < executionapp.DefaultDispatchLease {
+		t.Fatalf("dispatch lease = %v, want at least the %v queue-wait lease", lease, executionapp.DefaultDispatchLease)
 	}
 
 	// The work item waits 45s behind a busy worker before any agent claims it.
@@ -1302,6 +1435,11 @@ func TestDispatchLeaseSurvivesDelayedClaim(t *testing.T) {
 		!claimed.LeaseUntil.After(fixture.clock.Now()) {
 		t.Fatalf("delayed claim did not refresh the lease: %+v", claimed)
 	}
+	// Prepare replaces the long dispatch (queue-wait) lease with the short agent
+	// execution lease: the two leases stay separate.
+	if lease := claimed.LeaseUntil.Sub(fixture.clock.Now()); lease != executionapp.DefaultCaseLease {
+		t.Fatalf("execution lease after the claim = %v, want %v", lease, executionapp.DefaultCaseLease)
+	}
 }
 
 // queuedWorkItem rebuilds the agent work item the scheduler enqueued.
@@ -1320,14 +1458,16 @@ func queuedWorkItem(t *testing.T, queue *fakeDispatchQueue) agent.WorkItem {
 	return agent.WorkItem{ID: 9001, VersionID: queued.VersionID, Type: queued.Type, Payload: payload}
 }
 
-// TestFinalizeMapsExecutorUnavailableToExecutorLost: an unreachable executor is
-// an executor failure, not an environment failure; the frontend maps it to
-// “执行器失联”.
-func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
+// TestFinalizeMapsConnectionRefusedToExecutorLost: a refused dial is an
+// executor failure, not an environment failure; the frontend maps it to
+// “执行器失联”. A reachable-executor 5xx (no dial phase) is environment instead
+// (v0.2.3 X-01).
+func TestFinalizeMapsConnectionRefusedToExecutorLost(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	executorUnavailable := platform.NewError(503, "executor_unavailable", "executor is offline")
 	executorUnavailable.Retryable = true
+	executorUnavailable.Details = map[string]any{"phase": "dial"}
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: executorUnavailable}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 1, 1); err != nil {
 		t.Fatalf("Finalize: %v", err)
@@ -1338,6 +1478,9 @@ func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
 	}
 	if stored.FailureClass != execution.FailureClassExecutorLost {
 		t.Fatalf("failure class = %q, want executor_lost (not environment)", stored.FailureClass)
+	}
+	if stored.Summary.TerminalCause != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("terminal cause = %q, want executor_lost", stored.Summary.TerminalCause)
 	}
 }
 

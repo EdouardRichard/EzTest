@@ -19,6 +19,19 @@ type CatalogReader interface {
 	ListAllAccounts(context.Context) ([]AccountView, error)
 }
 
+// VersionRef identifies one version whose binding references a resource. The
+// title is read from the version row by the version context; the resource
+// context never imports the version package. Status and Stage describe the
+// version lifecycle, and Editable reports whether a binding edit is actually
+// possible (executing/reporting/completed versions are read-only).
+type VersionRef struct {
+	ID       int64
+	Title    string
+	Status   string
+	Stage    string
+	Editable bool
+}
+
 // UsageChecker answers whether a resource is still referenced by a version
 // binding. A page/API/database guard blocks resources that are inside a bound
 // environment's effective range (approved/active and not scope-excluded); an
@@ -32,6 +45,12 @@ type UsageChecker interface {
 	DatabaseInUse(context.Context, int64) (bool, error)
 	AccountInUse(context.Context, int64) (bool, error)
 	RepositoryInUse(context.Context, int64) (bool, error)
+	// ReferencingVersions lists the versions whose binding references the
+	// resource of the given kind: "sut", "environment", "page", "api",
+	// "database", "account" or "repository". The delete guard calls it after a
+	// positive in-use check to build stable 409 details; callers cap and
+	// de-duplicate the list.
+	ReferencingVersions(ctx context.Context, kind string, id int64) ([]VersionRef, error)
 }
 
 // KnowledgeBindingChange is the resource context's neutral page/route/account

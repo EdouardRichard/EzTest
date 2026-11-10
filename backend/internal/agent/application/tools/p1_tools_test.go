@@ -92,9 +92,11 @@ type fakeAttachmentPort struct {
 	offset   int
 	maxChars int
 
-	image    AttachmentImage
-	imageErr error
-	imageID  int64
+	image       AttachmentImage
+	imageErr    error
+	imageID     int64
+	imageByID   int64
+	imageListID int64
 }
 
 func (f *fakeAttachmentPort) ListAttachments(_ context.Context, versionID, conversationID int64) ([]AttachmentMeta, error) {
@@ -114,6 +116,12 @@ func (f *fakeAttachmentPort) ReadAttachmentText(_ context.Context, versionID, co
 
 func (f *fakeAttachmentPort) AttachmentImageRef(_ context.Context, versionID, conversationID, attachmentID int64) (AttachmentImage, error) {
 	f.imageID = attachmentID
+	return f.image, f.imageErr
+}
+
+func (f *fakeAttachmentPort) AttachmentImageRefByImage(_ context.Context, versionID, conversationID, imageID int64) (AttachmentImage, error) {
+	f.imageByID = imageID
+	f.imageListID = conversationID
 	return f.image, f.imageErr
 }
 
@@ -494,6 +502,138 @@ func TestAttachmentReadTextReportsPendingStatus(t *testing.T) {
 	}
 }
 
+// TestAttachmentReadTextExposesImageCaptions pins C-01: the read result carries
+// the persisted image rows and their platform-generated captions so the Host
+// reads the analysis instead of claiming the platform has no vision. The bytes
+// never enter the tool output.
+func TestAttachmentReadTextExposesImageCaptions(t *testing.T) {
+	port := &fakeAttachmentPort{text: AttachmentText{
+		AttachmentID: 9003, Name: "with-image.docx", MIME: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		Status: "done", Text: "登录界面示意", TotalChars: 6, ImageCount: 1,
+		Images: []AttachmentImageDetail{{
+			ID: 901, Seq: 1, SHA256: "abc123", MIME: "image/png", Width: 8, Height: 6,
+			Status: "done", Caption: "登录界面截图：手机号与验证码输入框",
+		}},
+	}}
+	registry := NewP1Registry(Deps{Attachment: port})
+	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9003"}`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	body := resultMap(t, result)
+	images, ok := body["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("images = %#v", body["images"])
+	}
+	image, ok := images[0].(map[string]any)
+	if !ok {
+		t.Fatalf("image = %#v", images[0])
+	}
+	if image["image_id"] != "901" || image["seq"] != float64(1) || image["status"] != "done" {
+		t.Fatalf("image = %#v", image)
+	}
+	if image["caption"] != "登录界面截图：手机号与验证码输入框" {
+		t.Fatalf("caption = %#v", image["caption"])
+	}
+	if image["sha256"] != "abc123" || image["mime"] != "image/png" ||
+		image["width"] != float64(8) || image["height"] != float64(6) {
+		t.Fatalf("image metadata = %#v", image)
+	}
+	for _, forbidden := range []string{"data", "data_ref", "base64"} {
+		if _, ok := image[forbidden]; ok {
+			t.Fatalf("image output leaked %q: %#v", forbidden, image)
+		}
+	}
+	if body["image_count"] != float64(1) || body["images_truncated"] != false {
+		t.Fatalf("image budget fields = %#v", body)
+	}
+
+	// A failed caption is still reported as data so the Host can say the image
+	// analysis is incomplete instead of guessing the image content.
+	port.text = AttachmentText{
+		AttachmentID: 9003, Name: "with-image.docx", Status: "failed",
+		Error: "vision_analysis_failed", ImageCount: 1,
+		Images: []AttachmentImageDetail{{
+			ID: 901, Seq: 1, MIME: "image/png", Status: "failed",
+			Error: "vision upstream returned HTTP 500",
+		}},
+	}
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9003"}`)
+	if err != nil {
+		t.Fatalf("failed attachment read returned a tool error: %v", err)
+	}
+	body = resultMap(t, result)
+	images, ok = body["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("failed images = %#v", body["images"])
+	}
+	image = images[0].(map[string]any)
+	if image["status"] != "failed" || image["caption"] != "" ||
+		!strings.Contains(image["error"].(string), "vision upstream") {
+		t.Fatalf("failed image = %#v", image)
+	}
+
+	// Pending attachments keep their per-image caption state too.
+	port.text = AttachmentText{
+		AttachmentID: 9003, Name: "with-image.docx", Status: "pending",
+		Error: "附件解析中，可重试", Retryable: true, ImageCount: 1,
+		Images: []AttachmentImageDetail{{
+			ID: 902, Seq: 1, MIME: "image/png", Status: "skipped",
+			Error: "image analysis pending",
+		}},
+	}
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9003"}`)
+	if err != nil {
+		t.Fatalf("pending attachment read returned a tool error: %v", err)
+	}
+	body = resultMap(t, result)
+	if images, ok = body["images"].([]any); !ok || len(images) != 1 {
+		t.Fatalf("pending images = %#v", body["images"])
+	}
+}
+
+// TestAttachmentReadTextOnlyReturnsImagesOnFirstPage pins the paging cap: the
+// image payload is attached to the first page only; later pages report
+// image_count but no captions.
+func TestAttachmentReadTextOnlyReturnsImagesOnFirstPage(t *testing.T) {
+	port := &fakeAttachmentPort{text: AttachmentText{
+		AttachmentID: 9004, Name: "with-image.docx", Status: "done",
+		Offset: 10, Text: "next page", TotalChars: 30, ImageCount: 1,
+	}}
+	registry := NewP1Registry(Deps{Attachment: port})
+	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20},
+		ToolAttachmentReadText, `{"attachment_id":"9004","offset":10}`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	body := resultMap(t, result)
+	if _, ok := body["images"]; ok {
+		t.Fatalf("later page repeated images: %#v", body["images"])
+	}
+	if _, ok := body["images_truncated"]; ok {
+		t.Fatalf("later page carried the first-page truncation flag: %#v", body)
+	}
+	if body["image_count"] != float64(1) {
+		t.Fatalf("image_count = %#v, want 1", body["image_count"])
+	}
+
+	// The first page of an attachment without images still returns an explicit
+	// empty array, not a missing key.
+	port.text = AttachmentText{AttachmentID: 9004, Name: "spec.md", Status: "done", Text: "page"}
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, `{"attachment_id":"9004"}`)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	body = resultMap(t, result)
+	images, ok := body["images"].([]any)
+	if !ok || len(images) != 0 {
+		t.Fatalf("first page images = %#v, want an empty array", body["images"])
+	}
+	if body["image_count"] != float64(0) || body["images_truncated"] != false {
+		t.Fatalf("image budget fields = %#v", body)
+	}
+}
+
 func TestAttachmentDefaultMaxChars(t *testing.T) {
 	port := &fakeAttachmentPort{}
 	registry := NewP1Registry(Deps{Attachment: port})
@@ -506,7 +646,13 @@ func TestAttachmentDefaultMaxChars(t *testing.T) {
 }
 
 func TestAttachmentImageRefReturnsMetadata(t *testing.T) {
-	port := &fakeAttachmentPort{image: AttachmentImage{AttachmentID: 9002, SHA256: "abc", URL: "/api/content/abc", MIME: "image/png"}}
+	port := &fakeAttachmentPort{image: AttachmentImage{
+		AttachmentID: 9002, SHA256: "abc", URL: "/api/content/abc", MIME: "image/png",
+		Images: []AttachmentImageDetail{{
+			ID: 902, Seq: 1, SHA256: "abc", MIME: "image/png", Width: 8, Height: 6,
+			Status: "done", Caption: "登录界面截图",
+		}},
+	}}
 	registry := NewP1Registry(Deps{Attachment: port})
 	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{"attachment_id":"9002"}`)
 	if err != nil {
@@ -518,6 +664,49 @@ func TestAttachmentImageRefReturnsMetadata(t *testing.T) {
 	body := resultMap(t, result)
 	if body["sha256"] != "abc" || body["url"] != "/api/content/abc" || body["mime"] != "image/png" {
 		t.Fatalf("result = %#v", body)
+	}
+	images, ok := body["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("images = %#v", body["images"])
+	}
+	image := images[0].(map[string]any)
+	if image["caption"] != "登录界面截图" || image["status"] != "done" || image["seq"] != float64(1) {
+		t.Fatalf("image = %#v", image)
+	}
+	if body["note"] != "" {
+		t.Fatalf("note = %#v, want empty for a document with persisted captions", body["note"])
+	}
+
+	// A standalone image upload has no persisted caption row: the tool returns
+	// the explicit empty-payload note instead of failing or looking analyzed.
+	port.image = AttachmentImage{
+		AttachmentID: 9005, SHA256: "def", URL: "/api/content/def", MIME: "image/png",
+		Note: "独立图片附件没有平台生成的 caption 行；images[] 为空，本工具不会重新运行视觉分析。",
+	}
+	result, err = execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{"attachment_id":"9005"}`)
+	if err != nil {
+		t.Fatalf("standalone image ref: %v", err)
+	}
+	body = resultMap(t, result)
+	if images, ok = body["images"].([]any); !ok || len(images) != 0 {
+		t.Fatalf("standalone images = %#v, want empty array", body["images"])
+	}
+	if note, _ := body["note"].(string); !strings.Contains(note, "不会重新运行视觉分析") {
+		t.Fatalf("standalone note = %#v", body["note"])
+	}
+
+	tool, ok := registry.Get(ToolAttachmentImageRef)
+	if !ok {
+		t.Fatalf("%s is not registered", ToolAttachmentImageRef)
+	}
+	description := tool.Description()
+	if strings.Contains(description, "P1 不做视觉理解") {
+		t.Fatalf("description still denies vision: %s", description)
+	}
+	for _, want := range []string{"caption", "不会重新运行视觉分析", "docx", "note"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("description %q lacks %q", description, want)
+		}
 	}
 }
 

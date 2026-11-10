@@ -17,6 +17,11 @@ type stubAttachmentImageService struct {
 	lastID    int64
 	listCalls int
 	reanalyze int
+
+	versionRows   []versionapp.VersionAttachmentView
+	versionErr    error
+	versionCalls  int
+	lastVersionID int64
 }
 
 func (s *stubAttachmentImageService) ListImages(_ context.Context, attachmentID int64) ([]versionapp.AttachmentImageView, error) {
@@ -26,6 +31,15 @@ func (s *stubAttachmentImageService) ListImages(_ context.Context, attachmentID 
 		return nil, s.err
 	}
 	return s.rows, nil
+}
+
+func (s *stubAttachmentImageService) ListVersionAttachments(_ context.Context, versionID int64) ([]versionapp.VersionAttachmentView, error) {
+	s.versionCalls++
+	s.lastVersionID = versionID
+	if s.versionErr != nil {
+		return nil, s.versionErr
+	}
+	return s.versionRows, nil
 }
 
 func (s *stubAttachmentImageService) Reanalyze(_ context.Context, attachmentID int64) ([]versionapp.AttachmentImageView, error) {
@@ -162,3 +176,107 @@ func TestAttachmentRoutesValidateID(t *testing.T) {
 }
 
 const versionappTestSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// ---------- version attachment list (C-05) ----------
+
+func sampleVersionAttachmentView() versionapp.VersionAttachmentView {
+	return versionapp.VersionAttachmentView{
+		ID:               55,
+		Name:             "spec.pdf",
+		MIME:             "application/pdf",
+		Size:             2048,
+		ExtractionStatus: version.AttachmentFailed,
+		ErrorCode:        version.AttachmentErrorExtraction,
+		ErrorText:        "parser crashed",
+		ImageCount:       2,
+	}
+}
+
+func newVersionAttachmentServer(t *testing.T) (http.Handler, *stubAttachmentImageService) {
+	t.Helper()
+	stub := &stubAttachmentImageService{
+		versionRows: []versionapp.VersionAttachmentView{sampleVersionAttachmentView()},
+	}
+	handler := versionapi.NewAttachmentHandler(stub)
+	mux := http.NewServeMux()
+	// Route registration itself belongs to the composition root (Task 20); the
+	// local mux pins the handler contract.
+	mux.HandleFunc("GET /api/versions/{id}/attachments", handler.ListVersionAttachments)
+	return mux, stub
+}
+
+func TestVersionAttachmentsHandler(t *testing.T) {
+	mux, stub := newVersionAttachmentServer(t)
+	recorder := call(t, mux, http.MethodGet, "/api/versions/7/attachments", "", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.versionCalls != 1 || stub.lastVersionID != 7 {
+		t.Fatalf("service calls = %d last version = %d", stub.versionCalls, stub.lastVersionID)
+	}
+	items := dataList(t, recorder)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	item := items[0].(map[string]any)
+	if item["id"] != "55" || item["name"] != "spec.pdf" || item["mime"] != "application/pdf" ||
+		item["size"] != float64(2048) || item["extraction_status"] != version.AttachmentFailed ||
+		item["error_code"] != version.AttachmentErrorExtraction || item["error_text"] != "parser crashed" ||
+		item["image_count"] != float64(2) {
+		t.Fatalf("item = %#v", item)
+	}
+	t.Logf("GET /api/versions/7/attachments -> %d %s", recorder.Code, recorder.Body.String())
+}
+
+func TestVersionAttachmentsHandlerEmptyIsArray(t *testing.T) {
+	mux, stub := newVersionAttachmentServer(t)
+	stub.versionRows = nil
+	recorder := call(t, mux, http.MethodGet, "/api/versions/7/attachments", "", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	items := dataList(t, recorder)
+	if len(items) != 0 {
+		t.Fatalf("items = %#v, want an empty array", items)
+	}
+}
+
+func TestVersionAttachmentsHandlerRequiresAuth(t *testing.T) {
+	mux, stub := newVersionAttachmentServer(t)
+	recorder := call(t, mux, http.MethodGet, "/api/versions/7/attachments", "", nil)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.versionCalls != 0 {
+		t.Fatal("unauthenticated request reached the service")
+	}
+}
+
+func TestVersionAttachmentsHandlerValidatesID(t *testing.T) {
+	mux, stub := newVersionAttachmentServer(t)
+	for _, path := range []string{
+		"/api/versions/not-a-number/attachments",
+		"/api/versions/0/attachments",
+	} {
+		recorder := call(t, mux, http.MethodGet, path, "", &platform.Actor{ID: 42})
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s status = %d, body = %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+	if stub.versionCalls != 0 {
+		t.Fatalf("invalid ID reached the service %d times", stub.versionCalls)
+	}
+}
+
+func TestVersionAttachmentsHandlerUnknownVersion(t *testing.T) {
+	mux, stub := newVersionAttachmentServer(t)
+	stub.versionRows = nil
+	stub.versionErr = platform.NotFound("version")
+	recorder := call(t, mux, http.MethodGet, "/api/versions/9999/attachments", "", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.versionCalls != 1 {
+		t.Fatalf("service calls = %d", stub.versionCalls)
+	}
+}

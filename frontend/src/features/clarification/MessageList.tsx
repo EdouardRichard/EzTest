@@ -433,6 +433,7 @@ export function MessageList({
   const previousNewestIdRef = useRef("")
   const previousOldestIdRef = useRef("")
   const previousScrollHeightRef = useRef(0)
+  const previousScrollTopRef = useRef(0)
   const loadOlderRequestedRef = useRef(false)
   const oldestMessageIdRef = useRef("")
 
@@ -552,6 +553,7 @@ export function MessageList({
         scrollToBottom()
       }
       previousScrollHeightRef.current = element.scrollHeight
+      previousScrollTopRef.current = element.scrollTop
       return
     }
 
@@ -578,6 +580,8 @@ export function MessageList({
       const heightDelta = nextHeight - previousHeight
       if (heightDelta > 0) element.scrollTop += heightDelta
       previousScrollHeightRef.current = nextHeight
+      // The compensation is not a user scroll: it must not be read as one.
+      previousScrollTopRef.current = element.scrollTop
       saveScrollPosition(element, autoFollowRef.current)
       return
     }
@@ -614,6 +618,8 @@ export function MessageList({
     const key = conversationKeyRef.current
     if (key !== null && key !== "") savedScrollPositions.delete(key)
     scrollToBottom()
+    const element = containerRef.current
+    if (element !== null) previousScrollTopRef.current = element.scrollTop
   }, [scrollToBottom])
 
   const handleScroll = useCallback(() => {
@@ -621,6 +627,14 @@ export function MessageList({
     if (element === null) return
 
     const following = distanceFromBottom(element) <= BOTTOM_THRESHOLD_PX
+    // D-05: only a real upward scroll pauses the follow. Content growth
+    // (a streaming increment, a taller image, the activity bubble) moves the
+    // bottom away without moving the reader, and the browser may dispatch the
+    // late scroll event only after the growth, so `distanceFromBottom` alone
+    // used to look like the reader had left the bottom.
+    const scrolledUp = element.scrollTop < previousScrollTopRef.current - 1
+    previousScrollTopRef.current = element.scrollTop
+
     if (following) {
       if (!autoFollowRef.current) {
         autoFollowRef.current = true
@@ -628,12 +642,16 @@ export function MessageList({
         setUnreadCount(0)
       }
       saveScrollPosition(element, true)
-    } else {
+    } else if (scrolledUp) {
       if (autoFollowRef.current) {
         autoFollowRef.current = false
         setAutoFollowState(false)
       }
       saveScrollPosition(element, false)
+    } else if (autoFollowRef.current) {
+      // Still following: the offset did not move up, so re-anchor after the
+      // growth instead of pausing.
+      scheduleScrollToBottom()
     }
 
     if (
@@ -646,7 +664,7 @@ export function MessageList({
       loadOlderRequestedRef.current = true
       onLoadMore()
     }
-  }, [hasMore, loadingMore, onLoadMore, saveScrollPosition])
+  }, [hasMore, loadingMore, onLoadMore, saveScrollPosition, scheduleScrollToBottom])
 
   const returnToLatestLabel = unreadCount > 0 ? `回到最新 (${unreadCount})` : "回到最新"
 

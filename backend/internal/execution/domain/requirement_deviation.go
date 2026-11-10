@@ -40,6 +40,218 @@ var missingFeatureNouns = []string{
 // (about 20 runes) while rejecting a distant unrelated noun.
 const missingFeatureWindow = 24
 
+// Executor capability limitation attribution (v0.2.3 X-02). When the executor
+// itself cannot perform an action (native file chooser, hover, download, ...),
+// the case executor records the structured marker below on the step observed
+// JSON instead of a prose-only observation. The deterministic analysis reads
+// the marker before the text heuristics and classifies the run blocked with the
+// stable terminal cause executor_capability, so no SUT issue candidate is
+// produced. The marker lives in the existing step_result.observed JSONB; there
+// is no DB enum or migration.
+const (
+	// ExecutorLimitationKey is the step_result.observed JSON key carrying the
+	// structured executor limitation marker (object, string code or bool).
+	ExecutorLimitationKey = "executor_limitation"
+	// ExecutorLimitationCodeKey is the optional code inside the marker object.
+	ExecutorLimitationCodeKey = "code"
+
+	// TerminalCauseExecutorCapability is the stable case_run.summary.terminal_cause
+	// of a run blocked by an executor capability limitation.
+	TerminalCauseExecutorCapability = "executor_capability"
+	// TerminalCauseExecutorTimeout is the stable cause of an executor request
+	// that timed out (not a lost executor).
+	TerminalCauseExecutorTimeout = "executor_timeout"
+	// TerminalCauseExecutorContextCreateFailed is the stable cause of a failure
+	// while creating the lazily-created browser context (the first browser
+	// action), which the UAT evidence pointed at.
+	TerminalCauseExecutorContextCreateFailed = "executor_context_create_failed"
+	// TerminalCauseExecutorUnavailable is the stable cause of a reachable
+	// executor that returned a 5xx/protocol failure.
+	TerminalCauseExecutorUnavailable = "executor_unavailable"
+	// TerminalCauseLeaseExpired is the stable cause of an expired lease on an
+	// online executor with no recorded transport failure.
+	TerminalCauseLeaseExpired = "lease_expired"
+	// TerminalCauseDispatchTimeout is the stable cause of a dispatched case_run
+	// whose dispatch lease expired before any agent worker claimed the work item
+	// (queue wait), distinguishable from an execution lease_expired.
+	TerminalCauseDispatchTimeout = "dispatch_timeout"
+)
+
+// executorLimitationCodes is the closed set of executor capability limitation
+// codes. The producer and the reader both accept only these concrete codes: a
+// generic *_unavailable/*_unsupported suffix (service_unavailable,
+// endpoint_unavailable, ...) can describe a real SUT/environment failure, so it
+// must never turn a product defect into an executor block.
+var executorLimitationCodes = map[string]struct{}{
+	"file_chooser_unavailable": {},
+	"hover_unavailable":        {},
+	"download_unavailable":     {},
+	"upload_unavailable":       {},
+	"dialog_unavailable":       {},
+	"clipboard_unavailable":    {},
+	"drag_unavailable":         {},
+	"unsupported_action":       {},
+	"action_unsupported":       {},
+}
+
+// StepExecutorLimitation reads the structured executor limitation marker of one
+// step. ok reports the marker's presence; code is empty when the marker carries
+// no concrete code (a legacy bool marker).
+func StepExecutorLimitation(step StepResult) (code string, ok bool) {
+	if len(step.Observed) == 0 {
+		return "", false
+	}
+	raw, present := step.Observed[ExecutorLimitationKey]
+	if !present || raw == nil {
+		return "", false
+	}
+	switch typed := raw.(type) {
+	case bool:
+		return "", typed
+	case string:
+		normalized := normalizeLimitationCode(typed)
+		if normalized == "" || normalized == "false" {
+			return "", false
+		}
+		if !IsExecutorLimitationCode(normalized) {
+			return "", false
+		}
+		return normalized, true
+	case map[string]any:
+		value, _ := typed[ExecutorLimitationCodeKey].(string)
+		normalized := normalizeLimitationCode(value)
+		if normalized != "" && !IsExecutorLimitationCode(normalized) {
+			// A marker carrying an unknown code (for example service_unavailable
+			// written by an older deployment) is not a capability limitation.
+			return "", false
+		}
+		return normalized, true
+	default:
+		return "", true
+	}
+}
+
+// ExecutorLimitationStep returns the first failed/blocked step carrying the
+// structured limitation marker.
+func ExecutorLimitationStep(steps []StepResult) (StepResult, string, bool) {
+	for _, step := range steps {
+		switch step.Status {
+		case StepFailed, StepBlocked:
+		default:
+			continue
+		}
+		if code, ok := StepExecutorLimitation(step); ok {
+			return step, code, true
+		}
+	}
+	return StepResult{}, "", false
+}
+
+// ExecutorFailureCause extracts a stable executor failure cause from recorded
+// text (case_run.summary.last_error / retry_reason). It returns "" when no
+// known executor cause is present.
+func ExecutorFailureCause(text string) string {
+	lower := strings.ToLower(text)
+	if lower == "" {
+		return ""
+	}
+	for _, cause := range []string{
+		TerminalCauseExecutorContextCreateFailed,
+		TerminalCauseExecutorTimeout,
+		TerminalCauseExecutorUnavailable,
+		TerminalCauseExecutorCapability,
+		string(FailureClassExecutorLost),
+		TerminalCauseLeaseExpired,
+		TerminalCauseDispatchTimeout,
+	} {
+		if strings.Contains(lower, cause) {
+			return cause
+		}
+	}
+	return ""
+}
+
+// ExecutorLimitationCodeFromError scans a tool error text for a structured
+// capability code token. It never matches prose keywords: only a lowercase code
+// token shaped like the executor's capability codes qualifies. This is the
+// producer bridge between the executor action error code and the persisted step
+// marker (tools.Error renders as "code: message").
+func ExecutorLimitationCodeFromError(text string) (string, bool) {
+	lower := strings.ToLower(text)
+	for index := 0; index < len(lower); {
+		if !isCodeStartByte(lower[index]) {
+			index++
+			continue
+		}
+		end := index
+		for end < len(lower) && isCodeByte(lower[end]) {
+			end++
+		}
+		if code := lower[index:end]; IsExecutorLimitationCode(code) {
+			return code, true
+		}
+		index = end
+	}
+	return "", false
+}
+
+// IsExecutorLimitationCode reports whether code is one of the closed-set
+// executor capability limitation codes (never a transport/failure-class code and
+// never an arbitrary *_unavailable suffix).
+func IsExecutorLimitationCode(code string) bool {
+	normalized := normalizeLimitationCode(code)
+	if normalized == "" || !isCodeToken(normalized) {
+		return false
+	}
+	switch normalized {
+	case "executor_unavailable", "executor_timeout", "executor_context_create_failed", "executor_lost", "executor_capability":
+		// Transport/failure attribution codes are not action capabilities.
+		return false
+	}
+	_, ok := executorLimitationCodes[normalized]
+	return ok
+}
+
+// ExecutorDialRefused reports whether recorded transport text proves the
+// executor could not be reached at all (a refused dial or an unreachable
+// network), as opposed to a reachable executor that returned an error.
+func ExecutorDialRefused(text string) bool {
+	lower := strings.ToLower(text)
+	for _, marker := range []string{
+		"connection refused",
+		"no route to host",
+		"network is unreachable",
+		"host is unreachable",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeLimitationCode(code string) string {
+	return strings.TrimSpace(strings.ToLower(code))
+}
+
+func isCodeToken(value string) bool {
+	if value == "" || !isCodeStartByte(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		if !isCodeByte(value[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isCodeStartByte(value byte) bool { return value >= 'a' && value <= 'z' }
+
+func isCodeByte(value byte) bool {
+	return (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9') || value == '_'
+}
+
 // FailedStepShowsRequirementDeviation reports whether a failed step carries an
 // observed product behavior instead of a tool/automation error.
 //
@@ -57,9 +269,14 @@ const missingFeatureWindow = 24
 //
 // This is the deterministic discriminator that keeps a real requirement
 // deviation on the failed(application) path; it never upgrades a step that has
-// no observation at all.
+// no observation at all. A step carrying the structured executor limitation
+// marker is never product evidence: the executor could not perform the action,
+// so it is blocked with terminal_cause=executor_capability (v0.2.3 X-02).
 func FailedStepShowsRequirementDeviation(step StepResult) bool {
 	if step.Status != StepFailed {
+		return false
+	}
+	if _, limited := StepExecutorLimitation(step); limited {
 		return false
 	}
 	if StepObservesMissingFeature(step) {
@@ -75,10 +292,14 @@ func FailedStepShowsRequirementDeviation(step StepResult) bool {
 // observation states that a required product control or feature is absent.
 // A blocked step can carry that observation when the executor could not even
 // start the action because the control does not exist; a budget stop, a tool
-// error or a missing login/database precondition never does.
+// error or a missing login/database precondition never does. The structured
+// executor limitation marker always wins over the observation text (X-02).
 func StepObservesMissingFeature(step StepResult) bool {
 	switch step.Status {
 	case StepFailed, StepBlocked:
+		if _, limited := StepExecutorLimitation(step); limited {
+			return false
+		}
 		return summaryObservesMissingFeature(StepObservedSummary(step))
 	default:
 		return false

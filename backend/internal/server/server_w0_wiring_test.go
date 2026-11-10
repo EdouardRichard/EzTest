@@ -348,6 +348,12 @@ func (s *stubAttachmentService) Reanalyze(context.Context, int64) ([]versionapp.
 	return nil, nil
 }
 
+// ListVersionAttachments completes the attachment route surface for the C-05
+// version list; this wiring test only exercises the H7 image scope.
+func (s *stubAttachmentService) ListVersionAttachments(context.Context, int64) ([]versionapp.VersionAttachmentView, error) {
+	return nil, nil
+}
+
 // TestV022W0AttachmentImagesRequireVersionScope pins H7: the version-scoped
 // image route rejects an attachment that does not belong to the addressed
 // version before touching the image read.

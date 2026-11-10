@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 	"time"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -124,6 +125,21 @@ type CaseRunUsageView struct {
 	CompletionTokens int `json:"completion_tokens"`
 }
 
+// CaseRunDispatchView is the dispatch-time executor diagnostic persisted in
+// case_run.summary["dispatch"] (v0.2.3 X-01) and exposed to the case-run detail
+// UI. It records which executor endpoint the scheduler picked for the latest
+// attempt.
+type CaseRunDispatchView struct {
+	OwnerExecutorID string  `json:"owner_executor_id"`
+	Endpoint        string  `json:"endpoint"`
+	ExecutorStatus  string  `json:"executor_status"`
+	LastHeartbeat   *string `json:"last_heartbeat"`
+	Version         string  `json:"version"`
+	RegistryHit     bool    `json:"registry_hit"`
+	DispatchAt      string  `json:"dispatch_at"`
+	Attempt         int     `json:"attempt"`
+}
+
 // CaseRunSummaryView is the stable subset of case_run.summary.
 type CaseRunSummaryView struct {
 	VerdictReason      string  `json:"verdict_reason"`
@@ -139,9 +155,16 @@ type CaseRunSummaryView struct {
 	HumanRequestID     *string `json:"human_request_id"`
 	// LastError/TerminalCause/NextAction explain an incomplete run: the concrete
 	// stop cause, the observable detail and the suggested human next step (QA Q2).
+	// A non-terminal row carries no verdict reason, and a raw failure enum is
+	// never surfaced as the human reason when a mapped cause exists (X-07).
 	LastError     string `json:"last_error"`
 	TerminalCause string `json:"terminal_cause"`
 	NextAction    string `json:"next_action"`
+	// RetryReason is the stable cause of a retryable run error persisted before
+	// the redispatch (X-01); it is a retry reason, not a terminal class.
+	RetryReason string `json:"retry_reason"`
+	// Dispatch is the latest dispatch-time executor snapshot (X-01).
+	Dispatch *CaseRunDispatchView `json:"dispatch"`
 	// Usage is the observed agent-run usage persisted at terminal settlement
 	// (QA Q2: it used to be visible only in Agent Center).
 	Usage *CaseRunUsageView `json:"usage"`
@@ -305,6 +328,35 @@ func toIntentView(intent execution.ExecutionIntent, caseID, title string) Intent
 
 func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, evidenceCount int) CaseRunView {
 	terminalCause, nextAction := execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
+	// A non-terminal row has no terminal explanation: never expose a persisted
+	// verdict reason/cause that an older deployment wrote on a running row
+	// (X-07 running-row fallback). interrupted is non-terminal too (it is
+	// redispatched), so Terminal() is the correct check, not Finished().
+	settled := run.Status.Terminal()
+	if !settled {
+		terminalCause, nextAction = "", ""
+	}
+	verdictReason := run.Summary.VerdictReason
+	failureClass := string(run.FailureClass)
+	if !settled {
+		// A non-terminal row (pending/running/paused/interrupted) has no terminal
+		// verdict: a failure class/verdict reason persisted by an older
+		// deployment must not be surfaced as its conclusion (X-07).
+		verdictReason = ""
+		failureClass = ""
+	} else if isRawFailureClass(verdictReason) {
+		// Legacy recovery rows stored the raw failure class (executor_lost, ...)
+		// in verdict_reason; the mapped terminal cause carries that information
+		// now, never the enum as the human verdict reason (X-07).
+		verdictReason = ""
+	}
+	lastError := strings.TrimSpace(run.Summary.LastError)
+	// Do not surface a raw failure enum (executor_lost, agent_failure, ...) as
+	// the human reason: the UI renders the localized terminal cause / retry
+	// reason instead (X-07).
+	if lastError != "" && isRawCaseRunCause(lastError) {
+		lastError = ""
+	}
 	var usage *CaseRunUsageView
 	if run.Summary.Usage != nil {
 		usage = &CaseRunUsageView{
@@ -322,10 +374,10 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 		CaseVersionID: platformid.Format(run.CaseVersionID),
 		Title:         meta.Title,
 		Status:        string(run.Status),
-		FailureClass:  string(run.FailureClass),
+		FailureClass:  failureClass,
 		Attempts:      run.Attempts,
 		Summary: CaseRunSummaryView{
-			VerdictReason:      run.Summary.VerdictReason,
+			VerdictReason:      verdictReason,
 			AssertionTotal:     run.Summary.AssertionTotal,
 			AssertionFailed:    run.Summary.AssertionFailed,
 			StepTotal:          run.Summary.StepTotal,
@@ -336,15 +388,90 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 			VisualFailed:       run.Summary.VisualFailed,
 			VisualInconclusive: run.Summary.VisualInconclusive,
 			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
-			LastError:          run.Summary.LastError,
+			LastError:          lastError,
 			TerminalCause:      terminalCause,
 			NextAction:         nextAction,
+			RetryReason:        run.Summary.RetryReason,
+			Dispatch:           toCaseRunDispatchView(run.Summary.Dispatch),
 			Usage:              usage,
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),
 		VersionSUTIDs: idsToStrings(versionSUTIDs),
 		EvidenceCount: evidenceCount,
+	}
+}
+
+// toCaseRunDispatchView maps the persisted dispatch diagnostic onto the API
+// view. A nil snapshot stays nil so the UI can tell "no diagnostic" apart from
+// a zero-valued one.
+func toCaseRunDispatchView(dispatch *execution.CaseRunDispatchDiagnostic) *CaseRunDispatchView {
+	if dispatch == nil {
+		return nil
+	}
+	view := &CaseRunDispatchView{
+		Endpoint:       dispatch.Endpoint,
+		ExecutorStatus: dispatch.ExecutorStatus,
+		Version:        dispatch.ExecutorVersion,
+		RegistryHit:    dispatch.RegistryHit,
+		DispatchAt:     dispatch.DispatchAt,
+		Attempt:        dispatch.Attempt,
+	}
+	if dispatch.OwnerExecutorID > 0 {
+		view.OwnerExecutorID = platformid.Format(dispatch.OwnerExecutorID)
+	}
+	if dispatch.LastHeartbeat != "" {
+		heartbeat := dispatch.LastHeartbeat
+		view.LastHeartbeat = &heartbeat
+	}
+	return view
+}
+
+// isRawFailureClass reports whether value is a bare persisted failure class
+// (executor_lost, environment, ...) rather than a human verdict reason. Some
+// verdict reasons are also valid failure-class strings ("blocked"), so a value
+// that names a known verdict reason is never treated as a raw legacy enum.
+func isRawFailureClass(value string) bool {
+	return value != "" && execution.FailureClass(value).Valid() && !isKnownVerdictReason(value)
+}
+
+// isKnownVerdictReason reports whether value is a stable verdict_reason code
+// written by the verdict aggregation or a human pause decision.
+func isKnownVerdictReason(value string) bool {
+	switch value {
+	case execution.VerdictReasonPassed, execution.VerdictReasonAssertionFailed,
+		execution.VerdictReasonStepFailed, execution.VerdictReasonIncomplete,
+		execution.VerdictReasonEmptyCase, execution.VerdictReasonNoAssertions,
+		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure,
+		execution.VerdictReasonVisualAssertionNotRun,
+		execution.VerdictReasonHumanTimeout, execution.VerdictReasonHumanCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// isRawCaseRunCause reports whether value is a bare persisted enum (a failure
+// class or verdict reason) rather than a human-readable message.
+func isRawCaseRunCause(value string) bool {
+	if value == "" || strings.ContainsAny(value, " :：,，") {
+		return false
+	}
+	if execution.FailureClass(value).Valid() {
+		return true
+	}
+	if execution.ExecutorFailureCause(value) == value {
+		return true
+	}
+	switch value {
+	case execution.VerdictReasonPassed, execution.VerdictReasonAssertionFailed,
+		execution.VerdictReasonStepFailed, execution.VerdictReasonIncomplete,
+		execution.VerdictReasonEmptyCase, execution.VerdictReasonNoAssertions,
+		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure,
+		execution.VerdictReasonVisualAssertionNotRun:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -16,7 +16,7 @@ import {
   type QuestionStatus,
 } from "./api"
 import { isClarificationQuestionBatch } from "./question-kinds"
-import type { ConversationMessage, NewMessagePart } from "./types"
+import type { ConversationMessage, NewMessagePart, SendOptions } from "./types"
 
 /** Matches the messages endpoint default: a full page implies another page. */
 const MESSAGES_PAGE_SIZE = 100
@@ -548,7 +548,7 @@ export type UseConversationResult = {
   /** Loads the next older history page from the stored server cursor. */
   loadMore: () => Promise<void>
   /** Returns true when the API accepted the message (draft can be cleared). */
-  send: (parts: NewMessagePart[]) => Promise<boolean>
+  send: (parts: NewMessagePart[], options?: SendOptions) => Promise<boolean>
 }
 
 /**
@@ -804,13 +804,16 @@ export function useConversation({
   }, [])
 
   const send = useCallback(
-    async (parts: NewMessagePart[]): Promise<boolean> => {
+    async (parts: NewMessagePart[], options?: SendOptions): Promise<boolean> => {
       if (conversationId === null) return false
       setSending(true)
       setSendError(null)
       try {
+        // C-04: the composer's retry chain supplies one stable id for every
+        // attempt, so a retried POST can never insert a second message. A
+        // first/manual send without an id still mints one per call.
         const message = await postMessage(versionId, conversationId, {
-          client_message_id: createClientMessageId(),
+          client_message_id: options?.clientMessageId ?? createClientMessageId(),
           parts,
         })
         setMessages((current) =>

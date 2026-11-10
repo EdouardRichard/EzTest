@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="EzTest">
+  <defs>
+    <linearGradient id="eztest-icon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#eztest-icon)"/>
+  <path d="M9 9h14v4H13v2h8v4h-8v2h10v4H9z" fill="#ffffff"/>
+</svg>

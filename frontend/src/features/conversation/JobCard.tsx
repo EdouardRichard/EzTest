@@ -60,6 +60,43 @@ const KIND_LABEL: Partial<Record<JobKind, string>> = {
 // not offer a button that is guaranteed to fail.
 const CANCELLABLE: ReadonlySet<JobStatus> = new Set<JobStatus>(["open", "claimed", "running"])
 
+/**
+ * Chinese copy for a typed job failure code. The backend keeps the stable code
+ * and (for older cards) an English `reason`; the UI explains every known code
+ * in the user's language and keeps the raw cause in the tooltip (D-04).
+ */
+const FAILURE_REASON: Record<string, string> = {
+  invalid_work_type:
+    "旧版设计轮次作业已停用，该作业不会影响已生成用例，也无需重试；请让 AI 重新执行设计以生成用例。",
+  llm_capability_mismatch:
+    "所选模型不支持图片输入，请在「设置 → LLM 配置」中改选支持视觉的模型后重试。",
+}
+
+/**
+ * Terminal failures whose retry is guaranteed to fail again. The retry control
+ * is hidden instead of offering a button that always ends in another red card.
+ */
+const NOT_RETRYABLE_CODES: ReadonlySet<string> = new Set(["invalid_work_type"])
+
+type FailurePresentation = {
+  text: string
+  /** Raw reason/code for support, never the primary copy. */
+  title?: string
+  /** Unknown codes keep showing the code inline next to the original reason. */
+  showCode: boolean
+}
+
+function failurePresentation(job: JobCardPart): FailurePresentation | null {
+  const reason = (job.reason ?? "").trim()
+  if (job.status !== "failed" || reason === "") return null
+  const code = (job.code ?? "").trim()
+  const localized = code === "" ? undefined : FAILURE_REASON[code]
+  if (localized !== undefined) {
+    return { text: localized, title: `${reason}（${code}）`, showCode: false }
+  }
+  return { text: reason, title: code === "" ? undefined : code, showCode: code !== "" }
+}
+
 type JobViewResponse = {
   state?: JobStatus
   current?: number
@@ -129,6 +166,10 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
   const total = typeof job.total === "number" && job.total > 0 ? job.total : null
   const current = typeof job.current === "number" && job.current >= 0 ? job.current : 0
   const percent = total !== null ? Math.min(100, Math.round((current / total) * 100)) : null
+  const failure = failurePresentation(job)
+  const showCancel = CANCELLABLE.has(job.status)
+  const showRetry =
+    job.status === "failed" && !(job.code !== undefined && NOT_RETRYABLE_CODES.has(job.code))
 
   async function runAction(action: "cancel" | "retry"): Promise<void> {
     setPending(action)
@@ -196,23 +237,24 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
         <p className="mt-1 text-[10px] text-muted-foreground">已处理 {current} 步</p>
       )}
 
-      {job.status === "failed" && typeof job.reason === "string" && job.reason.trim() !== "" ? (
+      {failure !== null ? (
         <p
           data-testid="job-card-reason"
           role="status"
+          title={failure.title}
           className="mt-1 text-[10px] text-destructive"
         >
           <span className="font-medium">失败原因：</span>
-          {job.reason}
-          {job.code !== undefined && job.code !== "" ? (
+          {failure.text}
+          {failure.showCode ? (
             <span className="ml-1 text-muted-foreground">（{job.code}）</span>
           ) : null}
         </p>
       ) : null}
 
-      {CANCELLABLE.has(job.status) || job.status === "failed" ? (
+      {showCancel || showRetry ? (
         <div className="mt-1.5 flex items-center gap-1.5">
-          {CANCELLABLE.has(job.status) ? (
+          {showCancel ? (
             <Button
               variant="secondary"
               size="sm"
@@ -223,7 +265,7 @@ export function JobCard({ versionId, part, onCancel, onRetry }: JobCardProps) {
               取消作业
             </Button>
           ) : null}
-          {job.status === "failed" ? (
+          {showRetry ? (
             <Button
               variant="secondary"
               size="sm"

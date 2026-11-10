@@ -44,9 +44,12 @@ func TestRepositorySeedUpdateAndRevisions(t *testing.T) {
 	}
 
 	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	updated, err := repo.Update(ctx, "execution.global_concurrency", json.RawMessage("5"), 9001, 42, at)
+	previous, updated, err := repo.Update(ctx, "execution.global_concurrency", json.RawMessage("5"), 9001, 42, at)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
+	}
+	if string(previous) != "3" {
+		t.Fatalf("previous = %s, want the locked old value 3", previous)
 	}
 	if string(updated.Value) != "5" || updated.Version != 2 {
 		t.Fatalf("updated = %#v", updated)

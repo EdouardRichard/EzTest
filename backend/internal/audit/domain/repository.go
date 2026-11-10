@@ -5,7 +5,9 @@ import "context"
 // Filter narrows one page of audit entries. Zero fields are ignored: a nil
 // ActorID and an empty Action mean "no narrowing".
 type Filter struct {
-	// Action selects one exact action name. Empty means any.
+	// Action selects entries whose action starts with this value (case
+	// insensitive). A historical alias such as "setting.update" also matches
+	// its canonical action. Empty means any.
 	Action string
 	// ActorID selects the entries performed by one user. Nil means any.
 	ActorID *int64

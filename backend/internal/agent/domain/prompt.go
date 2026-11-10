@@ -93,8 +93,9 @@ type PromptVersionInfo struct {
 }
 
 // PromptWrite is one checked prompt append request. ExpectedVersion is the
-// optional optimistic lock, and NoOpOnSame skips the append when the submitted
-// body equals the current agent_profile.system_prompt (PUT no-op semantics).
+// optional optimistic lock (0 means "the profile has no revision yet"), and
+// NoOpOnSame skips the append when the submitted body equals the current
+// agent_profile.system_prompt (PUT no-op semantics).
 type PromptWrite struct {
 	ProfileKey      string
 	SystemPrompt    string
@@ -116,8 +117,8 @@ func (w PromptWrite) Validate() error {
 	if err := ValidatePromptSource(w.Source); err != nil {
 		return err
 	}
-	if w.ExpectedVersion != nil && *w.ExpectedVersion <= 0 {
-		return platform.Invalid("expected_version", "must be a positive integer")
+	if w.ExpectedVersion != nil && *w.ExpectedVersion < 0 {
+		return platform.Invalid("expected_version", "must not be negative")
 	}
 	return nil
 }

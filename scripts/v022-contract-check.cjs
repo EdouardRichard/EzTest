@@ -84,6 +84,10 @@ const v022Operations = [
   ["POST", "/api/versions/{id}/requirements/extractions/{runID}/retry"],
   ["GET", "/api/versions/{id}/attachments/{attachmentId}/images"],
   ["POST", "/api/versions/{id}/attachments/{attachmentId}/reanalyze"],
+  // v0.2.3 C-05: version-scoped attachment list for the overview panel (1 new path).
+  ["GET", "/api/versions/{id}/attachments"],
+  // v0.2.3 S-01: model reset-params route (1 new path).
+  ["POST", "/api/admin/llm/configs/{id}/models/{modelId}/reset-params"],
   ["GET", "/api/versions/{id}/binding"],
   ["PUT", "/api/versions/{id}/binding"],
   ["PATCH", "/api/versions/{id}/binding"],
@@ -237,8 +241,8 @@ const baselinePaths = frozenPaths.size
 const baselineOperations = [...frozenPaths.values()].reduce((total, methods) => total + methods.size, 0)
 const releaseOperations = [...releasePaths.values()].reduce((total, methods) => total + methods.size, 0)
 check(
-  releasePaths.size === baselinePaths + 33 && releaseOperations === baselineOperations + 42,
-  `v0.22 openapi is exactly the 0.2.1 baseline + 33 paths / 42 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
+  releasePaths.size === baselinePaths + 35 && releaseOperations === baselineOperations + 44,
+  `v0.22 openapi is exactly the 0.2.1 baseline + 35 paths / 44 operations (got ${releasePaths.size}/${releaseOperations}, baseline ${baselinePaths}/${baselineOperations})`,
 )
 check(
   releaseSchemas.size === frozenSchemas.size + 41,

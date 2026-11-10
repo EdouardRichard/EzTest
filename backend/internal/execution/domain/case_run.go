@@ -276,6 +276,29 @@ func NewCaseRunUsage(turns int, usage map[string]int) *CaseRunUsage {
 	}
 }
 
+// CaseRunDispatchDiagnostic is the dispatch-time executor snapshot persisted in
+// case_run.summary["dispatch"] (v0.2.3 X-01). It records which executor the
+// scheduler picked for one attempt (owner/endpoint/health/route) so a later
+// failure can be attributed without a new table or migration.
+type CaseRunDispatchDiagnostic struct {
+	OwnerExecutorID int64  `json:"owner_executor_id"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	ExecutorStatus  string `json:"executor_status,omitempty"`
+	LastHeartbeat   string `json:"last_heartbeat,omitempty"`
+	ExecutorVersion string `json:"version,omitempty"`
+	// RegistryHit is the selection-time flag: true when the scheduler picked a
+	// registered executor row (owner id > 0), not a dial-time claim. The
+	// dial-route truth is the router-level registry_hit in the client error
+	// details (false there means primary-endpoint fallback).
+	RegistryHit bool   `json:"registry_hit"`
+	DispatchAt  string `json:"dispatch_at,omitempty"`
+	Attempt     int    `json:"attempt,omitempty"`
+	// ClaimedAt is set by CaseRunner.Prepare when an agent worker actually
+	// claims the run. Empty means the lease expired while the work item was
+	// still queued (dispatch_timeout), not during execution.
+	ClaimedAt string `json:"claimed_at,omitempty"`
+}
+
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
 	VerdictReason      string `json:"verdict_reason,omitempty"`
@@ -290,12 +313,19 @@ type CaseRunSummary struct {
 	VisualInconclusive int    `json:"visual_inconclusive"`
 	HumanRequestID     int64  `json:"human_request_id,omitempty"`
 	LastError          string `json:"last_error,omitempty"`
+	// RetryReason is the stable cause of a retryable run error persisted by a
+	// Finalize/Recovery retry (v0.2.3 X-01). It is a retry reason, not a
+	// terminal failure class: a pending/running row never carries one as its
+	// verdict explanation.
+	RetryReason string `json:"retry_reason,omitempty"`
 	// TerminalCause/NextAction explain a terminal incomplete run: which budget
 	// (or agent stop) ended it and what the human should do next (QA Q2).
 	TerminalCause string `json:"terminal_cause,omitempty"`
 	NextAction    string `json:"next_action,omitempty"`
 	// Usage is the observed agent-run usage of the terminal run (QA Q2).
 	Usage *CaseRunUsage `json:"usage,omitempty"`
+	// Dispatch is the latest dispatch-time executor snapshot (v0.2.3 X-01).
+	Dispatch *CaseRunDispatchDiagnostic `json:"dispatch,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.

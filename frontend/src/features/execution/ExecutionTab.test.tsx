@@ -286,7 +286,9 @@ describe("ExecutionTab", () => {
     await waitFor(() => {
       expect(api.listCaseRuns).toHaveBeenCalledWith("2001", "9199")
     })
-    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=execution&wave=9199")
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=execution&wave=9199", {
+      scroll: false,
+    })
   })
 
   it("writes ?case_run= when a result row is selected", async () => {
@@ -301,6 +303,7 @@ describe("ExecutionTab", () => {
     })
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=execution&wave=9201&case_run=9302",
+      { scroll: false },
     )
   })
 

@@ -142,10 +142,15 @@ func (f *fakeAttachmentRepo) ResetImagesForReanalysis(_ context.Context, attachm
 // imports the LLM context, and the real adapter is exercised separately.
 type fakeVisionCaptioner struct {
 	available    bool
-	availableErr error
-	caption      string
-	confidence   *float64
-	err          error
+	availability versionapp.ImageAvailability
+	// availabilitySet returns the typed availability verbatim, even when it is
+	// the zero value. It exists for the normalization test: the adapter should
+	// never produce an empty reason, but the 400 builder must still cope.
+	availabilitySet bool
+	availableErr    error
+	caption         string
+	confidence      *float64
+	err             error
 	// callErrs fails selected Caption calls by 1-based call index, so a
 	// multi-image attachment can fail only one of its images.
 	callErrs []error
@@ -154,8 +159,20 @@ type fakeVisionCaptioner struct {
 	lastData []byte
 }
 
-func (f *fakeVisionCaptioner) Available(context.Context) (bool, error) {
-	return f.available, f.availableErr
+func (f *fakeVisionCaptioner) Available(context.Context) (versionapp.ImageAvailability, error) {
+	if f.availableErr != nil {
+		return versionapp.ImageAvailability{}, f.availableErr
+	}
+	if f.availabilitySet {
+		return f.availability, nil
+	}
+	if f.available {
+		return versionapp.ImageAvailability{Available: true}, nil
+	}
+	if f.availability.ReasonCode != "" || f.availability.Retryable {
+		return f.availability, nil
+	}
+	return versionapp.ImageAvailability{ReasonCode: versionapp.VisionReasonNoDefaultConfig}, nil
 }
 
 func (f *fakeVisionCaptioner) Caption(_ context.Context, mime string, data []byte) (versionapp.ImageCaption, error) {

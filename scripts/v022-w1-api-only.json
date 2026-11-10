@@ -112,10 +112,7 @@
     {
       "method": "post",
       "path": "/api/versions/{id}/stage/advance",
-      "disposition": "ui",
-      "frontendFile": "frontend/src/features/versions/StageAdvanceAction.tsx",
-      "apiFunction": "advanceStage",
-      "apiModule": "frontend/src/features/versions/api.ts",
+      "disposition": "x-api-only",
       "evidence": "backend/internal/server/server.go:477"
     },
     {

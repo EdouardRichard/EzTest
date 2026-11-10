@@ -730,7 +730,18 @@ func TestImportAPIsShape(t *testing.T) {
 
 func TestDeleteUsageConflictReturns409(t *testing.T) {
 	handler, svc := newHandler()
-	svc.err = platform.Conflict("sut is referenced by a version binding")
+	svc.err = &platform.Error{
+		Status:  http.StatusConflict,
+		Code:    "resource_referenced",
+		Message: "sut is referenced by a version binding",
+		Details: map[string]any{
+			"kind": "sut",
+			"referencing_versions": []map[string]any{
+				{"id": "1001", "title": "Orders Q4"},
+			},
+			"resolution": "Delete the version that binds this SUT before deleting it.",
+		},
+	}
 	req := request(http.MethodDelete, "/api/resources/suts/1001", "", admin)
 	req.SetPathValue("id", "1001")
 	rec := httptest.NewRecorder()
@@ -740,14 +751,38 @@ func TestDeleteUsageConflictReturns409(t *testing.T) {
 	}
 	var body struct {
 		Error struct {
-			Code string `json:"code"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Details struct {
+				Kind                string `json:"kind"`
+				ReferencingVersions []struct {
+					ID    string `json:"id"`
+					Title string `json:"title"`
+				} `json:"referencing_versions"`
+				Resolution string `json:"resolution"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body.Error.Code != "conflict" {
+	if body.Error.Code != "resource_referenced" {
 		t.Fatalf("code = %q", body.Error.Code)
+	}
+	if body.Error.Message != "sut is referenced by a version binding" {
+		t.Fatalf("message = %q", body.Error.Message)
+	}
+	if body.Error.Details.Kind != "sut" {
+		t.Fatalf("details.kind = %q", body.Error.Details.Kind)
+	}
+	if len(body.Error.Details.ReferencingVersions) != 1 {
+		t.Fatalf("details.referencing_versions = %#v", body.Error.Details.ReferencingVersions)
+	}
+	if version := body.Error.Details.ReferencingVersions[0]; version.ID != "1001" || version.Title != "Orders Q4" {
+		t.Fatalf("referencing version = %#v", version)
+	}
+	if body.Error.Details.Resolution == "" {
+		t.Fatal("details.resolution is empty")
 	}
 	if svc.lastID != 1001 {
 		t.Fatalf("last id = %d", svc.lastID)

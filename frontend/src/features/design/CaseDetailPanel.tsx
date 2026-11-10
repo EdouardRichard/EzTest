@@ -53,10 +53,13 @@ function CaseVisualAssertions({
   versionId,
   selected,
   previousCaseVersionId,
+  onRequestChange,
 }: {
   versionId: string
   selected: DesignCaseVersionDetail
   previousCaseVersionId?: string
+  /** Fills the design chat draft; visual assertions are only created by design. */
+  onRequestChange: (draft: string) => void
 }) {
   const visualAssertions = selected.assertions
     .map((assertion, index) => {
@@ -97,7 +100,39 @@ function CaseVisualAssertions({
     }
   }, [versionId, selected.case_version_id, hasVisual, reloadToken])
 
-  if (!hasVisual) return null
+  if (!hasVisual) {
+    // D-08: the frozen design spec only offers the visual config editor for an
+    // assertion the design already generated. Without one the section used to
+    // vanish, which read as "visual assertions do not exist". Keep it visible as
+    // a discoverable empty state and route the request through the design chat
+    // draft (no create API in this release).
+    return (
+      <section
+        aria-label="视觉断言配置"
+        data-testid="visual-assertions-empty"
+        className="space-y-2"
+      >
+        <header className="flex flex-wrap items-center gap-2">
+          <h3 className="text-xs font-semibold text-foreground">视觉断言配置</h3>
+          <Badge tone="neutral">暂无</Badge>
+        </header>
+        <p className="text-[11px] text-muted-foreground">
+          该用例暂无视觉断言。视觉断言由设计生成，可请求 AI 为某步增加视觉基线断言。
+        </p>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() =>
+            onRequestChange(
+              `请为用例「${selected.title}」增加视觉基线断言：说明要断言的页面/元素与步骤，并生成基线，便于执行时做视觉对比。`,
+            )
+          }
+        >
+          请求 AI 添加视觉断言
+        </Button>
+      </section>
+    )
+  }
 
   function keyOf(assertion: DesignAssertion, assertionSeq: number): string {
     return `${assertion.step_seq}-${assertionSeq}`
@@ -398,6 +433,7 @@ function CaseDetailBody({
         versionId={visualConfigTarget.versionId}
         selected={visualConfigTarget.selected}
         previousCaseVersionId={visualConfigTarget.previousCaseVersionId}
+        onRequestChange={onRequestChange}
       />
 
       <section aria-label="来源" className="space-y-1">

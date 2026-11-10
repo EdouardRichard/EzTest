@@ -38,6 +38,7 @@ const api = vi.hoisted(() => ({
   retryRequirementExtraction: vi.fn(),
   getTeamRoom: vi.fn(),
   uploadContent: vi.fn(),
+  getAttachmentPendingDetails: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
@@ -120,6 +121,37 @@ describe("RequirementsTab integration", () => {
 
   afterEach(cleanup)
 
+  it("keeps the rollback success notice visible after the editor remount (C-06)", async () => {
+    const rolledBack = {
+      ...secondDetail,
+      status: "draft" as const,
+      revision: 2,
+      current_version_id: "6103",
+      confirmed_at: null,
+    }
+    api.rollbackRequirement.mockResolvedValue(rolledBack)
+
+    render(<RequirementsTab versionId="2001" initialRequirementId="6002" />)
+    const editor = await screen.findByTestId("requirement-editor")
+    expect(within(editor).getByTestId("editor-rollback")).toBeInTheDocument()
+    fireEvent.click(within(editor).getByTestId("editor-rollback"))
+
+    const dialog = await screen.findByRole("dialog", { name: "回退为草案" })
+    fireEvent.change(within(dialog).getByLabelText("回退原因"), {
+      target: { value: "验收口径变更，需要重新澄清" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "回退为草案" }))
+
+    await waitFor(() => expect(api.rollbackRequirement).toHaveBeenCalledTimes(1))
+    // `requirementUpdated` replaces `detail` and the editor key changes with the
+    // new current_version_id, so the notice must live in the parent tab rather
+    // than in the editor's local state.
+    const notice = await screen.findByTestId("requirement-notice")
+    expect(notice).toHaveTextContent("已回退为草案 v2")
+    const editorAfter = screen.getByTestId("requirement-editor")
+    expect(within(editorAfter).queryByTestId("requirement-notice")).not.toBeInTheDocument()
+  })
+
   it("assembles chat, sidebar, design CTA, team panel and loads workspace data", async () => {
     render(<RequirementsTab versionId="2001" />)
 
@@ -164,8 +196,29 @@ describe("RequirementsTab integration", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4001&requirement=6001",
+      { scroll: false },
     )
     expect(await screen.findByTestId("requirement-editor")).toHaveTextContent("退款到账时效")
+  })
+
+  it("applies a new conversation deep link without reloading the workspace", async () => {
+    const { rerender } = render(<RequirementsTab versionId="2001" />)
+    await screen.findByTestId("requirements-tab")
+    const composer = await screen.findByTestId("composer-textarea")
+    fireEvent.change(composer, { target: { value: "未发送的草稿" } })
+    const conversationCalls = api.listConversations.mock.calls.length
+    const requirementCalls = api.listRequirements.mock.calls.length
+
+    // The in-page URL sync arrives back as a server prop (same conversation as
+    // the active one). Loading the workspace again would unmount the whole tab
+    // for a loading card: the chat composer draft would be lost and the document
+    // scroll would clamp to the top.
+    rerender(<RequirementsTab versionId="2001" initialConversationId="4001" />)
+
+    expect(screen.queryByText("正在加载澄清工作区…")).not.toBeInTheDocument()
+    expect(api.listConversations).toHaveBeenCalledTimes(conversationCalls)
+    expect(api.listRequirements).toHaveBeenCalledTimes(requirementCalls)
+    expect(screen.getByTestId("composer-textarea")).toHaveValue("未发送的草稿")
   })
 
   it("switches conversations from the history dropdown and writes the URL", async () => {
@@ -177,6 +230,7 @@ describe("RequirementsTab integration", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4002",
+      { scroll: false },
     )
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4002"))
     expect(screen.getByText(conversationSecondFixture.title)).toBeInTheDocument()
@@ -195,6 +249,7 @@ describe("RequirementsTab integration", () => {
     )
     expect(navigation.replace).toHaveBeenCalledWith(
       "/versions/2001?tab=requirements&conversation=4003",
+      { scroll: false },
     )
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4003"))
   })

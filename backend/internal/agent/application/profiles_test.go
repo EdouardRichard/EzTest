@@ -291,4 +291,64 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if second[0].Name != "管理员改过的 Host" {
 		t.Fatalf("admin edit overwritten: %q", second[0].Name)
 	}
+	for _, profile := range second {
+		if profile.SeedVersion != agentapp.ProfileSeedVersion {
+			t.Fatalf("fresh profile %s seed version = %d, want %d",
+				profile.Key, profile.SeedVersion, agentapp.ProfileSeedVersion)
+		}
+	}
+}
+
+// TestHostPromptsExplainAttachmentTextCompleteness pins the prompt half of
+// R2-C-03: both conversation Hosts must page large attachments to
+// text_complete, report how much they actually read, and never present unread
+// pages as extraction loss.
+func TestHostPromptsExplainAttachmentTextCompleteness(t *testing.T) {
+	want := map[string][]string{
+		agentapp.ProfileKeyClarificationHost: {
+			"text_complete", "next_offset", "total_chars",
+			"不得把未读页当作附件解析缺失", "不得据此建议重新解析",
+			"image_offset=next_image_offset",
+		},
+		agentapp.ProfileKeyDesignHost: {
+			"text_complete", "next_offset",
+			"不得断言附件缺失", "建议重新解析",
+		},
+	}
+	for key, phrases := range want {
+		profile, ok := agentapp.Profile(key)
+		if !ok {
+			t.Fatalf("missing profile %q", key)
+		}
+		for _, phrase := range phrases {
+			if !strings.Contains(profile.SystemPrompt, phrase) {
+				t.Fatalf("profile %q prompt lacks %q: %s", key, phrase, profile.SystemPrompt)
+			}
+		}
+	}
+}
+
+// TestHostPromptsExplainPlatformCaptions pins C-01's prompt half: both
+// conversation Hosts must know the platform generates image captions, read
+// images[].caption first, and never claim the platform has no vision when a
+// caption is empty/failed.
+func TestHostPromptsExplainPlatformCaptions(t *testing.T) {
+	for _, key := range []string{agentapp.ProfileKeyClarificationHost, agentapp.ProfileKeyDesignHost} {
+		profile, ok := agentapp.Profile(key)
+		if !ok {
+			t.Fatalf("missing profile %q", key)
+		}
+		for _, want := range []string{
+			"caption 由平台视觉分析生成",
+			"用 attachment.read_text 读取附件",
+			"优先查看 images[].caption",
+			"caption 为空或 status=failed 时说明图片分析未完成",
+			"不要声称平台没有视觉能力",
+			"不要臆测图片内容",
+		} {
+			if !strings.Contains(profile.SystemPrompt, want) {
+				t.Fatalf("profile %q prompt lacks %q: %s", key, want, profile.SystemPrompt)
+			}
+		}
+	}
 }

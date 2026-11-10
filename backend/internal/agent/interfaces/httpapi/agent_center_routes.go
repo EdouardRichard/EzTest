@@ -65,7 +65,8 @@ func RegisterContextPacketRoutes(mux *http.ServeMux, auth func(http.Handler) htt
 // contains the stable system-prompt prefix and the replayed transcript, so it
 // follows the profile prompt read APIs: ordinary logged-in users must not
 // receive prompt content (spec R9). It returns the latest persisted cache-first
-// context packet of one version, or 404 when no packet has been recorded yet.
+// context packet of one version, or 200 with a null data body when no packet
+// has been recorded yet (G-09: "no packet" is an empty read, not a 404).
 func (h *ContextPacketHandler) Latest(w http.ResponseWriter, r *http.Request) {
 	if _, err := requireAdminActor(r); err != nil {
 		httpx.Error(w, r, err)
@@ -83,7 +84,11 @@ func (h *ContextPacketHandler) Latest(w http.ResponseWriter, r *http.Request) {
 	packet, err := h.reader.LatestContextPacket(r.Context(), versionID)
 	if err != nil {
 		if errors.Is(err, agentcontext.ErrContextPacketNotFound) {
-			httpx.Error(w, r, platform.NotFound("context_packet"))
+			// Empty read: the version has no persisted packet yet. Answering
+			// 200 with a null data body keeps the browser network layer free
+			// of spurious 404s (G-09); invalid ids and a missing reader still
+			// fail with their typed 4xx/503.
+			httpx.JSON(w, http.StatusOK, nil)
 			return
 		}
 		httpx.Error(w, r, err)

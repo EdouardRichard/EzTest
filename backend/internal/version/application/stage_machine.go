@@ -802,7 +802,9 @@ const StageAuditGateDenied = stageAuditDenied
 // JSON in version.blocker and exposes the production callbacks:
 //
 //   - OnWaveTerminal(waveID): executing -> reporting after every wave is
-//     terminal and the version report has been ensured;
+//     terminal. Report generation is the reporting stage's job (the
+//     report.version stage-entry job and the P4 report reconciler); this edge
+//     deliberately does not ensure the report (R2-NEW-02);
 //   - OnReportPublished(versionID): reporting -> completed after the version
 //     report is published, no blocking issue is open and the version row closed
 //     (an already-closed version is success, see ErrVersionAlreadyClosed);
@@ -826,7 +828,7 @@ type StageService struct {
 
 // StageServiceDeps wires the v0.22 stage service. Repo is required. Events,
 // audit, jobs and clock are optional (the clock defaults to the system clock).
-// Gates, Waves, Reports and Closer are required by the edge that needs them: a
+// Gates, Waves and Closer are required by the edge that needs them: a
 // missing port fails closed with a typed gate_not_configured error instead of
 // silently skipping the gate. WaveControl is required for Pause (and optional
 // for Resume, which must not strand a version that has no running wave).
@@ -839,9 +841,14 @@ type StageServiceDeps struct {
 	Gates       StageGates
 	Waves       StageWaveReader
 	WaveControl StageWaveController
-	Reports     StageReports
-	Closer      StageVersionCloser
-	Handoff     StageHandoffGenerator
+	// Reports is Deprecated: report generation is owned by the reporting
+	// stage-entry report.version job and the P4 report reconciler, so the
+	// executing -> reporting edge no longer calls EnsureVersionReport
+	// (R2-NEW-02). The field is kept so composition roots and wiring keep
+	// compiling; remove it in a dedicated cleanup.
+	Reports StageReports
+	Closer  StageVersionCloser
+	Handoff StageHandoffGenerator
 }
 
 // NewStageService wires the v0.22 orchestrated stage machine.
@@ -1131,23 +1138,26 @@ func (s *StageService) OnReportPublished(ctx context.Context, versionID int64) e
 // Reconcile re-drives the production terminal callbacks for one version
 // (Task 25 fix round 1, review finding 2). The scheduler's wave-terminal and the
 // report-published callbacks are best effort, and the scheduler never finalizes
-// an already-terminal wave twice; without a retry hook a transient
-// EnsureVersionReport failure would leave the version in executing until a
-// manual stage advance.
+// an already-terminal wave twice; without a retry hook a transient port failure
+// would leave the version in executing/reporting until a manual stage advance.
 //
 // Reconcile is idempotent and safe to call on every tick:
 //
 //   - executing: no-op while any wave is active; when every wave is terminal it
-//     advances to reporting (which re-runs the report gate and retries the
-//     transient report failure);
+//     advances to reporting (report generation is the reporting stage's job, so
+//     a report gate that is not due yet no longer blocks the edge);
 //   - reporting: no-op until the version report is published; then re-fires the
 //     completion (this also heals a report published while the stage was still
-//     executing, whose callback was a no-op);
+//     executing, whose callback was a no-op). A completion rejected by the
+//     version-close predicate is a deterministic gate, not a transient failure:
+//     it is a no-op so the scheduler does not retry it on every tick (the 30s
+//     reconciler still retries);
 //   - anything else: no-op.
 //
-// A gate that is not ready yet (active wave, unpublished report) is reported as
-// nil; a transient port failure is returned as *StageGateError so the caller can
-// keep the version pending and retry on the next tick.
+// A gate that is not ready yet (active wave, unpublished report, unsatisfied
+// close predicate) is reported as nil; a transient port failure is returned as
+// *StageGateError so the caller can keep the version pending and retry on the
+// next tick.
 func (s *StageService) Reconcile(ctx context.Context, versionID int64) error {
 	current, err := s.machine.load(ctx, versionID)
 	if err != nil {
@@ -1179,7 +1189,21 @@ func (s *StageService) Reconcile(ctx context.Context, versionID int64) error {
 		if !published {
 			return nil
 		}
-		return s.OnReportPublished(ctx, versionID)
+		if err := s.OnReportPublished(ctx, versionID); err != nil {
+			// A close-predicate rejection is deterministic: retrying the same
+			// unreachable predicate on every scheduler tick cannot advance the
+			// version and only floods the logs (R2-NEW-02). Treat it as "not
+			// ready yet"; the 30s reconciler still retries if the predicate
+			// later becomes satisfiable.
+			var predicateFailed *version.ErrVersionClosePredicateFailed
+			if errors.As(err, &predicateFailed) {
+				return nil
+			}
+			// Any other failure is transient (port/DB/stage CAS): keep it a
+			// *StageGateError so the caller keeps the version pending.
+			return err
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -1201,7 +1225,7 @@ func (s *StageService) checkGate(ctx context.Context, versionID int64, from, to 
 	case from == version.StageCaseReview && to == version.StageExecuting:
 		return s.requireExecutable(ctx, versionID)
 	case from == version.StageExecuting && to == version.StageReporting:
-		return s.requireReportReady(ctx, versionID)
+		return s.requireExecutionSettled(ctx, versionID)
 	case from == version.StageReporting && to == version.StageCompleted:
 		return s.requireCompletable(ctx, versionID)
 	default:
@@ -1345,7 +1369,13 @@ func (s *StageService) requireExecutable(ctx context.Context, versionID int64) e
 	return nil
 }
 
-func (s *StageService) requireReportReady(ctx context.Context, versionID int64) error {
+// requireExecutionSettled gates executing -> reporting (R2-NEW-02). It waits
+// only for every wave to reach a terminal state. Producing the version report is
+// the reporting stage's job (the report.version stage-entry job and the P4
+// report reconciler), never this edge: requiring the report here, while the
+// report due gate in turn waits for the requirements to settle, deadlocked any
+// version whose requirements could not close (blocked/inconclusive cases).
+func (s *StageService) requireExecutionSettled(ctx context.Context, versionID int64) error {
 	if s.gates.WavesTerminal == nil {
 		return newStageGateNotConfigured("wave")
 	}
@@ -1358,13 +1388,6 @@ func (s *StageService) requireReportReady(ctx context.Context, versionID int64) 
 		return newStageGateError("wave", "waves_active",
 			"wait for every execution wave to reach a terminal state",
 			"reporting", nil)
-	}
-	if s.reports == nil {
-		return newStageGateNotConfigured("report")
-	}
-	if err := s.reports.EnsureVersionReport(ctx, versionID); err != nil {
-		return newStageGateError("report", "report_not_generated",
-			"generate the version report", "reporting", err)
 	}
 	return nil
 }

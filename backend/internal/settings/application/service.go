@@ -137,7 +137,7 @@ func (s *Service) Update(ctx context.Context, key string, value any, actorID int
 	}
 
 	at := s.clock.Now()
-	updated, err := s.repo.Update(ctx, key, encoded, s.ids.Next(), actorID, at)
+	previous, updated, err := s.repo.Update(ctx, key, encoded, s.ids.Next(), actorID, at)
 	if err != nil {
 		return settings.Setting{}, err
 	}
@@ -152,13 +152,20 @@ func (s *Service) Update(ctx context.Context, key string, value any, actorID int
 
 	requestID := requestid.From(ctx)
 	if s.audit != nil {
+		metadata := map[string]any{"key": key, "category": def.Category}
+		if !def.Secret {
+			if len(previous) > 0 {
+				metadata["old_value"] = settingAuditValue(previous)
+			}
+			metadata["new_value"] = settingAuditValue(updated.Value)
+		}
 		_ = s.audit.Record(ctx, auditapp.Event{
 			ActorID:    &actorID,
 			Action:     "settings.updated",
 			TargetKind: "setting",
 			TargetID:   key,
 			RequestID:  requestID,
-			Metadata:   map[string]any{"key": key, "category": def.Category},
+			Metadata:   metadata,
 		})
 	}
 	if s.events != nil {
@@ -307,4 +314,23 @@ func decodeNumber(raw json.RawMessage) (float64, error) {
 
 func formatFloat(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
+}
+
+// settingAuditValue decodes a raw setting value for audit metadata. Numbers
+// keep their exact lexical form as strings so JSONB round-trips do not lose
+// precision or turn 5 into 5.0.
+func settingAuditValue(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return string(raw)
+	}
+	if number, ok := value.(json.Number); ok {
+		return number.String()
+	}
+	return value
 }

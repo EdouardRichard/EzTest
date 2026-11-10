@@ -11,7 +11,6 @@ import { formatDateTime } from "@/lib/format"
 import {
   parseStageBlocker,
   pauseVersion,
-  requestStage,
   resumeVersion,
   type StageBlocker,
   stageGateDetails,
@@ -30,13 +29,6 @@ const WORKFLOW_STAGES: readonly VersionStage[] = [
   "reporting",
   "completed",
 ]
-
-/** `nextWorkflowStage` returns the forward edge used by the advance button. */
-function nextWorkflowStage(stage: VersionStage): VersionStage | null {
-  const index = WORKFLOW_STAGES.indexOf(stage)
-  if (index < 0 || index >= WORKFLOW_STAGES.length - 1) return null
-  return WORKFLOW_STAGES[index + 1] ?? null
-}
 
 export type StageBarProps = {
   /** Version scope of the stage write transport. Without it the controls are disabled. */
@@ -59,13 +51,21 @@ export type StageBarProps = {
   onStageSelect?: (stage: VersionStage) => void
   /** Disables every write control (for example while the page projection is loading). */
   disabled?: boolean
+  /**
+   * Short design viewports hide the "版本阶段 / 进入于" header row only; the
+   * stage pills, blocked/paused overlays and write actions stay available
+   * (R2-D-01).
+   */
+  compact?: boolean
 }
 
 /**
  * Version stage bar (v0.22 R-B4-6/FE-6). It renders the deterministic workflow,
  * highlights the current stage, disables future stages, shows `stage_entered_at`,
  * exposes the blocked/paused overlay with its reason and sends typed
- * `stage/request`, `stage/pause` and `stage/resume` writes. A 409 gate response is
+ * `stage/pause` and `stage/resume` writes. Stage advancement is driven by the
+ * workflow itself (CTAs, gates and reconcilers), so the bar has no manual
+ * advance control. A 409 gate response is
  * rendered inline with its structured `gate/reason/action/next` details; the bar
  * never infers a stage locally after a failed write.
  */
@@ -80,6 +80,7 @@ export function StageBar({
   onStageChanged,
   onStageSelect,
   disabled = false,
+  compact = false,
 }: StageBarProps) {
   const [local, setLocal] = useState<{ signature: string; view: StageView } | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -98,7 +99,6 @@ export function StageBar({
 
   const blocked = activeStage === "blocked"
   const paused = activeStage === "paused"
-  const nextStage = blocked || paused ? null : nextWorkflowStage(activeStage)
   const canPause = !blocked && !paused && activeStage !== "completed"
   const currentIndex = WORKFLOW_STAGES.indexOf(activeStage)
   const writesDisabled = disabled || submitting || versionId === undefined || versionId === ""
@@ -126,12 +126,6 @@ export function StageBar({
     }
   }
 
-  function advance(): void {
-    if (nextStage === null || versionId === undefined || versionId === "") return
-    const target = nextStage
-    void run(() => requestStage(versionId, target))
-  }
-
   function pause(): void {
     if (versionId === undefined || versionId === "") return
     void run(() => pauseVersion(versionId, "用户暂停"))
@@ -145,20 +139,23 @@ export function StageBar({
   return (
     <section
       data-testid="stage-bar"
+      data-compact={compact ? "true" : "false"}
       aria-label="版本阶段"
       className="space-y-2 rounded-xl border border-border bg-card px-3 py-2"
     >
-      <header className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <h3 className="text-sm font-semibold text-foreground">版本阶段</h3>
-          <Badge tone={blocked ? "danger" : paused ? "warning" : "info"}>
-            {stageLabel(activeStage)}
-          </Badge>
-        </div>
-        <span data-testid="stage-entered-at" className="text-[11px] text-muted-foreground">
-          进入于 {formatDateTime(activeEnteredAt)}
-        </span>
-      </header>
+      {compact ? null : (
+        <header className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <h3 className="text-sm font-semibold text-foreground">版本阶段</h3>
+            <Badge tone={blocked ? "danger" : paused ? "warning" : "info"}>
+              {stageLabel(activeStage)}
+            </Badge>
+          </div>
+          <span data-testid="stage-entered-at" className="text-[11px] text-muted-foreground">
+            进入于 {formatDateTime(activeEnteredAt)}
+          </span>
+        </header>
+      )}
 
       <ol aria-label="阶段流转" className="flex flex-wrap items-center gap-1">
         {WORKFLOW_STAGES.map((item, index) => {
@@ -228,7 +225,7 @@ export function StageBar({
               ? `：${activeBlocker.reason}`
               : ""}
           </p>
-          <p className="text-[11px] text-muted-foreground">请先解除阻塞后再推进阶段。</p>
+          <p className="text-[11px] text-muted-foreground">请先解除阻塞后再继续。</p>
         </div>
       ) : null}
 
@@ -245,11 +242,6 @@ export function StageBar({
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        {nextStage !== null ? (
-          <Button size="sm" disabled={writesDisabled} onClick={advance}>
-            {submitting ? "请求中…" : `推进到「${stageLabel(nextStage)}」`}
-          </Button>
-        ) : null}
         {canPause ? (
           <Button
             size="sm"

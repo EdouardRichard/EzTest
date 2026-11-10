@@ -35,6 +35,7 @@ import type {
   RollbackRequest,
   TeamRoom,
   TeamRoomKind,
+  VersionAttachment,
 } from "./types"
 
 /** Builds `?a=1&b=2`, skipping empty values (spec §8 pagination). */
@@ -510,4 +511,101 @@ export function uploadContent(file: File): Promise<ContentObject> {
  */
 export function downloadContent(sha256: string): Promise<ApiDownload> {
   return apiDownload(`/api/content/${encodeURIComponent(sha256)}`)
+}
+
+/* ------------------------- version attachments (C-05) ----------------------- */
+
+/**
+ * Lists the version's attachments for the overview panel (C-05).
+ *
+ * The route is version-scoped, so the panel never guesses a global attachment
+ * ID: every row is already owned by the addressed version.
+ */
+export async function listVersionAttachments(versionId: string): Promise<VersionAttachment[]> {
+  const page = await apiGetPage<VersionAttachment>(`${versionPath(versionId)}/attachments`)
+  return page.items
+}
+
+/* ------------------ attachment_pending progress details (C-04) --------------- */
+
+/** Stage of a still-parsing attachment reported by the typed 409 (Task 10). */
+export type AttachmentPendingStage = "queued" | "parsing" | "analyzing_images" | "done" | "failed"
+
+/** Typed progress of the `409 attachment_pending` rejection. */
+export type AttachmentPendingProgress = {
+  attachmentId: string
+  name: string
+  /** null when an older server only sends `{attachment_id,name}`. */
+  stage: AttachmentPendingStage | null
+  imagesTotal: number
+  imagesDone: number
+  imagesFailed: number
+  imagesSkipped: number
+  /** 0..100 while `analyzing_images`; null before the image counter is known. */
+  percent: number | null
+  /** Estimated seconds to finish the image pass; null before the first image. */
+  etaSeconds: number | null
+  /** Delay the client must wait before the next automatic retry. */
+  retryAfterSeconds: number
+  error: string
+}
+
+const DEFAULT_RETRY_AFTER_SECONDS = 3
+const PENDING_STAGES: readonly AttachmentPendingStage[] = [
+  "queued",
+  "parsing",
+  "analyzing_images",
+  "done",
+  "failed",
+]
+
+function readDetailNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+function readPendingStage(value: unknown): AttachmentPendingStage | null {
+  return typeof value === "string" && PENDING_STAGES.includes(value as AttachmentPendingStage)
+    ? (value as AttachmentPendingStage)
+    : null
+}
+
+/**
+ * Reads the typed `409 attachment_pending` progress details (C-04).
+ *
+ * Returns null for every other error and for the pre-Task-10 shape without
+ * `details.attachment_id`; the composer then keeps the manual retry fallback.
+ * A legacy server with only `{attachment_id,name}` still auto-retries with the
+ * default delay and no stage/percent to display.
+ *
+ * Contract note: `done`/`failed` are parsed here (and handled defensively by the
+ * composer) but the current backend's `isAttachmentPending` only reports
+ * `pending`/`processing`, so those two stages are not emitted today. Do not rely
+ * on them without a server contract change.
+ */
+export function getAttachmentPendingDetails(error: unknown): AttachmentPendingProgress | null {
+  if (!(error instanceof ApiError) || error.code !== "attachment_pending") return null
+  const rawId = error.details.attachment_id
+  const attachmentId =
+    typeof rawId === "string" && rawId !== ""
+      ? rawId
+      : typeof rawId === "number" && Number.isFinite(rawId)
+        ? String(rawId)
+        : null
+  if (attachmentId === null) return null
+  const name = typeof error.details.name === "string" ? error.details.name : ""
+  const errorText = typeof error.details.error === "string" ? error.details.error : ""
+  const retryAfter = readDetailNumber(error.details.retry_after_seconds)
+  return {
+    attachmentId,
+    name,
+    stage: readPendingStage(error.details.stage),
+    imagesTotal: readDetailNumber(error.details.images_total) ?? 0,
+    imagesDone: readDetailNumber(error.details.images_done) ?? 0,
+    imagesFailed: readDetailNumber(error.details.images_failed) ?? 0,
+    imagesSkipped: readDetailNumber(error.details.images_skipped) ?? 0,
+    percent: readDetailNumber(error.details.percent),
+    etaSeconds: readDetailNumber(error.details.eta_seconds),
+    retryAfterSeconds: retryAfter === null ? DEFAULT_RETRY_AFTER_SECONDS : Math.max(0, retryAfter),
+    error: errorText,
+  }
 }

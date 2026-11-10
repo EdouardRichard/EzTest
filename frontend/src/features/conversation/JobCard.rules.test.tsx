@@ -82,8 +82,36 @@ describe("JobCardActionRules", () => {
     )
 
     const reason = screen.getByTestId("job-card-reason")
-    expect(reason).toHaveTextContent(/不支持图片|does not support images/)
-    expect(reason).toHaveTextContent("llm_capability_mismatch")
+    expect(reason).toHaveTextContent(/不支持图片/)
+    expect(reason).not.toHaveTextContent("does not support images")
+    // The stable code stays available for support, but not as the main copy.
+    expect(reason).toHaveAttribute("title", expect.stringContaining("llm_capability_mismatch"))
+  })
+
+  it("translates a legacy design.round failure and hides the retry that cannot succeed (D-04)", () => {
+    render(
+      <JobCard
+        versionId="2001"
+        part={{
+          type: "job_card",
+          job_id: "801",
+          kind: "design.round",
+          status: "failed",
+          code: "invalid_work_type",
+          reason: `unsupported work item type "design.round"`,
+        }}
+      />,
+    )
+
+    const reason = screen.getByTestId("job-card-reason")
+    expect(reason).toHaveTextContent(/旧版设计轮次作业已停用/)
+    expect(reason).not.toHaveTextContent("unsupported work item type")
+    expect(reason).not.toHaveTextContent("invalid_work_type")
+    expect(reason).toHaveAttribute("title", expect.stringContaining("invalid_work_type"))
+
+    // Re-queueing the removed work type fails again, so no retry is offered.
+    expect(screen.queryByRole("button", { name: "重试作业" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "取消作业" })).not.toBeInTheDocument()
   })
 
   it("shows a clear message when retry is rejected because the job is not retryable", async () => {

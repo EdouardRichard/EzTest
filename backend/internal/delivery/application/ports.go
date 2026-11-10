@@ -376,16 +376,23 @@ type Clock interface {
 // execution.failure_candidate dedupe_hint: candidate ingestion uses it only
 // when it is 32 lowercase hex chars and recomputes the key otherwise.
 type CaseRunSnapshot struct {
-	ID                       int64
-	VersionID                int64
-	WaveID                   int64
-	CaseVersionID            int64
-	RequirementID            int64
-	CaseTitle                string
-	VersionSUTID             *int64
-	VersionSUTIDs            []int64
-	Status                   string
-	FailureClass             string
+	ID            int64
+	VersionID     int64
+	WaveID        int64
+	CaseVersionID int64
+	RequirementID int64
+	CaseTitle     string
+	VersionSUTID  *int64
+	VersionSUTIDs []int64
+	Status        string
+	FailureClass  string
+	// ExecutorCapability marks a run blocked by an executor capability
+	// limitation (structured step marker, v0.2.3 X-02). It is never a SUT issue
+	// candidate even when an older classifier stored failed(application).
+	ExecutorCapability bool
+	// TerminalCause is the stable case_run.summary.terminal_cause (for example
+	// executor_capability), copied so triage/report projections keep the cause.
+	TerminalCause            string
 	DedupeHint               string
 	Summary                  string
 	StepCount                int
@@ -458,6 +465,11 @@ type RequirementSnapshot struct {
 	CloseRound       int32
 	ReopenCount      int
 	UpdatedAt        time.Time
+	// ExecutionSettled mirrors delivery.RequirementSnapshot.ExecutionSettled: it
+	// is derived execution metadata (every current+confirmed case version has a
+	// terminal latest case_run), is never fingerprinted, and lets the report due
+	// gate treat an executed-but-not-closed requirement as settled (R2-NEW-02).
+	ExecutionSettled bool
 }
 
 // VersionSUTSnapshot is one version SUT binding used to label report rows and

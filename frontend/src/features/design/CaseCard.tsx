@@ -15,6 +15,8 @@ type CaseData = Extract<DesignNodeData, { kind: "case" }> & {
   selected: boolean
   /** Checked in the mindmap multi-select (batch confirm/execute/AI modify). */
   batchSelected: boolean
+  /** D-09: hidden below the minimum action zoom (React Flow scales the node). */
+  destructiveActionsDisabled?: boolean
 }
 
 const STATUS_TONE: Record<Exclude<CaseVersionStatus, "superseded">, BadgeTone> = {
@@ -86,7 +88,9 @@ export function CaseCard({ data }: NodeProps) {
       <p className="mt-1 text-[10px] text-muted-foreground">
         v{designCase.revision} · 步骤 {designCase.step_count} · 断言 {designCase.assertion_count}
       </p>
-      {designCase.status === "draft" && node.actions.caseReviewEnabled !== false ? (
+      {designCase.status === "draft" &&
+      node.destructiveActionsDisabled !== true &&
+      node.actions.caseReviewEnabled !== false ? (
         <Button
           size="sm"
           variant="secondary"

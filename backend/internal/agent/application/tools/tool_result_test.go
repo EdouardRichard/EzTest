@@ -220,6 +220,26 @@ func TestSpillWithoutContentStoreFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSpillToolResultNoteExplainsEnvelope pins R2-C-03's spill-envelope note:
+// the envelope's total_chars/truncated describe the tool result JSON, not the
+// business object (for example the attachment full text), and tool_result.read
+// is how the full JSON is read back.
+func TestSpillToolResultNoteExplainsEnvelope(t *testing.T) {
+	out, _ := spillWithStore(t, strings.Repeat("a", 40000))
+	for _, want := range []string{"不代表被读取业务对象", "tool_result.read"} {
+		if !strings.Contains(out.Note, want) {
+			t.Fatalf("spill note lacks %q: %s", want, out.Note)
+		}
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal spill envelope: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"note"`) {
+		t.Fatalf("spill envelope JSON lacks the note field: %s", encoded)
+	}
+}
+
 // --- tool_result.read ------------------------------------------------------
 
 func TestToolResultReadPaginationAndLimitCap(t *testing.T) {
@@ -260,6 +280,18 @@ func TestToolResultReadPaginationAndLimitCap(t *testing.T) {
 	if body["returned_chars"] != float64(5000) || body["next_offset"] != float64(25000) ||
 		body["total_chars"] != float64(25000) || body["truncated"] != false {
 		t.Fatalf("final page = %#v", body)
+	}
+}
+
+// TestToolResultReadDescriptionDistinguishesEnvelopeFromBusinessObject pins the
+// description half of R2-C-03: the spill envelope's total_chars is the tool
+// result JSON length, while attachment completeness is attachment.total_chars.
+func TestToolResultReadDescriptionDistinguishesEnvelopeFromBusinessObject(t *testing.T) {
+	description := (&toolResultRead{}).Description()
+	for _, want := range []string{"业务对象", "attachment.total_chars"} {
+		if !strings.Contains(description, want) {
+			t.Fatalf("tool_result.read description lacks %q: %s", want, description)
+		}
 	}
 }
 

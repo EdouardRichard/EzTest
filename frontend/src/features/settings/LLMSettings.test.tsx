@@ -148,6 +148,78 @@ const apiMaxInputModel: LLMModel = {
   output_source: "manual",
 }
 
+/** Manually asserted vision capability that a catalog refresh must preserve. */
+const manualVisionModel: LLMModel = {
+  ...model,
+  id: "8013",
+  model: "manual-vision",
+  display_name: "manual-vision",
+  context_window: 1_048_576,
+  max_output: 8192,
+  max_input: 1_040_384,
+  supports_vision: true,
+  supports_vision_source: "manual",
+  source: "catalog",
+  window_source: "catalog",
+  output_source: "catalog",
+  capabilities: {
+    supports_tools: true,
+    supports_vision: true,
+    supports_reasoning: false,
+    supports_prompt_cache: false,
+    context_window: 1_048_576,
+    supports_vision_source: "manual",
+  },
+}
+
+const unhealthyConfig: LLMConfig = {
+  ...config,
+  health: {
+    default_model_valid: false,
+    vision_ready: false,
+    reason: "default_model_missing",
+  },
+}
+
+const notVisionConfig: LLMConfig = {
+  ...config,
+  id: "7005",
+  name: "vision-gap",
+  health: {
+    default_model_valid: true,
+    vision_ready: false,
+    reason: "default_model_not_vision",
+  },
+}
+
+/** The same default config once its default model satisfies the runtime gate. */
+const healthyConfig: LLMConfig = {
+  ...config,
+  health: { default_model_valid: true, vision_ready: true },
+}
+
+/** A secondary config never drives runtime, so its health must stay silent. */
+const nonDefaultUnhealthyConfig: LLMConfig = {
+  ...unhealthyConfig,
+  id: "7006",
+  name: "secondary",
+  is_default: false,
+}
+
+/** A refresh that reports catalog-owned vision: nothing was preserved. */
+const catalogVisionModel: LLMModel = {
+  ...manualVisionModel,
+  supports_vision_source: "catalog",
+  capabilities: {
+    supports_tools: true,
+    supports_vision: true,
+    supports_reasoning: false,
+    supports_prompt_cache: false,
+    context_window: 1_048_576,
+    supports_vision_source: "catalog",
+  },
+}
+
 type RouteHandler = (url: URL, init: RequestInit) => Response | Promise<Response>
 
 function installFetch(handler: RouteHandler): void {
@@ -487,11 +559,11 @@ describe("LLMSettings", () => {
         method(call[1] ?? {}) === "PATCH" &&
         new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models/8010",
     )
+    // ModelEditDialog sends only the capability keys this interaction changed:
+    // tools and prompt cache stay catalog-owned instead of being re-asserted.
     expect(readBody(patch?.[1] ?? {})).toEqual({
-      supports_tools: true,
       supports_vision: true,
       supports_reasoning: true,
-      supports_prompt_cache: false,
       deprecated: false,
     })
   })
@@ -533,8 +605,8 @@ describe("LLMSettings", () => {
     await screen.findByTestId("llm-config-7001")
     await openModelDirectory()
 
-    expect(within(screen.getByTestId("llm-model-8011")).getByText("[手工]")).toBeVisible()
-    expect(within(screen.getByTestId("llm-model-8010")).queryByText("[手工]")).toBeNull()
+    expect(within(screen.getByTestId("llm-model-8011")).getByText("参数：手工")).toBeVisible()
+    expect(within(screen.getByTestId("llm-model-8010")).queryByText("参数：手工")).toBeNull()
 
     let dialog = await openModelEditor("8011")
     expect(within(dialog).getByRole("button", { name: "恢复上游值" })).toBeEnabled()
@@ -779,6 +851,189 @@ describe("LLMSettings", () => {
     expect(fetchMock.mock.calls.some((call) => method(call[1] ?? {}) === "PATCH")).toBe(false)
   })
 
+  it("localizes the default-model vision gate under the select and focuses it", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [canonicalConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [reasoningModel, plainModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse(
+          {
+            error: {
+              code: "invalid_argument",
+              message: "default model must support vision",
+              details: {
+                field: "default_model_id",
+                model: "gpt-plain",
+                missing_capabilities: ["vision"],
+              },
+            },
+          },
+          400,
+        )
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+    const defaultModel = within(dialog).getByLabelText("默认模型")
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+
+    expect(
+      await within(dialog).findByText("默认模型必须支持视觉能力，才能分析文档中的图片"),
+    ).toBeVisible()
+    expect(defaultModel).toHaveFocus()
+    expect(screen.queryByText(/default model must support vision/)).toBeNull()
+  })
+
+  it("warns in Chinese when a config's default model is missing or not vision-ready", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") {
+        return jsonResponse({ data: [unhealthyConfig, notVisionConfig] })
+      }
+      // A selectable model exists, so the actionable copy is "re-pick" rather
+      // than "refresh the catalog".
+      if (url.pathname === "/api/admin/llm/models")
+        return jsonResponse({ data: [manualVisionModel] })
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+
+    const missingCard = await screen.findByTestId("llm-config-7001")
+    expect(within(missingCard).getByText(/默认模型缺失/)).toBeVisible()
+    expect(within(missingCard).getByText(/重新选择默认模型/)).toBeVisible()
+
+    const visionCard = screen.getByTestId("llm-config-7005")
+    expect(within(visionCard).getByText(/默认模型不支持视觉/)).toBeVisible()
+    expect(within(visionCard).getByText(/改选支持视觉的模型/)).toBeVisible()
+    expect(screen.queryByText(/default_model_/)).toBeNull()
+  })
+
+  it("only warns about the default config and asks for a catalog refresh when none is selectable", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") {
+        return jsonResponse({ data: [nonDefaultUnhealthyConfig, unhealthyConfig] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+
+    const defaultCard = await screen.findByTestId("llm-config-7001")
+    // No selectable model exists, so "重新选择默认模型" would be a dead end.
+    expect(within(defaultCard).getByText(/请先刷新模型目录/)).toBeVisible()
+    expect(within(defaultCard).queryByText(/重新选择默认模型/)).toBeNull()
+
+    const secondaryCard = screen.getByTestId("llm-config-7006")
+    expect(within(secondaryCard).queryByText(/默认模型缺失/)).toBeNull()
+    expect(within(secondaryCard).queryByText(/请先刷新模型目录/)).toBeNull()
+  })
+
+  it("clears the health warning after a refresh makes the default model valid", async () => {
+    let healed = false
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") {
+        return jsonResponse({ data: [healed ? healthyConfig : unhealthyConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      if (url.pathname.endsWith("/refresh-models") && method(init) === "POST") {
+        healed = true
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    const card = await screen.findByTestId("llm-config-7001")
+    expect(within(card).getByText(/默认模型缺失/)).toBeVisible()
+
+    fireEvent.click(within(card).getByRole("button", { name: "刷新模型" }))
+
+    await waitFor(() => expect(within(card).queryByText(/默认模型缺失/)).toBeNull())
+    expect(within(card).getByRole("status")).toHaveTextContent("已刷新 1 个模型")
+  })
+
+  it("shows capability provenance, the K conversion and the runtime budget note", async () => {
+    installFetch((url) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    const row = screen.getByTestId("llm-model-8013")
+    expect(row).toHaveTextContent("来源：上游目录")
+    expect(row).toHaveTextContent("参数：上游目录")
+    expect(row).toHaveTextContent("K 口径（1K = 1000）")
+    expect(row).toHaveTextContent("上下文 1048.576K（1048576 tokens）")
+    expect(row).toHaveTextContent(/模型容量/)
+    expect(row).toHaveTextContent(/context\.window_tokens/)
+    expect(row).toHaveTextContent(/128000 tokens/)
+  })
+
+  it("reports manual capabilities preserved across a catalog refresh", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      if (url.pathname.endsWith("/refresh-models") && method(init) === "POST") {
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+
+    fireEvent.click(within(configCard()).getByRole("button", { name: "刷新模型" }))
+
+    const notice = await within(configCard()).findByRole("status")
+    expect(notice).toHaveTextContent("已刷新 1 个模型")
+    expect(notice).toHaveTextContent("已保留 1 项手工能力：支持视觉")
+
+    fireEvent.click(within(configCard()).getByRole("button", { name: "管理模型" }))
+    expect(within(configCard()).getByText("视觉")).toBeVisible()
+    expect(within(configCard()).getByText("来源：上游目录")).toBeVisible()
+  })
+
+  it("does not claim preserved capabilities when the refresh returns catalog sources", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [manualVisionModel] })
+      }
+      if (url.pathname.endsWith("/refresh-models") && method(init) === "POST") {
+        return jsonResponse({ data: [catalogVisionModel] })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+
+    fireEvent.click(within(configCard()).getByRole("button", { name: "刷新模型" }))
+
+    const notice = await within(configCard()).findByRole("status")
+    expect(notice).toHaveTextContent("已刷新 1 个模型")
+    expect(notice).not.toHaveTextContent("已保留")
+  })
+
   it("deletes a config after confirmation", async () => {
     installFetch((url, init) => {
       if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
@@ -837,11 +1092,11 @@ describe("LLMSettings", () => {
     )
 
     fireEvent.click(within(configCard()).getByRole("button", { name: "刷新模型" }))
-    expect(await within(configCard()).findByText("已刷新 1 个模型")).toBeVisible()
+    expect(await within(configCard()).findByText(/已刷新 1 个模型/)).toBeVisible()
 
     fireEvent.click(within(configCard()).getByRole("button", { name: "管理模型" }))
     expect(within(configCard()).getByText("manual-a")).toBeVisible()
-    expect(within(configCard()).getByText("手工")).toBeVisible()
+    expect(within(configCard()).getByText("来源：手工")).toBeVisible()
   })
 
   it("adds and deletes a manual model", async () => {
@@ -864,13 +1119,14 @@ describe("LLMSettings", () => {
     fireEvent.click(within(configCard()).getByRole("button", { name: "新增模型" }))
 
     const dialog = screen.getByRole("dialog")
+    expect(dialog).toHaveTextContent("1K = 1000")
     fireEvent.change(within(dialog).getByLabelText("模型名称"), {
       target: { value: "manual-a" },
     })
-    fireEvent.change(within(dialog).getByLabelText("上下文窗口"), {
-      target: { value: "128000" },
+    fireEvent.change(within(dialog).getByLabelText("上下文窗口 (K)"), {
+      target: { value: "128" },
     })
-    fireEvent.change(within(dialog).getByLabelText("最大输出"), { target: { value: "4096" } })
+    fireEvent.change(within(dialog).getByLabelText("最大输出 (K)"), { target: { value: "4.096" } })
     fireEvent.click(within(dialog).getByLabelText("支持工具"))
     fireEvent.click(within(dialog).getByRole("button", { name: "添加模型" }))
 
@@ -897,5 +1153,92 @@ describe("LLMSettings", () => {
     await waitFor(() => expect(screen.queryByTestId("llm-model-8001")).not.toBeInTheDocument())
     const remove = fetchMock.mock.calls.find((call) => method(call[1] ?? {}) === "DELETE")
     expect(String(remove?.[0])).toContain("/api/admin/llm/configs/7001/models/8001")
+  })
+
+  it("localizes the default-model delete guard and opens the default-model editor", async () => {
+    const defaultConfig: LLMConfig = { ...config, default_model_id: "8001" }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [defaultConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [model] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7001/models/8001" && method(init) === "DELETE") {
+        return jsonResponse(
+          {
+            error: {
+              code: "default_model_in_use",
+              message:
+                'model "manual-a" is the default model of llm config "local-fake"; set default_model_id to another model before deleting it',
+              details: {
+                config_id: "7001",
+                config_name: "local-fake",
+                default_model_id: "8001",
+                field: "default_model_id",
+                next_action: "choose another model as default_model_id, then delete this model",
+              },
+            },
+          },
+          409,
+        )
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+    await openModelDirectory()
+
+    fireEvent.click(
+      within(screen.getByTestId("llm-model-8001")).getByRole("button", { name: "删除模型" }),
+    )
+
+    expect(await screen.findByText("该模型是当前配置的默认模型，无法删除")).toBeVisible()
+    expect(screen.getByText(/下一步：请先切换默认模型，再删除该模型/)).toBeVisible()
+    expect(screen.queryByText(/choose another model/)).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "切换默认模型" }))
+
+    const dialog = screen.getByRole("dialog")
+    expect(within(dialog).getByLabelText("默认模型")).toHaveValue("8001")
+    expect(within(dialog).getByLabelText("默认模型")).toHaveFocus()
+  })
+
+  it("sends explicit 0 for automatic window and output when adding a model", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs") return jsonResponse({ data: [config] })
+      if (url.pathname === "/api/admin/llm/models") return jsonResponse({ data: [] })
+      if (url.pathname === "/api/admin/llm/configs/7001/models" && method(init) === "POST") {
+        return jsonResponse({ data: model }, 201)
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7001")
+
+    fireEvent.click(within(configCard()).getByRole("button", { name: "管理模型" }))
+    fireEvent.click(within(configCard()).getByRole("button", { name: "新增模型" }))
+    const dialog = screen.getByRole("dialog")
+    fireEvent.change(within(dialog).getByLabelText("模型名称"), {
+      target: { value: "auto-model" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加模型" }))
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const add = fetchMock.mock.calls.find(
+      (call) =>
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7001/models" &&
+        method(call[1] ?? {}) === "POST",
+    )
+    expect(readBody(add?.[1] ?? {})).toEqual({
+      model: "auto-model",
+      context_window: 0,
+      max_output: 0,
+      supports_tools: false,
+      supports_vision: false,
+    })
   })
 })

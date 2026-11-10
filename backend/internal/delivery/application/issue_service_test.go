@@ -2007,3 +2007,40 @@ func TestManualIssueUpdateMergeTargetAndReason(t *testing.T) {
 		t.Fatalf("events = %+v, want issue.updated + issue.merged", fixture.events.records)
 	}
 }
+
+// v0.2.3 X-02: a run blocked by an executor capability limitation must never
+// become a SUT issue candidate, even if an older classifier stored it as
+// failed(application). The snapshot flag is the shared structured signal.
+func TestScanFailuresSkipsExecutorCapabilitySnapshot(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	capability := issueServiceTestSnapshot(201)
+	capability.ExecutorCapability = true
+	fixture.exec.failed = []CaseRunSnapshot{
+		capability,
+		issueServiceTestSnapshot(202),
+	}
+	fixture.repo.createResult = delivery.Issue{ID: 901, VersionID: 7, Status: delivery.IssueStatusOpen}
+	fixture.repo.createCreated = true
+
+	count, err := fixture.svc.ScanFailures(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("ScanFailures() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ScanFailures() count = %d, want 1 (the real application run)", count)
+	}
+	if fixture.repo.createCalls != 1 {
+		t.Fatalf("CreateCandidate calls = %d, want 1", fixture.repo.createCalls)
+	}
+	for _, ref := range fixture.repo.createdRefs {
+		if ref.Kind == delivery.IssueRefKindCaseRun && ref.RefID == 201 {
+			t.Fatal("executor capability snapshot produced an issue candidate")
+		}
+	}
+
+	// The single-run ingest path is defensive too.
+	fixture.exec.snapshots[201] = capability
+	if _, created, err := fixture.svc.IngestCandidate(context.Background(), 201); err != nil || created {
+		t.Fatalf("IngestCandidate(capability) created=%v err=%v, want no issue", created, err)
+	}
+}

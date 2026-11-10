@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -23,8 +23,10 @@ import {
   CASE_RUN_STATUS_LABEL,
   CASE_RUN_STATUS_TONE,
   CASE_RUN_TELEMETRY_TERMINAL_STATUSES,
+  causeTextLabel,
   EVIDENCE_KIND_LABEL,
   failureClassLabel,
+  isTelemetryPending,
   nextActionLabel,
   STEP_STATUS_LABEL,
   terminalCauseLabel,
@@ -38,6 +40,14 @@ export type CaseRunDetailProps = {
   error: unknown
   onRetry: () => void
 }
+
+/**
+ * One-shot refetches while a just-finished verdict's usage is still being
+ * written: after 5s, then 15s later (at most twice). `case_run.finished` is
+ * published before `Finalize` attaches usage and no event follows it, so the
+ * snapshot has to be pulled again rather than pushed.
+ */
+const TELEMETRY_RETRY_DELAYS_MS = [5_000, 15_000] as const
 
 function spanDuration(start: string | null, end: string | null): string {
   if (start === null || end === null) return "—"
@@ -164,11 +174,7 @@ type CreateIssueDialogProps = {
  */
 function CreateIssueDialog({ versionId, run, evidence, onClose }: CreateIssueDialogProps) {
   const defaultSummary =
-    typeof run.summary.last_error === "string" && run.summary.last_error.length > 0
-      ? run.summary.last_error
-      : typeof run.summary.verdict_reason === "string"
-        ? run.summary.verdict_reason
-        : ""
+    causeTextLabel(run.summary.last_error) ?? causeTextLabel(run.summary.verdict_reason) ?? ""
   const evidenceIds = evidence.slice(0, 5).map((item) => item.id)
 
   const [title, setTitle] = useState(run.title)
@@ -311,6 +317,44 @@ export function CaseRunDetailView({
   const [viewerEvidence, setViewerEvidence] = useState<Evidence | null>(null)
   const [issueDialogOpen, setIssueDialogOpen] = useState(false)
 
+  // The parent passes an inline arrow (`() => setDetailToken(...)`), so its
+  // identity changes on every render. Keep the latest callback in a ref but out
+  // of the effect deps: otherwise each SSE refresh would clear and reschedule
+  // the retry timer, possibly forever.
+  const onRetryRef = useRef(onRetry)
+  useEffect(() => {
+    onRetryRef.current = onRetry
+  }, [onRetry])
+
+  const telemetryRetryRef = useRef(0)
+  const telemetryRunIDRef = useRef<string | null>(null)
+  const pendingRun = detail?.case_run ?? null
+  const telemetryPending = pendingRun !== null && isTelemetryPending(pendingRun)
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: switching to another pending run restarts the one-shot refetch schedule
+  useEffect(() => {
+    // Each pending run gets its own 5s/15s one-shot budget. Switching directly
+    // from one just-finished run to another must not inherit the previous
+    // run's retry count, which would shorten the second run's schedule.
+    const pendingRunID = pendingRun?.id ?? null
+    if (telemetryRunIDRef.current !== pendingRunID) {
+      telemetryRetryRef.current = 0
+      telemetryRunIDRef.current = pendingRunID
+    }
+    if (!telemetryPending) {
+      telemetryRetryRef.current = 0
+      return
+    }
+    const retry = (): void => {
+      telemetryRetryRef.current += 1
+      onRetryRef.current()
+      if (telemetryRetryRef.current >= TELEMETRY_RETRY_DELAYS_MS.length) return
+      timer = setTimeout(retry, TELEMETRY_RETRY_DELAYS_MS[telemetryRetryRef.current])
+    }
+    let timer = setTimeout(retry, TELEMETRY_RETRY_DELAYS_MS[0])
+    return () => clearTimeout(timer)
+  }, [telemetryPending, pendingRun?.id, pendingRun?.finished_at])
+
   if (loading) return <LoadingCard label="正在加载用例详情…" />
 
   if (error !== null) {
@@ -327,9 +371,10 @@ export function CaseRunDetailView({
     (item) => item.step_seq === null || item.step_seq === undefined,
   )
   const terminalCause = terminalCauseLabel(run.summary.terminal_cause)
-  const verdictReason =
-    typeof run.summary.verdict_reason === "string" ? run.summary.verdict_reason.trim() : ""
-  const lastError = typeof run.summary.last_error === "string" ? run.summary.last_error.trim() : ""
+  // `verdict_reason`/`last_error` may still carry a raw stable enum on legacy
+  // rows; localize a bare code before deciding whether there is prose to show.
+  const verdictReason = causeTextLabel(run.summary.verdict_reason) ?? ""
+  const lastError = causeTextLabel(run.summary.last_error) ?? ""
   const nextAction =
     nextActionLabel(run.summary.next_action) ??
     (run.status === "blocked" ? "先解决阻塞条件（账号/环境/数据），再重跑用例" : null)
@@ -414,6 +459,13 @@ export function CaseRunDetailView({
           {usage.total_tokens} tokens
           {usage.turns > 0 ? ` · ${usage.turns} 轮` : ""}
         </p>
+      ) : telemetryPending ? (
+        <p
+          data-testid="case-run-telemetry-pending"
+          className="text-[11px] leading-relaxed text-muted-foreground"
+        >
+          遥测写入中…
+        </p>
       ) : CASE_RUN_TELEMETRY_TERMINAL_STATUSES.includes(run.status) ? (
         <p
           data-testid="case-run-telemetry-unavailable"
@@ -469,6 +521,7 @@ export function CaseRunDetailView({
       <EvidenceViewer
         versionId={versionId}
         evidence={viewerEvidence}
+        candidates={detail.evidence}
         open={viewerEvidence !== null}
         onClose={() => setViewerEvidence(null)}
       />

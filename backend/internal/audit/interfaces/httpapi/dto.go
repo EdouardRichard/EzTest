@@ -12,6 +12,7 @@ import (
 type entryDTO struct {
 	ID         string         `json:"id"`
 	ActorID    string         `json:"actor_id,omitempty"`
+	ActorName  string         `json:"actor_name,omitempty"`
 	Action     string         `json:"action"`
 	TargetKind string         `json:"target_kind"`
 	TargetID   string         `json:"target_id"`
@@ -30,6 +31,7 @@ func toEntryDTO(entry audit.Entry) entryDTO {
 	}
 	dto := entryDTO{
 		ID:         strconv.FormatInt(entry.ID, 10),
+		ActorName:  entry.ActorName,
 		Action:     entry.Action,
 		TargetKind: entry.TargetKind,
 		TargetID:   entry.TargetID,

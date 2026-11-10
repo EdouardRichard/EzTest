@@ -205,7 +205,9 @@ export function CodeTab({ versionId }: CodeTabProps) {
         if (value === null || value.length === 0) params.delete(key)
         else params.set(key, value)
       }
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
+        scroll: false,
+      })
     },
     [router, searchParams, versionId],
   )

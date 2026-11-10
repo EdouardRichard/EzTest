@@ -154,6 +154,48 @@ func TestAppendPromptRevisionIncrementsAndSyncsCurrentPrompt(t *testing.T) {
 	}
 }
 
+func TestSavePromptRevisionExpectedVersionZeroFencesFirstAppend(t *testing.T) {
+	repo, _ := newPromptRepo(t)
+	ctx := context.Background()
+
+	// Fresh profiles have no revision: expected_version 0 is the correct
+	// optimistic lock for the upgrade backfill's no-revision branch.
+	zero := 0
+	body := "[profile:clarification_host] upgrade seed"
+	result, err := repo.SavePromptRevision(ctx, agent.PromptWrite{
+		ProfileKey:      agentapp.ProfileKeyClarificationHost,
+		SystemPrompt:    body,
+		Note:            "upgrade 0.2.3",
+		Source:          agent.PromptSourceSeed,
+		ExpectedVersion: &zero,
+	})
+	if err != nil {
+		t.Fatalf("first SavePromptRevision: %v", err)
+	}
+	if !result.Changed || result.Version != 1 {
+		t.Fatalf("first result = %#v, want version 1", result)
+	}
+
+	// A duplicate startup or a concurrent administrator write landed first: the
+	// same expected_version must conflict instead of appending over it.
+	zero = 0
+	if _, err := repo.SavePromptRevision(ctx, agent.PromptWrite{
+		ProfileKey:      agentapp.ProfileKeyClarificationHost,
+		SystemPrompt:    "[profile:clarification_host] admin winner",
+		Source:          agent.PromptSourceAdmin,
+		ExpectedVersion: &zero,
+	}); !errors.Is(err, agent.ErrPromptVersionConflict) {
+		t.Fatalf("second SavePromptRevision err = %v, want ErrPromptVersionConflict", err)
+	}
+	revisions, _, err := repo.ListPromptRevisions(ctx, agentapp.ProfileKeyClarificationHost, 10, nil)
+	if err != nil {
+		t.Fatalf("ListPromptRevisions: %v", err)
+	}
+	if len(revisions) != 1 || revisions[0].SystemPrompt != body {
+		t.Fatalf("conflicting write changed revisions: %#v", revisions)
+	}
+}
+
 func TestSavePromptRevisionNoOpAndExpectedVersion(t *testing.T) {
 	repo, _ := newPromptRepo(t)
 	ctx := context.Background()
