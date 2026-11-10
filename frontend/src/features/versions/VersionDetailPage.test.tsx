@@ -33,7 +33,10 @@ vi.mock("@/features/delivery/api", () => deliveryApi)
 
 // The overview mounts `VersionAttachmentsSection`, which fetches on mount; this
 // test has no API server, so keep the read local and empty.
-const clarificationApi = vi.hoisted(() => ({ listVersionAttachments: vi.fn() }))
+const clarificationApi = vi.hoisted(() => ({
+  listVersionAttachments: vi.fn(),
+  listRequirements: vi.fn(),
+}))
 vi.mock("@/features/clarification/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/features/clarification/api")>()
   return { ...actual, ...clarificationApi }
@@ -236,6 +239,8 @@ describe("VersionDetailPage", () => {
     executionApi.resolveHumanRequest.mockReset()
     clarificationApi.listVersionAttachments.mockReset()
     clarificationApi.listVersionAttachments.mockResolvedValue([])
+    clarificationApi.listRequirements.mockReset()
+    clarificationApi.listRequirements.mockResolvedValue([])
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
     sse.handlers = null
@@ -303,6 +308,49 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("link", { name: /前往资源页/ })).toHaveAttribute(
       "href",
       "/resources?tab=pages",
+    )
+  })
+
+  it("shows the completion readiness panel while a running version is reporting (R3-E-01)", async () => {
+    api.getVersion.mockResolvedValue({
+      ...versionFixture,
+      requirement_counts: { total: 12, draft: 0, clarified: 1, closed: 11, obsolete: 0 },
+    })
+    api.getVersionStage.mockResolvedValue({
+      version_id: "2001",
+      stage: "reporting",
+      stage_entered_at: "2026-11-10T12:00:00Z",
+      blocker: null,
+    })
+    deliveryApi.listReports.mockResolvedValue([
+      {
+        id: "8101",
+        kind: "version",
+        status: "published",
+        current_revision: { revision: 1, pdf_status: "done" },
+      },
+    ])
+    clarificationApi.listRequirements.mockImplementation(
+      (_versionId: string, options: { status?: string }) =>
+        Promise.resolve(
+          options.status === "clarified"
+            ? [{ id: "6001", title: "素材上传与光标插入", status: "clarified" }]
+            : [],
+        ),
+    )
+
+    render(<VersionDetailPage versionId="2001" />)
+
+    const panel = await screen.findByTestId("completion-readiness")
+    expect(panel).toHaveTextContent("完成条件")
+    await waitFor(() => expect(panel).toHaveTextContent("等待需求闭环"))
+    await waitFor(() =>
+      expect(screen.getByTestId("completion-report")).toHaveTextContent(
+        "已发布（版本总结 v1，PDF 已生成）",
+      ),
+    )
+    expect(await screen.findByTestId("completion-unclosed-requirement")).toHaveTextContent(
+      "素材上传与光标插入",
     )
   })
 

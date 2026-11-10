@@ -50,6 +50,7 @@ import { formatDateTime } from "@/lib/format"
 import { getVersion, getVersionStage, parseStageBlocker } from "./api"
 import { BindingOverview } from "./BindingOverview"
 import { BlockerPanel } from "./BlockerPanel"
+import { CompletionBlockersPanel } from "./CompletionBlockersPanel"
 import { CoveragePanel } from "./CoveragePanel"
 import { DiscoveryPanel } from "./DiscoveryPanel"
 import { FactsPanel } from "./FactsPanel"
@@ -1092,6 +1093,14 @@ export function VersionDetailPage({
               setStage(view)
               refreshVersionAndCounts()
             }}
+          />
+          {/* R3-E-01: name the open completion conditions while reporting. */}
+          <CompletionBlockersPanel
+            version={version}
+            stage={stage.stage}
+            pendingQuestions={pendingQuestions.length}
+            pendingDecisions={pendingDecisions.length}
+            refreshKey={`${version.updated_at}|${reportRevision ?? ""}`}
           />
         </div>
       ) : null}
