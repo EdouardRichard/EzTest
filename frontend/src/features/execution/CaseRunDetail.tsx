@@ -327,11 +327,20 @@ export function CaseRunDetailView({
   }, [onRetry])
 
   const telemetryRetryRef = useRef(0)
+  const telemetryRunIDRef = useRef<string | null>(null)
   const pendingRun = detail?.case_run ?? null
   const telemetryPending = pendingRun !== null && isTelemetryPending(pendingRun)
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: switching to another pending run restarts the one-shot refetch schedule
   useEffect(() => {
+    // Each pending run gets its own 5s/15s one-shot budget. Switching directly
+    // from one just-finished run to another must not inherit the previous
+    // run's retry count, which would shorten the second run's schedule.
+    const pendingRunID = pendingRun?.id ?? null
+    if (telemetryRunIDRef.current !== pendingRunID) {
+      telemetryRetryRef.current = 0
+      telemetryRunIDRef.current = pendingRunID
+    }
     if (!telemetryPending) {
       telemetryRetryRef.current = 0
       return

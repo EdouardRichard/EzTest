@@ -31,6 +31,22 @@ function incompleteDetail(overrides: Partial<CaseRunDetail["case_run"]> = {}): C
   }
 }
 
+function pendingTelemetryDetail(id: string): CaseRunDetail {
+  return {
+    ...caseRunDetailFixture,
+    case_run: {
+      ...caseRunDetailFixture.case_run,
+      id,
+      status: "passed",
+      failure_class: "",
+      // Usage is attached by Finalize after `case_run.finished`: right after
+      // the event the snapshot can still answer `usage: null`.
+      finished_at: new Date().toISOString(),
+      summary: { ...caseRunDetailFixture.case_run.summary, usage: null },
+    },
+  }
+}
+
 function blockedDetail(): CaseRunDetail {
   const base = caseRunDetailFixture
   return {
@@ -284,6 +300,58 @@ describe("CaseRunDetail telemetry pending (R2-OBS-01)", () => {
         vi.advanceTimersByTime(60_000)
       })
       expect(onRetry).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("restarts the 5s/15s retry budget when a different run is pending", () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date("2026-11-10T12:33:43Z"))
+      const onRetry = vi.fn()
+      const { rerender } = render(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={pendingTelemetryDetail("9302")}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(1)
+
+      // Switching directly from one pending run to another used to keep the
+      // first run's retry count, leaving the second run a reduced budget.
+      rerender(
+        <CaseRunDetailView
+          versionId="2001"
+          detail={pendingTelemetryDetail("9999")}
+          loading={false}
+          error={null}
+          onRetry={onRetry}
+        />,
+      )
+
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(2)
+
+      act(() => {
+        vi.advanceTimersByTime(15_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(3)
+
+      // Still one-shot per run: no further retries after the second one.
+      act(() => {
+        vi.advanceTimersByTime(60_000)
+      })
+      expect(onRetry).toHaveBeenCalledTimes(3)
     } finally {
       vi.useRealTimers()
     }

@@ -461,6 +461,25 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 // or another path advanced it), so the release must not overwrite it.
 var errDispatchReleaseSkipped = errors.New("case_run dispatch was claimed or advanced")
 
+// releaseLeaseTolerance absorbs the precision loss of the lease_until
+// round-trip: production stores it as a PostgreSQL timestamptz (microseconds)
+// while the dispatched value comes from time.Now() (nanoseconds), so the stored
+// lease can differ by up to a microsecond once the dispatch row is persisted.
+// Anything larger is a later claim/mutation (for example the 90s execution lease
+// an old-build worker writes).
+const releaseLeaseTolerance = time.Millisecond
+
+// dispatchLeaseMatches reports whether the stored lease is still the one this
+// dispatch stamped, tolerating the microsecond precision of a timestamptz
+// round-trip. A nil on either side never matches.
+func dispatchLeaseMatches(current, dispatched *time.Time) bool {
+	if current == nil || dispatched == nil {
+		return false
+	}
+	diff := current.Sub(*dispatched)
+	return diff >= -releaseLeaseTolerance && diff <= releaseLeaseTolerance
+}
+
 // releaseDispatch returns a run whose dispatch ledger write failed to pending
 // under a new epoch: the old token can never claim it, no lease/owner survives,
 // and the local failure is the retry reason. The dispatch snapshot is
@@ -468,17 +487,24 @@ var errDispatchReleaseSkipped = errors.New("case_run dispatch was claimed or adv
 // work item is fenced by the epoch bump (its Prepare fails with lease_lost).
 //
 // The write is a CAS on the ledger state the dispatch wrote (running, matching
-// epoch/token, not claimed): on the intent-Transition failure path the work item
-// is already queued, so a worker can claim/Prepare the run in the window before
-// this release. An unconditional update would pull that claimed/running row back
-// to pending and the next tick could dispatch the case a second time, while the
-// worker is still executing it. A CAS miss leaves the row untouched and logs.
+// epoch/token, not claimed, and still carrying the dispatch-stamped lease and
+// owner): on the intent-Transition failure path the work item is already queued,
+// so a worker can claim/Prepare the run in the window before this release. An
+// unconditional update would pull that claimed/running row back to pending and
+// the next tick could dispatch the case a second time, while the worker is still
+// executing it. A CAS miss leaves the row untouched and logs.
 func (s *Scheduler) releaseDispatch(ctx context.Context, run *execution.CaseRun, cause error) {
 	if run == nil || cause == nil {
 		return
 	}
 	dispatchedEpoch := run.DispatchEpoch
 	dispatchedToken := run.DispatchToken
+	// The lease/owner this dispatch stamped, captured before the CAS so the
+	// predicate compares against a snapshot that the closure cannot mutate. An
+	// old-build worker claims a run by replacing exactly these two fields
+	// without writing claimed_at (rolling upgrade).
+	dispatchedLease := run.LeaseUntil
+	dispatchedOwner := run.OwnerInstance
 	if dispatchedToken == "" {
 		// Nothing fenced: never risk overwriting a row that this dispatch did not
 		// stamp (defensive; dispatchPending always sets a token first).
@@ -494,12 +520,18 @@ func (s *Scheduler) releaseDispatch(ctx context.Context, run *execution.CaseRun,
 	ok, err := s.caseRuns.UpdateCAS(ctx, run.ID, dispatchedEpoch, dispatchedToken,
 		func(current *execution.CaseRun) error {
 			// The ledger state this dispatch wrote, still unclaimed. A claim flips
-			// ClaimedAt; any later transition changes the status or the epoch/token.
+			// ClaimedAt; a worker from the previous binary (rolling upgrade) instead
+			// replaces the dispatch lease/owner with its own execution lease and
+			// owner without writing ClaimedAt. Any later transition changes the
+			// status or the epoch/token. Keeping the dispatch-stamped lease/owner
+			// in the predicate is what fences that old-build claim.
 			if current.Status != execution.CaseRunRunning ||
 				current.DispatchEpoch != dispatchedEpoch ||
 				current.DispatchToken != dispatchedToken ||
 				current.Summary.Dispatch == nil ||
-				current.Summary.Dispatch.ClaimedAt != "" {
+				current.Summary.Dispatch.ClaimedAt != "" ||
+				!dispatchLeaseMatches(current.LeaseUntil, dispatchedLease) ||
+				current.OwnerInstance != dispatchedOwner {
 				return errDispatchReleaseSkipped
 			}
 			current.Status = execution.CaseRunPending

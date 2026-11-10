@@ -340,3 +340,145 @@ func TestSchedulerReleaseDispatchKeepsClaimedRun(t *testing.T) {
 		t.Fatalf("queued execute items after the claimed tick = %d, want 1 (no duplicate)", got)
 	}
 }
+
+// TestSchedulerReleaseDispatchKeepsOldBuildWorkerClaim: a worker from the
+// previous binary claims a just-dispatched run during a rolling upgrade by
+// writing status=running, its owner and the 90s execution lease, but never
+// stamps claimed_at. The release CAS must recognize that claim from the
+// dispatch-stamped lease/owner and leave the row untouched; resetting it to
+// pending would let the next tick dispatch a duplicate.
+func TestSchedulerReleaseDispatchKeepsOldBuildWorkerClaim(t *testing.T) {
+	ctx := context.Background()
+	f := newQueuedDispatchFixture(t)
+	logs := captureSchedulerSlog(t)
+
+	oldLease := f.clock.Now().Add(DefaultCaseLease)
+	f.intents.transitionErr = errors.New("intent ledger write failed")
+	f.intents.onTransitionErr = func() {
+		inflight := singleWaveRun(t, f)
+		ok, err := f.runs.UpdateCAS(ctx, inflight.ID, inflight.DispatchEpoch, inflight.DispatchToken,
+			func(run *execution.CaseRun) error {
+				// An old-build worker's claim: only the execution lease and the
+				// owner change, claimed_at is never written.
+				run.OwnerInstance = "old-agent"
+				run.LeaseUntil = &oldLease
+				return nil
+			})
+		if err != nil || !ok {
+			t.Fatalf("simulated old-build worker claim: ok=%v err=%v", ok, err)
+		}
+	}
+
+	err := f.scheduler.ReconcileVersion(ctx, 100)
+	if err == nil || !strings.Contains(err.Error(), "intent ledger write failed") {
+		t.Fatalf("ReconcileVersion error = %v, want the original transition failure", err)
+	}
+
+	claimed := singleWaveRun(t, f)
+	if claimed.Status != execution.CaseRunRunning {
+		t.Fatalf("old-build claimed run status = %q, want running (the release overwrote it)", claimed.Status)
+	}
+	if claimed.DispatchEpoch != 1 {
+		t.Fatalf("old-build claimed run epoch = %d, want the claimed epoch 1 kept", claimed.DispatchEpoch)
+	}
+	if claimed.DispatchToken == "" {
+		t.Fatal("old-build claimed run lost its dispatch token")
+	}
+	if claimed.OwnerInstance != "old-agent" {
+		t.Fatalf("old-build claimed owner = %q, want old-agent", claimed.OwnerInstance)
+	}
+	if claimed.LeaseUntil == nil || !claimed.LeaseUntil.Equal(oldLease) {
+		t.Fatalf("old-build claimed lease = %v, want the worker lease %v", claimed.LeaseUntil, oldLease)
+	}
+	if claimed.Summary.Dispatch == nil || claimed.Summary.Dispatch.ClaimedAt != "" {
+		t.Fatalf("old-build claimed marker = %+v, want claimed_at still empty", claimed.Summary.Dispatch)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "already claimed or advanced") {
+		t.Fatalf("old-build claim CAS miss was not logged: %q", logged)
+	}
+
+	// The next tick must not dispatch a duplicate: the claimed row is not
+	// returned to pending, so no second execute item is queued.
+	f.intents.transitionErr = nil
+	if err := f.scheduler.ReconcileVersion(ctx, 100); err != nil {
+		t.Fatalf("post-claim ReconcileVersion: %v", err)
+	}
+	after := singleWaveRun(t, f)
+	if after.Status != execution.CaseRunRunning || after.Attempts != 1 ||
+		after.DispatchEpoch != claimed.DispatchEpoch || after.DispatchToken != claimed.DispatchToken {
+		t.Fatalf("post-claim run = %s attempt %d epoch %d token %q, want the claimed row untouched",
+			after.Status, after.Attempts, after.DispatchEpoch, after.DispatchToken)
+	}
+	if got := f.queue.countType(WorkTypeExecuteCase); got != 1 {
+		t.Fatalf("queued execute items after the old-build claim tick = %d, want 1 (no duplicate)", got)
+	}
+}
+
+// TestSchedulerReleasesRunWhenStoredLeaseIsTruncated: production stores
+// case_run.lease_until as PostgreSQL timestamptz (microsecond precision), while
+// the dispatched lease is stamped from time.Now() at nanosecond precision. After
+// the dispatch row round-trips through the repository the stored lease differs
+// from the in-memory snapshot by a sub-millisecond rounding error, which must not
+// be mistaken for a later claim: the release CAS has to accept it and reset the
+// run to pending, otherwise a stranded dispatch waits out the 10-minute lease.
+func TestSchedulerReleasesRunWhenStoredLeaseIsTruncated(t *testing.T) {
+	ctx := context.Background()
+	f := newQueuedDispatchFixture(t)
+	logs := captureSchedulerSlog(t)
+	// Give the dispatch instant a sub-microsecond component so the timestamptz
+	// round-trip changes the lease by a nonzero, sub-millisecond amount.
+	f.clock.now = f.clock.now.Add(1234 * time.Nanosecond)
+
+	var truncatedDiff time.Duration
+	f.intents.transitionErr = errors.New("intent ledger write failed")
+	f.intents.onTransitionErr = func() {
+		// Simulate PostgreSQL persisting lease_until at microsecond precision:
+		// the stored row keeps the dispatched ledger but its lease is truncated
+		// before releaseDispatch runs its CAS.
+		stored := singleWaveRun(t, f)
+		if stored.LeaseUntil == nil {
+			t.Fatal("dispatched run has no lease to truncate")
+		}
+		truncated := stored.LeaseUntil.Truncate(time.Microsecond)
+		truncatedDiff = stored.LeaseUntil.Sub(truncated)
+		stored.LeaseUntil = timePtr(truncated)
+		if _, err := f.runs.Update(ctx, stored); err != nil {
+			t.Fatalf("store truncated lease: %v", err)
+		}
+	}
+
+	err := f.scheduler.ReconcileVersion(ctx, 100)
+	if err == nil || !strings.Contains(err.Error(), "intent ledger write failed") {
+		t.Fatalf("ReconcileVersion error = %v, want the original transition failure", err)
+	}
+	if truncatedDiff <= 0 || truncatedDiff > time.Millisecond {
+		t.Fatalf("stored lease truncation = %v, want a nonzero sub-millisecond difference", truncatedDiff)
+	}
+
+	released := singleWaveRun(t, f)
+	if released.Status != execution.CaseRunPending {
+		t.Fatalf("released status = %q, want pending (the truncated lease was treated as a claim)", released.Status)
+	}
+	if released.LeaseUntil != nil {
+		t.Fatalf("released dispatch kept lease until %v", released.LeaseUntil)
+	}
+	if released.DispatchEpoch != 2 {
+		t.Fatalf("released epoch = %d, want 2 (dispatch + release)", released.DispatchEpoch)
+	}
+	if released.DispatchToken != "" {
+		t.Fatalf("released dispatch kept token %q", released.DispatchToken)
+	}
+	if released.OwnerInstance != "" || released.OwnerExecutorID != nil {
+		t.Fatalf("released owner = %q/%v, want cleared", released.OwnerInstance, released.OwnerExecutorID)
+	}
+	if !strings.Contains(released.Summary.LastError, "intent ledger write failed") {
+		t.Fatalf("last error = %q, want the transition failure", released.Summary.LastError)
+	}
+	if released.Summary.RetryReason != "dispatch_failed" {
+		t.Fatalf("retry reason = %q, want dispatch_failed", released.Summary.RetryReason)
+	}
+	if logged := logs.String(); !strings.Contains(logged, "released a stranded case_run dispatch") {
+		t.Fatalf("release was skipped instead of committed: %q", logged)
+	}
+}
