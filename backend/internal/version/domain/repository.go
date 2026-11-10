@@ -38,10 +38,15 @@ type VersionStats struct {
 
 // ReferencingVersion identifies one version whose binding references a
 // resource. It backs the resource delete-guard conflict details, which need the
-// version title the resource context cannot read itself.
+// version title the resource context cannot read itself, plus the lifecycle
+// status/stage so the client can tell an editable reference from a read-only
+// terminal one.
 type ReferencingVersion struct {
-	ID    int64
-	Title string
+	ID            int64
+	Title         string
+	Status        string
+	Stage         Stage
+	SuspendedFrom *Stage
 }
 
 // Repository persists versions, their SUT bindings and the selected database/

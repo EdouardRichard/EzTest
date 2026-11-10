@@ -593,7 +593,14 @@ func (f *fakeRepo) ReferencingVersions(_ context.Context, kind string, id int64)
 	}
 	out := make([]version.ReferencingVersion, 0, len(matched))
 	for versionID := range matched {
-		out = append(out, version.ReferencingVersion{ID: versionID, Title: f.versions[versionID].Title})
+		entity := f.versions[versionID]
+		out = append(out, version.ReferencingVersion{
+			ID:            versionID,
+			Title:         entity.Title,
+			Status:        entity.Status,
+			Stage:         entity.Stage,
+			SuspendedFrom: entity.SuspendedFrom,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -1390,6 +1397,73 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 	}
 	if len(repositoryRefs) != 1 || repositoryRefs[0].ID != created.ID {
 		t.Fatalf("repository referencing versions = %#v", repositoryRefs)
+	}
+}
+
+// TestReferencingVersionsCarriesStatusStageAndEditable pins the resource delete
+// conflict projection: the resource context needs the lifecycle status, the
+// effective stage and whether a binding edit is actually possible. A completed
+// version is terminal regardless of a lagging stage projection, and a suspended
+// version uses the stage it was suspended from.
+func TestReferencingVersionsCarriesStatusStageAndEditable(t *testing.T) {
+	env := newTestEnv(t)
+	completed := createVersion(t, env, "Completed")
+	executing := createVersion(t, env, "Executing")
+	suspendedDesigning := createVersion(t, env, "Suspended designing")
+	suspendedExecuting := createVersion(t, env, "Suspended executing")
+
+	stageDesigning := version.StageDesigning
+	stageExecuting := version.StageExecuting
+	set := func(id int64, status string, stage version.Stage, suspendedFrom *version.Stage) {
+		entity := env.repo.versions[id]
+		entity.Status = status
+		entity.Stage = stage
+		entity.SuspendedFrom = suspendedFrom
+		env.repo.versions[id] = entity
+		env.repo.stages[id] = version.StageState{
+			VersionID: id, Stage: stage, SuspendedFrom: suspendedFrom,
+		}
+	}
+	// The persisted stage lags behind the completed status: status is the close
+	// gate, so the effective stage must still project completed/read-only.
+	set(completed.ID, version.StatusCompleted, version.StageReporting, nil)
+	set(executing.ID, version.StatusRunning, version.StageExecuting, nil)
+	set(suspendedDesigning.ID, version.StatusRunning, version.StageBlocked, &stageDesigning)
+	set(suspendedExecuting.ID, version.StatusRunning, version.StagePaused, &stageExecuting)
+
+	refs, err := env.svc.ReferencingVersions(requestContext(), "environment", 1101)
+	if err != nil {
+		t.Fatalf("ReferencingVersions: %v", err)
+	}
+	got := make(map[int64]resourceapp.VersionRef, len(refs))
+	for _, ref := range refs {
+		got[ref.ID] = ref
+	}
+	want := map[int64]resourceapp.VersionRef{
+		completed.ID: {
+			ID: completed.ID, Title: "Completed", Status: version.StatusCompleted,
+			Stage: string(version.StageCompleted), Editable: false,
+		},
+		executing.ID: {
+			ID: executing.ID, Title: "Executing", Status: version.StatusRunning,
+			Stage: string(version.StageExecuting), Editable: false,
+		},
+		suspendedDesigning.ID: {
+			ID: suspendedDesigning.ID, Title: "Suspended designing", Status: version.StatusRunning,
+			Stage: string(version.StageDesigning), Editable: true,
+		},
+		suspendedExecuting.ID: {
+			ID: suspendedExecuting.ID, Title: "Suspended executing", Status: version.StatusRunning,
+			Stage: string(version.StageExecuting), Editable: false,
+		},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("referencing versions = %#v, want %d entries", got, len(want))
+	}
+	for id, expected := range want {
+		if got[id] != expected {
+			t.Fatalf("referencing version %d = %#v, want %#v", id, got[id], expected)
+		}
 	}
 }
 

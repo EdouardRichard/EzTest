@@ -21,10 +21,15 @@ type CatalogReader interface {
 
 // VersionRef identifies one version whose binding references a resource. The
 // title is read from the version row by the version context; the resource
-// context never imports the version package.
+// context never imports the version package. Status and Stage describe the
+// version lifecycle, and Editable reports whether a binding edit is actually
+// possible (executing/reporting/completed versions are read-only).
 type VersionRef struct {
-	ID    int64
-	Title string
+	ID       int64
+	Title    string
+	Status   string
+	Stage    string
+	Editable bool
 }
 
 // UsageChecker answers whether a resource is still referenced by a version

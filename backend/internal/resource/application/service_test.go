@@ -1602,6 +1602,72 @@ func TestDeleteConflictCapsAndDedupesReferencingVersions(t *testing.T) {
 	}
 }
 
+// TestDeleteConflictDetailsCarryVersionStatusAndEditable pins R2-S-02: the 409
+// must let the client tell an editable version from a read-only terminal one so
+// it never suggests an impossible binding edit on executing/completed versions.
+func TestDeleteConflictDetailsCarryVersionStatusAndEditable(t *testing.T) {
+	h := newHarness()
+	h.usage.inUse["page"] = true
+
+	terminal := []VersionRef{
+		{ID: 9001, Title: "执行中版本", Status: "running", Stage: "executing", Editable: false},
+		{ID: 9002, Title: "已完成版本", Status: "completed", Stage: "completed", Editable: false},
+	}
+	designing := VersionRef{ID: 9003, Title: "设计中的版本", Status: "running", Stage: "designing", Editable: true}
+
+	t.Run("mixed editable and terminal", func(t *testing.T) {
+		h.usage.refs["page"] = append(append([]VersionRef{}, terminal...), designing)
+
+		apiErr := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+		if got := apiErr.Details["resource_id"]; got != "1003" {
+			t.Fatalf("details.resource_id = %#v, want 1003", got)
+		}
+		if got := apiErr.Details["kind"]; got != "page" {
+			t.Fatalf("details.kind = %#v, want page", got)
+		}
+		versions, ok := apiErr.Details["referencing_versions"].([]map[string]any)
+		if !ok || len(versions) != 3 {
+			t.Fatalf("referencing_versions = %#v", apiErr.Details["referencing_versions"])
+		}
+		want := map[string]struct {
+			status   string
+			stage    string
+			editable bool
+		}{
+			"9001": {"running", "executing", false},
+			"9002": {"completed", "completed", false},
+			"9003": {"running", "designing", true},
+		}
+		for _, item := range versions {
+			id, _ := item["id"].(string)
+			expected, present := want[id]
+			if !present {
+				t.Fatalf("unexpected referencing version %#v", item)
+			}
+			if item["status"] != expected.status || item["stage"] != expected.stage || item["editable"] != expected.editable {
+				t.Fatalf("referencing version %s = %#v", id, item)
+			}
+		}
+		resolution, _ := apiErr.Details["resolution"].(string)
+		if !strings.Contains(resolution, "read-only") || !strings.Contains(resolution, "administrator") {
+			t.Fatalf("resolution must flag the read-only terminal path: %q", resolution)
+		}
+	})
+
+	t.Run("terminal only", func(t *testing.T) {
+		h.usage.refs["page"] = terminal
+
+		apiErr := assertAPIError(t, h.svc.DeletePage(context.Background(), 1003, 42), 409, "resource_referenced")
+		resolution, _ := apiErr.Details["resolution"].(string)
+		if strings.Contains(resolution, "Exclude this page from the version scope") {
+			t.Fatalf("resolution suggests an impossible scope edit on terminal versions: %q", resolution)
+		}
+		if !strings.Contains(resolution, "read-only") || !strings.Contains(resolution, "administrator") {
+			t.Fatalf("resolution must name the administrator/operations path: %q", resolution)
+		}
+	})
+}
+
 func TestDeleteReferencedConflictIsDistinctFromPageURLDuplicate(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)

@@ -1786,18 +1786,21 @@ func (s *Service) checkUsage(ctx context.Context, check func(context.Context) (b
 	if err != nil {
 		return err
 	}
-	return resourceReferencedError(kind, refs)
+	return resourceReferencedError(kind, id, refs)
 }
 
 // resourceReferencedError builds the stable 409 returned when a delete is
 // blocked by a version binding. The message stays English (clients localize by
-// code/details); referencing_versions is capped and de-duplicated by version ID.
-func resourceReferencedError(kind string, refs []VersionRef) error {
+// code/details); referencing_versions is capped and de-duplicated by version ID,
+// and every entry carries the version status/stage plus whether the binding is
+// still editable so the client never suggests an impossible edit.
+func resourceReferencedError(kind string, id int64, refs []VersionRef) error {
 	apiErr := platform.NewError(http.StatusConflict, "resource_referenced", kind+" is referenced by a version binding")
 	apiErr.Details = map[string]any{
 		"kind":                 kind,
+		"resource_id":          platformid.Format(id),
 		"referencing_versions": referencingVersionDetails(refs),
-		"resolution":           resourceReferencedResolution(kind),
+		"resolution":           resourceReferencedResolution(kind, refs),
 	}
 	return apiErr
 }
@@ -1818,34 +1821,59 @@ func referencingVersionDetails(refs []VersionRef) []map[string]any {
 		}
 		seen[ref.ID] = struct{}{}
 		out = append(out, map[string]any{
-			"id":    platformid.Format(ref.ID),
-			"title": ref.Title,
+			"id":       platformid.Format(ref.ID),
+			"title":    ref.Title,
+			"status":   ref.Status,
+			"stage":    ref.Stage,
+			"editable": ref.Editable,
 		})
 	}
 	return out
 }
 
 // resourceReferencedResolution is the human-resolution hint for one resource
-// kind: what the operator can change so the delete is no longer blocked.
-func resourceReferencedResolution(kind string) string {
+// kind: what the operator can change so the delete is no longer blocked. Only
+// editable versions can exclude the resource in scope; executing/reporting/
+// completed versions are read-only, so the hint names the administrator/
+// operations path instead of suggesting an edit those versions reject.
+func resourceReferencedResolution(kind string, refs []VersionRef) string {
+	editable, terminal := 0, 0
+	for _, ref := range refs {
+		if ref.Editable {
+			editable++
+		} else {
+			terminal++
+		}
+	}
+
+	var hint string
 	switch kind {
 	case "sut":
-		return "Delete the referencing versions, or bind a different SUT, before deleting this SUT."
+		hint = "Delete the referencing versions or bind a different SUT in editable versions."
 	case "environment":
-		return "Delete the referencing versions, or select another environment in their binding, before deleting this environment."
+		hint = "Delete the referencing versions or select another environment in editable versions."
 	case "page":
-		return "Exclude this page from the version scope, or change the version's environment binding, before deleting it."
+		hint = "Exclude this page from the scope of editable versions (created through case_review), or change their environment binding."
 	case "api":
-		return "Exclude this API from the version scope, or change the version's environment binding, before deleting it."
+		hint = "Exclude this API from the scope of editable versions (created through case_review), or change their environment binding."
 	case "database":
-		return "Exclude this database from the version scope, deactivate it, or change the version's environment binding, before deleting it."
+		hint = "Exclude this database from the scope of editable versions (created through case_review), deactivate it, or change their environment binding."
 	case "account":
-		return "Disable this account in the referencing versions before deleting it."
+		hint = "Disable this account in editable versions."
 	case "repository":
-		return "Remove the SUT repository association or the version repository override before deleting this repository."
+		hint = "Remove the SUT repository association or the version repository override in editable versions."
 	default:
-		return "Remove this resource from the referencing version bindings before deleting it."
+		hint = "Remove this resource from the bindings of editable versions."
 	}
+
+	if terminal == 0 {
+		return hint
+	}
+	if editable == 0 {
+		return "All referencing versions are read-only (executing, reporting or completed); removing this " +
+			kind + " from their scope requires an administrator or operations process."
+	}
+	return hint + " Executing, reporting and completed versions are read-only; terminal references require an administrator or operations process."
 }
 
 // removedStrings returns the trimmed values of before that are absent from

@@ -48,7 +48,16 @@ import {
   validateSutForm,
 } from "./validation"
 
-export type ReferencingVersion = { id: string; title: string }
+export type ReferencingVersion = {
+  id: string
+  title: string
+  /** Version lifecycle status (initial/running/completed); absent on old servers. */
+  status?: string
+  /** Effective workflow stage; absent on old servers. */
+  stage?: string
+  /** False for read-only executing/reporting/completed references. */
+  editable?: boolean
+}
 
 /** The backend caps `details.referencing_versions`; a full page may hide more. */
 export const REFERENCING_VERSIONS_LIMIT = 20
@@ -56,6 +65,11 @@ export const REFERENCING_VERSIONS_LIMIT = 20
 export type ResourceRequestErrorView = {
   message: string
   nextAction?: string
+  /**
+   * Actionable copy for the editable subset when the server reported
+   * per-version `editable`. Terminal references get their own read-only copy.
+   */
+  editableNextAction?: string
   versions: ReferencingVersion[]
   /** Stable server code kept visible for support/troubleshooting. */
   code?: string
@@ -83,7 +97,13 @@ function readReferencingVersions(value: unknown): ReferencingVersion[] {
     const record = item as Record<string, unknown>
     const id = readString(record.id)
     if (id === undefined) continue
-    versions.push({ id, title: readString(record.title) ?? `#${id}` })
+    versions.push({
+      id,
+      title: readString(record.title) ?? `#${id}`,
+      status: readString(record.status),
+      stage: readString(record.stage),
+      editable: typeof record.editable === "boolean" ? record.editable : undefined,
+    })
   }
   return versions
 }
@@ -135,6 +155,9 @@ export function describeResourceRequestError(
     const details = caught.details
     const versions = readReferencingVersions(details.referencing_versions)
     const kind = readString(details.kind)
+    // New servers report per-version editability; old servers omit it, so the
+    // legacy single-resolution copy must stay unchanged for them.
+    const hasEditability = versions.some((version) => version.editable !== undefined)
 
     if (caught.status === 409) {
       if (caught.code === "page_url_exists") {
@@ -154,7 +177,10 @@ export function describeResourceRequestError(
         return {
           code: caught.code,
           message,
-          nextAction: resourceResolution(kind, versions.length > 0),
+          nextAction: hasEditability ? undefined : resourceResolution(kind, versions.length > 0),
+          editableNextAction: hasEditability
+            ? resourceResolution(kind, versions.length > 0)
+            : undefined,
           versions,
         }
       }
@@ -201,34 +227,79 @@ export function describeResourceRequestError(
   return { message: fallback, versions: [] }
 }
 
+/** Version links shared by the legacy and split reference notices. */
+function ReferencingVersionLinks({ versions }: { versions: ReferencingVersion[] }) {
+  return (
+    <>
+      {versions.map((version, index) => (
+        <span key={version.id}>
+          {index > 0 ? "、" : ""}
+          <Link
+            className="underline"
+            href={`/versions/${encodeURIComponent(version.id)}?tab=overview`}
+          >
+            {version.title}
+          </Link>
+        </span>
+      ))}
+    </>
+  )
+}
+
 /** Inline resource error with Chinese copy, version links and the stable code. */
 export function ResourceRequestError({ error, fallback }: { error: unknown; fallback: string }) {
   const view = describeResourceRequestError(error, fallback)
+  const hasEditability = view.versions.some((version) => version.editable !== undefined)
+  const editableVersions = hasEditability
+    ? view.versions.filter((version) => version.editable === true)
+    : []
+  const terminalVersions = hasEditability
+    ? view.versions.filter((version) => version.editable === false)
+    : []
   return (
     <Alert tone="danger">
       <p>{view.message}</p>
-      {view.versions.length > 0 ? (
-        <p className="mt-1">
-          引用版本：
-          {view.versions.map((version, index) => (
-            <span key={version.id}>
-              {index > 0 ? "、" : ""}
-              <Link
-                className="underline"
-                href={`/versions/${encodeURIComponent(version.id)}?tab=overview`}
-              >
-                {version.title}
-              </Link>
-            </span>
-          ))}
-        </p>
-      ) : null}
+      {hasEditability ? (
+        <>
+          {editableVersions.length > 0 ? (
+            <div data-testid="resource-editable-versions">
+              <p className="mt-1">
+                可编辑引用版本：
+                <ReferencingVersionLinks versions={editableVersions} />
+              </p>
+              {view.editableNextAction !== undefined ? (
+                <p className="mt-1 text-muted-foreground">处理建议：{view.editableNextAction}</p>
+              ) : null}
+            </div>
+          ) : null}
+          {terminalVersions.length > 0 ? (
+            <div data-testid="resource-terminal-versions">
+              <p className="mt-1">
+                终态/只读引用版本：
+                <ReferencingVersionLinks versions={terminalVersions} />
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                处理建议：终态版本只读，需管理员/运维处理；可点击版本名称查看版本总览。
+              </p>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <>
+          {view.versions.length > 0 ? (
+            <p className="mt-1">
+              引用版本：
+              <ReferencingVersionLinks versions={view.versions} />
+            </p>
+          ) : null}
+        </>
+      )}
       {view.versions.length >= REFERENCING_VERSIONS_LIMIT ? (
         <p className="mt-1 text-muted-foreground">
           仅显示前 {REFERENCING_VERSIONS_LIMIT} 个，引用版本可能更多。
         </p>
       ) : null}
-      {view.nextAction !== undefined ? (
+      {!hasEditability && view.nextAction !== undefined ? (
         <p className="mt-1 text-muted-foreground">处理建议：{view.nextAction}</p>
       ) : null}
       {view.code !== undefined ? (

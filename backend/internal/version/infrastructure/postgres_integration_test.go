@@ -33,6 +33,14 @@ func newIDs(t *testing.T) *id.Snowflake {
 
 func ptr[T any](value T) *T { return &value }
 
+// initialRef is the reference projection of a freshly created sampleVersion:
+// version.Create writes status initial and the stage column defaults to created.
+func initialRef(id int64, title string) version.ReferencingVersion {
+	return version.ReferencingVersion{
+		ID: id, Title: title, Status: version.StatusInitial, Stage: version.StageCreated,
+	}
+}
+
 func sampleVersion(ids *id.Snowflake, actorID int64) version.Version {
 	return version.Version{
 		ID:          ids.Next(),
@@ -618,23 +626,23 @@ func TestRepositoryReferencingVersions(t *testing.T) {
 		want []version.ReferencingVersion
 	}{
 		{"sut both", "sut", 1001, []version.ReferencingVersion{
-			{ID: q4.ID, Title: "Orders Q4"}, {ID: q5.ID, Title: "Orders Q5"},
+			initialRef(q4.ID, "Orders Q4"), initialRef(q5.ID, "Orders Q5"),
 		}},
 		{"sut unbound", "sut", 1003, nil},
-		{"environment prod", "environment", 1101, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
-		{"environment staging", "environment", 1102, []version.ReferencingVersion{{ID: q5.ID, Title: "Orders Q5"}}},
+		{"environment prod", "environment", 1101, []version.ReferencingVersion{initialRef(q4.ID, "Orders Q4")}},
+		{"environment staging", "environment", 1102, []version.ReferencingVersion{initialRef(q5.ID, "Orders Q5")}},
 		{"page excluded", "page", 1301, nil},
-		{"page staging", "page", 1305, []version.ReferencingVersion{{ID: q5.ID, Title: "Orders Q5"}}},
+		{"page staging", "page", 1305, []version.ReferencingVersion{initialRef(q5.ID, "Orders Q5")}},
 		{"api excluded", "api", 1401, nil},
-		{"api prod", "api", 1402, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"api prod", "api", 1402, []version.ReferencingVersion{initialRef(q4.ID, "Orders Q4")}},
 		{"database excluded", "database", 1501, nil},
-		{"database prod", "database", 1502, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
-		{"account bound", "account", 1601, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"database prod", "database", 1502, []version.ReferencingVersion{initialRef(q4.ID, "Orders Q4")}},
+		{"account bound", "account", 1601, []version.ReferencingVersion{initialRef(q4.ID, "Orders Q4")}},
 		{"account unbound", "account", 1604, nil},
 		{"repository inherited", "repository", 1201, []version.ReferencingVersion{
-			{ID: q4.ID, Title: "Orders Q4"}, {ID: q5.ID, Title: "Orders Q5"},
+			initialRef(q4.ID, "Orders Q4"), initialRef(q5.ID, "Orders Q5"),
 		}},
-		{"repository override", "repository", 1203, []version.ReferencingVersion{{ID: q4.ID, Title: "Orders Q4"}}},
+		{"repository override", "repository", 1203, []version.ReferencingVersion{initialRef(q4.ID, "Orders Q4")}},
 		{"repository unbound", "repository", 1204, nil},
 	}
 	for _, tc := range cases {
