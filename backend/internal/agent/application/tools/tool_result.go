@@ -124,8 +124,10 @@ func ToolResultMaxBytes(ctx context.Context, settings SettingsPort) int {
 }
 
 // SpilledToolResult is the model-visible spill envelope (R-A6-3): head + tail +
-// content_ref, never head-only. The JSON tags are the payload the model sees;
-// the runner may marshal the value directly.
+// content_ref, never head-only. Note tells the model that the envelope's
+// total_chars/truncated describe this result JSON, not the business object it
+// carries (R2-C-03). The JSON tags are the payload the model sees; the runner
+// may marshal the value directly.
 type SpilledToolResult struct {
 	Head       string `json:"head"`
 	Tail       string `json:"tail,omitempty"`
@@ -134,7 +136,12 @@ type SpilledToolResult struct {
 	Truncated  bool   `json:"truncated"`
 	TotalChars int    `json:"total_chars"`
 	TotalBytes int    `json:"total_bytes"`
+	Note       string `json:"note,omitempty"`
 }
+
+// spilledToolResultNote disambiguates the envelope metadata from the payload's
+// own business fields (for example attachment.read_text's attachment summary).
+const spilledToolResultNote = "本结果是分页信封：head/tail 仅为片段，可用 tool_result.read(content_ref, offset, limit) 读回完整 JSON；信封的 total_chars/truncated 只描述本工具结果 JSON 的长度，不代表被读取业务对象（如附件全文）的字符数或完整性。"
 
 // Payload renders the spill envelope with the stable field names. It is
 // equivalent to marshaling the struct; the map form is convenient for callers
@@ -154,6 +161,9 @@ func (s SpilledToolResult) Payload() map[string]any {
 	}
 	if s.SHA256 != "" {
 		payload["sha256"] = s.SHA256
+	}
+	if s.Note != "" {
+		payload["note"] = s.Note
 	}
 	return payload
 }
@@ -182,6 +192,7 @@ func SpillToolResult(ctx context.Context, writer ContentWriter, content string, 
 	result.SHA256 = ref.SHA256
 	result.ContentRef = ref.Ref
 	result.Truncated = true
+	result.Note = spilledToolResultNote
 	return result, nil
 }
 
@@ -216,7 +227,7 @@ type toolResultRead struct{ deps Deps }
 func (t *toolResultRead) Name() string { return ToolToolResultRead }
 
 func (t *toolResultRead) Description() string {
-	return "按 content_ref 分页读回工具结果 spill 的完整内容。offset 从 0 开始，limit 默认 8000、最多 20000；响应返回实际 returned_chars 与 next_offset，必须按 next_offset 前进，禁止按请求的 limit 跳段。"
+	return "按 content_ref 分页读回工具结果 spill 的完整内容。offset 从 0 开始，limit 默认 8000、最多 20000；响应返回实际 returned_chars 与 next_offset，必须按 next_offset 前进，禁止按请求的 limit 跳段。注意：spill 信封的 total_chars 是被 spill 的工具结果 JSON 的字符数，不是被读取业务对象（如附件）的长度；业务对象的完整性看其自身字段（attachment.read_text 看 attachment.total_chars/text_complete）。"
 }
 
 func (t *toolResultRead) Parameters() json.RawMessage {

@@ -299,6 +299,35 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	}
 }
 
+// TestHostPromptsExplainAttachmentTextCompleteness pins the prompt half of
+// R2-C-03: both conversation Hosts must page large attachments to
+// text_complete, report how much they actually read, and never present unread
+// pages as extraction loss.
+func TestHostPromptsExplainAttachmentTextCompleteness(t *testing.T) {
+	want := map[string][]string{
+		agentapp.ProfileKeyClarificationHost: {
+			"text_complete", "next_offset", "total_chars",
+			"不得把未读页当作附件解析缺失", "不得据此建议重新解析",
+			"image_offset=next_image_offset",
+		},
+		agentapp.ProfileKeyDesignHost: {
+			"text_complete", "next_offset",
+			"不得断言附件缺失", "建议重新解析",
+		},
+	}
+	for key, phrases := range want {
+		profile, ok := agentapp.Profile(key)
+		if !ok {
+			t.Fatalf("missing profile %q", key)
+		}
+		for _, phrase := range phrases {
+			if !strings.Contains(profile.SystemPrompt, phrase) {
+				t.Fatalf("profile %q prompt lacks %q: %s", key, phrase, profile.SystemPrompt)
+			}
+		}
+	}
+}
+
 // TestHostPromptsExplainPlatformCaptions pins C-01's prompt half: both
 // conversation Hosts must know the platform generates image captions, read
 // images[].caption first, and never claim the platform has no vision when a

@@ -105,13 +105,14 @@ func (f *fakeStorage) Upload(ctx context.Context, filename, mime string, r io.Re
 }
 
 type fakeAttachments struct {
-	extractFn   func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
-	getInfoFn   func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
-	listFn      func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
-	readTextFn  func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
-	imageRefFn  func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
-	readImageFn func(ctx context.Context, dataRef string) (string, []byte, error)
-	pendingFn   func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
+	extractFn         func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
+	getInfoFn         func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
+	listFn            func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
+	readTextFn        func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
+	imageRefFn        func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
+	imageRefByImageFn func(ctx context.Context, versionID, conversationID, imageID int64) (versionapp.AttachmentImageRef, error)
+	readImageFn       func(ctx context.Context, dataRef string) (string, []byte, error)
+	pendingFn         func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
 }
 
 func (f *fakeAttachments) Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
@@ -132,6 +133,13 @@ func (f *fakeAttachments) ReadAttachmentText(ctx context.Context, versionID, con
 
 func (f *fakeAttachments) AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
 	return f.imageRefFn(ctx, versionID, conversationID, attachmentID)
+}
+
+func (f *fakeAttachments) AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (versionapp.AttachmentImageRef, error) {
+	if f.imageRefByImageFn == nil {
+		return versionapp.AttachmentImageRef{}, platform.NotFound("attachment image")
+	}
+	return f.imageRefByImageFn(ctx, versionID, conversationID, imageID)
 }
 
 func (f *fakeAttachments) ReadImage(ctx context.Context, dataRef string) (string, []byte, error) {
@@ -619,11 +627,17 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 			return versionapp.AttachmentTextRead{
 				AttachmentID: attachmentID, Name: "spec.md", MIME: "text/markdown", Status: "done",
 				Offset: offset, Text: "page", TotalChars: 10, Truncated: true,
-				Images: []versionapp.AttachmentImageInfo{{
-					ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
-					Status: "done", Caption: "登录界面截图",
-				}},
-				ImageCount: 2, ImagesTruncated: true,
+				Images: []versionapp.AttachmentImageInfo{
+					{
+						ID: 901, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
+						Status: "done", Caption: "登录界面截图",
+					},
+					{
+						ID: 902, Seq: 2, SHA256: strings.Repeat("d", 64), MIME: "image/png", Width: 10, Height: 4,
+						Status: "done", Caption: "提交成功截图",
+					},
+				},
+				ImageCount: 2,
 			}, nil
 		},
 		imageRefFn: func(_ context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
@@ -634,6 +648,15 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 					Status: "done", Caption: "登录界面截图",
 				}},
 				Note: "独立图片附件没有平台生成的 caption 行",
+			}, nil
+		},
+		imageRefByImageFn: func(_ context.Context, versionID, conversationID, imageID int64) (versionapp.AttachmentImageRef, error) {
+			return versionapp.AttachmentImageRef{
+				AttachmentID: 9, SHA256: sha, Name: "login.png", MIME: "image/png", Size: 5,
+				Images: []versionapp.AttachmentImageInfo{{
+					ID: imageID, Seq: 1, SHA256: sha, MIME: "image/png", Width: 8, Height: 6,
+					Status: "done", Caption: "登录界面截图",
+				}},
 			}, nil
 		},
 		readImageFn: func(_ context.Context, dataRef string) (string, []byte, error) {
@@ -663,15 +686,18 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	if text.Text != "page" || text.TotalChars != 10 || !text.Truncated || text.Name != "spec.md" {
 		t.Fatalf("text = %#v", text)
 	}
-	if len(text.Images) != 1 {
-		t.Fatalf("text images = %#v, want the persisted caption", text.Images)
+	if len(text.Images) != 2 {
+		t.Fatalf("text images = %#v, want both persisted captions", text.Images)
 	}
 	if text.Images[0].Caption != "登录界面截图" || text.Images[0].Status != "done" ||
 		text.Images[0].SHA256 != sha || text.Images[0].Seq != 1 {
 		t.Fatalf("text image = %#v", text.Images[0])
 	}
-	if text.ImageCount != 2 || !text.ImagesTruncated {
-		t.Fatalf("text image budget = %d/%v, want 2/true", text.ImageCount, text.ImagesTruncated)
+	if text.Images[1].ID != 902 || text.Images[1].Caption != "提交成功截图" || text.Images[1].Seq != 2 {
+		t.Fatalf("second text image = %#v", text.Images[1])
+	}
+	if text.ImageCount != 2 {
+		t.Fatalf("text image count = %d, want 2", text.ImageCount)
 	}
 
 	image, err := adapter.AttachmentImageRef(ctx, 10, 20, 9)
@@ -686,6 +712,18 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	}
 	if image.Note != "独立图片附件没有平台生成的 caption 行" {
 		t.Fatalf("image ref note = %q", image.Note)
+	}
+
+	imageByImage, err := adapter.AttachmentImageRefByImage(ctx, 10, 20, 901)
+	if err != nil {
+		t.Fatalf("AttachmentImageRefByImage: %v", err)
+	}
+	if imageByImage.AttachmentID != 9 || imageByImage.URL != "/api/content/"+sha {
+		t.Fatalf("image by image = %#v", imageByImage)
+	}
+	if len(imageByImage.Images) != 1 || imageByImage.Images[0].ID != 901 ||
+		imageByImage.Images[0].Caption != "登录界面截图" {
+		t.Fatalf("image by image rows = %#v", imageByImage.Images)
 	}
 
 	loaded, err := adapter.LoadImage(ctx, sha)

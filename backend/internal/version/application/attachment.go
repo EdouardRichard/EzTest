@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -1090,16 +1089,6 @@ func attachmentImageInfo(image AttachmentImageView) AttachmentImageInfo {
 const (
 	DefaultAttachmentReadChars = 4000
 	MaxAttachmentReadChars     = 20000
-	// MaxAttachmentReadImages bounds how many persisted image rows
-	// attachment.read_text returns on its first page. An attachment can carry
-	// vision.max_images_per_attachment rows (50 by default), and returning all
-	// of them on every page would silently grow the Host context.
-	MaxAttachmentReadImages = 20
-	// MaxAttachmentReadImageCaptionChars bounds the total caption characters of
-	// images[] on the first read page. Captions are the only free-form part of
-	// the image payload; the other fields are short metadata. When the cap is
-	// reached the payload is truncated and ImagesTruncated is set.
-	MaxAttachmentReadImageCaptionChars = 4000
 )
 
 // AttachmentInfo is the agent-facing attachment view used by the ingest run.
@@ -1161,16 +1150,13 @@ type AttachmentTextRead struct {
 	// Images carries the persisted image rows with their platform-generated
 	// captions. It lets attachment.read_text expose the analysis even when the
 	// attachment text itself is empty (scanned/image-only documents). It is only
-	// populated on the first page (offset == 0) and is bounded by
-	// MaxAttachmentReadImages / MaxAttachmentReadImageCaptionChars so paging the
-	// text never repeats or unbounds the image payload.
+	// populated on the first page (offset == 0) and holds every persisted row:
+	// caption budgeting/pagination is the agent tools layer's responsibility
+	// (R2-C-01), so the version layer never truncates a caption.
 	Images []AttachmentImageInfo
 	// ImageCount is the total number of persisted image rows of the attachment.
 	// It is returned on every page so a later page still says images exist.
 	ImageCount int
-	// ImagesTruncated reports that Images holds only a bounded prefix of the
-	// persisted rows/captions (the caps above were hit).
-	ImagesTruncated bool
 }
 
 // AttachmentMeta is the compact attachment list entry for agent tools.
@@ -1392,46 +1378,12 @@ func (s *AttachmentService) ReadAttachmentText(ctx context.Context, versionID, c
 		return AttachmentTextRead{}, err
 	}
 	result.ImageCount = len(images)
-	result.Images, result.ImagesTruncated = attachmentReadImages(images, offset)
+	if offset == 0 {
+		// The full image projection is returned; the agent tools layer pages the
+		// captions (R2-C-01) so a 12-image document is never silently cut to 10.
+		result.Images = attachmentImageInfos(images)
+	}
 	return result, nil
-}
-
-// attachmentReadImages projects the persisted image rows into the read_text
-// payload. Only the first page (offset == 0) carries images: repeating them on
-// every page would silently grow the Host context, and a caption payload is not
-// part of the paged text. The payload is bounded by MaxAttachmentReadImages and
-// MaxAttachmentReadImageCaptionChars; the bool reports that a cap was hit.
-func attachmentReadImages(views []AttachmentImageView, offset int) ([]AttachmentImageInfo, bool) {
-	if offset != 0 {
-		return nil, false
-	}
-	remaining := MaxAttachmentReadImageCaptionChars
-	infos := make([]AttachmentImageInfo, 0, len(views))
-	for index, image := range views {
-		if index >= MaxAttachmentReadImages {
-			return infos, true
-		}
-		caption := image.Caption
-		captionChars := utf8.RuneCountInString(caption)
-		if captionChars > remaining {
-			if remaining <= 0 {
-				return infos, true
-			}
-			caption = string([]rune(caption)[:remaining])
-			captionChars = remaining
-			infos = append(infos, attachmentImageInfoWithCaption(image, caption))
-			return infos, true
-		}
-		remaining -= captionChars
-		infos = append(infos, attachmentImageInfoWithCaption(image, caption))
-	}
-	return infos, false
-}
-
-func attachmentImageInfoWithCaption(image AttachmentImageView, caption string) AttachmentImageInfo {
-	info := attachmentImageInfo(image)
-	info.Caption = caption
-	return info
 }
 
 // AttachmentParsingMessage is the explicit "still parsing, retry later" result
@@ -1464,6 +1416,46 @@ func (s *AttachmentService) AttachmentImageRef(ctx context.Context, versionID, c
 	if err != nil {
 		return AttachmentImageRef{}, err
 	}
+	return s.attachmentImageRefFor(ctx, attachment)
+}
+
+// AttachmentImageRefByImage resolves one attachment_image row (the image_id
+// exposed by attachment.read_text images[]) inside the conversation and returns
+// the image reference of its parent attachment. The scan is bounded to
+// ListByConversation, so an image id owned by another conversation of the same
+// version is not_found exactly like an unknown id. No repository/SQL change is
+// needed: a conversation has few attachments and the image rows are already
+// loaded per attachment (R2-C-02).
+func (s *AttachmentService) AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (AttachmentImageRef, error) {
+	if versionID <= 0 || conversationID <= 0 || imageID <= 0 {
+		return AttachmentImageRef{}, platform.Invalid("image_id", "must be positive decimal IDs")
+	}
+	if err := s.ensureConversation(ctx, versionID, conversationID); err != nil {
+		return AttachmentImageRef{}, err
+	}
+	attachments, err := s.repo.ListByConversation(ctx, versionID, conversationID)
+	if err != nil {
+		return AttachmentImageRef{}, mapAttachmentRepositoryError(err)
+	}
+	for _, attachment := range attachments {
+		images, err := s.repo.ListImages(ctx, attachment.ID)
+		if err != nil {
+			return AttachmentImageRef{}, mapAttachmentRepositoryError(err)
+		}
+		for _, image := range images {
+			if image.ID == imageID {
+				return s.attachmentImageRefFor(ctx, attachment)
+			}
+		}
+	}
+	return AttachmentImageRef{}, platform.NotFound("attachment image")
+}
+
+// attachmentImageRefFor builds the reference for one already-resolved
+// conversation attachment: the original content SHA plus every persisted image
+// row/caption. Both image_ref entry points (attachment id and image id) share
+// this projection so they can never disagree on the returned images[].
+func (s *AttachmentService) attachmentImageRefFor(ctx context.Context, attachment version.Attachment) (AttachmentImageRef, error) {
 	images, err := s.attachmentImageViews(ctx, attachment.ID)
 	if err != nil {
 		return AttachmentImageRef{}, err

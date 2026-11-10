@@ -69,6 +69,9 @@ type AttachmentService interface {
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
 	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
 	AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
+	// AttachmentImageRefByImage resolves the read_text images[].image_id to its
+	// parent attachment (R2-C-02).
+	AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (versionapp.AttachmentImageRef, error)
 	// ReadImage resolves an image part data_ref (content SHA-256) into the
 	// original bytes plus the sniffed MIME for the vision model.
 	ReadImage(ctx context.Context, dataRef string) (mime string, data []byte, err error)

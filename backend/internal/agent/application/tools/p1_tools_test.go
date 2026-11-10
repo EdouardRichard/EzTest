@@ -92,9 +92,11 @@ type fakeAttachmentPort struct {
 	offset   int
 	maxChars int
 
-	image    AttachmentImage
-	imageErr error
-	imageID  int64
+	image       AttachmentImage
+	imageErr    error
+	imageID     int64
+	imageByID   int64
+	imageListID int64
 }
 
 func (f *fakeAttachmentPort) ListAttachments(_ context.Context, versionID, conversationID int64) ([]AttachmentMeta, error) {
@@ -114,6 +116,12 @@ func (f *fakeAttachmentPort) ReadAttachmentText(_ context.Context, versionID, co
 
 func (f *fakeAttachmentPort) AttachmentImageRef(_ context.Context, versionID, conversationID, attachmentID int64) (AttachmentImage, error) {
 	f.imageID = attachmentID
+	return f.image, f.imageErr
+}
+
+func (f *fakeAttachmentPort) AttachmentImageRefByImage(_ context.Context, versionID, conversationID, imageID int64) (AttachmentImage, error) {
+	f.imageByID = imageID
+	f.imageListID = conversationID
 	return f.image, f.imageErr
 }
 

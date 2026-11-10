@@ -99,19 +99,18 @@ func (a *Adapter) ReadAttachmentText(ctx context.Context, versionID, conversatio
 		return tools.AttachmentText{}, err
 	}
 	return tools.AttachmentText{
-		AttachmentID:    read.AttachmentID,
-		Name:            read.Name,
-		MIME:            read.MIME,
-		Status:          read.Status,
-		Offset:          read.Offset,
-		Text:            read.Text,
-		TotalChars:      read.TotalChars,
-		Truncated:       read.Truncated,
-		Error:           read.Error,
-		Retryable:       read.Retryable,
-		Images:          attachmentImageDetails(read.Images),
-		ImageCount:      read.ImageCount,
-		ImagesTruncated: read.ImagesTruncated,
+		AttachmentID: read.AttachmentID,
+		Name:         read.Name,
+		MIME:         read.MIME,
+		Status:       read.Status,
+		Offset:       read.Offset,
+		Text:         read.Text,
+		TotalChars:   read.TotalChars,
+		Truncated:    read.Truncated,
+		Error:        read.Error,
+		Retryable:    read.Retryable,
+		Images:       attachmentImageDetails(read.Images),
+		ImageCount:   read.ImageCount,
 	}, nil
 }
 
@@ -156,6 +155,26 @@ func (a *Adapter) AttachmentImageRef(ctx context.Context, versionID, conversatio
 	if err != nil {
 		return tools.AttachmentImage{}, err
 	}
+	return attachmentImage(reference), nil
+}
+
+// AttachmentImageRefByImage implements tools.AttachmentPort for the R2-C-02
+// image-id branch: attachment.read_text images[].image_id (attachment_image.id)
+// resolves its parent attachment inside the same conversation.
+func (a *Adapter) AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (tools.AttachmentImage, error) {
+	if a.attachments == nil {
+		return tools.AttachmentImage{}, a.missing("attachments")
+	}
+	reference, err := a.attachments.AttachmentImageRefByImage(ctx, versionID, conversationID, imageID)
+	if err != nil {
+		return tools.AttachmentImage{}, err
+	}
+	return attachmentImage(reference), nil
+}
+
+// attachmentImage maps the version-side image reference onto the tool DTO shared
+// by both image_ref id kinds.
+func attachmentImage(reference versionapp.AttachmentImageRef) tools.AttachmentImage {
 	return tools.AttachmentImage{
 		AttachmentID: reference.AttachmentID,
 		SHA256:       reference.SHA256,
@@ -163,7 +182,7 @@ func (a *Adapter) AttachmentImageRef(ctx context.Context, versionID, conversatio
 		MIME:         reference.MIME,
 		Images:       attachmentImageDetails(reference.Images),
 		Note:         reference.Note,
-	}, nil
+	}
 }
 
 func attachmentError(code, text string) string {

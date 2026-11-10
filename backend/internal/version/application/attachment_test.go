@@ -813,8 +813,8 @@ func TestReadAttachmentTextReturnsImageCaptions(t *testing.T) {
 	if image.SHA256 == "" || image.MIME != "image/png" || image.Width != 8 || image.Height != 6 {
 		t.Fatalf("image metadata = %#v", image)
 	}
-	if read.ImageCount != 1 || read.ImagesTruncated {
-		t.Fatalf("image count/truncated = %d/%v, want 1/false", read.ImageCount, read.ImagesTruncated)
+	if read.ImageCount != 1 {
+		t.Fatalf("image count = %d, want 1", read.ImageCount)
 	}
 }
 
@@ -857,18 +857,21 @@ func TestReadAttachmentTextPaginatesImages(t *testing.T) {
 	}
 }
 
-// TestReadAttachmentTextBoundsImages pins the explicit image budget: at most
-// MaxAttachmentReadImages rows and MaxAttachmentReadImageCaptionChars caption
-// characters are returned on the first page, and the truncation is reported.
-func TestReadAttachmentTextBoundsImages(t *testing.T) {
+// TestReadAttachmentTextReturnsAllImageCaptions pins R2-C-01's version-layer
+// exit: the caption budget/pagination now lives in the agent tools layer, so
+// ReadAttachmentText returns every persisted image row with its complete
+// caption on the first page. A 12-image document used to stop around image 10
+// with a caption cut in half; that made images 11/12 unreachable.
+func TestReadAttachmentTextReturnsAllImageCaptions(t *testing.T) {
 	env := newAttachmentEnv(t)
 	sha := strings.Repeat("6", 64)
 	view := registerAttachment(t, env, sha, "many-images.docx", docxMIME, []byte("docx"))
-	for index := 1; index <= 25; index++ {
-		env.repo.images[int64(9000+index)] = version.AttachmentImageRecord{
-			ID: int64(9000 + index), AttachmentID: view.ID, Seq: index,
+	const imageTotal = 12
+	for index := 1; index <= imageTotal; index++ {
+		env.repo.images[int64(9100+index)] = version.AttachmentImageRecord{
+			ID: int64(9100 + index), AttachmentID: view.ID, Seq: index,
 			MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
-			Status: version.AttachmentImageDone, Caption: strings.Repeat("图", 400),
+			Status: version.AttachmentImageDone, Caption: strings.Repeat("图", 800),
 		}
 	}
 
@@ -876,21 +879,35 @@ func TestReadAttachmentTextBoundsImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAttachmentText: %v", err)
 	}
-	if read.ImageCount != 25 {
-		t.Fatalf("image_count = %d, want 25", read.ImageCount)
+	if read.ImageCount != imageTotal {
+		t.Fatalf("image_count = %d, want %d", read.ImageCount, imageTotal)
 	}
-	if !read.ImagesTruncated {
-		t.Fatalf("images_truncated = false, want the budget cap")
+	if len(read.Images) != imageTotal {
+		t.Fatalf("images = %d, want all %d captions (the version layer must not budget them)",
+			len(read.Images), imageTotal)
 	}
-	if len(read.Images) > versionapp.MaxAttachmentReadImages {
-		t.Fatalf("images = %d, want <= %d", len(read.Images), versionapp.MaxAttachmentReadImages)
+	for index, image := range read.Images {
+		if got := len([]rune(image.Caption)); got != 800 {
+			t.Fatalf("image %d caption runes = %d, want 800 (caption was truncated at the version layer)",
+				index+1, got)
+		}
 	}
-	captionChars := 0
-	for _, image := range read.Images {
-		captionChars += len([]rune(image.Caption))
+	if read.Images[0].ID != 9101 || read.Images[imageTotal-1].ID != int64(9100+imageTotal) {
+		t.Fatalf("image ids = %d..%d, want 9101..%d",
+			read.Images[0].ID, read.Images[imageTotal-1].ID, 9100+imageTotal)
 	}
-	if captionChars > versionapp.MaxAttachmentReadImageCaptionChars {
-		t.Fatalf("caption chars = %d, want <= %d", captionChars, versionapp.MaxAttachmentReadImageCaptionChars)
+
+	// Later text pages still do not repeat the image payload, but they keep
+	// reporting image_count so the Host knows images exist.
+	later, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 8000, 8000)
+	if err != nil {
+		t.Fatalf("later page: %v", err)
+	}
+	if len(later.Images) != 0 {
+		t.Fatalf("later page repeated %d image captions", len(later.Images))
+	}
+	if later.ImageCount != imageTotal {
+		t.Fatalf("later page image_count = %d, want %d", later.ImageCount, imageTotal)
 	}
 }
 
@@ -993,6 +1010,54 @@ func TestAttachmentImageRefIncludesPersistedCaption(t *testing.T) {
 	}
 	if ref.Note != "" {
 		t.Fatalf("note = %q, want empty for a document with persisted captions", ref.Note)
+	}
+}
+
+// TestAttachmentImageRefByImageResolvesParentAttachment pins R2-C-02: the image
+// id returned in attachment.read_text images[] (attachment_image.id) resolves
+// its parent attachment inside the same conversation. A foreign image id or an
+// image row reachable only through another conversation of the same version
+// stays not_found, so the image path cannot leak cross-conversation attachments.
+func TestAttachmentImageRefByImageResolvesParentAttachment(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.conversationMessages = map[int64]int64{7001: 8001}
+	env.repo.conversations = map[int64]int64{8001: env.versionID, 8002: env.versionID}
+	view := registerAttachment(t, env, strings.Repeat("a", 64), "with-image.docx", docxMIME, []byte("docx"))
+	env.repo.images[9301] = version.AttachmentImageRecord{
+		ID: 9301, AttachmentID: view.ID, Seq: 1,
+		MIME: "image/png", Width: 8, Height: 6, SourceKind: version.AttachmentImageSourceEmbedded,
+		Status: version.AttachmentImageDone, Caption: "登录界面截图",
+	}
+
+	ref, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8001, 9301)
+	if err != nil {
+		t.Fatalf("AttachmentImageRefByImage: %v", err)
+	}
+	if ref.AttachmentID != view.ID {
+		t.Fatalf("attachment id = %d, want the parent %d", ref.AttachmentID, view.ID)
+	}
+	if len(ref.Images) != 1 || ref.Images[0].ID != 9301 || ref.Images[0].Caption != "登录界面截图" {
+		t.Fatalf("images = %#v, want the persisted parent row/caption", ref.Images)
+	}
+	if ref.Images[0].Seq != 1 || ref.Images[0].Status != version.AttachmentImageDone {
+		t.Fatalf("image metadata = %#v", ref.Images[0])
+	}
+	if ref.Name != "with-image.docx" || ref.MIME != docxMIME {
+		t.Fatalf("metadata = %#v, want the parent attachment metadata", ref)
+	}
+
+	// Unknown image id: not_found, never an empty success.
+	if _, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8001, 999999); err == nil {
+		t.Fatal("unknown image id returned a reference")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("unknown image status = %d, want 404", apiError(t, err).Status)
+	}
+	// An image id owned by another conversation of the same version must stay
+	// invisible: the scan runs over ListByConversation only.
+	if _, err := env.svc.AttachmentImageRefByImage(requestContext(), env.versionID, 8002, 9301); err == nil {
+		t.Fatal("cross-conversation image id returned a reference")
+	} else if apiError(t, err).Status != http.StatusNotFound {
+		t.Fatalf("cross-conversation image status = %d, want 404", apiError(t, err).Status)
 	}
 }
 
