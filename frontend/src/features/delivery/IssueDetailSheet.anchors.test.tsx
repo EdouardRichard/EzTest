@@ -28,7 +28,7 @@ const issue: IssueDetailView = {
   merged_into_id: null,
   merged_at: null,
   reopen_count: 0,
-  refs: [{ kind: "case_run", ref_id: "9302", version_sut_id: "3001", role: "source" }],
+  refs: [{ kind: "case_run", ref_id: "9302", sut_id: "3001", role: "source" }],
   triage: null,
   created_at: "2026-11-01T02:00:00Z",
   updated_at: "2026-11-01T03:00:00Z",

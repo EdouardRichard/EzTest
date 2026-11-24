@@ -70,7 +70,7 @@ function zeroWaveCounts(): WaveCounts {
     interrupted: 0,
     superseded: 0,
     evidence: 0,
-    by_version_sut: {},
+    by_sut: {},
   }
 }
 
@@ -477,7 +477,7 @@ describe("ExecutionTab", () => {
       counts: {
         ...zeroWaveCounts(),
         evidence: 7,
-        by_version_sut: {
+        by_sut: {
           "1099": { total: 0, passed: 0, failed: 0, blocked: 0, inconclusive: 0 },
         },
       },
@@ -627,6 +627,38 @@ describe("ExecutionTab", () => {
     expect(blocked).toHaveTextContent("先解决阻塞条件")
   })
 
+  it("shows a capacity remedy for a context-capacity blocked run, not the generic blocker text", async () => {
+    // T11 terminates this run with terminal_cause=context_requirement_exceeds_capacity
+    // and the generic next_action=resolve_blocker. The dispatch event carrying the
+    // right remedy is suppressed (the run is already blocked), so the blocked-case
+    // banner must surface the capacity remedy, not 账号/环境/数据.
+    const runs = fiveCaseRuns().map((run) =>
+      run.id === "9303"
+        ? {
+            ...run,
+            summary: {
+              ...run.summary,
+              terminal_cause: "context_requirement_exceeds_capacity",
+              next_action: "resolve_blocker",
+              last_error:
+                "the case needs 3 executor browser context(s) but no dispatchable executor has that much capacity",
+            },
+          }
+        : run,
+    )
+    api.listCaseRuns.mockResolvedValue(runs)
+
+    render(<ExecutionTab versionId="2001" />)
+
+    const blocked = await screen.findByTestId("blocked-case-run-9303")
+    // M3: the banner reason prefers the Chinese cause label over the English
+    // last_error, and the next step is the capacity remedy, not 账号/环境/数据.
+    expect(blocked).toHaveTextContent("用例所需上下文数超过机群最大容量")
+    expect(blocked).toHaveTextContent("提高执行器容量（max_contexts）")
+    expect(blocked).not.toHaveTextContent("先解决阻塞条件")
+    expect(blocked).not.toHaveTextContent("the case needs 3 executor")
+  })
+
   it("keeps the login takeover as the single blocked surface for its case run", async () => {
     // The blocked case 9303 already owns an open login-takeover request; the
     // takeover banner is the actionable surface and the generic blocked banner
@@ -765,9 +797,23 @@ describe("ExecutionTab", () => {
 
     const settings = await screen.findByTestId("execution-settings")
     expect(settings).toHaveTextContent("人工请求 TTL 30 分钟")
-    expect(settings).toHaveTextContent("全局 3")
-    expect(settings).toHaveTextContent("每 SUT 2")
+    // v0.2.4-F design P5: a single global limit; the per-SUT/cross-system
+    // dimensions are retired and must not render.
+    expect(settings).toHaveTextContent("全局并发 3")
+    expect(settings).not.toHaveTextContent("每 SUT")
+    expect(settings).not.toHaveTextContent("跨系统")
     expect(settings).toHaveTextContent("用例超时")
+  })
+
+  it("renders the unlimited default (0) as unlimited, not as a zero limit", async () => {
+    api.getOverview.mockResolvedValue({
+      ...executionOverviewFixture,
+      quotas: { max_concurrent_case_runs: 0 },
+    } as unknown as ExecutionOverview)
+
+    render(<ExecutionTab versionId="2001" />)
+
+    expect(await screen.findByTestId("execution-settings")).toHaveTextContent("全局并发不限")
   })
 
   it("renders when the execution settings are missing", async () => {

@@ -11,6 +11,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// analysisActiveStatuses is the single active-analysis status set, bound as a
+// query parameter so the SQL can never drift from the domain authority
+// (constitution 五.1; R-H10/T11e-3).
+func analysisActiveStatuses() []string {
+	return []string{string(codeintel.AnalysisQueued), string(codeintel.AnalysisRunning)}
+}
+
 // AnalysisRepository stores code_analysis rows.
 type AnalysisRepository struct {
 	pool *pgxpool.Pool
@@ -117,10 +124,10 @@ func (r *AnalysisRepository) Update(ctx context.Context, analysis codeintel.Anal
 func (r *AnalysisRepository) Active(ctx context.Context, versionID, repoID int64) (codeintel.Analysis, bool, error) {
 	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `
 		SELECT `+analysisColumns+` FROM code_analysis
-		WHERE version_id = $1 AND repo_id = $2 AND status IN ('queued', 'running')
+		WHERE version_id = $1 AND repo_id = $2 AND status = ANY($3)
 		ORDER BY id DESC
 		LIMIT 1
-	`, versionID, repoID))
+	`, versionID, repoID, analysisActiveStatuses()))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return codeintel.Analysis{}, false, nil
@@ -135,10 +142,10 @@ func (r *AnalysisRepository) DoneByRange(ctx context.Context, versionID, repoID 
 	analysis, err := scanAnalysis(r.pool.QueryRow(ctx, `
 		SELECT `+analysisColumns+` FROM code_analysis
 		WHERE version_id = $1 AND repo_id = $2 AND base_commit_sha = $3 AND head_commit_sha = $4
-		  AND status = 'done'
+		  AND status = $5
 		ORDER BY id DESC
 		LIMIT 1
-	`, versionID, repoID, base, head))
+	`, versionID, repoID, base, head, string(codeintel.AnalysisDone)))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return codeintel.Analysis{}, false, nil

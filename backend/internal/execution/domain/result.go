@@ -37,17 +37,17 @@ func (s StepStatus) Terminal() bool {
 // StepResult is one persisted step of a case_run. Step results are upserted by
 // (case_run_id, seq) and fenced by dispatch epoch/token.
 type StepResult struct {
-	ID                 int64
-	CaseRunID          int64
-	Seq                int
-	TargetVersionSUTID *int64
-	Status             StepStatus
-	Observed           map[string]any
-	Error              string
-	StartedAt          *time.Time
-	FinishedAt         *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID          int64
+	CaseRunID   int64
+	Seq         int
+	TargetSUTID *int64
+	Status      StepStatus
+	Observed    map[string]any
+	Error       string
+	StartedAt   *time.Time
+	FinishedAt  *time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // AssertionVerdict is the assertion_result.verdict enum (P3-D-07).
@@ -70,8 +70,7 @@ func (v AssertionVerdict) Valid() bool {
 	}
 }
 
-// Terminal reports whether the verdict is final. A skipped visual assertion is
-// reserved for P5 and may be re-evaluated there, so it is not terminal.
+// Terminal reports whether the verdict is final.
 func (v AssertionVerdict) Terminal() bool {
 	switch v {
 	case AssertionPassed, AssertionFailed, AssertionInconclusive:
@@ -85,27 +84,26 @@ func (v AssertionVerdict) Terminal() bool {
 // from the P2 case_assertion row; assertion_seq is derived by ascending P2
 // assertion ID (P3-D-06).
 type AssertionResult struct {
-	ID                 int64
-	CaseRunID          int64
-	StepSeq            int
-	AssertionSeq       int
-	Kind               string
-	Verdict            AssertionVerdict
-	Reason             string
-	Expected           string
-	Actual             string
-	TargetVersionSUTID *int64
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID           int64
+	CaseRunID    int64
+	StepSeq      int
+	AssertionSeq int
+	Kind         string
+	Verdict      AssertionVerdict
+	Reason       string
+	Expected     string
+	Actual       string
+	TargetSUTID  *int64
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Assertion kinds are the frozen P2 values; P3 only consumes them.
 const (
-	AssertionKindUI     = "ui"
-	AssertionKindAPI    = "api"
-	AssertionKindDB     = "db"
-	AssertionKindText   = "text"
-	AssertionKindVisual = "visual"
+	AssertionKindUI   = "ui"
+	AssertionKindAPI  = "api"
+	AssertionKindDB   = "db"
+	AssertionKindText = "text"
 )
 
 // Result text limits (spec §3.2).

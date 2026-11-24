@@ -492,11 +492,13 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
     })
   })
 
-  it("shows the discovery revision notice and refetches discovery on case.revision.auto_confirmed", async () => {
+  it("shows the rollback draft notice and refetches discovery on case.revision.auto_confirmed", async () => {
     render(<VersionDetailPage versionId="2001" />)
     await screen.findByTestId("discovery-panel")
     await waitFor(() => expect(versionApi.getDiscoveryObservations).toHaveBeenCalledTimes(1))
 
+    // R-E2r: the event's only producer is the Rollback path (a DRAFT replacement),
+    // never a discovery auto-confirm.
     act(() => {
       sse.handlers?.onDesignCaseChanged?.({
         type: "case.revision.auto_confirmed",
@@ -504,18 +506,19 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
           version_id: "2001",
           case_id: "7001",
           case_version_id: "7010",
-          trigger: "discovery_delta",
+          trigger: "rollback",
           source_observation_id: "501",
           resource_id: "2301",
-          rollback_of: "0",
+          rollback_of: "7009",
           confidence: "high",
-          actor: "system",
+          actor: "1",
         },
       })
     })
 
     expect(await screen.findByTestId("discovery-revision-notice")).toBeInTheDocument()
-    expect(screen.getByText(/自动确认/)).toBeInTheDocument()
+    expect(screen.getByText(/已回滚到替代 revision 7010/)).toBeInTheDocument()
+    expect(screen.queryByText("自动确认")).not.toBeInTheDocument()
     await waitFor(() => expect(versionApi.getDiscoveryObservations.mock.calls.length).toBe(2), {
       timeout: 2000,
     })
@@ -532,7 +535,7 @@ describe("VersionDetailPage v0.22 W0 wiring", () => {
           resource_id: "2301",
           rollback_of: "7010",
           confidence: "high",
-          actor: "system",
+          actor: "1",
         },
       })
     })

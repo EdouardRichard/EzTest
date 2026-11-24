@@ -42,7 +42,6 @@ import type {
   RequirementDetail,
   RequirementExtractionProgress,
   RequirementFilter,
-  TargetOptions,
   VersionClarificationStats,
 } from "./types"
 import { useVersionEvents } from "./useVersionEvents"
@@ -606,21 +605,6 @@ export function RequirementsTab({
     onExtractionChanged: scheduleExtractionRefresh,
   })
 
-  const targetOptions = useMemo<TargetOptions>(() => {
-    if (version === null) return { suts: [], pages: [], apis: [] }
-    const suts = new Map<string, string>()
-    const pages = new Map<string, string>()
-    const apis = new Map<string, string>()
-    for (const binding of version.bindings) {
-      suts.set(binding.sut.id, binding.sut.name)
-      for (const page of binding.pages) pages.set(page.id, page.name)
-      for (const api of binding.apis) apis.set(api.id, `${api.method} ${api.path_template}`)
-    }
-    const toOptions = (values: Map<string, string>) =>
-      [...values.entries()].map(([id, label]) => ({ id, label }))
-    return { suts: toOptions(suts), pages: toOptions(pages), apis: toOptions(apis) }
-  }, [version])
-
   // Draft cleanup only ever sees draft selections; confirmed requirements keep
   // their own (confirm/rollback) paths and the server rejects them as 409 too.
   const draftRequirements = useMemo(
@@ -1001,7 +985,6 @@ export function RequirementsTab({
 
           <RequirementSidebar
             requirements={requirements}
-            targetOptions={targetOptions}
             filter={filter}
             onFilterChange={setFilter}
             selectedIds={selectedIds}
@@ -1052,7 +1035,6 @@ export function RequirementsTab({
                     key={`${detail.id}-${detail.current_version_id}`}
                     versionId={versionId}
                     requirement={detail}
-                    targetOptions={targetOptions}
                     onUpdated={requirementUpdated}
                     onNotice={setEditorNotice}
                   />

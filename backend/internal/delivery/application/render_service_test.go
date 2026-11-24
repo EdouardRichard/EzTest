@@ -322,8 +322,9 @@ func TestRenderTaskContractIsDeterministicOps(t *testing.T) {
 	if RenderTaskType != "report.render_pdf" {
 		t.Fatalf("RenderTaskType = %q", RenderTaskType)
 	}
-	// The generic agent worker claims the five product teams only; deterministic
-	// worker tasks must live outside them so report.render_pdf is never stolen.
+	// The generic agent worker claims the four product teams only (GD-17 removed
+	// steward); deterministic worker tasks must live outside them so
+	// report.render_pdf is never stolen.
 	if RenderTaskTeam != "ops" {
 		t.Fatalf("RenderTaskTeam = %q, want ops", RenderTaskTeam)
 	}
@@ -337,8 +338,8 @@ func TestRenderJobEnsurerEnsuresPendingRevisions(t *testing.T) {
 	}
 	ensurer := NewRenderJobEnsurer(jobs, fakeRenderSettings{renderPDF: true, maxAttempts: 3})
 
-	if err := ensurer.ReconcileP7(context.Background()); err != nil {
-		t.Fatalf("ReconcileP7: %v", err)
+	if err := ensurer.ReconcileReportRenders(context.Background()); err != nil {
+		t.Fatalf("ReconcileReportRenders: %v", err)
 	}
 	if len(jobs.ensureCalls) != 2 {
 		t.Fatalf("ensure calls = %+v, want 2", jobs.ensureCalls)
@@ -361,8 +362,8 @@ func TestRenderJobEnsurerDisablesPendingWhenRenderPDFOff(t *testing.T) {
 	}
 	ensurer := NewRenderJobEnsurer(jobs, fakeRenderSettings{renderPDF: false})
 
-	if err := ensurer.ReconcileP7(context.Background()); err != nil {
-		t.Fatalf("ReconcileP7: %v", err)
+	if err := ensurer.ReconcileReportRenders(context.Background()); err != nil {
+		t.Fatalf("ReconcileReportRenders: %v", err)
 	}
 	if len(jobs.ensureCalls) != 0 {
 		t.Fatalf("render_pdf=false still ensured jobs: %+v", jobs.ensureCalls)
@@ -382,8 +383,8 @@ func TestRenderJobEnsurerSkipsExhaustedAndSettledRevisions(t *testing.T) {
 	}
 	ensurer := NewRenderJobEnsurer(jobs, fakeRenderSettings{renderPDF: true, maxAttempts: 3})
 
-	if err := ensurer.ReconcileP7(context.Background()); err != nil {
-		t.Fatalf("ReconcileP7: %v", err)
+	if err := ensurer.ReconcileReportRenders(context.Background()); err != nil {
+		t.Fatalf("ReconcileReportRenders: %v", err)
 	}
 	if len(jobs.ensureCalls) != 1 || jobs.ensureCalls[0].RevisionID != 9004 {
 		t.Fatalf("ensure calls = %+v, want only revision 9004", jobs.ensureCalls)
@@ -397,8 +398,8 @@ func TestRenderJobEnsurerDefaultsWhenSettingsUnreadable(t *testing.T) {
 	}
 	ensurer := NewRenderJobEnsurer(jobs, fakeRenderSettings{err: errors.New("settings down")})
 
-	if err := ensurer.ReconcileP7(context.Background()); err != nil {
-		t.Fatalf("ReconcileP7: %v", err)
+	if err := ensurer.ReconcileReportRenders(context.Background()); err != nil {
+		t.Fatalf("ReconcileReportRenders: %v", err)
 	}
 	if len(jobs.ensureCalls) != 1 || jobs.ensureCalls[0].MaxAttempts != 3 {
 		t.Fatalf("ensure calls = %+v, want the default max attempts 3", jobs.ensureCalls)
@@ -410,8 +411,8 @@ func TestRenderJobEnsurerPropagatesListAndEnsureErrors(t *testing.T) {
 	jobs := newFakeRenderJobs()
 	jobs.listErr = listErr
 	ensurer := NewRenderJobEnsurer(jobs, fakeRenderSettings{renderPDF: true})
-	if err := ensurer.ReconcileP7(context.Background()); !errors.Is(err, listErr) {
-		t.Fatalf("ReconcileP7 list error = %v, want %v", err, listErr)
+	if err := ensurer.ReconcileReportRenders(context.Background()); !errors.Is(err, listErr) {
+		t.Fatalf("ReconcileReportRenders list error = %v, want %v", err, listErr)
 	}
 
 	ensureErr := errors.New("ensure failed")
@@ -422,8 +423,8 @@ func TestRenderJobEnsurerPropagatesListAndEnsureErrors(t *testing.T) {
 	}
 	jobs.ensureErr = ensureErr
 	ensurer = NewRenderJobEnsurer(jobs, fakeRenderSettings{renderPDF: true})
-	if err := ensurer.ReconcileP7(context.Background()); !errors.Is(err, ensureErr) {
-		t.Fatalf("ReconcileP7 ensure error = %v, want %v", err, ensureErr)
+	if err := ensurer.ReconcileReportRenders(context.Background()); !errors.Is(err, ensureErr) {
+		t.Fatalf("ReconcileReportRenders ensure error = %v, want %v", err, ensureErr)
 	}
 }
 

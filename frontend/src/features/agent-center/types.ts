@@ -1,12 +1,12 @@
 import type { BadgeTone } from "@/components/ui/Badge"
 
 /**
- * Wire types for the P6 Agent center.
+ * Wire types for the Agent center.
  *
- * Names/fields are pinned by the frozen P6 OpenAPI contract
- * (`docs/version-V0.2/contracts/openapi.yaml`): IDs are decimal strings,
- * timestamps RFC3339 UTC. The read models never carry a transcript, and only
- * the admin profile/prompt endpoints return the prompt body.
+ * IDs are decimal strings, timestamps RFC3339 UTC. The metadata read models
+ * (catalog/runs/quality) never carry a transcript; only the admin profile
+ * endpoints return the prompt body, and only the admin run-transcript endpoint
+ * and the run:{id} event channel carry the transcript types below.
  */
 
 /* --------------------------------- catalog -------------------------------- */
@@ -73,6 +73,58 @@ export type AgentRunView = {
   usage: Record<string, number>
   started_at: string | null
   finished_at: string | null
+}
+
+/* -------------------------------- transcript ------------------------------- */
+
+/**
+ * Admin-only run transcript wire types. They mirror the Go authority verbatim
+ * (`agentapp.TranscriptMessage` / `agentapp.TranscriptDelta` json tags in
+ * backend/internal/agent/application/transcript_stream.go): the snapshot
+ * endpoint and the delta's full-snapshot mode share the ONE row type.
+ */
+export type TranscriptMessagePart = {
+  type: string
+  text?: string
+}
+
+export type TranscriptToolCall = {
+  id: string
+  name: string
+  arguments: string
+}
+
+export type TranscriptStreamState = "streaming" | "complete" | "interrupted"
+
+export type TranscriptMessage = {
+  id: string
+  run_id?: string
+  conversation_id?: string
+  role: string
+  parts: TranscriptMessagePart[]
+  tool_calls: TranscriptToolCall[]
+  tool_call_id?: string
+  usage: Record<string, number>
+  stream_state: TranscriptStreamState
+  created_at: string
+}
+
+/**
+ * The `agent.transcript.delta` payload. Exactly one of two mutually exclusive
+ * modes is present: append (non-empty `increment`, 1-based part `seq`,
+ * `offset` = accumulated UTF-16 code units before the suffix, 0 omitted) or
+ * snapshot (`message` = the full row, wholesale replace). A terminal
+ * `stream_state` means the row is frozen and no further frame will arrive.
+ */
+export type TranscriptDelta = {
+  run_id: string
+  message_id: string
+  stream_state: TranscriptStreamState
+  seq?: number
+  part_type?: string
+  offset?: number
+  increment?: string
+  message?: TranscriptMessage
 }
 
 /* --------------------------------- quality -------------------------------- */
@@ -169,6 +221,19 @@ export const AGENT_RUN_STATUS_TONE: Record<AgentRunStatus, BadgeTone> = {
   failed: "danger",
   aborted: "warning",
   interrupted: "warning",
+}
+
+export const TRANSCRIPT_STREAM_STATE_LABEL: Record<TranscriptStreamState, string> = {
+  streaming: "生成中",
+  complete: "完成",
+  interrupted: "中断",
+}
+
+export const TRANSCRIPT_ROLE_LABEL: Record<string, string> = {
+  system: "系统",
+  user: "用户",
+  assistant: "助手",
+  tool: "工具",
 }
 
 export const EVAL_STATUS_LABEL: Record<EvalSummary["status"], string> = {

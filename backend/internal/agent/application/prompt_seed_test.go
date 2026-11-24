@@ -93,7 +93,7 @@ func TestEnsurePromptRevisionsWithoutRepository(t *testing.T) {
 func TestDefaultPromptMatchesSeedProfiles(t *testing.T) {
 	seeds := agentapp.ProfileSeeds()
 	if len(seeds) != 11 {
-		t.Fatalf("ProfileSeeds = %d, want 11", len(seeds))
+		t.Fatalf("ProfileSeeds = %d, want 11 (GD-17 removed version_steward)", len(seeds))
 	}
 	for _, profile := range seeds {
 		got, ok := agentapp.DefaultPrompt(profile.Key)

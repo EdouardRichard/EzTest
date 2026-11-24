@@ -39,11 +39,6 @@ const STATUS_TONE: Record<JobStatus, BadgeTone> = {
 }
 
 const KIND_LABEL: Partial<Record<JobKind, string>> = {
-  "explore.login": "探索登录",
-  "explore.page": "探索页面",
-  "explore.api": "探索接口",
-  "explore.coverage": "覆盖分析",
-  "explore.gap": "探索缺口",
   "design.cases": "设计用例",
   "review.cases": "评审用例",
   "execute.batch": "批量执行",

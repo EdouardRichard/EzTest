@@ -10,8 +10,22 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orderedMigrations: %v", err)
 	}
-	if len(migrations) != 65 {
-		t.Fatalf("len = %d, want 65", len(migrations))
+	// The count is derived from order.txt (non-comment, non-empty lines) so
+	// appended migrations do not need to touch this test.
+	wantCount := 0
+	orderRaw, err := migrationsFS.ReadFile(orderFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", orderFile, err)
+	}
+	for _, line := range strings.Split(string(orderRaw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		wantCount++
+	}
+	if len(migrations) != wantCount {
+		t.Fatalf("len = %d, want %d (derived from order.txt)", len(migrations), wantCount)
 	}
 	for _, item := range migrations {
 		if !strings.HasSuffix(item.Name, ".sql") {
@@ -69,6 +83,33 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 		"design_0003_v022_case_rollback_trigger.sql",
 		"quality_0002_v022_eval_scope.sql",
 		"agent_0009_profile_seed_version.sql",
+		"visual_0002_v024_drop_visual.sql",
+		"resource_0004_v024_hierarchy_inversion.sql",
+		"version_0015_v024_environment_binding.sql",
+		"version_0016_v024_environment_not_null.sql",
+		"delivery_0003_v024_rekey.sql",
+		"version_0017_v024_requirement_contract.sql",
+		"design_0004_v024_case_contract.sql",
+		"execution_0008_v024_rekey.sql",
+		"resource_0005_v024_sut_registration.sql",
+		"execution_0009_v024_evidence_kinds.sql",
+		"execution_0010_v024_executor_sessions.sql",
+		"agent_0010_v024_skills.sql",
+		"agent_0011_v024_skill_usage.sql",
+		"version_0018_v024_stream_state.sql",
+		"agent_0012_v024_stream_state.sql",
+		"agent_0013_v024_activity_seq.sql",
+		"design_0005_v024_judgment.sql",
+		"execution_0011_v024_f_sut_resolution.sql",
+		"execution_0012_v024_f_asset_registration.sql",
+		"execution_0013_v024_f_session_fixture.sql",
+		"execution_0014_v024_f_code_baseline_immutability.sql",
+		"execution_0015_v024_f_sut_resolution_ambiguous.sql",
+		"execution_0016_v024_f_sut_context_fixture.sql",
+		"delivery_0006_v024_g_issue_structured.sql",
+		"version_0019_v024_g_waiver.sql",
+		"delivery_0007_v024_g_display_fingerprint.sql",
+		"execution_0017_v024_h_drop_human_other.sql",
 	}
 	tail := migrations[len(migrations)-len(wantTail):]
 	for i, want := range wantTail {

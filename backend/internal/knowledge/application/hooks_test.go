@@ -99,6 +99,17 @@ func assertSecretRejected(t *testing.T, label string, err error) {
 	}
 }
 
+// autoApproveFixture returns a fixture with knowledge.review_required=false, the
+// precondition under which a low-risk success draft is auto-approved. The
+// default fixture leaves the toggle unset, which reviewRequired treats as review
+// required (fail closed), so the auto-approval path must opt in explicitly.
+func autoApproveFixture(t *testing.T) *fixture {
+	t.Helper()
+	f := newFixture(t)
+	f.settings.bools[knowledgeapp.SettingReviewRequired] = false
+	return f
+}
+
 // draftKindItem seeds a low-risk draft in the repository so AutoApprove can be
 // exercised without depending on the success-hook path.
 func draftKindItem(id int64, kind knowledgeapp.Kind) knowledge.Item {
@@ -116,7 +127,7 @@ func draftKindItem(id int64, kind knowledgeapp.Kind) knowledge.Item {
 // integration: the success pipeline persists a draft and then auto-approves it
 // (low-risk kind) with the dedicated audit action.
 func TestLoginSuccessCreatesDraftAndAutoApproves(t *testing.T) {
-	f := newFixture(t)
+	f := autoApproveFixture(t)
 	item, err := f.svc.OnLoginSuccess(context.Background(), testSuccessFact())
 	if err != nil {
 		t.Fatalf("OnLoginSuccess: %v", err)
@@ -194,7 +205,7 @@ func TestLoginSuccessCreatesDraftAndAutoApproves(t *testing.T) {
 // fail when the automatic promotion does: the draft is persisted and returned,
 // and only the review gate is left to promote it later.
 func TestLoginSuccessAutoApprovalIsBestEffort(t *testing.T) {
-	f := newFixture(t)
+	f := autoApproveFixture(t)
 	f.repo.statusErr = errors.New("knowledge store down")
 	item, err := f.svc.OnLoginSuccess(context.Background(), testSuccessFact())
 	if err != nil {
@@ -215,7 +226,7 @@ func TestLoginSuccessAutoApprovalIsBestEffort(t *testing.T) {
 }
 
 func TestPageLocatedCreatesDraftAndAutoApproves(t *testing.T) {
-	f := newFixture(t)
+	f := autoApproveFixture(t)
 	item, err := f.svc.OnPageLocated(context.Background(), knowledgeapp.SuccessFact{
 		VersionID:   10,
 		SystemKey:   "mozhan",
@@ -251,7 +262,7 @@ func TestPageLocatedCreatesDraftAndAutoApproves(t *testing.T) {
 }
 
 func TestAPIAuthSuccessCreatesDraftAndAutoApproves(t *testing.T) {
-	f := newFixture(t)
+	f := autoApproveFixture(t)
 	item, err := f.svc.OnAPIAuthSuccess(context.Background(), knowledgeapp.SuccessFact{
 		VersionID:   10,
 		SystemKey:   "mozhan",
@@ -298,7 +309,7 @@ func TestAutoApproveLowRisk(t *testing.T) {
 		knowledgeapp.KindLoginRecipe, knowledgeapp.KindPageLocator, knowledgeapp.KindAPIAuth,
 	} {
 		t.Run(string(kind), func(t *testing.T) {
-			f := newFixture(t)
+			f := autoApproveFixture(t)
 			item := draftKindItem(42, kind)
 			f.repo.items[42] = item
 			if !f.svc.AutoApprove(context.Background(), item) {
@@ -373,6 +384,69 @@ func TestAutoApproveLowRisk(t *testing.T) {
 		f.repo.items[42] = item
 		if f.svc.AutoApprove(context.Background(), item) {
 			t.Fatal("AutoApprove re-approved an already approved item")
+		}
+	})
+}
+
+// TestAutoApproveRespectsReviewRequired proves the human-judgment gate
+// (knowledge.review_required, constitution 一.3): execution-sedimented low-risk
+// knowledge is auto-approved only when review is not required. When review is
+// required the draft is left for an admin to review, with no promotion write.
+func TestAutoApproveRespectsReviewRequired(t *testing.T) {
+	t.Run("review required leaves draft", func(t *testing.T) {
+		f := newFixture(t)
+		f.settings.bools[knowledgeapp.SettingReviewRequired] = true
+		item := draftKindItem(42, knowledgeapp.KindLoginRecipe)
+		f.repo.items[42] = item
+		if f.svc.AutoApprove(context.Background(), item) {
+			t.Fatal("AutoApprove promoted a low-risk draft while review_required=true")
+		}
+		if f.repo.statusItem.ID != 0 {
+			t.Fatalf("review-gated auto approval wrote a status transition: %+v", f.repo.statusItem)
+		}
+		if _, ok := findAudit(f.audit.calls, knowledgeapp.ActionAutoApproved); ok {
+			t.Fatal("review-gated auto approval wrote knowledge.auto_approved audit")
+		}
+		if _, ok := findEvent(f.events.events, knowledgeapp.EventAutoApproved); ok {
+			t.Fatal("review-gated auto approval published knowledge.auto_approved")
+		}
+	})
+
+	t.Run("review not required approves low risk", func(t *testing.T) {
+		f := newFixture(t)
+		f.settings.bools[knowledgeapp.SettingReviewRequired] = false
+		item := draftKindItem(42, knowledgeapp.KindLoginRecipe)
+		f.repo.items[42] = item
+		if !f.svc.AutoApprove(context.Background(), item) {
+			t.Fatal("AutoApprove did not promote a low-risk draft while review_required=false")
+		}
+		if f.repo.statusItem.ID != item.ID || f.repo.statusItem.Status != knowledge.StatusApproved ||
+			f.repo.statusFrom != knowledge.StatusDraft {
+			t.Fatalf("status write = %+v from %q, want approved from draft", f.repo.statusItem, f.repo.statusFrom)
+		}
+		if _, ok := findAudit(f.audit.calls, knowledgeapp.ActionAutoApproved); !ok {
+			t.Fatalf("audit = %v, want knowledge.auto_approved", f.audit.calls)
+		}
+	})
+
+	t.Run("success hook leaves draft when review required", func(t *testing.T) {
+		f := newFixture(t)
+		f.settings.bools[knowledgeapp.SettingReviewRequired] = true
+		item, err := f.svc.OnLoginSuccess(context.Background(), testSuccessFact())
+		if err != nil {
+			t.Fatalf("OnLoginSuccess: %v", err)
+		}
+		if item.Status != knowledge.StatusDraft {
+			t.Fatalf("status = %q, want draft (review_required blocks auto approval)", item.Status)
+		}
+		if f.repo.insertCalls != 1 || f.repo.insertedItem.Status != knowledge.StatusDraft {
+			t.Fatalf("insert calls = %d item = %+v, want the draft persisted", f.repo.insertCalls, f.repo.insertedItem)
+		}
+		if f.repo.statusItem.ID != 0 {
+			t.Fatalf("review-gated hook wrote a status transition: %+v", f.repo.statusItem)
+		}
+		if _, ok := findEvent(f.events.events, knowledgeapp.EventAutoApproved); ok {
+			t.Fatal("review-gated hook published knowledge.auto_approved")
 		}
 	})
 }
@@ -495,7 +569,7 @@ func TestNoSecretInKnowledge(t *testing.T) {
 	})
 
 	t.Run("allows credential placeholders", func(t *testing.T) {
-		f := newFixture(t)
+		f := autoApproveFixture(t)
 		fact := testSuccessFact()
 		fact.APIKey = "POST /api/v1/login"
 		fact.Recipe = map[string]any{"headers": map[string]any{"Authorization": "Bearer {{access_token}}"}}

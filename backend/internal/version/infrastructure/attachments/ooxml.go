@@ -501,7 +501,7 @@ func escapeMarkdownCell(cell string) string {
 // extractDOCXResult extracts the document body plus every auxiliary Word part:
 // headers/footers, footnotes/endnotes, comments and word/media images.
 func extractDOCXResult(data []byte) (versionapp.ExtractionResult, error) {
-	archive, err := openOOXML(data, "docx")
+	archive, err := openOOXML(data, string(version.AttachmentDOCX))
 	if err != nil {
 		return versionapp.ExtractionResult{}, err
 	}
@@ -844,7 +844,7 @@ func parseDrawingPart(raw []byte) (drawingPart, error) {
 }
 
 func extractPPTXResult(data []byte) (versionapp.ExtractionResult, error) {
-	archive, err := openOOXML(data, "pptx")
+	archive, err := openOOXML(data, string(version.AttachmentPPTX))
 	if err != nil {
 		return versionapp.ExtractionResult{}, err
 	}
@@ -1325,7 +1325,7 @@ func parseComments(raw []byte) ([]sheetComment, error) {
 // extractXLSXResult renders every sheet (hidden ones are marked), cached
 // formula values, comments and xl/media images.
 func extractXLSXResult(data []byte) (versionapp.ExtractionResult, error) {
-	archive, err := openOOXML(data, "xlsx")
+	archive, err := openOOXML(data, string(version.AttachmentXLSX))
 	if err != nil {
 		return versionapp.ExtractionResult{}, err
 	}

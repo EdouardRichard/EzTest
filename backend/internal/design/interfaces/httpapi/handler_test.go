@@ -279,13 +279,15 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 		Stats: designapp.GraphStatsView{Requirements: 1, Scenarios: 1, Cases: 1, Draft: 1},
 		Requirements: []designapp.RequirementGraphView{{
 			RequirementID: 3001, RequirementVersionID: 3002, Revision: 2, Title: "登录",
-			Status: "clarified", DesignStatus: "draft", TargetVersionSUTIDs: []int64{9001},
+			Status: "clarified", DesignStatus: "draft",
 			Scenarios: []designapp.ScenarioGraphView{{
 				ID: 5001, RequirementVersionID: 3002, Name: "正常登录",
-				VersionSUTIDs: []int64{9001}, Cases: []designapp.CaseCardView{{
+				Cases: []designapp.CaseCardView{{
 					CaseID: 7001, CurrentVersionID: 7002, Revision: 1, Title: "登录成功",
-					Priority: "P1", Status: "draft", DefaultVersionSUTID: int64Ptr(9001),
-					VersionSUTIDs: []int64{9001}, StepCount: 2, AssertionCount: 1,
+					Priority: "P1", Status: "draft",
+					SutDescription: "商城前台登录页与登录接口。",
+					CoveredACs:     []string{"AC-1", "AC-2"},
+					StepCount:      2, AssertionCount: 1,
 					ExecutionVerdict: "failed",
 				}},
 			}},
@@ -310,9 +312,26 @@ func TestGraphHandlerReturnsEnvelope(t *testing.T) {
 		t.Fatalf("requirement = %v", requirement)
 	}
 	scenario := requirement["scenarios"].([]any)[0].(map[string]any)
+	for _, gone := range []string{"version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := scenario[gone]; ok {
+			t.Fatalf("scenario DTO still carries the retired field %q: %v", gone, scenario)
+		}
+	}
 	card := scenario["cases"].([]any)[0].(map[string]any)
-	if card["case_id"] != "7001" || card["current_version_id"] != "7002" || card["default_version_sut_id"] != "9001" {
+	if card["case_id"] != "7001" || card["current_version_id"] != "7002" {
 		t.Fatalf("case card = %v", card)
+	}
+	if card["sut_description"] != "商城前台登录页与登录接口。" {
+		t.Fatalf("case card sut_description = %v", card["sut_description"])
+	}
+	coveredACs, ok := card["covered_acs"].([]any)
+	if !ok || len(coveredACs) != 2 || coveredACs[0] != "AC-1" || coveredACs[1] != "AC-2" {
+		t.Fatalf("case card covered_acs = %v", card["covered_acs"])
+	}
+	for _, gone := range []string{"default_version_sut_id", "version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := card[gone]; ok {
+			t.Fatalf("case card DTO still carries the retired field %q: %v", gone, card)
+		}
 	}
 	if card["execution_verdict"] != "failed" {
 		t.Fatalf("case execution_verdict = %v", card["execution_verdict"])
@@ -351,9 +370,17 @@ func TestCaseHandlerUsesVersionQuery(t *testing.T) {
 		}},
 		Selected: designapp.CaseVersionDetailView{
 			CaseVersionID: 7002, Revision: 1, Title: "登录成功", Priority: "P2", Status: "draft",
-			VersionSUTIDs: []int64{9001}, DefaultVersionSUTID: int64Ptr(9001),
-			TestData: json.RawMessage(`{}`),
-			Steps:    []designapp.CaseStepView{{Seq: 1, Action: "打开登录页", Data: json.RawMessage(`{}`)}},
+			SutDescription: "商城前台登录页与登录接口。",
+			Preconditions:  "已有可用账号",
+			CoveredACs:     []string{"AC-1"},
+			TestData:       json.RawMessage(`{}`),
+			Steps: []designapp.CaseStepView{{
+				Seq: 1, Action: "打开登录页", Expected: "显示表单",
+				TargetDescription: "登录页账号输入框", Data: json.RawMessage(`{}`),
+			}},
+			Assertions: []designapp.CaseAssertionView{{
+				ID: 11, StepSeq: 1, Kind: "db", Target: "订单行数", Expected: "1", SUTID: int64Ptr(9001),
+			}},
 		},
 		Confirmable: true,
 	}
@@ -367,12 +394,44 @@ func TestCaseHandlerUsesVersionQuery(t *testing.T) {
 		t.Fatalf("case detail = %v", data)
 	}
 	selected := data["selected"].(map[string]any)
-	if selected["case_version_id"] != "7002" || selected["default_version_sut_id"] != "9001" {
+	if selected["case_version_id"] != "7002" {
 		t.Fatalf("selected = %v", selected)
+	}
+	if selected["sut_description"] != "商城前台登录页与登录接口。" {
+		t.Fatalf("selected sut_description = %v", selected["sut_description"])
+	}
+	if selected["preconditions"] != "已有可用账号" {
+		t.Fatalf("selected preconditions = %v", selected["preconditions"])
+	}
+	selectedACs, ok := selected["covered_acs"].([]any)
+	if !ok || len(selectedACs) != 1 || selectedACs[0] != "AC-1" {
+		t.Fatalf("selected covered_acs = %v", selected["covered_acs"])
+	}
+	for _, gone := range []string{"default_version_sut_id", "version_sut_ids", "page_ids", "api_ids"} {
+		if _, found := selected[gone]; found {
+			t.Fatalf("case version DTO still carries the retired field %q: %v", gone, selected)
+		}
 	}
 	step := selected["steps"].([]any)[0].(map[string]any)
 	if step["seq"].(float64) != 1 {
 		t.Fatalf("step = %v", step)
+	}
+	if step["target_description"] != "登录页账号输入框" {
+		t.Fatalf("step target_description = %v", step["target_description"])
+	}
+	for _, gone := range []string{"target_version_sut_id", "target_page_id", "target_api_id"} {
+		if _, found := step[gone]; found {
+			t.Fatalf("step DTO still carries the retired field %q: %v", gone, step)
+		}
+	}
+	assertion := selected["assertions"].([]any)[0].(map[string]any)
+	if assertion["sut_id"] != "9001" {
+		t.Fatalf("db assertion sut_id = %v, want the renamed database_id", assertion["sut_id"])
+	}
+	for _, gone := range []string{"target_version_sut_id", "target_api_id", "database_id"} {
+		if _, found := assertion[gone]; found {
+			t.Fatalf("assertion DTO still carries the retired field %q: %v", gone, assertion)
+		}
 	}
 
 	bad := httptest.NewRecorder()

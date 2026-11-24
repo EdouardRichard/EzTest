@@ -2,8 +2,12 @@ package executionapp_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,6 +24,9 @@ type fakeIntentRepo struct {
 	mu      sync.Mutex
 	rows    map[int64]execution.ExecutionIntent
 	updates []execution.IntentStatus
+	// transitionErr injects a failure of the next Transition call, so a test can
+	// pin that a failed create+transition leaves no orphan intent behind.
+	transitionErr error
 }
 
 func newFakeIntentRepo() *fakeIntentRepo {
@@ -30,6 +37,33 @@ func (f *fakeIntentRepo) Create(_ context.Context, intent execution.ExecutionInt
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rows[intent.ID] = intent
+	return nil
+}
+
+// CreateAndTransition models the repository contract atomically: the row is
+// inserted already transitioned, or nothing is inserted at all (a failed
+// transition rolls the insert back — no orphan open intent).
+func (f *fakeIntentRepo) CreateAndTransition(_ context.Context, intent execution.ExecutionIntent, from []execution.IntentStatus, to execution.IntentStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.transitionErr != nil {
+		err := f.transitionErr
+		f.transitionErr = nil
+		return err
+	}
+	matched := len(from) == 0
+	for _, status := range from {
+		if intent.Status == status {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return execution.ErrStateConflict
+	}
+	intent.Status = to
+	f.rows[intent.ID] = intent
+	f.updates = append(f.updates, to)
 	return nil
 }
 
@@ -47,8 +81,16 @@ func (f *fakeIntentRepo) List(context.Context, int64, string, int, *int64) ([]ex
 	return nil, false, nil
 }
 
-func (f *fakeIntentRepo) ListOpen(context.Context, int64) ([]execution.ExecutionIntent, error) {
-	return nil, nil
+func (f *fakeIntentRepo) ListOpen(_ context.Context, versionID int64) ([]execution.ExecutionIntent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows := make([]execution.ExecutionIntent, 0)
+	for _, row := range f.rows {
+		if row.Status == execution.IntentOpen && (versionID <= 0 || row.VersionID == versionID) {
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
 }
 
 func (f *fakeIntentRepo) ListActive(context.Context, int64) ([]execution.ExecutionIntent, error) {
@@ -58,6 +100,11 @@ func (f *fakeIntentRepo) ListActive(context.Context, int64) ([]execution.Executi
 func (f *fakeIntentRepo) Transition(_ context.Context, id int64, from []execution.IntentStatus, to execution.IntentStatus) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.transitionErr != nil {
+		err := f.transitionErr
+		f.transitionErr = nil
+		return false, err
+	}
 	row, ok := f.rows[id]
 	if !ok {
 		return false, nil
@@ -134,6 +181,33 @@ func (f *fakeCaseRunRepo) Create(_ context.Context, caseRun execution.CaseRun) e
 	return nil
 }
 
+// CreateAndTransition models the repository contract atomically: the row is
+// inserted already transitioned, or nothing is inserted at all (a failed
+// guard/fence rolls the insert back — no orphan anchor).
+func (f *fakeCaseRunRepo) CreateAndTransition(_ context.Context, caseRun execution.CaseRun, from []execution.CaseRunStatus, to execution.CaseRunStatus, epoch int64, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	matched := len(from) == 0
+	for _, status := range from {
+		if caseRun.Status == status {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return execution.ErrStateConflict
+	}
+	if epoch != 0 && caseRun.DispatchEpoch != epoch {
+		return execution.ErrStateConflict
+	}
+	if token != "" && caseRun.DispatchToken != token {
+		return execution.ErrStateConflict
+	}
+	caseRun.Status = to
+	f.rows[caseRun.ID] = caseRun
+	return nil
+}
+
 func (f *fakeCaseRunRepo) UpdateCAS(_ context.Context, id, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -166,10 +240,44 @@ func (f *fakeCaseRunRepo) UpdateCAS(_ context.Context, id, epoch int64, token st
 func (f *fakeCaseRunRepo) Update(_ context.Context, caseRun execution.CaseRun) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.rows[caseRun.ID]; !ok {
+	stored, ok := f.rows[caseRun.ID]
+	if !ok {
 		return false, nil
 	}
+	// Mirror the production terminal-transition guard (V-0022): Update can
+	// never move a row into or out of a terminal status.
+	if caseRun.Status != stored.Status && (caseRun.Status.Terminal() || stored.Status.Terminal()) {
+		return false, execution.ErrStateConflict
+	}
 	f.rows[caseRun.ID] = caseRun
+	return true, nil
+}
+
+// ReclassifyTerminal mirrors the production guarded terminal->terminal
+// reclassification primitive (V-0022).
+func (f *fakeCaseRunRepo) ReclassifyTerminal(_ context.Context, id, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[id]
+	if !ok {
+		return false, execution.ErrNotFound
+	}
+	if !row.Status.CanReclassifyTo(row.Status) {
+		return false, nil
+	}
+	if (epoch > 0 && row.DispatchEpoch != epoch) || (token != "" && row.DispatchToken != token) {
+		return false, nil
+	}
+	priorStatus := row.Status
+	if mutate != nil {
+		if err := mutate(&row); err != nil {
+			return false, err
+		}
+	}
+	if !priorStatus.CanReclassifyTo(row.Status) {
+		return false, execution.ErrStateConflict
+	}
+	f.rows[id] = row
 	return true, nil
 }
 
@@ -220,6 +328,20 @@ func (f *fakeCaseRunRepo) ListRunningByExecutor(context.Context, int64) ([]execu
 	return nil, nil
 }
 
+// AddEvidenceDrop mirrors the production atomic increment of the evidence-drop
+// fact (no dispatch fence: a terminal capture must still be able to record one).
+func (f *fakeCaseRunRepo) AddEvidenceDrop(_ context.Context, id int64, delta int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[id]
+	if !ok {
+		return 0, execution.ErrNotFound
+	}
+	row.EvidenceDropped += delta
+	f.rows[id] = row
+	return row.EvidenceDropped, nil
+}
+
 // LatestByCaseVersions mirrors the production "newest non-superseded run per
 // case version" projection (the coverage reader feeds on it).
 func (f *fakeCaseRunRepo) LatestByCaseVersions(_ context.Context, _ int64, caseVersionIDs []int64) (map[int64]execution.CaseRun, error) {
@@ -257,6 +379,8 @@ func (f *fakeCaseRunRepo) get(t interface{ Fatalf(string, ...any) }, id int64) e
 type fakeSUTContextRepo struct {
 	mu   sync.Mutex
 	rows map[int64]execution.CaseRunSUTContext
+	// listErr injects a ListByCaseRun failure (the terminal-drain loss path).
+	listErr error
 }
 
 func newFakeSUTContextRepo() *fakeSUTContextRepo {
@@ -267,7 +391,7 @@ func (f *fakeSUTContextRepo) Create(_ context.Context, sutContext execution.Case
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, row := range f.rows {
-		if row.CaseRunID == sutContext.CaseRunID && row.VersionSUTID == sutContext.VersionSUTID &&
+		if row.CaseRunID == sutContext.CaseRunID && row.SUTID == sutContext.SUTID &&
 			row.AccountRole == sutContext.AccountRole {
 			return execution.ErrDuplicate
 		}
@@ -279,6 +403,9 @@ func (f *fakeSUTContextRepo) Create(_ context.Context, sutContext execution.Case
 func (f *fakeSUTContextRepo) ListByCaseRun(_ context.Context, caseRunID int64) ([]execution.CaseRunSUTContext, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	rows := make([]execution.CaseRunSUTContext, 0)
 	for _, row := range f.rows {
 		if row.CaseRunID == caseRunID {
@@ -310,11 +437,11 @@ func (f *fakeSUTContextRepo) ListAll(context.Context) ([]execution.CaseRunSUTCon
 	return nil, nil
 }
 
-func (f *fakeSUTContextRepo) row(versionSUTID int64, role string) (execution.CaseRunSUTContext, bool) {
+func (f *fakeSUTContextRepo) row(sutID int64, role string) (execution.CaseRunSUTContext, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, row := range f.rows {
-		if row.VersionSUTID == versionSUTID && row.AccountRole == role {
+		if row.SUTID == sutID && row.AccountRole == role {
 			return row, true
 		}
 	}
@@ -405,6 +532,9 @@ type fakeEvidenceRepo struct {
 	refs    []execution.EvidenceRef
 	nextID  int64
 	nextRef int64
+	// countErr, when set, makes CountByCaseRun fail so a test can prove the
+	// verdict aggregation surfaces a count read failure instead of swallowing it.
+	countErr error
 }
 
 func newFakeEvidenceRepo() *fakeEvidenceRepo { return &fakeEvidenceRepo{} }
@@ -439,8 +569,37 @@ func (f *fakeEvidenceRepo) ListByCaseRun(_ context.Context, caseRunID int64, _ i
 	return rows, nil
 }
 
-func (f *fakeEvidenceRepo) ListByVersion(context.Context, int64, execution.EvidenceFilter) ([]execution.Evidence, bool, error) {
-	return nil, false, nil
+func (f *fakeEvidenceRepo) ListByVersion(_ context.Context, _ int64, filter execution.EvidenceFilter) ([]execution.Evidence, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	matching := make([]execution.Evidence, 0)
+	for _, row := range f.rows {
+		if filter.CaseRunID != nil && row.CaseRunID != *filter.CaseRunID {
+			continue
+		}
+		if filter.SUTID != nil && (row.SUTID == nil || *row.SUTID != *filter.SUTID) {
+			continue
+		}
+		if filter.Kind != "" && row.Kind != filter.Kind {
+			continue
+		}
+		if filter.BeforeID != nil && row.ID >= *filter.BeforeID {
+			continue
+		}
+		matching = append(matching, row)
+	}
+	// Descending-ID cursor pages like the real repository (the replay loader
+	// re-sorts ascending); the repo caps a page at 100.
+	sort.Slice(matching, func(i, j int) bool { return matching[i].ID > matching[j].ID })
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	hasMore := len(matching) > limit
+	if hasMore {
+		matching = matching[:limit]
+	}
+	return matching, hasMore, nil
 }
 
 func (f *fakeEvidenceRepo) InsertRef(_ context.Context, ref execution.EvidenceRef) error {
@@ -455,6 +614,9 @@ func (f *fakeEvidenceRepo) InsertRef(_ context.Context, ref execution.EvidenceRe
 func (f *fakeEvidenceRepo) CountByCaseRun(_ context.Context, caseRunID int64) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
 	count := 0
 	for _, row := range f.rows {
 		if row.CaseRunID == caseRunID {
@@ -530,6 +692,21 @@ func (f *fakeHumanRepo) ExpireQuestions(context.Context, time.Time) ([]execution
 
 // --- readers / ports -------------------------------------------------------
 
+// fakeReplayVersionReader serves the version binding the replay fingerprint
+// gate recomputes from. The default binding matches the fixture's SUT 7.
+type fakeReplayVersionReader struct {
+	binding executionapp.VersionBinding
+}
+
+func (f *fakeReplayVersionReader) Get(_ context.Context, id int64) (executionapp.VersionBinding, error) {
+	if f.binding.VersionID != id {
+		return executionapp.VersionBinding{}, execution.ErrNotFound
+	}
+	return f.binding, nil
+}
+
+func (f *fakeReplayVersionReader) Reopen(context.Context, int64) error { return nil }
+
 type fakeExecutionCaseReader struct {
 	snapshot   execution.CaseSnapshot
 	executable []execution.CaseSnapshot
@@ -564,83 +741,170 @@ func (f *fakeBindingResolver) Resolve(context.Context, int64) ([]execution.SUTBi
 	return f.bindings, f.err
 }
 
-type fakeBrowserExecutor struct {
-	mu             sync.Mutex
-	contexts       int
-	actions        []string
-	actionContexts []string
-	actionArgs     []json.RawMessage
-	lastArgs       json.RawMessage
-	contextID      string
-	actionErr      error
-	// actionErrByContext fails the action of one browser context only, so a
-	// multi-context test can prove the capture is per-context best effort.
-	actionErrByContext map[string]error
-	result             executionapp.BrowserActionResult
-	closed             int
-	canceled           int
-	lastSpec           executionapp.BrowserContextSpec
-	lastExecutorID     int64
-	createErr          error
+// fakeExecutionExecutor is the in-memory executor protocol v2 port: sessions,
+// general commands, the recording-ledger pull and the retained browser bridge.
+type fakeExecutionExecutor struct {
+	mu        sync.Mutex
+	sessions  int
+	sessionID string
+	// networkLog is the raw recorded browser-traffic payload served by NetworkLog
+	// (T16 passive CDP recording; replaces the retired bridge's network action).
+	networkLog         json.RawMessage
+	networkLogErr      error
+	networkLogCalls    int
+	networkLogSessions []string
+	networkLogTails    []int
+	// networkLogErrBySession fails the read of one session only, so a
+	// multi-session test can prove the capture is per-session best effort.
+	networkLogErrBySession map[string]error
+	closed                 int
+	canceled               int
+	lastSpec               executionapp.SessionSpec
+	lastExecutorID         int64
+	createErr              error
+	// leaseEpochs records the epoch every write carried (fencing contract).
+	leaseEpochs []int64
+	// commands records the general-execution calls.
+	commands    []executionapp.ExecCommand
+	execOutcome executionapp.ExecOutcome
+	execErr     error
+	// execErrBySession fails the command of one session only, so a test can
+	// simulate a session that vanished mid-run while later ones still work.
+	execErrBySession map[string]error
+	// createdSessions records every session id handed out, in creation order.
+	createdSessions []string
+	// artifactPages are served in order, one per Artifacts pull; the last one
+	// repeats so a settlement drain after the scripted pages sees no new items.
+	artifactPages []executionapp.ArtifactPage
+	artifactPulls []int64
+	artifactsErr  error
+	traceRef      executionapp.TraceRef
+	traceProbes   int
+	renewedEpochs []int64
+	renewErr      error
+	// shellOps/fileOps record the general-execution shell/PTY and workspace file
+	// calls (op vocabulary + argument shape + fencing epoch).
+	shellOps    []executionapp.ShellOperation
+	shellResult executionapp.ShellOutcome
+	shellErr    error
+	// shellErrBySession fails the shell op of one session only (vanished-session
+	// recovery on the shell path).
+	shellErrBySession map[string]error
+	fileOps           []executionapp.FileOperation
+	fileResult        executionapp.FileOutcome
+	fileErr           error
 }
 
-func (f *fakeBrowserExecutor) CreateContext(_ context.Context, spec executionapp.BrowserContextSpec) (string, error) {
+func (f *fakeExecutionExecutor) CreateSession(_ context.Context, spec executionapp.SessionSpec) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.createErr != nil {
 		return "", f.createErr
 	}
-	f.contexts++
+	f.sessions++
 	f.lastSpec = spec
-	if f.contextID != "" {
-		return f.contextID, nil
+	f.leaseEpochs = append(f.leaseEpochs, spec.LeaseEpoch)
+	id := f.sessionID
+	if id == "" {
+		// Sequential ids so a test can prove a dead reservation was REPLACED.
+		id = fmt.Sprintf("sess_%d", f.sessions)
 	}
-	return "ctx_1", nil
+	f.createdSessions = append(f.createdSessions, id)
+	return id, nil
 }
 
-func (f *fakeBrowserExecutor) Action(_ context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
+func (f *fakeExecutionExecutor) Exec(_ context.Context, executorID int64, sessionID string, command executionapp.ExecCommand, leaseEpoch int64) (executionapp.ExecOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lastExecutorID = executorID
-	f.actions = append(f.actions, action)
-	f.actionContexts = append(f.actionContexts, contextID)
-	f.actionArgs = append(f.actionArgs, args)
-	f.lastArgs = args
-	if err := f.actionErrByContext[contextID]; err != nil {
-		return executionapp.BrowserActionResult{}, err
+	f.commands = append(f.commands, command)
+	f.leaseEpochs = append(f.leaseEpochs, leaseEpoch)
+	outcome := f.execOutcome
+	outcome.SessionID = sessionID
+	if err := f.execErrBySession[sessionID]; err != nil {
+		return outcome, err
 	}
-	return f.result, f.actionErr
+	return outcome, f.execErr
 }
 
-// countActions counts executed actions of one kind (for example "network").
-func (f *fakeBrowserExecutor) countActions(action string) int {
+func (f *fakeExecutionExecutor) Artifacts(_ context.Context, executorID int64, _ string, since int64) (executionapp.ArtifactPage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	count := 0
-	for _, recorded := range f.actions {
-		if recorded == action {
-			count++
-		}
+	f.lastExecutorID = executorID
+	f.artifactPulls = append(f.artifactPulls, since)
+	if f.artifactsErr != nil {
+		return executionapp.ArtifactPage{}, f.artifactsErr
 	}
-	return count
+	if len(f.artifactPulls) <= len(f.artifactPages) {
+		return f.artifactPages[len(f.artifactPulls)-1], nil
+	}
+	if len(f.artifactPages) == 0 {
+		return executionapp.ArtifactPage{}, nil
+	}
+	last := f.artifactPages[len(f.artifactPages)-1]
+	return executionapp.ArtifactPage{NextCursor: last.NextCursor, BaseCursor: last.BaseCursor}, nil
 }
 
-func (f *fakeBrowserExecutor) Cancel(context.Context, int64, string) error {
+func (f *fakeExecutionExecutor) Trace(context.Context, int64, string) (executionapp.TraceRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.traceProbes++
+	return f.traceRef, nil
+}
+
+func (f *fakeExecutionExecutor) RenewLease(_ context.Context, _ int64, _ string, leaseEpoch int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewedEpochs = append(f.renewedEpochs, leaseEpoch)
+	return f.renewErr
+}
+
+func (f *fakeExecutionExecutor) Shell(_ context.Context, executorID int64, sessionID string, op executionapp.ShellOperation, leaseEpoch int64) (executionapp.ShellOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastExecutorID = executorID
+	f.shellOps = append(f.shellOps, op)
+	f.leaseEpochs = append(f.leaseEpochs, leaseEpoch)
+	if err := f.shellErrBySession[sessionID]; err != nil {
+		return executionapp.ShellOutcome{}, err
+	}
+	return f.shellResult, f.shellErr
+}
+
+func (f *fakeExecutionExecutor) Files(_ context.Context, executorID int64, _ string, op executionapp.FileOperation, leaseEpoch int64) (executionapp.FileOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastExecutorID = executorID
+	f.fileOps = append(f.fileOps, op)
+	f.leaseEpochs = append(f.leaseEpochs, leaseEpoch)
+	return f.fileResult, f.fileErr
+}
+
+func (f *fakeExecutionExecutor) NetworkLog(_ context.Context, executorID int64, sessionID string, tail int) (json.RawMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastExecutorID = executorID
+	f.networkLogCalls++
+	f.networkLogSessions = append(f.networkLogSessions, sessionID)
+	f.networkLogTails = append(f.networkLogTails, tail)
+	if err := f.networkLogErrBySession[sessionID]; err != nil {
+		return nil, err
+	}
+	return f.networkLog, f.networkLogErr
+}
+
+func (f *fakeExecutionExecutor) Cancel(context.Context, int64, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.canceled++
 	return nil
 }
 
-func (f *fakeBrowserExecutor) Close(context.Context, int64, string) error {
+func (f *fakeExecutionExecutor) Close(context.Context, int64, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closed++
 	return nil
-}
-
-func (f *fakeBrowserExecutor) ListContexts(context.Context, int64) ([]executionapp.BrowserContextRef, error) {
-	return nil, nil
 }
 
 type fakeCredentialReader struct {
@@ -648,14 +912,20 @@ type fakeCredentialReader struct {
 	database executionapp.DatabaseCredential
 	err      error
 	roles    []string
+	// sutIDs records every SUT a credential was requested for, in call order, so
+	// a test can prove WHICH SUT an explicit `sut_id` tool argument
+	// decoded to rather than inferring it from a single-binding fixture.
+	sutIDs []int64
 }
 
-func (f *fakeCredentialReader) Account(_ context.Context, _, _ int64, role string) (executionapp.AccountCredential, error) {
+func (f *fakeCredentialReader) Account(_ context.Context, _, sutID int64, role string) (executionapp.AccountCredential, error) {
 	f.roles = append(f.roles, role)
+	f.sutIDs = append(f.sutIDs, sutID)
 	return f.account, f.err
 }
 
-func (f *fakeCredentialReader) Database(context.Context, int64, int64, *int64) (executionapp.DatabaseCredential, error) {
+func (f *fakeCredentialReader) Database(_ context.Context, _, sutID int64, _ *int64) (executionapp.DatabaseCredential, error) {
+	f.sutIDs = append(f.sutIDs, sutID)
 	return f.database, f.err
 }
 
@@ -675,7 +945,10 @@ func (f *fakeContentStore) PutEvidence(_ context.Context, _ int64, _ execution.E
 	}
 	f.puts = append(f.puts, data)
 	f.nextRef++
-	return executionapp.ContentRef{ID: 7000 + f.nextRef, SHA256: "sha", SizeBytes: int64(len(data)), MIME: "text/plain"}, nil
+	// Content-addressed like the real storage producer: the ref SHA-256 is the
+	// sha256 of the stored bytes (the content_ref the model reads back).
+	sum := sha256.Sum256(data)
+	return executionapp.ContentRef{ID: 7000 + f.nextRef, SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(data)), MIME: "text/plain"}, nil
 }
 
 func (f *fakeContentStore) Open(context.Context, string) ([]byte, error) {
@@ -698,10 +971,12 @@ type fakeDatabaseQuerier struct {
 	schemaResult []executionapp.TableSchema
 	err          error
 	lastSQL      string
+	lastOpts     executionapp.DBQueryOptions
 }
 
-func (f *fakeDatabaseQuerier) Query(_ context.Context, _, _, _, sql string, _ int) (executionapp.DBQueryResult, error) {
+func (f *fakeDatabaseQuerier) Query(_ context.Context, _, _, _, sql string, opts executionapp.DBQueryOptions) (executionapp.DBQueryResult, error) {
 	f.lastSQL = sql
+	f.lastOpts = opts
 	return f.queryResult, f.err
 }
 

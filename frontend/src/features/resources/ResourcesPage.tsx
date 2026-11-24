@@ -5,12 +5,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { type TabItem, Tabs } from "@/components/ui/Tabs"
 
-import { getSut, listSuts } from "./api"
+import { getSut, listEnvironments, listSuts } from "./api"
 import { CodeRepoPanel } from "./CodeRepoPanel"
 import { DataAccessPanel } from "./DataAccessPanel"
 import { PageAPIPanel } from "./PageAPIPanel"
 import { SUTPanel } from "./SUTPanel"
-import type { ResourceScope, ResourceTab, Sut } from "./types"
+import type { ResourceScope, ResourceTab, Sut, SutEnvironment } from "./types"
 
 export const RESOURCE_TABS: TabItem[] = [
   { value: "suts", label: "SUT 与环境" },
@@ -31,13 +31,10 @@ function tabLabel(tab: ResourceTab): string {
   return RESOURCE_TABS.find((item) => item.value === tab)?.label ?? "SUT 与环境"
 }
 
-function pickEnvironmentId(detail: Sut, currentId: string): string {
-  if (detail.environments.some((environment) => environment.id === currentId)) return currentId
-  return (
-    detail.environments.find((environment) => environment.is_default)?.id ??
-    detail.environments[0]?.id ??
-    ""
-  )
+function pickEnvironmentId(detail: Sut, _currentId: string): string {
+  // v0.2.4-B: a SUT belongs to exactly one environment (NOT NULL environment_id),
+  // so the console scope derives the environment from the selected SUT.
+  return detail.environment_id
 }
 
 /** `?tab=` deep link for the resources console (spec §11.1). */
@@ -45,6 +42,7 @@ export function ResourcesPage({ initialTab }: { initialTab?: string | string[] |
   const router = useRouter()
   const [tab, setTab] = useState<ResourceTab>(() => parseResourceTab(initialTab))
   const [suts, setSuts] = useState<Sut[]>([])
+  const [environments, setEnvironments] = useState<SutEnvironment[]>([])
   const [selectedSutId, setSelectedSutId] = useState("")
   const [detail, setDetail] = useState<Sut | null>(null)
   const [selectedEnvironmentId, setSelectedEnvironmentId] = useState("")
@@ -84,6 +82,16 @@ export function ResourcesPage({ initialTab }: { initialTab?: string | string[] |
     }
   }, [])
 
+  const loadEnvironments = useCallback(async () => {
+    try {
+      setEnvironments(await listEnvironments())
+    } catch {
+      // A failed environment read leaves the selector empty; the SUT-scoped
+      // asset panels still work from the SUT aggregate.
+      setEnvironments([])
+    }
+  }, [])
+
   const loadSuts = useCallback(async (preferredSutId?: string): Promise<string> => {
     setSutsLoading(true)
     setSutsError(null)
@@ -110,17 +118,19 @@ export function ResourcesPage({ initialTab }: { initialTab?: string | string[] |
 
   useEffect(() => {
     void (async () => {
+      await loadEnvironments()
       const sutId = await loadSuts()
       await loadDetail(sutId)
     })()
-  }, [loadSuts, loadDetail])
+  }, [loadEnvironments, loadSuts, loadDetail])
 
   const refresh = useCallback(
     async (preferredSutId?: string) => {
+      await loadEnvironments()
       const sutId = await loadSuts(preferredSutId)
       await loadDetail(sutId)
     },
-    [loadSuts, loadDetail],
+    [loadEnvironments, loadSuts, loadDetail],
   )
 
   const selectSut = useCallback(
@@ -141,6 +151,7 @@ export function ResourcesPage({ initialTab }: { initialTab?: string | string[] |
   const scope = useMemo<ResourceScope>(
     () => ({
       suts,
+      environments,
       sutId: selectedSutId,
       environmentId: selectedEnvironmentId,
       detail,
@@ -151,6 +162,7 @@ export function ResourcesPage({ initialTab }: { initialTab?: string | string[] |
     }),
     [
       suts,
+      environments,
       selectedSutId,
       selectedEnvironmentId,
       detail,

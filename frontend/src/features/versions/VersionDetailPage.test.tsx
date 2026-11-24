@@ -273,6 +273,22 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("1 个目标库")
     expect(overview).toHaveTextContent("2 个测试账号")
     expect(overview).toHaveTextContent("order-center-web")
+    expect(overview).toHaveTextContent("payment-gateway")
+  })
+
+  it("shows the no-repository fallback for a SUT without a code-pool row", async () => {
+    // Drop the payment SUT's code-pool row so that SUT card hits the fallback.
+    api.getVersion.mockResolvedValue({
+      ...versionFixture,
+      binding: {
+        ...versionFixture.binding,
+        repositories: versionFixture.binding.repositories.filter((row) => row.sut_id === "1001"),
+      },
+    })
+    render(<VersionDetailPage versionId="2001" />)
+
+    const overview = await screen.findByRole("region", { name: "绑定概览" })
+    expect(overview).toHaveTextContent("order-center-web")
     expect(overview).toHaveTextContent("未绑定代码仓")
   })
 
@@ -293,12 +309,12 @@ describe("VersionDetailPage", () => {
   it("guides the user to resources when the version has no bound pages", async () => {
     api.getVersion.mockResolvedValue({
       ...versionFixture,
-      bindings: versionFixture.bindings.map((binding) => ({
-        ...binding,
+      binding: {
+        ...versionFixture.binding,
         pages: [],
         apis: [],
         databases: [],
-      })),
+      },
     })
     render(<VersionDetailPage versionId="2001" />)
 
@@ -477,7 +493,6 @@ describe("VersionDetailPage", () => {
     expect(workspace).toHaveAttribute("data-version-id", "2001")
     expect(workspace).not.toHaveAttribute("data-wave-id")
     expect(workspace).not.toHaveAttribute("data-case-run-id")
-    expect(screen.queryByText("执行将在 P3 阶段提供")).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
   })
 
@@ -514,7 +529,6 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: /^问题/ })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("issues-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
-    expect(screen.queryByText("问题将在 P4 阶段提供")).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
   })
 
@@ -536,7 +550,6 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: "报告" })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("reports-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
-    expect(screen.queryByText("报告将在 P4 阶段提供")).not.toBeInTheDocument()
   })
 
   it("keeps ?report= and ?revision= deep links when switching to the reports tab", async () => {
@@ -559,7 +572,6 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: "探索链路" })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("chain-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
-    expect(screen.queryByText("探索链路将在 P4 阶段提供")).not.toBeInTheDocument()
   })
 
   it("keeps ?node/issue/report/wave deep links when switching to the chain tab", async () => {
@@ -586,7 +598,6 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: "代码与变更" })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("code-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
-    expect(screen.queryByText("代码与变更将在 P5 阶段提供")).not.toBeInTheDocument()
     expect(navigation.replace).not.toHaveBeenCalled()
   })
 
@@ -622,7 +633,6 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: "用例设计" })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("design-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
-    expect(screen.queryByText("用例设计将在 P2 阶段提供")).not.toBeInTheDocument()
   })
 
   it("forwards the design deep links (?case= and ?conversation=) to the design tab", async () => {

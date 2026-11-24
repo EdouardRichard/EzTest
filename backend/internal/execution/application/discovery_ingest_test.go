@@ -23,24 +23,24 @@ func (f *fakeDiscoveryStore) UpsertObservations(_ context.Context, rows []execut
 	return nil
 }
 
-// fakeDiscoveryHostResolver returns the allowed hosts of one version_sut.
+// fakeDiscoveryHostResolver returns the allowed hosts of one SUT.
 type fakeDiscoveryHostResolver struct {
 	hosts map[int64]map[string]bool
 	err   error
 }
 
-func (f *fakeDiscoveryHostResolver) AllowedHosts(_ context.Context, versionSUTID int64) (map[string]bool, error) {
+func (f *fakeDiscoveryHostResolver) AllowedHosts(_ context.Context, sutID int64) (map[string]bool, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.hosts[versionSUTID], nil
+	return f.hosts[sutID], nil
 }
 
 func newDiscoveryIngest(store executionapp.DiscoveryObservationStore, hosts executionapp.SUTHostResolver) *executionapp.DiscoveryIngest {
 	return executionapp.NewDiscoveryIngest(executionapp.DiscoveryIngestDeps{Store: store, Hosts: hosts})
 }
 
-// TestDiscoveryIngestDedupesAndNormalizes: two requests of the same version_sut
+// TestDiscoveryIngestDedupesAndNormalizes: two requests of the same SUT
 // collapse into one observation whose occurrences count, and the stored api
 // template is the path template (method lives in its own column).
 func TestDiscoveryIngestDedupesAndNormalizes(t *testing.T) {
@@ -49,11 +49,11 @@ func TestDiscoveryIngestDedupesAndNormalizes(t *testing.T) {
 	ctx := context.Background()
 
 	err := ingest.WriteObservations(ctx, []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "sut.test", Path: "/orders/42?tab=x", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "page", Host: "sut.test", Path: "/orders/43?tab=y", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42?q=1", MIME: "application/json", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/43?q=2", MIME: "application/json", VersionSUTID: 7},
-		{Kind: "page", Host: "sut.test", Path: "/app#/reports/42", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/orders/42?tab=x", MIME: "text/html", SUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/orders/43?tab=y", MIME: "text/html", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42?q=1", MIME: "application/json", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/43?q=2", MIME: "application/json", SUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/app#/reports/42", MIME: "text/html", SUTID: 7},
 	})
 	if err != nil {
 		t.Fatalf("WriteObservations: %v", err)
@@ -66,7 +66,7 @@ func TestDiscoveryIngestDedupesAndNormalizes(t *testing.T) {
 	if page.Kind != "page" || page.Method != "" || page.ResourceTemplate != "/orders/{id}" || page.Occurrences != 2 {
 		t.Fatalf("page row = %+v, want method empty, template /orders/{id}, occurrences 2", page)
 	}
-	if page.Host != "sut.test" || page.VersionSUTID != 7 {
+	if page.Host != "sut.test" || page.SUTID != 7 {
 		t.Fatalf("page row lost its identity: %+v", page)
 	}
 	api := store.rows[1]
@@ -82,21 +82,21 @@ func TestDiscoveryIngestDedupesAndNormalizes(t *testing.T) {
 	}
 }
 
-// TestDiscoveryIngestKeepsSUTsIsolated: the same path on two version_sut
-// bindings is two rows (the DB-29 unique key includes version_sut_id).
+// TestDiscoveryIngestKeepsSUTsIsolated: the same path on two SUTs
+// bindings is two rows (the DB-29 unique key includes sut_id).
 func TestDiscoveryIngestKeepsSUTsIsolated(t *testing.T) {
 	store := &fakeDiscoveryStore{}
 	ingest := newDiscoveryIngest(store, nil)
 
 	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/1", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/1", VersionSUTID: 8},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/1", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/1", SUTID: 8},
 	})
 	if err != nil {
 		t.Fatalf("WriteObservations: %v", err)
 	}
 	if len(store.rows) != 2 {
-		t.Fatalf("stored rows = %d, want one per version_sut", len(store.rows))
+		t.Fatalf("stored rows = %d, want one per SUT", len(store.rows))
 	}
 }
 
@@ -109,11 +109,11 @@ func TestDiscoveryIngestFiltersThirdPartyStaticAndMIME(t *testing.T) {
 	}})
 
 	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/static/app.js", MIME: "application/javascript", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/assets/logo", MIME: "image/png", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/stream", MIME: "text/event-stream", ResourceType: "eventsource", VersionSUTID: 7},
-		{Kind: "page", Host: "sut.test", Path: "/dashboard", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/static/app.js", MIME: "application/javascript", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/assets/logo", MIME: "image/png", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/stream", MIME: "text/event-stream", ResourceType: "eventsource", SUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/dashboard", MIME: "text/html", SUTID: 7},
 	})
 	if err != nil {
 		t.Fatalf("WriteObservations: %v", err)
@@ -135,7 +135,7 @@ func TestDiscoveryIngestNoHostFilterWhenResolverNil(t *testing.T) {
 	store := &fakeDiscoveryStore{}
 	ingest := newDiscoveryIngest(store, nil)
 	if err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", SUTID: 7},
 	}); err != nil {
 		t.Fatalf("WriteObservations: %v", err)
 	}
@@ -151,13 +151,13 @@ func TestDiscoveryIngestPropagatesIdentity(t *testing.T) {
 	ingest := newDiscoveryIngest(store, nil)
 	if err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
 		{Kind: "page", Host: "sut.test", Path: "/home", MIME: "text/html",
-			VersionSUTID: 7, WaveID: 2001, CaseRunID: 3001},
+			SUTID: 7, WaveID: 2001, CaseRunID: 3001},
 	}); err != nil {
 		t.Fatalf("WriteObservations: %v", err)
 	}
 	row := store.rows[0]
-	if row.VersionSUTID != 7 || row.WaveID != 2001 || row.CaseRunID != 3001 || row.VersionID != 0 {
-		t.Fatalf("identity = %+v, want version_sut 7, wave 2001, case_run 3001, version 0", row)
+	if row.SUTID != 7 || row.WaveID != 2001 || row.CaseRunID != 3001 || row.VersionID != 0 {
+		t.Fatalf("identity = %+v, want sut 7, wave 2001, case_run 3001, version 0", row)
 	}
 }
 
@@ -168,11 +168,11 @@ func TestDiscoveryIngestNormalizesTrailingSlash(t *testing.T) {
 	ingest := newDiscoveryIngest(store, nil)
 
 	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "sut.test", Path: "/orders/42", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "page", Host: "sut.test", Path: "/orders/42/", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42/", MIME: "application/json", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42", MIME: "application/json", VersionSUTID: 7},
-		{Kind: "page", Host: "sut.test", Path: "/", MIME: "text/html", VersionSUTID: 8},
+		{Kind: "page", Host: "sut.test", Path: "/orders/42", MIME: "text/html", SUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/orders/42/", MIME: "text/html", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42/", MIME: "application/json", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "sut.test", Path: "/api/orders/42", MIME: "application/json", SUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/", MIME: "text/html", SUTID: 8},
 	})
 	if err != nil {
 		t.Fatalf("WriteObservations: %v", err)
@@ -200,10 +200,10 @@ func TestDiscoveryIngestAllowsSameRegistrableDomain(t *testing.T) {
 	}})
 
 	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "shop.example.com", Path: "/home", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "api.shop.example.com", Path: "/api/orders/1", MIME: "application/json", VersionSUTID: 7},
-		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "page", Host: "shop.example.com.evil.test", Path: "/orders/2", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "shop.example.com", Path: "/home", MIME: "text/html", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "api.shop.example.com", Path: "/api/orders/1", MIME: "application/json", SUTID: 7},
+		{Kind: "page", Host: "cdn.other.test", Path: "/orders/1", MIME: "text/html", SUTID: 7},
+		{Kind: "page", Host: "shop.example.com.evil.test", Path: "/orders/2", MIME: "text/html", SUTID: 7},
 	})
 	if err != nil {
 		t.Fatalf("WriteObservations: %v", err)
@@ -222,8 +222,8 @@ func TestDiscoveryIngestIPv6Host(t *testing.T) {
 	store := &fakeDiscoveryStore{}
 	ingest := newDiscoveryIngest(store, nil)
 	if err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "::1", Path: "/orders/42", MIME: "text/html", VersionSUTID: 7},
-		{Kind: "api", Method: "GET", Host: "::1", Path: "/api/orders/42", MIME: "application/json", VersionSUTID: 7},
+		{Kind: "page", Host: "::1", Path: "/orders/42", MIME: "text/html", SUTID: 7},
+		{Kind: "api", Method: "GET", Host: "::1", Path: "/api/orders/42", MIME: "application/json", SUTID: 7},
 	}); err != nil {
 		t.Fatalf("WriteObservations: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestDiscoveryIngestReturnsStoreError(t *testing.T) {
 	store := &fakeDiscoveryStore{err: want}
 	ingest := newDiscoveryIngest(store, nil)
 	err := ingest.WriteObservations(context.Background(), []executionapp.DiscoveryObservation{
-		{Kind: "page", Host: "sut.test", Path: "/home", MIME: "text/html", VersionSUTID: 7},
+		{Kind: "page", Host: "sut.test", Path: "/home", MIME: "text/html", SUTID: 7},
 	})
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)

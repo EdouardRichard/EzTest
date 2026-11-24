@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -32,11 +33,13 @@ func (r *QueryReader) CountIssueValidity(ctx context.Context, versionID *int64) 
 	var num, denom int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
-			count(*) FILTER (WHERE status = 'confirmed'),
-			count(*) FILTER (WHERE status IN ('confirmed', 'dismissed'))
+			count(*) FILTER (WHERE status = $2),
+			count(*) FILTER (WHERE status = ANY($3))
 		FROM delivery_issue
 		WHERE $1::bigint IS NULL OR version_id = $1
-	`, versionID).Scan(&num, &denom); err != nil {
+	`, versionID, string(delivery.IssueStatusConfirmed),
+		[]string{string(delivery.IssueStatusConfirmed), string(delivery.IssueStatusDismissed)},
+	).Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("count issue validity: %w", err)
 	}
 	return num, denom, nil
@@ -80,11 +83,11 @@ func (r *QueryReader) SearchReports(ctx context.Context, q string, limit int) ([
 		FROM delivery_report
 		WHERE kind ILIKE '%' || $1 || '%'
 		   OR status ILIKE '%' || $1 || '%'
-		   OR (kind = 'wave' AND '波次报告' ILIKE '%' || $1 || '%')
-		   OR (kind = 'version' AND '版本报告' ILIKE '%' || $1 || '%')
+		   OR (kind = $3 AND '波次报告' ILIKE '%' || $1 || '%')
+		   OR (kind = $4 AND '版本报告' ILIKE '%' || $1 || '%')
 		ORDER BY updated_at DESC, id DESC
 		LIMIT $2
-	`, q, limit)
+	`, q, limit, string(delivery.ReportKindWave), string(delivery.ReportKindVersion))
 	if err != nil {
 		return nil, fmt.Errorf("search reports: %w", err)
 	}
@@ -110,10 +113,10 @@ func (r *QueryReader) ListOpenIssues(ctx context.Context, limit int) ([]delivery
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, version_id, title, severity, created_at
 		FROM delivery_issue
-		WHERE status = 'open'
+		WHERE status = $2
 		ORDER BY created_at DESC, id DESC
 		LIMIT $1
-	`, limit)
+	`, limit, string(delivery.IssueStatusOpen))
 	if err != nil {
 		return nil, fmt.Errorf("list open issues: %w", err)
 	}

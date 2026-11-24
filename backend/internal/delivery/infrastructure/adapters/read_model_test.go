@@ -32,8 +32,10 @@ func (f *fakeVersions) Get(_ context.Context, id int64) (versionapp.VersionView,
 }
 
 type fakeRequirements struct {
-	views map[int64][]versionapp.RequirementView
-	raw   map[int64]version.Requirement
+	views   map[int64][]versionapp.RequirementView
+	raw     map[int64]version.Requirement
+	details map[int64]versionapp.RequirementDetail
+	getErr  error
 }
 
 func (f *fakeRequirements) List(_ context.Context, versionID int64, _ string, limit int, beforeID *int64) ([]versionapp.RequirementView, bool, error) {
@@ -51,6 +53,16 @@ func (f *fakeRequirements) List(_ context.Context, versionID int64, _ string, li
 		filtered = filtered[:limit]
 	}
 	return filtered, hasMore, nil
+}
+
+// Get serves the requirement detail (current revision NL/AC). A fixture without
+// detail data returns the zero detail (no NL context); getErr injects a read
+// failure for the fail-closed test.
+func (f *fakeRequirements) Get(_ context.Context, _ int64, requirementID int64) (versionapp.RequirementDetail, error) {
+	if f.getErr != nil {
+		return versionapp.RequirementDetail{}, f.getErr
+	}
+	return f.details[requirementID], nil
 }
 
 func (f *fakeRequirements) GetRequirement(_ context.Context, requirementID int64) (version.Requirement, error) {
@@ -181,8 +193,24 @@ type fakeEvidence struct {
 	rows map[int64][]execution.Evidence
 }
 
-func (f *fakeEvidence) ListByCaseRun(_ context.Context, caseRunID int64, _ int) ([]execution.Evidence, error) {
-	return append([]execution.Evidence(nil), f.rows[caseRunID]...), nil
+func (f *fakeEvidence) SHA256sByCaseRun(_ context.Context, caseRunID int64) ([]string, error) {
+	rows := f.rows[caseRunID]
+	shas := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.ID > 0 {
+			shas = append(shas, row.SHA256)
+		}
+	}
+	return shas, nil
+}
+
+func (f *fakeEvidence) ListNewestByCaseRun(_ context.Context, caseRunID int64, limit int) ([]execution.Evidence, error) {
+	rows := append([]execution.Evidence(nil), f.rows[caseRunID]...)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID > rows[j].ID })
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
 }
 
 type fakeSUTContexts struct {
@@ -195,10 +223,17 @@ func (f *fakeSUTContexts) ListByCaseRun(_ context.Context, caseRunID int64) ([]e
 
 type fakeIntents struct {
 	active map[int64][]execution.ExecutionIntent
+	byID   map[int64]execution.ExecutionIntent
 }
 
 func (f *fakeIntents) ListActive(_ context.Context, versionID int64) ([]execution.ExecutionIntent, error) {
 	return append([]execution.ExecutionIntent(nil), f.active[versionID]...), nil
+}
+
+// GetByID serves the frozen intent fingerprint. A fixture without byID data
+// returns the zero intent (legacy runs carry IntentID 0 and never call this).
+func (f *fakeIntents) GetByID(_ context.Context, intentID int64) (execution.ExecutionIntent, error) {
+	return f.byID[intentID], nil
 }
 
 type fakeHumans struct {
@@ -248,16 +283,15 @@ var (
 
 func newReadModelFixture() (Deps, *fakeIssues) {
 	sutRef := int64(70)
-	versionSUT := int64(70)
 	waves := &fakeWaves{waves: []execution.RunWave{
 		{
 			ID: 11, VersionID: 7, Status: execution.WaveDone, Trigger: execution.WaveTriggerManual,
-			Counts:    execution.WaveCounts{Total: 2, Passed: 1, Failed: 1, Evidence: 1, ByVersionSUT: map[string]execution.SUTCounts{"70": {Total: 2, Passed: 1, Failed: 1}}},
+			Counts:    execution.WaveCounts{Total: 2, Passed: 1, Failed: 1, Evidence: 1, BySUT: map[string]execution.SUTCounts{"70": {Total: 2, Passed: 1, Failed: 1}}},
 			StartedAt: &fixtureTime, FinishedAt: &fixtureAfter, CreatedAt: fixtureTime, UpdatedAt: fixtureAfter,
 		},
 		{
 			ID: 12, VersionID: 7, Status: execution.WaveDone, Trigger: execution.WaveTriggerAuto,
-			Counts:    execution.WaveCounts{Total: 0, ByVersionSUT: map[string]execution.SUTCounts{}},
+			Counts:    execution.WaveCounts{Total: 0, BySUT: map[string]execution.SUTCounts{}},
 			CreatedAt: fixtureTime, UpdatedAt: fixtureTime,
 		},
 	}}
@@ -285,26 +319,26 @@ func newReadModelFixture() (Deps, *fakeIssues) {
 	results := &fakeResults{
 		steps: map[int64][]execution.StepResult{
 			5001: {
-				{ID: 6001, CaseRunID: 5001, Seq: 1, TargetVersionSUTID: &sutRef, Status: execution.StepFailed},
+				{ID: 6001, CaseRunID: 5001, Seq: 1, TargetSUTID: &sutRef, Status: execution.StepFailed},
 				{ID: 6002, CaseRunID: 5001, Seq: 2, Status: execution.StepPassed},
 			},
 		},
 		assertions: map[int64][]execution.AssertionResult{
 			5001: {
-				{ID: 6501, CaseRunID: 5001, StepSeq: 1, AssertionSeq: 1, Kind: execution.AssertionKindAPI, Verdict: execution.AssertionFailed, Expected: "200", Actual: "500", Reason: "boom", TargetVersionSUTID: &sutRef},
+				{ID: 6501, CaseRunID: 5001, StepSeq: 1, AssertionSeq: 1, Kind: execution.AssertionKindAPI, Verdict: execution.AssertionFailed, Expected: "200", Actual: "500", Reason: "boom", TargetSUTID: &sutRef},
 				{ID: 6502, CaseRunID: 5001, StepSeq: 2, AssertionSeq: 1, Kind: execution.AssertionKindUI, Verdict: execution.AssertionPassed},
 			},
 		},
 	}
 	evidence := &fakeEvidence{rows: map[int64][]execution.Evidence{
-		5001: {{ID: 7001, CaseRunID: 5001, VersionSUTID: &sutRef, StepSeq: intPtr(1), AssertionSeq: intPtr(1), Kind: execution.EvidenceScreenshot, SHA256: "aabb", SizeBytes: 128}},
+		5001: {{ID: 7001, CaseRunID: 5001, SUTID: &sutRef, StepSeq: intPtr(1), AssertionSeq: intPtr(1), Kind: execution.EvidenceScreenshot, SHA256: "aabb", SizeBytes: 128}},
 	}}
 	suts := &fakeSUTContexts{rows: map[int64][]execution.CaseRunSUTContext{
-		5001: {{ID: 1, CaseRunID: 5001, VersionSUTID: 70, Status: execution.SUTContextClosed}},
+		5001: {{ID: 1, CaseRunID: 5001, SUTID: 70, Status: execution.SUTContextClosed}},
 	}}
 	design := &fakeDesign{
 		cases: map[int64][]designapp.ExecutableCaseView{7: {
-			{CaseID: 201, CaseVersionID: 3001, RequirementID: 101, RequirementVersionID: 1001, Title: "Case A", Priority: "P1", VersionSUTIDs: []int64{versionSUT}},
+			{CaseID: 201, CaseVersionID: 3001, RequirementID: 101, RequirementVersionID: 1001, Title: "Case A", Priority: "P1"},
 			{CaseID: 202, CaseVersionID: 3002, RequirementID: 101, RequirementVersionID: 1001, Title: "Case B", Priority: "P2"},
 		}},
 		history: map[int64][]designapp.CaseVersionHistoryView{7: {
@@ -324,11 +358,14 @@ func newReadModelFixture() (Deps, *fakeIssues) {
 	}}
 	versions := &fakeVersions{views: map[int64]versionapp.VersionView{7: {
 		ID: 7, Title: "Version", Status: "running", CreatedAt: fixtureTime, UpdatedAt: fixtureAfter,
-		Bindings: []versionapp.BindingView{{
-			ID:          70,
-			SUT:         resourceapp.SUTView{ID: "700", Name: "SUT"},
-			Environment: resourceapp.EnvironmentView{ID: "710", Name: "dev"},
-		}},
+		EnvironmentID: 710,
+		Binding: versionapp.EnvironmentSUTCatalog{
+			VersionID: 7, EnvironmentID: 710,
+			Environment: resourceapp.EnvironmentView{
+				ID: "710", Name: "dev",
+				SUTs: []resourceapp.SUTView{{ID: "700", EnvironmentID: "710", Name: "SUT"}},
+			},
+		},
 	}}}
 	issues := &fakeIssues{
 		rows: map[int64][]delivery.Issue{7: {
@@ -378,8 +415,8 @@ func TestExecutionReaderListFailedApplicationCaseRuns(t *testing.T) {
 	if snapshot.CaseTitle != "Case A" || snapshot.RequirementID != 101 {
 		t.Fatalf("case = %+v", snapshot)
 	}
-	if snapshot.VersionSUTID == nil || *snapshot.VersionSUTID != 70 || len(snapshot.VersionSUTIDs) != 1 {
-		t.Fatalf("version SUTs = %v/%v", snapshot.VersionSUTID, snapshot.VersionSUTIDs)
+	if snapshot.SUTID == nil || *snapshot.SUTID != 70 || len(snapshot.SUTIDs) != 1 {
+		t.Fatalf("SUTs = %v/%v", snapshot.SUTID, snapshot.SUTIDs)
 	}
 	if snapshot.Category != "api" || snapshot.Severity != "major" {
 		t.Fatalf("category/severity = %q/%q, want api/major", snapshot.Category, snapshot.Severity)
@@ -434,9 +471,10 @@ func TestReportDataReaderVersionSnapshot(t *testing.T) {
 		requirement.ClosureID == nil || *requirement.ClosureID != 9001 || requirement.CloseRound != 1 {
 		t.Fatalf("requirement = %+v", requirement)
 	}
-	if len(snapshot.VersionSUTs) != 1 || snapshot.VersionSUTs[0].ID != 70 || snapshot.VersionSUTs[0].SUTName != "SUT" ||
-		snapshot.VersionSUTs[0].EnvironmentName != "dev" {
-		t.Fatalf("version SUTs = %+v", snapshot.VersionSUTs)
+	if len(snapshot.SUTs) != 1 || snapshot.SUTs[0].ID != 700 || snapshot.SUTs[0].SUTID != 700 ||
+		snapshot.SUTs[0].SUTName != "SUT" ||
+		snapshot.SUTs[0].EnvironmentName != "dev" {
+		t.Fatalf("SUTs = %+v", snapshot.SUTs)
 	}
 	if len(snapshot.CaseRuns) != 3 {
 		t.Fatalf("case runs = %+v, want all three version runs", snapshot.CaseRuns)

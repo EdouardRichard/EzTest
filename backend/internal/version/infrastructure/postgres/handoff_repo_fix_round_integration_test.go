@@ -23,8 +23,13 @@ import (
 	"testing"
 
 	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	resourcepg "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -41,9 +46,10 @@ func handoffSeedQuestionRow(
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO human_request (id, version_id, conversation_id, message_id, kind, payload,
 			question, status, response, expires_at, resolved_at)
-		VALUES ($1, $2, $3, $4, 'clarification_question', '{}'::jsonb, $5::jsonb, $6, $7::jsonb,
+		VALUES ($1, $2, $3, $4, $9, '{}'::jsonb, $5::jsonb, $6, $7::jsonb,
 			'2026-11-06T06:00:00Z', $8)
-	`, requestID, versionID, conversationID, messageID, questionJSON, status, responseJSON, resolvedAt); err != nil {
+	`, requestID, versionID, conversationID, messageID, questionJSON, status, responseJSON, resolvedAt,
+		string(execution.HumanClarificationQuestion)); err != nil {
 		t.Fatalf("seed question row %d: %v", requestID, err)
 	}
 }
@@ -62,20 +68,24 @@ func handoffSeedConversationKind(
 	`, conversationID, versionID, kind); err != nil {
 		t.Fatalf("seed %s conversation: %v", kind, err)
 	}
-	parts, _ := json.Marshal([]map[string]any{{"type": "text", "text": text}})
+	parts, _ := json.Marshal([]version.MessagePart{{Type: version.MessagePartText, Text: text}})
+	refs := handoffFixtureJSON(t, []map[string]any{{"kind": version.MessageRefKindRequirement, "id": "101"}})
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO conversation_message (id, conversation_id, role, parts, refs)
-		VALUES ($1, $2, 'user', $3::jsonb, '[{"kind":"requirement","id":"101"}]'::jsonb)
-	`, messageID, conversationID, parts); err != nil {
+		VALUES ($1, $2, $4, $3::jsonb, $5::jsonb)
+	`, messageID, conversationID, parts, version.MessageRoleUser, refs); err != nil {
 		t.Fatalf("seed %s message: %v", kind, err)
 	}
 }
 
 // handoffSeedSharedRepository binds one repository to a version through two SUTs
-// with different roles. The role selection must stay stable across
-// regenerations instead of depending on physical row order.
+// of the bound environment (990001) with different roles. The role selection must
+// stay stable across regenerations instead of depending on physical row order.
+// The version_sut chain is gone: both SUTs belong to the environment the version
+// binds directly, and the repository is inherited through sut_repository.
 func handoffSeedSharedRepository(t *testing.T, pool *pgxpool.Pool, versionID int64) {
 	t.Helper()
+	_ = versionID // the version binds environment 990001 via handoffSeedVersion
 	ctx := context.Background()
 	exec := func(query string, args ...any) {
 		t.Helper()
@@ -83,16 +93,10 @@ func handoffSeedSharedRepository(t *testing.T, pool *pgxpool.Pool, versionID int
 			t.Fatalf("seed shared repository: %v", err)
 		}
 	}
-	exec(`INSERT INTO sut (id, name, created_by) VALUES (2101, 'Backend SUT', 1)`)
-	exec(`INSERT INTO sut (id, name, created_by) VALUES (2102, 'Frontend SUT', 1)`)
-	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
-		VALUES (2201, 2101, 'backend', 'https://backend.example.test')`)
-	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
-		VALUES (2202, 2102, 'frontend', 'https://frontend.example.test')`)
-	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
-		VALUES (2301, $1, 2101, 2201, 'active')`, versionID)
-	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
-		VALUES (2302, $1, 2102, 2202, 'active')`, versionID)
+	exec(`INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (2101, 990001, 'Backend SUT', 'https://backend.example.test', 1)`)
+	exec(`INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (2102, 990001, 'Frontend SUT', 'https://frontend.example.test', 1)`)
 	exec(`INSERT INTO code_repository (id, name, path, created_by)
 		VALUES (2401, 'shared-repo', '/repos/shared', 1)`)
 	exec(`INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled)
@@ -113,20 +117,20 @@ func handoffSeedBulkRequirementsAndFacts(t *testing.T, pool *pgxpool.Pool, versi
 		}
 	}
 	exec(`INSERT INTO requirement (id, version_id, status, source_quote)
-		SELECT 3000 + g, $1, 'clarified', '' FROM generate_series(1, 250) AS g`, versionID)
-	exec(`INSERT INTO requirement_version (id, requirement_id, revision, title, description,
+		SELECT 3000 + g, $1, $2, '' FROM generate_series(1, 250) AS g`, versionID, string(version.RequirementClarified))
+	exec(`INSERT INTO requirement_version (id, requirement_id, revision, title, rules,
 			acceptance_criteria, priority, content_hash)
-		SELECT 4000 + g, 3000 + g, 1, '批量需求 ' || g, '', '', 'P2', repeat('d', 64)
-		FROM generate_series(1, 250) AS g`)
+		SELECT 4000 + g, 3000 + g, 1, '批量需求 ' || g, '', '[]'::jsonb, $1, repeat('d', 64)
+		FROM generate_series(1, 250) AS g`, version.DefaultPriority)
 	exec(`UPDATE requirement SET current_version_id = 4000 + (id - 3000) WHERE version_id = $1`, versionID)
 	exec(`INSERT INTO version_fact (id, version_id, kind, key, payload, source, source_ref, content_hash)
-		SELECT 5000 + g, $1, 'decision', '批量决策 ' || g,
+		SELECT 5000 + g, $1, $2, '批量决策 ' || g,
 		       jsonb_build_object('summary', '批量决策 ' || g), 'exploration', '', repeat('e', 64)
-		FROM generate_series(1, 150) AS g`, versionID)
+		FROM generate_series(1, 150) AS g`, versionID, version.FactKindDecision)
 	exec(`INSERT INTO version_fact (id, version_id, kind, key, payload, source, source_ref, content_hash)
-		SELECT 6000 + g, $1, 'gap', '批量缺口 ' || g,
+		SELECT 6000 + g, $1, $2, '批量缺口 ' || g,
 		       jsonb_build_object('summary', '批量缺口 ' || g), 'exploration', '', repeat('f', 64)
-		FROM generate_series(1, 150) AS g`, versionID)
+		FROM generate_series(1, 150) AS g`, versionID, version.FactKindGap)
 }
 
 // TestHandoffRepositoryKeepsBatchQuestionsAndResolvesExternalRefs pins the two
@@ -140,19 +144,14 @@ func TestHandoffRepositoryKeepsBatchQuestionsAndResolvesExternalRefs(t *testing.
 	versionID := int64(1010)
 	handoffSeedVersion(t, pool, versionID, "designing")
 	handoffSeedRequirements(t, pool, versionID)
-	batch := `{"questions":[` +
-		`{"id":"q1","text":"问题一（外部 FR 引用）","options":[{"id":"a","label":"A"}],"source_refs":["requirement:FR-102"]},` +
-		`{"id":"q2","text":"问题二（内部数字引用）","options":[{"id":"a","label":"A"}],"source_refs":["requirement:102"]},` +
-		`{"id":"q3","text":"问题三（附件引用）","options":[{"id":"a","label":"A"}],"source_refs":["attachment:7"]}` +
-		`],"batch_id":"qb-batch","expires_at":"2026-11-06T06:00:00Z"}`
-	handoffSeedQuestionRow(t, pool, versionID, 1601, 9601, 1301, batch, "pending", "{}", nil)
+	batch := handoffQuestionBatchJSON(t, []execution.HumanQuestion{
+		{ID: "q1", Text: "问题一（外部 FR 引用）", Options: []execution.HumanQuestionOption{{ID: "a", Label: "A"}}, SourceRefs: []string{"requirement:FR-102"}},
+		{ID: "q2", Text: "问题二（内部数字引用）", Options: []execution.HumanQuestionOption{{ID: "a", Label: "A"}}, SourceRefs: []string{"requirement:102"}},
+		{ID: "q3", Text: "问题三（附件引用）", Options: []execution.HumanQuestionOption{{ID: "a", Label: "A"}}, SourceRefs: []string{"attachment:7"}},
+	}, "qb-batch", "2026-11-06T06:00:00Z")
+	handoffSeedQuestionRow(t, pool, versionID, 1601, 9601, 1301, batch, string(execution.HumanPending), "{}", nil)
 
-	service := versionapp.NewHandoffService(
-		versionpg.NewHandoffStore(pool),
-		versionpg.NewHandoffReader(pool),
-		handoffIntegrationIDs(t),
-		nil,
-	)
+	service := handoffIntegrationService(t, pool)
 	document, err := service.Generate(ctx, versionID)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -201,12 +200,7 @@ func TestHandoffRepositoryCapsKeepNewest(t *testing.T) {
 	handoffSeedVersion(t, pool, versionID, "designing")
 	handoffSeedBulkRequirementsAndFacts(t, pool, versionID)
 
-	service := versionapp.NewHandoffService(
-		versionpg.NewHandoffStore(pool),
-		versionpg.NewHandoffReader(pool),
-		handoffIntegrationIDs(t),
-		nil,
-	)
+	service := handoffIntegrationService(t, pool)
 	document, err := service.Generate(ctx, versionID)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -229,7 +223,7 @@ func TestHandoffRepositoryCapsKeepNewest(t *testing.T) {
 	}
 	openGaps := make([]versionapp.HandoffOpenItem, 0, 100)
 	for _, item := range document.Open {
-		if item.Kind == "gap" {
+		if item.Kind == version.FactKindGap {
 			openGaps = append(openGaps, item)
 		}
 	}
@@ -242,10 +236,13 @@ func TestHandoffRepositoryCapsKeepNewest(t *testing.T) {
 	}
 }
 
-// TestHandoffRepositorySharedRepositoryRoleDeterministic pins deterministic role
-// selection when the same repository is inherited from two SUTs. The
-// lexicographically smallest role wins ("backend" before "frontend"), and two
-// regenerations produce identical content and stay on revision 1.
+// TestHandoffRepositorySharedRepositoryRoleDeterministic pins role selection when
+// the same repository is inherited from two SUTs: it must agree with the
+// authoritative environment code pool, which orders by repo_id, sut_id, id and
+// de-duplicates first-wins (resource ListEnvironmentSUTRepositories), so the
+// LOWEST sut_id wins. The fixture binds sut 2101=frontend and sut 2102=backend, so
+// the resolved role is "frontend". Two regenerations produce identical content and
+// stay on revision 1.
 func TestHandoffRepositorySharedRepositoryRoleDeterministic(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ctx := context.Background()
@@ -253,12 +250,7 @@ func TestHandoffRepositorySharedRepositoryRoleDeterministic(t *testing.T) {
 	handoffSeedVersion(t, pool, versionID, "designing")
 	handoffSeedSharedRepository(t, pool, versionID)
 
-	service := versionapp.NewHandoffService(
-		versionpg.NewHandoffStore(pool),
-		versionpg.NewHandoffReader(pool),
-		handoffIntegrationIDs(t),
-		nil,
-	)
+	service := handoffIntegrationService(t, pool)
 	first, err := service.Generate(ctx, versionID)
 	if err != nil {
 		t.Fatalf("Generate first: %v", err)
@@ -266,9 +258,29 @@ func TestHandoffRepositorySharedRepositoryRoleDeterministic(t *testing.T) {
 	if len(first.Resources.Repositories) != 1 {
 		t.Fatalf("repositories = %+v, want the one shared repository", first.Resources.Repositories)
 	}
-	if first.Resources.Repositories[0].Role != "backend" {
-		t.Fatalf("shared repository role = %q, want the deterministic role %q",
-			first.Resources.Repositories[0].Role, "backend")
+	// Agreement with the authority: call the real environment code pool
+	// (resourceapp.ListEnvironmentRepositories, which orders by repo_id, sut_id, id
+	// and de-duplicates first-wins) and require the handoff role to match the role
+	// it resolves for the shared repository. Calling the authority — not a
+	// hand-written copy of its SQL — means the two cannot move together and stay
+	// green if the pool's tie-break ever changes.
+	resourceSvc := resourceapp.New(resourcepg.New(pool), handoffIntegrationIDs(t), clock.System{}, nil, nil, nil)
+	authorityPool, err := resourceSvc.ListEnvironmentRepositories(ctx, 990001)
+	if err != nil {
+		t.Fatalf("ListEnvironmentRepositories: %v", err)
+	}
+	authorityRole := ""
+	for _, view := range authorityPool {
+		if view.Repository.ID == "2401" {
+			authorityRole = view.Role
+		}
+	}
+	if authorityRole == "" {
+		t.Fatalf("authority pool did not resolve the shared repository 2401: %+v", authorityPool)
+	}
+	if first.Resources.Repositories[0].Role != authorityRole || authorityRole != "frontend" {
+		t.Fatalf("shared repository role = %q, want the authoritative lowest-sut_id role %q",
+			first.Resources.Repositories[0].Role, authorityRole)
 	}
 	firstResources, err := json.Marshal(first.Resources)
 	if err != nil {
@@ -308,13 +320,17 @@ func TestClarificationSearchStoreEvidenceAndScope(t *testing.T) {
 	handoffSeedFactsAndPlan(t, pool, versionID, 0)
 	handoffSeedConversation(t, pool, versionID, 2301, 2401, "退款到账时间按 T+1 验收，退款失败可重试。")
 	// A design conversation in the same version is not clarification evidence.
-	handoffSeedConversationKind(t, pool, versionID, 2303, 2403, "design", "设计阶段的退款讨论，不属于澄清检索。")
+	handoffSeedConversationKind(t, pool, versionID, 2303, 2403, version.ConversationDesign, "设计阶段的退款讨论，不属于澄清检索。")
 	// Other-version rows with the same keyword must never enter the result.
 	handoffSeedFactsAndPlan(t, pool, otherVersionID, 10000)
 	handoffSeedConversation(t, pool, otherVersionID, 2302, 2402, "其它版本的退款说明，绝不能返回。")
 	handoffSeedQuestionRow(t, pool, otherVersionID, 2501, 9801, 2302,
-		`{"questions":[{"id":"q1","text":"其它版本的退款问题，不能返回","options":[{"id":"a","label":"A"}],"source_refs":["requirement:999"]}],"batch_id":"qb-other"}`,
-		"pending", "{}", nil)
+		handoffQuestionBatchJSON(t, []execution.HumanQuestion{{
+			ID: "q1", Text: "其它版本的退款问题，不能返回",
+			Options:    []execution.HumanQuestionOption{{ID: "a", Label: "A"}},
+			SourceRefs: []string{"requirement:999"},
+		}}, "qb-other", ""),
+		string(execution.HumanPending), "{}", nil)
 
 	store := versionpg.NewClarificationSearchStore(pool)
 	hits, err := store.SearchClarification(ctx, agenttools.ClarificationSearchQuery{
@@ -398,10 +414,10 @@ func TestClarificationSearchStoreClampsDirectCallerLimit(t *testing.T) {
 	handoffSeedVersion(t, pool, versionID, "designing")
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO version_fact (id, version_id, kind, key, payload, source, source_ref, content_hash)
-		SELECT 7000 + g, $1, 'decision', '批量决策 ' || g,
+		SELECT 7000 + g, $1, $2, '批量决策 ' || g,
 		       jsonb_build_object('summary', '批量决策 ' || g), 'exploration', '', repeat('a', 64)
 		FROM generate_series(1, 60) AS g
-	`, versionID); err != nil {
+	`, versionID, version.FactKindDecision); err != nil {
 		t.Fatalf("seed facts: %v", err)
 	}
 	store := versionpg.NewClarificationSearchStore(pool)

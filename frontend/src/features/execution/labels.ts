@@ -142,14 +142,13 @@ export const PAUSE_MODE_LABEL: Record<PauseMode, string> = {
   immediate: "立即暂停",
 }
 
-/** All six v0.22 human_request kinds (spec R-W2-1 / DB-16). */
+/** The five v0.22 human_request kinds (spec R-W2-1 / DB-16; Q06 removed "other"). */
 export const HUMAN_REQUEST_KIND_LABEL: Record<HumanRequestKind, string> = {
   clarification_question: "澄清提问",
   approval: "审批",
   blocked_recovery: "阻塞恢复",
   login_takeover: "登录接管",
   conflict: "冲突处理",
-  other: "其他",
 }
 
 export const HUMAN_REQUEST_STATUS_LABEL: Record<HumanRequestStatus, string> = {
@@ -175,8 +174,9 @@ export const EVIDENCE_KIND_LABEL: Record<EvidenceKind, string> = {
   db: "数据库",
   download: "下载",
   text: "文本",
-  visual_actual: "视觉实际截图",
-  visual_diff: "视觉差异图",
+  command: "命令",
+  file: "文件",
+  trace: "跟踪",
 }
 
 export const STEP_STATUS_LABEL: Record<StepResultStatus, string> = {
@@ -200,7 +200,6 @@ export const ASSERTION_KIND_LABEL: Record<AssertionKind, string> = {
   api: "API",
   db: "数据库",
   text: "文本",
-  visual: "视觉",
 }
 
 /**
@@ -226,9 +225,6 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   step_failed: "步骤失败（应用缺陷）",
   empty_case: "用例没有步骤",
   no_assertions: "用例没有断言",
-  visual_assertion_not_run: "视觉断言未执行",
-  missing_visual_baseline: "缺少视觉基线",
-  visual_environment_mismatch: "视觉环境不一致",
   human_timeout: "等待人工处理超时",
   application: "应用缺陷",
   environment: "环境异常",
@@ -248,6 +244,10 @@ export const CASE_RUN_TERMINAL_CAUSE_LABEL: Record<string, string> = {
   // R2-NEW-01: the dispatch lease expired before any agent worker claimed the
   // queued work item. It is a queue stall, not an executor/environment failure.
   dispatch_timeout: "执行排队超时（未被 Agent 领取）",
+  // T11: the case needs more browser contexts (one per distinct account role)
+  // than any reachable executor can serve, so it is terminated rather than left
+  // pending forever. Waiting cannot help; the remedy is capacity, not a blocker.
+  context_requirement_exceeds_capacity: "用例所需上下文数超过机群最大容量",
 }
 
 export function terminalCauseLabel(value: string | undefined): string | null {
@@ -303,7 +303,6 @@ export const CASE_RUN_NEXT_ACTION_LABEL: Record<string, string> = {
   rerun: "重跑用例（新的执行会使用新的预算从头开始）",
   resolve_blocker: "先解决阻塞条件（账号/环境/数据），再重跑用例",
   review_failure: "查看失败详情并确认问题（必要时修复后重跑）",
-  repair_visual_baseline: "补齐视觉基线后重跑用例",
   repair_case_version: "修复用例的步骤/断言后重新确认并执行",
   reconfirm_case_version: "重新确认被取代的用例版本",
   case_version_superseded_replanned: "替代用例已自动重排，无需人工重跑",
@@ -315,6 +314,36 @@ export function nextActionLabel(value: string | undefined): string | null {
     return CASE_RUN_NEXT_ACTION_LABEL[value]
   }
   return value
+}
+
+/**
+ * Terminal causes whose persisted `next_action` is the generic `resolve_blocker`
+ * but whose real remedy is cause-specific. T11 terminates a case that needs more
+ * browser contexts than any reachable executor can serve with
+ * `context_requirement_exceeds_capacity` and the generic `resolve_blocker`; the
+ * 账号/环境/数据 blocker text misdirects a capacity problem (constitution 七.6).
+ * The dispatch event carrying the correct remedy is suppressed once the run is
+ * already blocked, so this summary-driven override is the only surface shown.
+ */
+const CASE_RUN_TERMINAL_CAUSE_REMEDY: Record<string, string> = {
+  // Wording MUST match the backend blockedAction for this reason: it is the same
+  // remedy (raise max_contexts / cut account roles, then re-run) surfaced through a
+  // different channel (persisted summary vs the dispatch event). The shared case
+  // set backend/internal/execution/application/testdata/capacity_remedy_gate.json
+  // pins both sides; capacity-remedy.authority.test.ts fails on drift (H-B9).
+  context_requirement_exceeds_capacity:
+    "需要提高执行器容量（max_contexts）或减少用例的账号角色数后重新执行",
+}
+
+/**
+ * A cause-specific remedy that overrides the generic next_action, or null when
+ * the cause has no override (callers keep their own next_action fallback).
+ */
+export function terminalCauseRemedy(terminalCause: string | undefined): string | null {
+  if (terminalCause !== undefined && Object.hasOwn(CASE_RUN_TERMINAL_CAUSE_REMEDY, terminalCause)) {
+    return CASE_RUN_TERMINAL_CAUSE_REMEDY[terminalCause]
+  }
+  return null
 }
 
 export const EXECUTOR_STATUS_LABEL: Record<ExecutorStatus, string> = {

@@ -56,30 +56,30 @@ type KnowledgeProposePort interface {
 	ProposeKnowledge(ctx context.Context, versionID, agentRunID int64, in KnowledgeProposal) (KnowledgeProposalResult, error)
 }
 
-// P7Deps is the additive P7/P8 knowledge service surface. It is nested inside
+// KnowledgeDeps is the additive P7/P8 knowledge service surface. It is nested inside
 // Deps so the frozen P1–P6 wiring keeps compiling untouched; a nil writer makes
 // the P7 tool fail as an internal configuration error, never as a model-visible
 // business error. Retrieval is the P8 structured search/read surface.
-type P7Deps struct {
+type KnowledgeDeps struct {
 	Knowledge KnowledgeProposePort
 	// Retrieval serves knowledge.search and knowledge.read. A nil value makes
 	// both tools fail closed as an internal configuration error.
 	Retrieval KnowledgeRetrievalPort
 }
 
-// P7ToolNames returns a copy of the frozen P7 knowledge tool names plus the P8
+// KnowledgeToolNames returns a copy of the frozen P7 knowledge tool names plus the P8
 // structured retrieval tools.
-func P7ToolNames() []string {
+func KnowledgeToolNames() []string {
 	return []string{ToolKnowledgePropose, ToolKnowledgeSearch, ToolKnowledgeRead}
 }
 
-// NewP7Registry registers the frozen P1–P6 tool set plus the P7 knowledge tool,
+// NewKnowledgeRegistry registers the frozen P1–P6 tool set plus the P7 knowledge tool,
 // the P8 structured retrieval tools and the v0.22 tool_result.read continuation
 // tool when its content store is wired. Profiles still filter the registry by
 // allowed_tools (and the runtime RoleToolGuard by the role whitelist), so only
 // roles that explicitly list them can call knowledge.* or tool_result.read.
-func NewP7Registry(deps Deps) *Registry {
-	base := NewP5Registry(deps)
+func NewKnowledgeRegistry(deps Deps) *Registry {
+	base := NewCodeIntelRegistry(deps)
 	all := make([]Tool, 0, len(base.byName)+4)
 	all = append(all,
 		&knowledgePropose{deps: deps},
@@ -151,7 +151,7 @@ type knowledgeProposePayload struct {
 }
 
 func (t *knowledgePropose) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
-	if t.deps.P7.Knowledge == nil {
+	if t.deps.Knowledge.Knowledge == nil {
 		return nil, missingDep("knowledge proposal writer")
 	}
 	var params knowledgeProposePayload
@@ -165,7 +165,7 @@ func (t *knowledgePropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 	if scope.VersionID <= 0 {
 		return nil, Invalid("scope", "the version scope is required")
 	}
-	created, err := t.deps.P7.Knowledge.ProposeKnowledge(ctx, scope.VersionID, scope.AgentRunID, proposal)
+	created, err := t.deps.Knowledge.Knowledge.ProposeKnowledge(ctx, scope.VersionID, scope.AgentRunID, proposal)
 	if err != nil {
 		return nil, mapPortError(err)
 	}

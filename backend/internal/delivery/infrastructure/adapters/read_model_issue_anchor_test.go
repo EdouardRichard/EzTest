@@ -38,25 +38,25 @@ func TestIssueAnchorPrefersEarlierMissingFeatureStep(t *testing.T) {
 	})
 	deps.Design.(*fakeDesign).cases[7] = append(deps.Design.(*fakeDesign).cases[7], designapp.ExecutableCaseView{
 		CaseID: 210, CaseVersionID: caseVer, RequirementID: 102, RequirementVersionID: 1002,
-		Title: "AC-FR-106-02 到点自动发布", Priority: "P2", VersionSUTIDs: []int64{sutRef},
+		Title: "AC-FR-106-02 到点自动发布", Priority: "P2",
 		Steps: []designapp.ExecutableStepView{{Seq: 1, Action: "设置未来发布时间 T", Expected: stepExpect}},
 	})
 	deps.Results.(*fakeResults).steps[caseRunID] = []execution.StepResult{
 		{
 			ID: step1ID, CaseRunID: caseRunID, Seq: 1, Status: execution.StepFailed,
-			TargetVersionSUTID: &sutRef,
-			Observed:           map[string]any{"summary": observed},
+			TargetSUTID: &sutRef,
+			Observed:    map[string]any{"summary": observed},
 		},
-		{ID: 6011, CaseRunID: caseRunID, Seq: 2, Status: execution.StepFailed, TargetVersionSUTID: &sutRef},
-		{ID: 6012, CaseRunID: caseRunID, Seq: 3, Status: execution.StepFailed, TargetVersionSUTID: &sutRef},
-		{ID: 6013, CaseRunID: caseRunID, Seq: 4, Status: execution.StepFailed, TargetVersionSUTID: &sutRef},
+		{ID: 6011, CaseRunID: caseRunID, Seq: 2, Status: execution.StepFailed, TargetSUTID: &sutRef},
+		{ID: 6012, CaseRunID: caseRunID, Seq: 3, Status: execution.StepFailed, TargetSUTID: &sutRef},
+		{ID: 6013, CaseRunID: caseRunID, Seq: 4, Status: execution.StepFailed, TargetSUTID: &sutRef},
 	}
 	deps.Results.(*fakeResults).assertions[caseRunID] = []execution.AssertionResult{
 		{ID: 6510, CaseRunID: caseRunID, StepSeq: 2, AssertionSeq: 1, Kind: execution.AssertionKindAPI, Verdict: execution.AssertionFailed, Expected: "201", Actual: "500"},
 		{ID: 6511, CaseRunID: caseRunID, StepSeq: 3, AssertionSeq: 1, Kind: execution.AssertionKindAPI, Verdict: execution.AssertionFailed, Expected: "published", Actual: "scheduled"},
 	}
 	deps.Evidence.(*fakeEvidence).rows[caseRunID] = []execution.Evidence{
-		{ID: evidenceID, CaseRunID: caseRunID, VersionSUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "eeff", SizeBytes: 40},
+		{ID: evidenceID, CaseRunID: caseRunID, SUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "eeff", SizeBytes: 40},
 	}
 
 	reader := NewExecutionReader(deps)

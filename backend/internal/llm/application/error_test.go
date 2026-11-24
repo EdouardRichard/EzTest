@@ -109,6 +109,13 @@ func (f *stubChatClient) Chat(context.Context, domain.Config, llmapp.ChatRequest
 	return f.response, f.err
 }
 
+// Stream satisfies the extended ChatClient port. The classification tests in
+// this file only exercise Chat; a Stream call here means the path under test
+// changed, so fail loudly instead of supplying a fiat zero value.
+func (f *stubChatClient) Stream(context.Context, domain.Config, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	panic("stubChatClient.Stream must not be called: classification tests use Chat")
+}
+
 func (f *stubChatClient) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -283,7 +290,7 @@ func TestNoAutoFailover(t *testing.T) {
 func TestProtocolClassifiedThroughService(t *testing.T) {
 	requests := make([]string, 0, 4)
 	server := countingServer(t, http.StatusBadRequest,
-		`{"error":{"message":"invalid parameter: temperature","code":"invalid_request_error"}}`, &requests)
+		`{"error":{"message":"invalid parameter: temperature for sk-classify-secret","code":"invalid_request_error"}}`, &requests)
 	defer server.Close()
 
 	cfg := errorTestConfig(domain.ProtocolOpenAIResponses, server.URL)
@@ -314,9 +321,12 @@ func TestProtocolClassifiedThroughService(t *testing.T) {
 		t.Fatal("IsProtocol = false, want true")
 	}
 	if !strings.Contains(apiErr.Message, "invalid parameter: temperature") {
-		t.Fatalf("message = %q, want the redacted provider message", apiErr.Message)
+		t.Fatalf("message = %q, want the provider message", apiErr.Message)
 	}
-	assertNoClassificationSecret(t, apiErr, "sk-classify-secret")
+	// GD-01 (Q05=B): the classified provider message keeps the key verbatim.
+	if !strings.Contains(apiErr.Message, "sk-classify-secret") {
+		t.Fatalf("api key must appear verbatim in message (GD-01 plaintext): %q", apiErr.Message)
+	}
 }
 
 // TestProtocolSubclassesClassifiedThroughService pins the 4xx sub-classes: an
@@ -477,16 +487,5 @@ func TestChatRejectsReasoningWithoutCapability(t *testing.T) {
 		Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
 	}); err != nil {
 		t.Fatalf("Chat with a reasoning-capable model: %v", err)
-	}
-}
-
-func assertNoClassificationSecret(t *testing.T, value any, secret string) {
-	t.Helper()
-	raw, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if strings.Contains(string(raw), secret) {
-		t.Fatalf("secret %q leaked in %s", secret, raw)
 	}
 }

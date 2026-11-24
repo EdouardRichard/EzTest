@@ -11,25 +11,23 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-// ProposalTarget is the resource destination of one version SUT: the SUT,
-// environment and base URL its proposed pages/APIs belong to (spec §8.1).
+// ProposalTarget is the resource destination of one SUT: pages and APIs are
+// SUT-owned (v0.2.4-B), so the SUT and its base URL are the whole destination
+// (spec §8.1).
 type ProposalTarget struct {
-	VersionSUTID  int64
-	SUTID         int64
-	EnvironmentID int64
-	BaseURL       string
+	SUTID   int64
+	BaseURL string
 }
 
-// ProposalTargetReader resolves the resource target of a version SUT binding.
-// The version/resource adapters implement it; codeintel never joins those
-// contexts directly.
+// ProposalTargetReader resolves the resource target of one SUT of the version's
+// bound environment. The version/resource adapters implement it; codeintel never
+// joins those contexts directly.
 type ProposalTargetReader interface {
-	ProposalTarget(ctx context.Context, versionSUTID int64) (ProposalTarget, error)
+	ProposalTarget(ctx context.Context, sutID int64) (ProposalTarget, error)
 }
 
 // ProposalPageInput is one proposed page write.
 type ProposalPageInput struct {
-	EnvironmentID int64
 	SUTID         int64
 	Name          string
 	URL           string
@@ -42,14 +40,13 @@ type ProposalPageInput struct {
 
 // ProposalAPIInput is one proposed API write.
 type ProposalAPIInput struct {
-	EnvironmentID int64
-	SUTID         int64
-	Method        string
-	PathTemplate  string
-	Name          string
-	AuthRole      string
-	SchemaRef     string
-	Source        string
+	SUTID        int64
+	Method       string
+	PathTemplate string
+	Name         string
+	AuthRole     string
+	SchemaRef    string
+	Source       string
 }
 
 // ProposalItem is one proposed resource row returned by the resource port.
@@ -73,7 +70,7 @@ type ProposalItem struct {
 type ProposalResourcePort interface {
 	ProposePage(ctx context.Context, in ProposalPageInput) (ProposalItem, bool, error)
 	ProposeAPI(ctx context.Context, in ProposalAPIInput) (ProposalItem, bool, error)
-	ListProposals(ctx context.Context, environmentIDs []int64) ([]ProposalItem, error)
+	ListProposals(ctx context.Context, sutIDs []int64) ([]ProposalItem, error)
 }
 
 // ProposalResult reports the generation counts (spec §4.2 #24).
@@ -146,26 +143,26 @@ func NewProposalService(deps ProposalDeps) *ProposalService {
 // is idempotent: existing approved/proposed/rejected rows are skipped or
 // refreshed by the resource port and reported in the skipped counts.
 func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64) (ProposalResult, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return ProposalResult{}, err
 	}
-	selected := make([]VersionSUTBinding, 0, len(bindings))
+	selected := make([]SUTRepoBinding, 0, len(bindings))
 	seenSUT := map[int64]bool{}
 	for _, binding := range bindings {
 		if repoID > 0 && binding.RepoID != repoID {
 			continue
 		}
-		if binding.VersionSUTID <= 0 || binding.RepoID <= 0 || seenSUT[binding.VersionSUTID] {
+		if binding.SUTID <= 0 || binding.RepoID <= 0 || seenSUT[binding.SUTID] {
 			continue
 		}
-		seenSUT[binding.VersionSUTID] = true
+		seenSUT[binding.SUTID] = true
 		selected = append(selected, binding)
 	}
 	if len(selected) == 0 {
 		return ProposalResult{}, unprocessable("repo_not_bound", "repository is not bound to this version")
 	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].VersionSUTID < selected[j].VersionSUTID })
+	sort.Slice(selected, func(i, j int) bool { return selected[i].SUTID < selected[j].SUTID })
 
 	network := make([]NetworkRequest, 0)
 	if s.execution != nil {
@@ -181,7 +178,7 @@ func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64)
 	seenAPIs := map[string]bool{}
 	analyzed := false
 	for _, binding := range selected {
-		target, targetErr := s.targets.ProposalTarget(ctx, binding.VersionSUTID)
+		target, targetErr := s.targets.ProposalTarget(ctx, binding.SUTID)
 		if targetErr != nil {
 			return ProposalResult{}, mapDomainError(targetErr, "proposal target")
 		}
@@ -209,13 +206,12 @@ func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64)
 				if !ok {
 					continue
 				}
-				key := platformid.Format(target.EnvironmentID) + "|" + route
+				key := platformid.Format(target.SUTID) + "|" + route
 				if seenPages[key] {
 					continue
 				}
 				seenPages[key] = true
 				item, created, proposeErr := s.resources.ProposePage(ctx, ProposalPageInput{
-					EnvironmentID: target.EnvironmentID,
 					SUTID:         target.SUTID,
 					Name:          proposePageName(fact, route),
 					URL:           joinBaseURL(target.BaseURL, route),
@@ -237,18 +233,17 @@ func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64)
 				if !ok {
 					continue
 				}
-				key := platformid.Format(target.EnvironmentID) + "|" + apiRouteKey(method, path)
+				key := platformid.Format(target.SUTID) + "|" + apiRouteKey(method, path)
 				if seenAPIs[key] {
 					continue
 				}
 				seenAPIs[key] = true
 				item, created, proposeErr := s.resources.ProposeAPI(ctx, ProposalAPIInput{
-					EnvironmentID: target.EnvironmentID,
-					SUTID:         target.SUTID,
-					Method:        method,
-					PathTemplate:  path,
-					Name:          proposeAPIName(fact, method, path),
-					Source:        "ai",
+					SUTID:        target.SUTID,
+					Method:       method,
+					PathTemplate: path,
+					Name:         proposeAPIName(fact, method, path),
+					Source:       "ai",
 				})
 				if proposeErr != nil {
 					return ProposalResult{}, proposeErr
@@ -262,25 +257,24 @@ func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64)
 			}
 		}
 		for _, request := range network {
-			if request.VersionSUTID != nil && *request.VersionSUTID != binding.VersionSUTID {
+			if request.SUTID != nil && *request.SUTID != binding.SUTID {
 				continue
 			}
 			method, path, ok := networkRoute(target.BaseURL, request)
 			if !ok {
 				continue
 			}
-			key := platformid.Format(target.EnvironmentID) + "|" + apiRouteKey(method, path)
+			key := platformid.Format(target.SUTID) + "|" + apiRouteKey(method, path)
 			if seenAPIs[key] {
 				continue
 			}
 			seenAPIs[key] = true
 			item, created, proposeErr := s.resources.ProposeAPI(ctx, ProposalAPIInput{
-				EnvironmentID: target.EnvironmentID,
-				SUTID:         target.SUTID,
-				Method:        method,
-				PathTemplate:  path,
-				Name:          method + " " + path,
-				Source:        "code",
+				SUTID:        target.SUTID,
+				Method:       method,
+				PathTemplate: path,
+				Name:         method + " " + path,
+				Source:       "code",
 			})
 			if proposeErr != nil {
 				return ProposalResult{}, proposeErr
@@ -314,40 +308,41 @@ func (s *ProposalService) Generate(ctx context.Context, versionID, repoID int64)
 	return result, nil
 }
 
-// List returns the proposed resources of the version's bound environments.
+// List returns the proposed resources of the SUTs the version's environment
+// code pool reaches.
 func (s *ProposalService) List(ctx context.Context, versionID int64) ([]ProposalView, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
-	versionSUTIDs := make([]int64, 0, len(bindings))
+	boundSUTIDs := make([]int64, 0, len(bindings))
 	seenSUT := map[int64]bool{}
 	for _, binding := range bindings {
-		if binding.VersionSUTID <= 0 || seenSUT[binding.VersionSUTID] {
+		if binding.SUTID <= 0 || seenSUT[binding.SUTID] {
 			continue
 		}
-		seenSUT[binding.VersionSUTID] = true
-		versionSUTIDs = append(versionSUTIDs, binding.VersionSUTID)
+		seenSUT[binding.SUTID] = true
+		boundSUTIDs = append(boundSUTIDs, binding.SUTID)
 	}
-	sort.Slice(versionSUTIDs, func(i, j int) bool { return versionSUTIDs[i] < versionSUTIDs[j] })
-	environmentIDs := make([]int64, 0, len(versionSUTIDs))
-	seenEnv := map[int64]bool{}
-	for _, versionSUTID := range versionSUTIDs {
-		target, targetErr := s.targets.ProposalTarget(ctx, versionSUTID)
+	sort.Slice(boundSUTIDs, func(i, j int) bool { return boundSUTIDs[i] < boundSUTIDs[j] })
+	sutIDs := make([]int64, 0, len(boundSUTIDs))
+	seenTarget := map[int64]bool{}
+	for _, boundSUTID := range boundSUTIDs {
+		target, targetErr := s.targets.ProposalTarget(ctx, boundSUTID)
 		if targetErr != nil {
 			return nil, mapDomainError(targetErr, "proposal target")
 		}
-		if target.EnvironmentID <= 0 || seenEnv[target.EnvironmentID] {
+		if target.SUTID <= 0 || seenTarget[target.SUTID] {
 			continue
 		}
-		seenEnv[target.EnvironmentID] = true
-		environmentIDs = append(environmentIDs, target.EnvironmentID)
+		seenTarget[target.SUTID] = true
+		sutIDs = append(sutIDs, target.SUTID)
 	}
-	sort.Slice(environmentIDs, func(i, j int) bool { return environmentIDs[i] < environmentIDs[j] })
-	if len(environmentIDs) == 0 {
+	sort.Slice(sutIDs, func(i, j int) bool { return sutIDs[i] < sutIDs[j] })
+	if len(sutIDs) == 0 {
 		return []ProposalView{}, nil
 	}
-	items, err := s.resources.ListProposals(ctx, environmentIDs)
+	items, err := s.resources.ListProposals(ctx, sutIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -391,7 +386,7 @@ func joinBaseURL(baseURL, route string) string {
 }
 
 // networkRoute accepts a captured request only when its host matches the
-// version SUT environment base URL (spec §8.1).
+// target SUT's base URL (spec §8.1).
 func networkRoute(baseURL string, request NetworkRequest) (string, string, bool) {
 	base, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || base.Host == "" {
@@ -403,7 +398,7 @@ func networkRoute(baseURL string, request NetworkRequest) (string, string, bool)
 	}
 	if captured.Host == "" {
 		// The executor may persist a browser-relative request URL; resolve it
-		// against the version SUT base URL before host matching.
+		// against the SUT base URL before host matching.
 		captured = base.ResolveReference(captured)
 	}
 	if !strings.EqualFold(captured.Host, base.Host) {

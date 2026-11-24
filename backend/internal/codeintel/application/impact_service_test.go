@@ -185,9 +185,9 @@ func newImpactHarness(t *testing.T) *impactHarness {
 		}
 	}
 	reviews := newFakeReviewStore()
-	versions := &fakeVersionReader{bindings: []VersionSUTBinding{
-		{VersionSUTID: 11, VersionID: 1, SUTID: 21, RepoID: 10, CodeBaselineCommit: impactBaseCommit},
-		{VersionSUTID: 12, VersionID: 1, SUTID: 22, RepoID: 11, CodeBaselineCommit: impactBaseCommit},
+	versions := &fakeVersionReader{bindings: []SUTRepoBinding{
+		{SUTID: 21, VersionID: 1, RepoID: 10, CodeBaselineCommit: impactBaseCommit},
+		{SUTID: 22, VersionID: 1, RepoID: 11, CodeBaselineCommit: impactBaseCommit},
 	}}
 	git := &fakeGit{windows: map[string]codeintel.FileWindow{
 		"src/a.ts": {Path: "src/a.ts", Lines: []string{"export const x = 1;", "changed"}, StartLine: 1, EndLine: 2, TotalLines: 2},
@@ -198,10 +198,10 @@ func newImpactHarness(t *testing.T) *impactHarness {
 			11: {ID: 11, Name: "b", Path: "/repo-b", Branch: "main"},
 		},
 		pages: map[int64][]PageRef{
-			11: {{ID: 500, Name: "Orders", RouteTemplate: "/orders", Status: "approved", Source: "admin"}},
+			21: {{ID: 500, Name: "Orders", RouteTemplate: "/orders", Status: "approved", Source: "admin"}},
 		},
 		apis: map[int64][]APIRef{
-			11: {{ID: 600, Name: "Refund", Method: "POST", PathTemplate: "/api/refund", Status: "approved", Source: "manual"}},
+			21: {{ID: 600, Name: "Refund", Method: "POST", PathTemplate: "/api/refund", Status: "approved", Source: "manual"}},
 		},
 	}
 	design := &fakeImpactDesign{
@@ -461,7 +461,7 @@ func TestImpactSetSelectedAndList(t *testing.T) {
 	if len(views) != len(candidates) {
 		t.Fatalf("views = %d", len(views))
 	}
-	if views[0].RepoID != 10 || len(views[0].VersionSUTIDs) == 0 || views[0].VersionSUTIDs[0] != 11 {
+	if views[0].RepoID != 10 || len(views[0].SUTIDs) == 0 || views[0].SUTIDs[0] != 21 {
 		t.Fatalf("view tags = %+v", views[0])
 	}
 }

@@ -44,7 +44,6 @@ type VersionCloseServiceDeps struct {
 	Requirements  VersionRequirementReader
 	Reports       ReportStatusReader
 	ReportStaler  VersionReportStaler
-	Tasks         VersionCloseTaskEnsurer
 	Audit         auditapp.Recorder
 	Events        eventingapp.Publisher
 	Clock         clock.Clock
@@ -63,7 +62,6 @@ type VersionCloseService struct {
 	requirements VersionRequirementReader
 	reports      ReportStatusReader
 	staler       VersionReportStaler
-	tasks        VersionCloseTaskEnsurer
 	audit        auditapp.Recorder
 	events       eventingapp.Publisher
 	clock        clock.Clock
@@ -84,7 +82,6 @@ func NewVersionCloseService(deps VersionCloseServiceDeps) *VersionCloseService {
 		requirements: deps.Requirements,
 		reports:      deps.Reports,
 		staler:       deps.ReportStaler,
-		tasks:        deps.Tasks,
 		audit:        deps.Audit,
 		events:       deps.Events,
 		clock:        clk,
@@ -92,7 +89,8 @@ func NewVersionCloseService(deps VersionCloseServiceDeps) *VersionCloseService {
 }
 
 // Evaluate recomputes the close predicate of one version without changing any
-// state. It backs the version.close_read Steward tool.
+// state. It is the read-only predicate surface (the waiver path consumes it to
+// check the execution-settled conditions).
 func (s *VersionCloseService) Evaluate(ctx context.Context, versionID int64) (version.ClosePredicate, error) {
 	input, err := s.loadInput(ctx, versionID)
 	if err != nil {
@@ -101,16 +99,21 @@ func (s *VersionCloseService) Evaluate(ctx context.Context, versionID int64) (ve
 	return version.EvaluateVersionClose(input), nil
 }
 
-// EnsureVersionClose is the reconciler hook: when every close condition passes
-// it idempotently ensures the version.close steward task for the current
-// version report revision and predicate fingerprint. A failing predicate is not
-// an error (no task is created); port failures propagate.
+// deterministicCloseReason is the close_reason written when the reconciler closes
+// a version directly (GD-17 / R-G4). It is a functional, human-readable statement
+// — there is no Steward LLM run to supply a reason.
+const deterministicCloseReason = "全部闭环条件满足，系统自动关闭"
+
+// EnsureVersionClose is the reconciler hook (GD-17 / R-G4, SC-G10): when every
+// close condition passes it DIRECTLY calls the terminal Close entry — no Steward
+// LLM run and no version.close work item. Close re-evaluates the predicate under
+// the version row lock (CAS running -> completed), so a concurrent change that
+// committed after the scan rejects the close; that rejection (predicate failure or
+// a non-running version) is a benign no-op for the ensure hook. Port failures
+// propagate.
 func (s *VersionCloseService) EnsureVersionClose(ctx context.Context, versionID int64) error {
 	if versionID <= 0 {
 		return platform.Invalid("id", "must be a positive decimal ID")
-	}
-	if s.tasks == nil {
-		return errors.New("version close service is missing its task ensurer")
 	}
 	input, err := s.loadInput(ctx, versionID)
 	if err != nil {
@@ -119,7 +122,20 @@ func (s *VersionCloseService) EnsureVersionClose(ctx context.Context, versionID 
 	if !version.EvaluateVersionClose(input).Passed() {
 		return nil
 	}
-	return s.tasks.EnsureVersionClose(ctx, versionID, input.Report.RevisionID, version.VersionCloseFingerprint(input))
+	if _, err := s.Close(ctx, versionID, 0, deterministicCloseReason); err != nil {
+		var predicateFailed *version.ErrVersionClosePredicateFailed
+		if errors.As(err, &predicateFailed) {
+			return nil
+		}
+		var apiErr *platform.Error
+		if errors.As(err, &apiErr) && apiErr.Status == 409 {
+			// The version stopped running between the scan and the CAS close
+			// (concurrent close/reopen); a later tick reconciles the new state.
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Close recomputes the close predicate inside the version row-lock transaction
@@ -128,7 +144,27 @@ func (s *VersionCloseService) EnsureVersionClose(ctx context.Context, versionID 
 // the audit entry. A rejected predicate returns
 // *version.ErrVersionClosePredicateFailed and changes nothing; a version that is
 // not running is a state conflict.
+//
+// Close and CloseWaived are the SAME terminal entry (constitution 三.6): both
+// funnel into closeVersion, which performs the single repository Close CAS
+// (running -> completed). The waiver variant only swaps the predicate and the
+// closure_kind/unverified projection — it is never a second status writer.
 func (s *VersionCloseService) Close(ctx context.Context, versionID, runID int64, reason string) (version.Version, error) {
+	return s.closeVersion(ctx, versionID, runID, reason, false)
+}
+
+// CloseWaived is the admin-waiver variant of the single terminal Close entry
+// (GD-06/P23, R-G6/R-G8, SC-G11). It evaluates the waived predicate (six
+// execution-settled checks + execution data; RequirementsClosed and report
+// currency overridden), writes closure_kind=waived + unverified=true through the
+// same Close CAS, and discloses the waiver in the version.closed event/audit.
+// The caller (WaiverService) regenerates and publishes the unverified report
+// synchronously afterwards.
+func (s *VersionCloseService) CloseWaived(ctx context.Context, versionID int64, reason string) (version.Version, error) {
+	return s.closeVersion(ctx, versionID, 0, reason, true)
+}
+
+func (s *VersionCloseService) closeVersion(ctx context.Context, versionID, runID int64, reason string, waived bool) (version.Version, error) {
 	if versionID <= 0 {
 		return version.Version{}, platform.Invalid("id", "must be a positive decimal ID")
 	}
@@ -144,17 +180,29 @@ func (s *VersionCloseService) Close(ctx context.Context, versionID, runID int64,
 		return version.Version{}, err
 	}
 
+	evaluate := version.EvaluateVersionClose
+	failureCounts := version.VersionCloseFailureCounts
+	closureKind := version.ClosureKindNormal
+	if waived {
+		evaluate = version.EvaluateVersionCloseWaived
+		failureCounts = version.VersionCloseWaivedFailureCounts
+		closureKind = version.ClosureKindWaived
+	}
+
 	now := s.clock.Now()
 	var closeRunID *int64
 	if runID > 0 {
 		closeRunID = &runID
 	}
 	var evaluated version.VersionCloseInput
-	closed, err := s.versions.Close(ctx, versionID, version.VersionCloseFields{
+	closeFields := &version.VersionCloseFields{
 		ClosedAt:    now,
 		CloseReason: reason,
 		CloseRunID:  closeRunID,
-	}, func(_ context.Context, locked version.Version) error {
+		ClosureKind: closureKind,
+		Unverified:  waived,
+	}
+	closed, err := s.versions.Close(ctx, versionID, closeFields, func(_ context.Context, locked version.Version) error {
 		// Re-evaluate while the version row is locked. A concurrent intent,
 		// wave, human request or requirement change committed before this
 		// point is visible here and rejects the close.
@@ -162,10 +210,25 @@ func (s *VersionCloseService) Close(ctx context.Context, versionID, runID int64,
 		if err != nil {
 			return err
 		}
-		if predicate := version.EvaluateVersionClose(input); !predicate.Passed() {
-			return &version.ErrVersionClosePredicateFailed{Failed: version.VersionCloseFailureCounts(input)}
+		if predicate := evaluate(input); !predicate.Passed() {
+			return &version.ErrVersionClosePredicateFailed{Failed: failureCounts(input)}
 		}
 		evaluated = input
+		// A normal close whose requirements include an admin-waived requirement
+		// is NOT fully verified: the requirement waiver overrode closure
+		// completeness (SC-G11, final fix wave #1). Disclose it through
+		// unverified so the closure is never labeled fully-verified normal;
+		// closure_kind stays normal (the version itself was not waive-closed).
+		// The waived variant already sets unverified. The decision is made from
+		// the authoritative under-lock evaluation, not a pre-lock read.
+		if !waived {
+			for _, requirement := range input.Requirements {
+				if requirement.Waived {
+					closeFields.Unverified = true
+					break
+				}
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -178,6 +241,8 @@ func (s *VersionCloseService) Close(ctx context.Context, versionID, runID int64,
 		"report_revision_id": platformid.Format(evaluated.Report.RevisionID),
 		"closed_at":          closed.ClosedAt.UTC().Format(closeTimeLayout),
 		"close_reason":       closed.CloseReason,
+		"closure_kind":       closed.ClosureKind,
+		"unverified":         closed.Unverified,
 	}
 	if closed.CloseRunID != nil {
 		payload["close_run_id"] = platformid.Format(*closed.CloseRunID)
@@ -190,6 +255,8 @@ func (s *VersionCloseService) Close(ctx context.Context, versionID, runID int64,
 		"closed_at":             closed.ClosedAt.UTC().Format(closeTimeLayout),
 		"close_reason":          closed.CloseReason,
 		"close_run_id":          payload["close_run_id"],
+		"closure_kind":          closed.ClosureKind,
+		"unverified":            closed.Unverified,
 		"predicate_fingerprint": version.VersionCloseFingerprint(evaluated),
 	})
 	return closed, nil
@@ -266,9 +333,9 @@ func (s *VersionCloseService) loadInput(ctx context.Context, versionID int64) (v
 	return s.buildInput(ctx, stored)
 }
 
-// buildInput recomputes the close projection of one already loaded version. The
-// version.close task itself is subtracted from the blocking work item count
-// here (self-task exclusion, spec §7.3 check 2).
+// buildInput recomputes the close projection of one already loaded version.
+// GD-17 removed the version.close work type, so there is no self-task to subtract:
+// BlockingWorkItems is the raw blocking total (spec §7.3 check 2).
 func (s *VersionCloseService) buildInput(ctx context.Context, stored version.Version) (version.VersionCloseInput, error) {
 	requirements, err := s.requirements.ListByVersion(ctx, stored.ID)
 	if err != nil {
@@ -302,10 +369,7 @@ func (s *VersionCloseService) buildInput(ctx context.Context, stored version.Ver
 	if err != nil {
 		return version.VersionCloseInput{}, fmt.Errorf("version close %d: load execution coverage: %w", stored.ID, err)
 	}
-	blockingWorkItems := workCounts.Total - workCounts.VersionClose
-	if blockingWorkItems < 0 {
-		blockingWorkItems = 0
-	}
+	blockingWorkItems := workCounts.Total
 	return version.VersionCloseInput{
 		Version:           stored,
 		BlockingWorkItems: blockingWorkItems,

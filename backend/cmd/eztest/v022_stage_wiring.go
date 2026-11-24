@@ -27,6 +27,7 @@ import (
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -331,12 +332,8 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 			if err != nil {
 				return false, err
 			}
-			for _, binding := range view.Bindings {
-				if strings.TrimSpace(binding.Environment.ID) != "" {
-					return true, nil
-				}
-			}
-			return false, nil
+			// v0.2.4-B: the environment binding is a column on the version.
+			return view.EnvironmentID > 0, nil
 		}
 		gates.RequirementCount = func(ctx context.Context, versionID int64) (int, error) {
 			view, err := deps.Versions.Get(ctx, versionID)
@@ -363,19 +360,14 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 			if err != nil {
 				return false, err
 			}
-			if len(view.Bindings) == 0 {
+			if view.EnvironmentID <= 0 {
 				return false, nil
 			}
-			for _, binding := range view.Bindings {
-				if strings.TrimSpace(binding.Environment.ID) == "" {
-					return false, nil
-				}
-				// A binding that lists target databases needs at least one
-				// account to reach them; a UI-only binding is valid without an
-				// account.
-				if len(binding.Databases) > 0 && len(binding.Accounts) == 0 {
-					return false, nil
-				}
+			// A version whose environment exposes target databases needs at
+			// least one account to reach them; a UI-only environment is valid
+			// without an account.
+			if len(view.Binding.Databases) > 0 && len(view.Binding.Accounts) == 0 {
+				return false, nil
 			}
 			return true, nil
 		}
@@ -436,7 +428,7 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 			}
 			considered := 0
 			for _, requirement := range graph.Requirements {
-				if !strings.EqualFold(strings.TrimSpace(requirement.Status), "clarified") {
+				if !strings.EqualFold(strings.TrimSpace(requirement.Status), string(versiondomain.RequirementClarified)) {
 					continue
 				}
 				considered++
@@ -444,7 +436,7 @@ func newV022StageGates(deps v022StageGateDeps) versionapp.StageGates {
 				for _, scenario := range requirement.Scenarios {
 					for _, testCase := range scenario.Cases {
 						switch strings.ToLower(strings.TrimSpace(testCase.Status)) {
-						case "draft", "confirmed":
+						case design.CaseStatusDraft, design.CaseStatusConfirmed:
 							covered = true
 						}
 					}

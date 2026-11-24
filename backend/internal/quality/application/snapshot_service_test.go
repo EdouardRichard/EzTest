@@ -13,7 +13,7 @@ import (
 	quality "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
 )
 
-// fakeSnapshotPorts implements the four read-only product-data ports wired by
+// fakeSnapshotPorts implements the three read-only product-data ports wired by
 // WithSnapshotPorts. A non-nil err makes every port fail so the failed-event
 // path is observable.
 type fakeSnapshotPorts struct {
@@ -25,9 +25,6 @@ type fakeSnapshotPorts struct {
 
 	execPassed int
 	execTotal  int
-
-	visualPassed int
-	visualFailed int
 
 	err error
 
@@ -47,11 +44,6 @@ func (f *fakeSnapshotPorts) CountCaseConfirmation(_ context.Context, versionID *
 func (f *fakeSnapshotPorts) CountExecutionPass(_ context.Context, versionID *int64) (int, int, error) {
 	f.versionID = versionID
 	return f.execPassed, f.execTotal, f.err
-}
-
-func (f *fakeSnapshotPorts) VisualClassification(_ context.Context, versionID *int64) (int, int, error) {
-	f.versionID = versionID
-	return f.visualPassed, f.visualFailed, f.err
 }
 
 // fakeVersionExists implements the narrow VersionExistsPort wired by
@@ -99,13 +91,12 @@ func snapshotPorts() *fakeSnapshotPorts {
 		closureClosed: 9, closureTotal: 10,
 		caseConfirmed: 8, caseTotal: 10,
 		execPassed: 9, execTotal: 10,
-		visualPassed: 9, visualFailed: 1,
 	}
 }
 
 func snapshotService(repo *fakeRepo, ports *fakeSnapshotPorts, events *fakeEvalEvents) *qualityapp.Service {
 	service := newService(repo, nil, nil, nil)
-	service.WithSnapshotPorts(ports, ports, ports, ports)
+	service.WithSnapshotPorts(ports, ports, ports)
 	service.WithVersionExistence(&fakeVersionExists{exists: true})
 	if events != nil {
 		service.WithEvents(events)
@@ -126,7 +117,7 @@ func snapshotMetric(t *testing.T, run qualityapp.EvalRun, name string) quality.M
 
 // TestSnapshotTriggerMetricsStatusAndEvents is the W2-14 behavioural contract:
 // one admin trigger derives a mode=snapshot run scoped to the version, persists
-// four metrics and publishes eval.started before eval.completed.
+// three metrics and publishes eval.started before eval.completed.
 func TestSnapshotTriggerMetricsStatusAndEvents(t *testing.T) {
 	repo := &fakeRepo{}
 	events := &fakeEvalEvents{}
@@ -146,14 +137,13 @@ func TestSnapshotTriggerMetricsStatusAndEvents(t *testing.T) {
 	if run.Status != quality.StatusPassed {
 		t.Fatalf("status = %q", run.Status)
 	}
-	if len(run.Metrics) != 4 || len(repo.insertedMetrics) != 4 {
+	if len(run.Metrics) != 3 || len(repo.insertedMetrics) != 3 {
 		t.Fatalf("metrics = %d/%d", len(run.Metrics), len(repo.insertedMetrics))
 	}
 	for _, name := range []string{
 		quality.MetricDesignCoverage,
 		quality.MetricExecutionPassRate,
 		quality.MetricCaseCoverage,
-		quality.MetricVisualClassificationAccuracy,
 	} {
 		snapshotMetric(t, run, name)
 	}
@@ -286,7 +276,6 @@ func TestSnapshotTriggerPreviousSnapshotIsWarnOnlyBaseline(t *testing.T) {
 			{Name: quality.MetricDesignCoverage, Value: previousBaseline},
 			{Name: quality.MetricExecutionPassRate, Value: previousBaseline},
 			{Name: quality.MetricCaseCoverage, Value: previousBaseline},
-			{Name: quality.MetricVisualClassificationAccuracy, Value: previousBaseline},
 		},
 	}
 	service := snapshotService(repo, snapshotPorts(), nil)

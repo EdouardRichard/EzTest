@@ -7,14 +7,17 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var _ agentapp.AgentCenterReader = (*AgentCenterReader)(nil)
 
-// AgentCenterReader is the agent context's P6 read-only source for the Agent
-// center catalog, run list and run statistics. It never writes and never reads
-// agent_message/context_packet, so prompts and transcripts stay private.
+// AgentCenterReader is the agent context's read-only source for the Agent
+// center catalog, run list and run statistics. It never writes. The catalog and
+// run projections never read agent_message/context_packet, so prompts and
+// transcripts stay out of the ordinary metadata view; RunTranscript is the
+// separate admin-only transcript read (v0.2.4-D T8).
 type AgentCenterReader struct {
 	pool *pgxpool.Pool
 }
@@ -88,14 +91,14 @@ func (r *AgentCenterReader) ProfileRunStats(ctx context.Context) (map[string]age
 	rows, err := r.pool.Query(ctx, `
 		SELECT profile_key,
 		       count(*),
-		       count(*) FILTER (WHERE status = 'done'),
-		       count(*) FILTER (WHERE status = 'failed'),
-		       count(*) FILTER (WHERE status = 'aborted'),
-		       count(*) FILTER (WHERE status = 'interrupted'),
+		       count(*) FILTER (WHERE status = $1),
+		       count(*) FILTER (WHERE status = $2),
+		       count(*) FILTER (WHERE status = $3),
+		       count(*) FILTER (WHERE status = $4),
 		       max(started_at)
 		FROM agent_run
 		GROUP BY profile_key
-	`)
+	`, string(agent.AgentRunDone), string(agent.AgentRunFailed), string(agent.AgentRunAborted), string(agent.AgentRunInterrupted))
 	if err != nil {
 		return nil, fmt.Errorf("aggregate agent run stats: %w", err)
 	}
@@ -183,4 +186,21 @@ func (r *AgentCenterReader) ListRuns(ctx context.Context, query agentapp.RunQuer
 		runs = runs[:query.Limit]
 	}
 	return runs, hasMore, nil
+}
+
+// RunTranscript reads one run's whole transcript for the ADMIN-ONLY Agent
+// Center transcript (v0.2.4-D T8, SC-D3). It shares the ONE transcript query
+// with the runtime repository and reads without a page limit: the admin view
+// must not be silently truncated. The role gate lives at the HTTP edge.
+func (r *AgentCenterReader) RunTranscript(ctx context.Context, runID int64) ([]agent.AgentMessage, error) {
+	return queryRunMessages(ctx, r.pool, runID, noLimit)
+}
+
+// RunActivity reads one run's whole agent_activity fact ledger for the
+// ADMIN-ONLY Agent Center activity read (v0.2.4-D T10, SC-D5). It shares the ONE
+// activity query with the runtime repository and reads without a page limit.
+// This is the production read side that closes the agent_activity share of
+// V-0019 (a table with no reader). The role gate lives at the HTTP edge.
+func (r *AgentCenterReader) RunActivity(ctx context.Context, runID int64) ([]agent.Activity, error) {
+	return queryRunActivity(ctx, r.pool, runID)
 }

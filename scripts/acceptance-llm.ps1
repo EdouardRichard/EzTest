@@ -259,7 +259,7 @@ try {
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
     }
     Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue

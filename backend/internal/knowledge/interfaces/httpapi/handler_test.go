@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -56,6 +57,11 @@ type fakeService struct {
 	revisionsErr  error
 	revisionsID   int64
 	revisionsCall int
+
+	usageStats knowledgeapp.UsageStats
+	usageErr   error
+	usageID    int64
+	usageCalls int
 }
 
 func (f *fakeService) List(_ context.Context, filter knowledgeapp.ListFilter) (knowledgeapp.Page, error) {
@@ -116,6 +122,12 @@ func (f *fakeService) Revisions(_ context.Context, id int64) ([]knowledge.Revisi
 	f.revisionsCall++
 	f.revisionsID = id
 	return f.revisions, f.revisionsErr
+}
+
+func (f *fakeService) ItemUsage(_ context.Context, id int64) (knowledgeapp.UsageStats, error) {
+	f.usageCalls++
+	f.usageID = id
+	return f.usageStats, f.usageErr
 }
 
 /* --------------------------------- helpers -------------------------------- */
@@ -459,6 +471,89 @@ func TestGetItemRejectsInvalidID(t *testing.T) {
 	if fake.getCalls != 0 {
 		t.Fatalf("service calls = %d", fake.getCalls)
 	}
+}
+
+// TestGetItemReturnsUsageStats pins the H-A5/R-H8 detail read surface: the
+// detail payload carries the real knowledge_usage aggregates (injection count
+// and last-used time) read through the service, and the usage read stays behind
+// the R91 secret gate.
+func TestGetItemReturnsUsageStats(t *testing.T) {
+	t.Run("renders the service aggregates", func(t *testing.T) {
+		lastUsed := handlerNow.Add(-time.Hour)
+		fake := &fakeService{
+			getItem:    fixtureItem(),
+			revisions:  []knowledge.Revision{fixtureRevision()},
+			usageStats: knowledgeapp.UsageStats{InjectionCount: 3, LastUsedAt: &lastUsed},
+		}
+		mux := newKnowledgeMux(fake, "user")
+		recorder, body := perform(t, mux, http.MethodGet, "/api/knowledge/items/9001", "")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%v", recorder.Code, body)
+		}
+		if fake.usageCalls != 1 || fake.usageID != 9001 {
+			t.Fatalf("usage calls = %d id = %d, want one call for 9001", fake.usageCalls, fake.usageID)
+		}
+		usage, ok := body["data"].(map[string]any)["usage"].(map[string]any)
+		if !ok {
+			t.Fatalf("detail usage = %#v, want an object", body["data"])
+		}
+		if usage["injection_count"] != float64(3) {
+			t.Fatalf("injection_count = %v (%T), want 3", usage["injection_count"], usage["injection_count"])
+		}
+		if usage["last_used_at"] != lastUsed.Format(time.RFC3339) {
+			t.Fatalf("last_used_at = %v, want %s", usage["last_used_at"], lastUsed.Format(time.RFC3339))
+		}
+	})
+
+	t.Run("never-used item renders zero and null", func(t *testing.T) {
+		fake := &fakeService{getItem: fixtureItem(), revisions: []knowledge.Revision{}}
+		mux := newKnowledgeMux(fake, "user")
+		recorder, body := perform(t, mux, http.MethodGet, "/api/knowledge/items/9001", "")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%v", recorder.Code, body)
+		}
+		usage, ok := body["data"].(map[string]any)["usage"].(map[string]any)
+		if !ok {
+			t.Fatalf("detail usage = %#v, want an object", body["data"])
+		}
+		if usage["injection_count"] != float64(0) || usage["last_used_at"] != nil {
+			t.Fatalf("usage = %#v, want {injection_count:0, last_used_at:null}", usage)
+		}
+	})
+
+	t.Run("secret-bearing item 404s without a usage read", func(t *testing.T) {
+		item := fixtureItem()
+		item.Content = `{"recipe":"password=hunter2"}`
+		fake := &fakeService{getItem: item}
+		mux := newKnowledgeMux(fake, "user")
+		recorder, body := perform(t, mux, http.MethodGet, "/api/knowledge/items/9001", "")
+		assertErrorCode(t, recorder.Code, body, http.StatusNotFound, "not_found")
+		if fake.usageCalls != 0 {
+			t.Fatalf("usage calls = %d, want 0 behind the secret gate", fake.usageCalls)
+		}
+	})
+
+	t.Run("usage read failure is a 500, not a zero-stats 200", func(t *testing.T) {
+		fake := &fakeService{
+			getItem:   fixtureItem(),
+			revisions: []knowledge.Revision{},
+			usageErr:  errors.New("usage read failed"),
+		}
+		mux := newKnowledgeMux(fake, "user")
+		recorder, body := perform(t, mux, http.MethodGet, "/api/knowledge/items/9001", "")
+		assertErrorCode(t, recorder.Code, body, http.StatusInternalServerError, "internal")
+	})
+
+	t.Run("usage reader unavailable is a 503, not a zero-stats 200", func(t *testing.T) {
+		fake := &fakeService{
+			getItem:   fixtureItem(),
+			revisions: []knowledge.Revision{},
+			usageErr:  platform.Unavailable("knowledge usage repository is not configured"),
+		}
+		mux := newKnowledgeMux(fake, "user")
+		recorder, body := perform(t, mux, http.MethodGet, "/api/knowledge/items/9001", "")
+		assertErrorCode(t, recorder.Code, body, http.StatusServiceUnavailable, "unavailable")
+	})
 }
 
 /* --------------------------------- update --------------------------------- */

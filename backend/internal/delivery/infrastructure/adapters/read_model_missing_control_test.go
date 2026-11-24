@@ -40,14 +40,14 @@ func TestBlockedMissingControlIssueCarriesExpectedObservedEvidence(t *testing.T)
 	})
 	deps.Design.(*fakeDesign).cases[7] = append(deps.Design.(*fakeDesign).cases[7], designapp.ExecutableCaseView{
 		CaseID: 206, CaseVersionID: caseVersion, RequirementID: 102, RequirementVersionID: 1002,
-		Title: "AC-FR-106-02 到点自动发布", Priority: "P2", VersionSUTIDs: []int64{sutRef},
+		Title: "AC-FR-106-02 到点自动发布", Priority: "P2",
 		Steps: []designapp.ExecutableStepView{{Seq: 1, Action: "在编辑页设置未来发布时间 T", Expected: stepExpect}},
 	})
 	deps.Results.(*fakeResults).steps[caseRunID] = []execution.StepResult{
 		{
 			ID: stepID, CaseRunID: caseRunID, Seq: 1, Status: execution.StepBlocked,
-			TargetVersionSUTID: &sutRef,
-			Observed:           map[string]any{"summary": observed},
+			TargetSUTID: &sutRef,
+			Observed:    map[string]any{"summary": observed},
 		},
 	}
 	deps.Results.(*fakeResults).assertions[caseRunID] = []execution.AssertionResult{
@@ -58,7 +58,7 @@ func TestBlockedMissingControlIssueCarriesExpectedObservedEvidence(t *testing.T)
 		},
 	}
 	deps.Evidence.(*fakeEvidence).rows[caseRunID] = []execution.Evidence{
-		{ID: evidenceID, CaseRunID: caseRunID, VersionSUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "eeff", SizeBytes: 32},
+		{ID: evidenceID, CaseRunID: caseRunID, SUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "eeff", SizeBytes: 32},
 	}
 
 	reader := NewExecutionReader(deps)

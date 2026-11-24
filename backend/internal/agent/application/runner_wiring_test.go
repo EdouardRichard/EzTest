@@ -194,7 +194,7 @@ func newWiringFixture(t *testing.T, options ...func(*agentapp.RunnerDeps)) *wiri
 			Attachment:  &fakeAttachmentPort{},
 			Resource:    &fakeResourcePort{},
 			Design:      base.design,
-			P7:          tools.P7Deps{Knowledge: base.knowledgeWriter},
+			Knowledge:   tools.KnowledgeDeps{Knowledge: base.knowledgeWriter},
 		},
 		PlanWriter:          fixture.plan,
 		QuestionAsker:       fixture.asker,
@@ -322,7 +322,7 @@ func requestToolNames(request llmapp.ChatRequest) []string {
 // Deps.Completion.
 func registerCompletionToolGroup() {
 	completionGroupOnce.Do(func() {
-		tools.RegisterP4ToolGroup(tools.TaskCompleteTools)
+		tools.RegisterToolGroup(tools.TaskCompleteTools)
 	})
 }
 

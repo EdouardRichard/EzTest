@@ -41,7 +41,6 @@ func RenderOPML(data ExportData) ([]byte, error) {
 	for _, requirement := range data.Requirements {
 		requirementOutline := opmlOutline{
 			Text: fmt.Sprintf("%s（v%d，%s）", requirement.Title, requirement.Revision, requirement.Status),
-			Note: fmt.Sprintf("目标 SUT: %s", formatIDs(requirement.TargetVersionSUTIDs)),
 		}
 		for _, scenario := range requirement.Scenarios {
 			scenarioOutline := opmlOutline{Text: scenario.Name, Note: scenario.Description}
@@ -71,7 +70,8 @@ func opmlCaseNote(item ExportCase) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "状态: %s\n", item.Status)
 	fmt.Fprintf(&builder, "优先级: %s\n", item.Priority)
-	fmt.Fprintf(&builder, "默认 SUT: %s\n", formatOptionalID(item.DefaultVersionSUTID))
+	fmt.Fprintf(&builder, "被测系统: %s\n", exportText(item.SutDescription))
+	fmt.Fprintf(&builder, "覆盖验收标准: %s\n", formatACList(item.CoveredACs))
 	if strings.TrimSpace(item.Preconditions) != "" {
 		fmt.Fprintf(&builder, "前置条件: %s\n", item.Preconditions)
 	}
@@ -86,7 +86,12 @@ func opmlCaseNote(item ExportCase) string {
 		fmt.Fprintf(&builder, "测试数据: %s\n", string(testData))
 	}
 	for _, step := range item.Steps {
-		fmt.Fprintf(&builder, "步骤 %d: %s -> %s\n", step.Seq, step.Action, step.Expected)
+		if strings.TrimSpace(step.TargetDescription) == "" {
+			fmt.Fprintf(&builder, "步骤 %d: %s -> %s\n", step.Seq, step.Action, step.Expected)
+			continue
+		}
+		fmt.Fprintf(&builder, "步骤 %d: %s -> %s（目标: %s）\n",
+			step.Seq, step.Action, step.Expected, step.TargetDescription)
 	}
 	for _, assertion := range item.Assertions {
 		fmt.Fprintf(&builder, "断言 %d: %s %s -> %s\n", assertion.StepSeq, assertion.Kind, assertion.Target, assertion.Expected)

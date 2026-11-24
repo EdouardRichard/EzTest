@@ -17,13 +17,14 @@ func augmentedDraftCase() AugmentedCaseDraft {
 	return AugmentedCaseDraft{
 		RequirementID:        3001,
 		RequirementVersionID: 3002,
-		VersionSUTID:         9001,
 		Title:                "[补用例] 登录 · 验收",
 		Description:          "登录缺少可验证的验收标准",
+		SutDescription:       "商城前台登录页与登录接口。",
 		Preconditions:        "需求当前版本已确认",
+		CoveredACs:           []string{"AC-1"},
 		Priority:             "P2",
 		Steps: []AugmentedCaseDraftStep{
-			{Seq: 1, Action: "打开登录页", Expected: "出现登录表单"},
+			{Seq: 1, Action: "打开登录页", Expected: "出现登录表单", TargetDescription: "登录页"},
 			{Seq: 2, Action: "逐条核对验收标准", Expected: "每条标准均可观察"},
 		},
 		Assertions: []AugmentedCaseDraftAssertion{

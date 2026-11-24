@@ -4,6 +4,7 @@ package designpg
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,19 +13,32 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func p6DesignInt64Ptr(value int64) *int64 { return &value }
+func designInt64Ptr(value int64) *int64 { return &value }
 
-func p6SeedDesignVersion(t *testing.T, pool *pgxpool.Pool, id int64, title string) {
+// readModelSeedDesignVersion inserts one version row. v0.2.4-B: version.environment_id
+// is NOT NULL (version_0016), so the fixture creates the environment the version
+// binds first. The environment id/name are derived from the version id so a test
+// that seeds several versions gets distinct environments (uk_environment_name is
+// unique on lower(name)).
+func readModelSeedDesignVersion(t *testing.T, pool *pgxpool.Pool, id int64, title string) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO version (id, title, status, created_by)
-		VALUES ($1, $2, 'initial', 1)
-	`, id, title); err != nil {
+	ctx := context.Background()
+	environmentID := id*10 + 1
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO environment (id, name, status) VALUES ($1, $2, 'active')
+		ON CONFLICT (id) DO NOTHING
+	`, environmentID, fmt.Sprintf("p6-design-env-%d", environmentID)); err != nil {
+		t.Fatalf("seed environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO version (id, title, status, created_by, environment_id)
+		VALUES ($1, $2, 'initial', 1, $3)
+	`, id, title, environmentID); err != nil {
 		t.Fatalf("seed version: %v", err)
 	}
 }
 
-func p6SeedDesignScenario(t *testing.T, pool *pgxpool.Pool, versionID, scenarioID int64) {
+func readModelSeedDesignScenario(t *testing.T, pool *pgxpool.Pool, versionID, scenarioID int64) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
@@ -34,7 +48,7 @@ func p6SeedDesignScenario(t *testing.T, pool *pgxpool.Pool, versionID, scenarioI
 	}
 }
 
-func p6SeedDesignCase(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID, scenarioID int64, status, title string, createdAt, updatedAt time.Time) {
+func readModelSeedDesignCase(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID, scenarioID int64, status, title string, createdAt, updatedAt time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
@@ -52,7 +66,7 @@ func p6SeedDesignCase(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID, s
 	}
 }
 
-func p6SeedDesignCaseVersion(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID int64, revision int, status, title string) {
+func readModelSeedDesignCaseVersion(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID int64, revision int, status, title string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO case_version (id, case_id, revision, title, content_hash, status)
@@ -62,7 +76,7 @@ func p6SeedDesignCaseVersion(t *testing.T, pool *pgxpool.Pool, caseID, caseVersi
 	}
 }
 
-func p6SeedDesignRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status string) {
+func readModelSeedDesignRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status string) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
@@ -79,7 +93,7 @@ func p6SeedDesignRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requir
 	}
 }
 
-func p6SeedDesignScope(t *testing.T, pool *pgxpool.Pool, id, versionID, requirementID int64, status string) {
+func readModelSeedDesignScope(t *testing.T, pool *pgxpool.Pool, id, versionID, requirementID int64, status string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO design_scope (id, version_id, requirement_id, status)
@@ -89,7 +103,7 @@ func p6SeedDesignScope(t *testing.T, pool *pgxpool.Pool, id, versionID, requirem
 	}
 }
 
-func TestP6DesignQueryReaderCountCaseConfirmation(t *testing.T) {
+func TestDesignQueryReaderCountCaseConfirmation(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -98,12 +112,12 @@ func TestP6DesignQueryReaderCountCaseConfirmation(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedDesignScenario(t, pool, 1001, 5001)
-	p6SeedDesignScenario(t, pool, 1002, 5002)
-	p6SeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "draft case", base, base)
-	p6SeedDesignCase(t, pool, 7002, 8002, 5001, "confirmed", "confirmed case", base, base)
-	p6SeedDesignCase(t, pool, 7003, 8003, 5001, "stale", "stale case", base, base)
-	p6SeedDesignCase(t, pool, 7011, 8011, 5002, "confirmed", "other confirmed", base, base)
+	readModelSeedDesignScenario(t, pool, 1001, 5001)
+	readModelSeedDesignScenario(t, pool, 1002, 5002)
+	readModelSeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "draft case", base, base)
+	readModelSeedDesignCase(t, pool, 7002, 8002, 5001, "confirmed", "confirmed case", base, base)
+	readModelSeedDesignCase(t, pool, 7003, 8003, 5001, "stale", "stale case", base, base)
+	readModelSeedDesignCase(t, pool, 7011, 8011, 5002, "confirmed", "other confirmed", base, base)
 	// A case without a current version does not belong to the current-version
 	// denominator.
 	if _, err := pool.Exec(ctx, `
@@ -121,7 +135,7 @@ func TestP6DesignQueryReaderCountCaseConfirmation(t *testing.T) {
 		t.Fatalf("global counts = %d/%d, want 2/4", num, denom)
 	}
 
-	num, denom, err = reader.CountCaseConfirmation(ctx, p6DesignInt64Ptr(1001))
+	num, denom, err = reader.CountCaseConfirmation(ctx, designInt64Ptr(1001))
 	if err != nil {
 		t.Fatalf("CountCaseConfirmation version: %v", err)
 	}
@@ -129,7 +143,7 @@ func TestP6DesignQueryReaderCountCaseConfirmation(t *testing.T) {
 		t.Fatalf("version counts = %d/%d, want 1/3", num, denom)
 	}
 
-	num, denom, err = reader.CountCaseConfirmation(ctx, p6DesignInt64Ptr(1003))
+	num, denom, err = reader.CountCaseConfirmation(ctx, designInt64Ptr(1003))
 	if err != nil {
 		t.Fatalf("CountCaseConfirmation empty version: %v", err)
 	}
@@ -138,7 +152,7 @@ func TestP6DesignQueryReaderCountCaseConfirmation(t *testing.T) {
 	}
 }
 
-func TestP6DesignQueryReaderSearchCases(t *testing.T) {
+func TestDesignQueryReaderSearchCases(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -146,11 +160,11 @@ func TestP6DesignQueryReaderSearchCases(t *testing.T) {
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedDesignScenario(t, pool, 1001, 5001)
+	readModelSeedDesignScenario(t, pool, 1001, 5001)
 
-	p6SeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "Login success", base, base.Add(time.Hour))
-	p6SeedDesignCase(t, pool, 7002, 8002, 5001, "confirmed", "Login failure", base, base.Add(2*time.Hour))
-	p6SeedDesignCase(t, pool, 7003, 8003, 5001, "confirmed", "Checkout", base, base.Add(3*time.Hour))
+	readModelSeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "Login success", base, base.Add(time.Hour))
+	readModelSeedDesignCase(t, pool, 7002, 8002, 5001, "confirmed", "Login failure", base, base.Add(2*time.Hour))
+	readModelSeedDesignCase(t, pool, 7003, 8003, 5001, "confirmed", "Checkout", base, base.Add(3*time.Hour))
 
 	// 7004's historical revision matches q but its current revision does not.
 	if _, err := pool.Exec(ctx, `
@@ -159,8 +173,8 @@ func TestP6DesignQueryReaderSearchCases(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("seed case entity: %v", err)
 	}
-	p6SeedDesignCaseVersion(t, pool, 7004, 8104, 1, "superseded", "Login old")
-	p6SeedDesignCaseVersion(t, pool, 7004, 8004, 2, "confirmed", "Other")
+	readModelSeedDesignCaseVersion(t, pool, 7004, 8104, 1, "superseded", "Login old")
+	readModelSeedDesignCaseVersion(t, pool, 7004, 8004, 2, "confirmed", "Other")
 
 	rows, err := reader.SearchCases(ctx, "login", 2)
 	if err != nil {
@@ -188,7 +202,7 @@ func TestP6DesignQueryReaderSearchCases(t *testing.T) {
 	}
 }
 
-func TestP6DesignQueryReaderListDraftCases(t *testing.T) {
+func TestDesignQueryReaderListDraftCases(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -196,10 +210,10 @@ func TestP6DesignQueryReaderListDraftCases(t *testing.T) {
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedDesignScenario(t, pool, 1001, 5001)
-	p6SeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "Older draft", base, base)
-	p6SeedDesignCase(t, pool, 7002, 8002, 5001, "draft", "Newer draft", base.Add(time.Hour), base.Add(time.Hour))
-	p6SeedDesignCase(t, pool, 7003, 8003, 5001, "confirmed", "Confirmed", base.Add(2*time.Hour), base.Add(2*time.Hour))
+	readModelSeedDesignScenario(t, pool, 1001, 5001)
+	readModelSeedDesignCase(t, pool, 7001, 8001, 5001, "draft", "Older draft", base, base)
+	readModelSeedDesignCase(t, pool, 7002, 8002, 5001, "draft", "Newer draft", base.Add(time.Hour), base.Add(time.Hour))
+	readModelSeedDesignCase(t, pool, 7003, 8003, 5001, "confirmed", "Confirmed", base.Add(2*time.Hour), base.Add(2*time.Hour))
 
 	rows, err := reader.ListDraftCases(ctx, 10)
 	if err != nil {
@@ -224,27 +238,27 @@ func TestP6DesignQueryReaderListDraftCases(t *testing.T) {
 	}
 }
 
-func TestP6DesignQueryReaderPendingDesignCounts(t *testing.T) {
+func TestDesignQueryReaderPendingDesignCounts(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
-	p6SeedDesignVersion(t, pool, 1001, "Login SUT")
-	p6SeedDesignVersion(t, pool, 1002, "Checkout SUT")
+	readModelSeedDesignVersion(t, pool, 1001, "Login SUT")
+	readModelSeedDesignVersion(t, pool, 1002, "Checkout SUT")
 
 	// 1001: two clarified requirements without an active scope (2001 and 2003);
 	// an active scope clears 2002. Draft/closed requirements are not pending.
-	p6SeedDesignRequirement(t, pool, 1001, 2001, 3001, "clarified")
-	p6SeedDesignRequirement(t, pool, 1001, 2002, 3002, "clarified")
-	p6SeedDesignRequirement(t, pool, 1001, 2003, 3003, "clarified")
-	p6SeedDesignRequirement(t, pool, 1001, 2004, 3004, "draft")
-	p6SeedDesignRequirement(t, pool, 1001, 2005, 3005, "closed")
-	p6SeedDesignScope(t, pool, 4001, 1001, 2002, "active")
-	p6SeedDesignScope(t, pool, 4002, 1001, 2003, "closed")
+	readModelSeedDesignRequirement(t, pool, 1001, 2001, 3001, "clarified")
+	readModelSeedDesignRequirement(t, pool, 1001, 2002, 3002, "clarified")
+	readModelSeedDesignRequirement(t, pool, 1001, 2003, 3003, "clarified")
+	readModelSeedDesignRequirement(t, pool, 1001, 2004, 3004, "draft")
+	readModelSeedDesignRequirement(t, pool, 1001, 2005, 3005, "closed")
+	readModelSeedDesignScope(t, pool, 4001, 1001, 2002, "active")
+	readModelSeedDesignScope(t, pool, 4002, 1001, 2003, "closed")
 	// 1002 has one pending requirement.
-	p6SeedDesignRequirement(t, pool, 1002, 2011, 3011, "clarified")
+	readModelSeedDesignRequirement(t, pool, 1002, 2011, 3011, "clarified")
 
 	counts, err := reader.PendingDesignCounts(ctx, []int64{1001, 1002, 1003})
 	if err != nil {
@@ -258,7 +272,7 @@ func TestP6DesignQueryReaderPendingDesignCounts(t *testing.T) {
 	}
 }
 
-func TestP6DesignQueryReaderRequiresPool(t *testing.T) {
+func TestDesignQueryReaderRequiresPool(t *testing.T) {
 	if _, err := NewQueryReader(nil); err == nil {
 		t.Fatal("expected an error for a nil pool")
 	}

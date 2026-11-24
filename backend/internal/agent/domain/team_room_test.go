@@ -14,7 +14,6 @@ func TestTeamValidity(t *testing.T) {
 		agent.TeamDesign,
 		agent.TeamExecution,
 		agent.TeamDelivery,
-		agent.TeamSteward,
 		agent.TeamCode,
 		agent.TeamOps,
 	} {
@@ -24,6 +23,10 @@ func TestTeamValidity(t *testing.T) {
 	}
 	if agent.Team("unknown").Valid() {
 		t.Fatal("unknown team must be invalid")
+	}
+	// GD-17 removed the steward team with the Version Steward profile.
+	if agent.Team("steward").Valid() {
+		t.Fatal("steward team must be invalid after GD-17")
 	}
 	if _, err := agent.ParseTeam("design"); err != nil {
 		t.Fatalf("ParseTeam(design): %v", err)
@@ -56,7 +59,7 @@ func TestParseTeamErrorListsEveryTeam(t *testing.T) {
 	}
 	message := platform.AsError(err).Message
 	for _, team := range []string{
-		"clarification", "design", "execution", "delivery", "steward", "code", "ops",
+		"clarification", "design", "execution", "delivery", "code", "ops",
 	} {
 		if !strings.Contains(message, team) {
 			t.Fatalf("team error %q does not list %q", message, team)

@@ -35,7 +35,7 @@ func TestVersionReadServerRoutesMounted(t *testing.T) {
 	t.Run("P6.VersionRead mounts the read routes behind the bearer middleware", func(t *testing.T) {
 		handler := New(Deps{
 			Version: "0.2.1-p0-t6",
-			P6: &P6Handlers{
+			ReadModel: &ReadModelHandlers{
 				VersionRead: versionapi.NewVersionReadHandler(nil, nil),
 			},
 		})

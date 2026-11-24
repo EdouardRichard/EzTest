@@ -11,7 +11,6 @@ import (
 	"context"
 	"strings"
 
-	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
@@ -28,7 +27,7 @@ func (s *CaseRunner) resultFailureAttribution(ctx context.Context, versionID int
 		return nil
 	}
 	caseSnapshot := s.failureSignalCase(ctx, versionID, run.CaseVersionID)
-	signal := exploreapp.FailureSignal{
+	signal := FailureSignal{
 		CaseRunID:     run.ID,
 		CaseVersionID: run.CaseVersionID,
 		CaseTitle:     caseSnapshot.Title,
@@ -125,7 +124,7 @@ func failureAttributionCategory(assertions []execution.AssertionResult) string {
 
 // failureAttributionValue renders the attribution as the JSON shape the
 // failure_analyst consumes from execution.result_read.
-func failureAttributionValue(result exploreapp.FailureAttributionResult) map[string]any {
+func failureAttributionValue(result FailureAttributionResult) map[string]any {
 	value := map[string]any{
 		"classification": result.Classification,
 		"category":       result.Category,

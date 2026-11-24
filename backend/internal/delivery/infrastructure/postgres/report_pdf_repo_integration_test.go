@@ -459,7 +459,8 @@ func TestReportRepoEnsureRenderJobIdempotent(t *testing.T) {
 }
 
 // TestReportRepoCreateRevisionTemplateVersions covers the P7-D-03 template
-// version gate: "1" and "2" are built in, anything else is rejected.
+// version gate: "1", "2" and "3" (v0.2.4-G human-useful template) are built in,
+// anything else is rejected.
 func TestReportRepoCreateRevisionTemplateVersions(t *testing.T) {
 	repo, _ := newReportRepoForTest(t)
 	ctx := context.Background()
@@ -467,7 +468,7 @@ func TestReportRepoCreateRevisionTemplateVersions(t *testing.T) {
 	report := reportRepoCreateReport(t, repo, delivery.Report{
 		VersionID: 101, WaveID: &waveID, Kind: delivery.ReportKindWave,
 	})
-	for index, version := range []string{"1", "2"} {
+	for index, version := range []string{"1", "2", "3"} {
 		created, err := repo.CreateRevision(ctx, delivery.ReportRevision{
 			ReportID: report.ID, Revision: int32(index + 1),
 			InputFingerprint: reportRepoFingerprint("a"), TemplateVersion: version,
@@ -480,8 +481,8 @@ func TestReportRepoCreateRevisionTemplateVersions(t *testing.T) {
 		}
 	}
 	if _, err := repo.CreateRevision(ctx, delivery.ReportRevision{
-		ReportID: report.ID, Revision: 3,
-		InputFingerprint: reportRepoFingerprint("b"), TemplateVersion: "3",
+		ReportID: report.ID, Revision: 4,
+		InputFingerprint: reportRepoFingerprint("b"), TemplateVersion: "4",
 	}); !errors.Is(err, delivery.ErrInvalidArgument) {
 		t.Fatalf("unsupported template version error = %v, want ErrInvalidArgument", err)
 	}

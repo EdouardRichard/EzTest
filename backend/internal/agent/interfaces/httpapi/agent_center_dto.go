@@ -16,18 +16,18 @@ type agentCatalogDTO struct {
 }
 
 type catalogProfileDTO struct {
-	ProfileKey        string         `json:"profile_key"`
-	Name              string         `json:"name"`
-	Team              string         `json:"team"`
-	Order             int            `json:"order"`
-	Mode              string         `json:"mode"`
-	Model             *string        `json:"model"`
-	Enabled           bool           `json:"enabled"`
-	Budgets           budgetDTO      `json:"budgets"`
-	AllowedToolsCount int            `json:"allowed_tools_count"`
-	PromptVersion     int            `json:"prompt_version"`
-	PromptUpdatedAt   *string        `json:"prompt_updated_at"`
-	UpdatedAt         string         `json:"updated_at"`
+	ProfileKey        string           `json:"profile_key"`
+	Name              string           `json:"name"`
+	Team              string           `json:"team"`
+	Order             int              `json:"order"`
+	Mode              string           `json:"mode"`
+	Model             *string          `json:"model"`
+	Enabled           bool             `json:"enabled"`
+	Budgets           budgetDTO        `json:"budgets"`
+	AllowedToolsCount int              `json:"allowed_tools_count"`
+	PromptVersion     int              `json:"prompt_version"`
+	PromptUpdatedAt   *string          `json:"prompt_updated_at"`
+	UpdatedAt         string           `json:"updated_at"`
 	Stats             agentRunStatsDTO `json:"stats"`
 }
 
@@ -214,6 +214,48 @@ func toAgentRunStatsDTO(stats agentapp.RunStats) agentRunStatsDTO {
 		LastRunAt:        formatTimePointer(stats.LastRunAt),
 	}
 }
+
+/* -------------------------------- activity -------------------------------- */
+
+// agentActivityDTO is the wire row of the admin-only agent_activity fact read
+// (v0.2.4-D T10, SC-D5). IDs are decimal strings (the platform wire convention);
+// ended_at and error are omitted while a fact is still in flight or did not fail,
+// so the reader never sees a fabricated end or outcome.
+type agentActivityDTO struct {
+	ID        string         `json:"id"`
+	RunID     string         `json:"run_id"`
+	Seq       int            `json:"seq"`
+	Type      string         `json:"type"`
+	Title     string         `json:"title"`
+	StartedAt string         `json:"started_at"`
+	EndedAt   *string        `json:"ended_at,omitempty"`
+	Payload   map[string]any `json:"payload"`
+	Error     string         `json:"error,omitempty"`
+	CreatedAt string         `json:"created_at"`
+	UpdatedAt string         `json:"updated_at"`
+}
+
+func toAgentActivityDTO(activity agent.Activity) agentActivityDTO {
+	payload := activity.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	return agentActivityDTO{
+		ID:        strconv.FormatInt(activity.ID, 10),
+		RunID:     strconv.FormatInt(activity.RunID, 10),
+		Seq:       activity.Seq,
+		Type:      string(activity.Type),
+		Title:     activity.Title,
+		StartedAt: formatTime(activity.StartedAt),
+		EndedAt:   formatTimePointer(activity.EndedAt),
+		Payload:   payload,
+		Error:     activity.Error,
+		CreatedAt: formatTime(activity.CreatedAt),
+		UpdatedAt: formatTime(activity.UpdatedAt),
+	}
+}
+
+/* -------------------------------- helpers -------------------------------- */
 
 func formatIDPointer(value *int64) *string {
 	if value == nil {

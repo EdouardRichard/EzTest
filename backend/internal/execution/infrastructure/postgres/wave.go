@@ -7,6 +7,17 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
+// activeWaveStatuses is the active set of the single-active-wave partial unique
+// index, mirrored as a query parameter (never SQL-inline literals). It is pinned
+// against WaveStatus.Active() by TestWaveActiveSetMatchesDomain (value-derived
+// from the domain const block), so a new active status cannot join the domain
+// without joining the query set.
+var activeWaveStatuses = statusStrings([]execution.WaveStatus{
+	execution.WavePlanned,
+	execution.WaveRunning,
+	execution.WavePaused,
+})
+
 const waveColumns = `id, version_id, status, trigger, counts, started_at, finished_at,
 	paused_at, paused_by, pause_reason, pause_mode, report_id, scope_snapshot, created_at, updated_at`
 
@@ -43,9 +54,9 @@ func (r *WaveRepository) CreateWithCaseRuns(ctx context.Context, wave execution.
 
 	for _, intent := range intents {
 		tag, err := tx.Exec(ctx, `
-			UPDATE execution_intent SET status = 'claimed', updated_at = now()
-			WHERE id = $1 AND status = 'open'
-		`, intent.ID)
+			UPDATE execution_intent SET status = $2, updated_at = now()
+			WHERE id = $1 AND status = $3
+		`, intent.ID, string(execution.IntentClaimed), string(execution.IntentOpen))
 		if err != nil {
 			return wrapDB("claim intent for wave", err)
 		}
@@ -97,9 +108,9 @@ func (r *WaveRepository) GetActive(ctx context.Context, versionID int64) (*execu
 	ctx = contextOrBackground(ctx)
 	wave, err := scanWave(r.pool.QueryRow(ctx, `
 		SELECT `+waveColumns+` FROM run_wave
-		WHERE version_id = $1 AND status IN ('planned', 'running', 'paused')
+		WHERE version_id = $1 AND status = ANY($2::text[])
 		ORDER BY id DESC LIMIT 1
-	`, versionID))
+	`, versionID, activeWaveStatuses))
 	if err != nil {
 		if isNoRows(err) {
 			return nil, nil
@@ -187,21 +198,24 @@ func (r *WaveRepository) Transition(ctx context.Context, id int64, from []execut
 // Counts recomputes the wave counts from case_run and evidence rows.
 func (r *WaveRepository) Counts(ctx context.Context, waveID int64) (execution.WaveCounts, error) {
 	ctx = contextOrBackground(ctx)
-	counts := execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}}
+	counts := execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}}
 	err := r.pool.QueryRow(ctx, `
 		SELECT count(*),
-			count(*) FILTER (WHERE status = 'pending'),
-			count(*) FILTER (WHERE status = 'running'),
-			count(*) FILTER (WHERE status = 'paused'),
-			count(*) FILTER (WHERE status = 'passed'),
-			count(*) FILTER (WHERE status = 'failed'),
-			count(*) FILTER (WHERE status = 'blocked'),
-			count(*) FILTER (WHERE status = 'inconclusive'),
-			count(*) FILTER (WHERE status = 'skipped'),
-			count(*) FILTER (WHERE status = 'interrupted'),
-			count(*) FILTER (WHERE status = 'superseded')
+			count(*) FILTER (WHERE status = $2),
+			count(*) FILTER (WHERE status = $3),
+			count(*) FILTER (WHERE status = $4),
+			count(*) FILTER (WHERE status = $5),
+			count(*) FILTER (WHERE status = $6),
+			count(*) FILTER (WHERE status = $7),
+			count(*) FILTER (WHERE status = $8),
+			count(*) FILTER (WHERE status = $9),
+			count(*) FILTER (WHERE status = $10),
+			count(*) FILTER (WHERE status = $11)
 		FROM case_run WHERE wave_id = $1
-	`, waveID).Scan(&counts.Total, &counts.Pending, &counts.Running, &counts.Paused,
+	`, waveID, string(execution.CaseRunPending), string(execution.CaseRunRunning),
+		string(execution.CaseRunPaused), string(execution.CaseRunPassed), string(execution.CaseRunFailed),
+		string(execution.CaseRunBlocked), string(execution.CaseRunInconclusive), string(execution.CaseRunSkipped),
+		string(execution.CaseRunInterrupted), string(execution.CaseRunSuperseded)).Scan(&counts.Total, &counts.Pending, &counts.Running, &counts.Paused,
 		&counts.Passed, &counts.Failed, &counts.Blocked, &counts.Inconclusive,
 		&counts.Skipped, &counts.Interrupted, &counts.Superseded)
 	if err != nil {
@@ -215,30 +229,31 @@ func (r *WaveRepository) Counts(ctx context.Context, waveID int64) (execution.Wa
 		return execution.WaveCounts{}, wrapDB("count wave evidence", err)
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT context.version_sut_id,
+		SELECT context.sut_id,
 			count(DISTINCT run.id),
-			count(DISTINCT run.id) FILTER (WHERE run.status = 'passed'),
-			count(DISTINCT run.id) FILTER (WHERE run.status = 'failed'),
-			count(DISTINCT run.id) FILTER (WHERE run.status = 'blocked'),
-			count(DISTINCT run.id) FILTER (WHERE run.status = 'inconclusive')
+			count(DISTINCT run.id) FILTER (WHERE run.status = $2),
+			count(DISTINCT run.id) FILTER (WHERE run.status = $3),
+			count(DISTINCT run.id) FILTER (WHERE run.status = $4),
+			count(DISTINCT run.id) FILTER (WHERE run.status = $5)
 		FROM case_run_sut_context context
 		JOIN case_run run ON run.id = context.case_run_id
 		WHERE run.wave_id = $1
-		GROUP BY context.version_sut_id
-		ORDER BY context.version_sut_id
-	`, waveID)
+		GROUP BY context.sut_id
+		ORDER BY context.sut_id
+	`, waveID, string(execution.CaseRunPassed), string(execution.CaseRunFailed),
+		string(execution.CaseRunBlocked), string(execution.CaseRunInconclusive))
 	if err != nil {
-		return execution.WaveCounts{}, wrapDB("count wave case runs by version sut", err)
+		return execution.WaveCounts{}, wrapDB("count wave case runs by sut", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var versionSUTID int64
+		var sutID int64
 		var sutCounts execution.SUTCounts
-		if err := rows.Scan(&versionSUTID, &sutCounts.Total, &sutCounts.Passed,
+		if err := rows.Scan(&sutID, &sutCounts.Total, &sutCounts.Passed,
 			&sutCounts.Failed, &sutCounts.Blocked, &sutCounts.Inconclusive); err != nil {
 			return execution.WaveCounts{}, err
 		}
-		counts.ByVersionSUT[platformid.Format(versionSUTID)] = sutCounts
+		counts.BySUT[platformid.Format(sutID)] = sutCounts
 	}
 	if err := rows.Err(); err != nil {
 		return execution.WaveCounts{}, err
@@ -251,9 +266,9 @@ func (r *WaveRepository) ListActive(ctx context.Context) ([]execution.RunWave, e
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+waveColumns+` FROM run_wave
-		WHERE status IN ('planned', 'running', 'paused')
+		WHERE status = ANY($1::text[])
 		ORDER BY id
-	`)
+	`, activeWaveStatuses)
 	if err != nil {
 		return nil, wrapDB("list active waves", err)
 	}
@@ -292,5 +307,15 @@ func scanWave(row rowScanner) (execution.RunWave, error) {
 		}
 		wave.Counts = counts.Normalize()
 	}
+	// SC-F7: rebuild the wave-level fingerprint carriers from the frozen scope
+	// document through the domain's single parse authority. A legacy wave whose
+	// document predates the carrier ("{}") yields empty carriers; a malformed
+	// document fails the read closed rather than silently dropping the carriers.
+	frozen, err := execution.ParseWaveScopeSnapshot(wave.ScopeSnapshot)
+	if err != nil {
+		return execution.RunWave{}, err
+	}
+	wave.EnvironmentFingerprint = frozen.EnvironmentFingerprint
+	wave.CodeBaseline = frozen.CodeBaseline
 	return wave, nil
 }

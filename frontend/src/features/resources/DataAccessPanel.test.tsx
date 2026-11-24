@@ -8,6 +8,7 @@ vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>()
   return {
     ...actual,
+    listAccounts: vi.fn(),
     createDatabase: vi.fn(),
     updateDatabase: vi.fn(),
     deleteDatabase: vi.fn(),
@@ -22,6 +23,8 @@ import { DataAccessPanel, type DataAccessPanelProps } from "./DataAccessPanel"
 import {
   accountFixture,
   databaseFixture,
+  environmentFixture,
+  secondEnvironmentFixture,
   secondSutFixture,
   sutFixture,
   sutListItemFixture,
@@ -30,6 +33,7 @@ import type { ResourceScope } from "./types"
 
 const baseScope: ResourceScope = {
   suts: [sutListItemFixture, secondSutFixture],
+  environments: [environmentFixture, secondEnvironmentFixture],
   sutId: "1001",
   environmentId: "1101",
   detail: sutFixture,
@@ -57,6 +61,8 @@ function renderPanel(overrides: Partial<DataAccessPanelProps> = {}): {
 
 describe("DataAccessPanel", () => {
   beforeEach(() => {
+    vi.mocked(api.listAccounts).mockReset()
+    vi.mocked(api.listAccounts).mockResolvedValue([accountFixture])
     vi.mocked(api.createDatabase).mockReset()
     vi.mocked(api.updateDatabase).mockReset()
     vi.mocked(api.deleteDatabase).mockReset()
@@ -67,13 +73,14 @@ describe("DataAccessPanel", () => {
 
   afterEach(cleanup)
 
-  it("shows password_set only, never a stored password value", () => {
+  it("shows password_set only, never a stored password value", async () => {
     renderPanel()
 
     expect(screen.getByRole("table", { name: "目标库列表" })).toBeInTheDocument()
     expect(screen.getByRole("table", { name: "测试账号列表" })).toBeInTheDocument()
     expect(screen.getByText("order_db")).toBeInTheDocument()
-    expect(screen.getAllByText("buyer").length).toBeGreaterThan(0)
+    // The global account pool is fetched asynchronously; wait for it to render.
+    expect((await screen.findAllByText("buyer")).length).toBeGreaterThan(0)
     expect(screen.getAllByText("已设置")).toHaveLength(2)
     expect(screen.queryByText("secret")).not.toBeInTheDocument()
   })
@@ -97,7 +104,6 @@ describe("DataAccessPanel", () => {
 
     await waitFor(() =>
       expect(api.createDatabase).toHaveBeenCalledWith("1001", {
-        environmentId: "1101",
         name: "pay_db",
         dsn: "postgres://pay-db:5432/pay",
         username: "pay",
@@ -147,7 +153,6 @@ describe("DataAccessPanel", () => {
 
     await waitFor(() =>
       expect(api.createAccount).toHaveBeenCalledWith("1001", {
-        environmentId: "1101",
         username: "qa",
         password: "secret",
         roles: "buyer, admin",
@@ -186,7 +191,7 @@ describe("DataAccessPanel", () => {
     )
     const { onRefresh } = renderPanel()
 
-    fireEvent.click(screen.getByRole("button", { name: "删除账号 buyer" }))
+    fireEvent.click(await screen.findByRole("button", { name: "删除账号 buyer" }))
     fireEvent.click(screen.getByRole("button", { name: "删除账号" }))
 
     expect(await screen.findByText("该测试账号已被版本绑定引用，无法删除")).toBeVisible()
@@ -215,7 +220,7 @@ describe("DataAccessPanel", () => {
     )
     renderPanel()
 
-    fireEvent.click(screen.getByRole("button", { name: "删除账号 buyer" }))
+    fireEvent.click(await screen.findByRole("button", { name: "删除账号 buyer" }))
     fireEvent.click(screen.getByRole("button", { name: "删除账号" }))
 
     expect(await screen.findByText("该测试账号被版本绑定引用，无法删除")).toBeVisible()
@@ -225,7 +230,7 @@ describe("DataAccessPanel", () => {
 
   it("prompts for an environment when the SUT has none", () => {
     renderPanel({
-      scope: { ...baseScope, detail: { ...sutFixture, environments: [] }, environmentId: "" },
+      scope: { ...baseScope, detail: { ...sutFixture }, environmentId: "" },
     })
     expect(screen.getByText("还没有环境")).toBeInTheDocument()
   })

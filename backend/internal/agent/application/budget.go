@@ -40,6 +40,12 @@ const (
 	BudgetCauseTokens = "token_budget"
 	BudgetCauseTime   = "time_budget"
 	BudgetCauseTurns  = "turn_budget"
+	// BudgetCauseStall is the P6 thinking-only stall gate cause (design §4.5):
+	// consecutive rounds with no tool call and no substantive content forced the
+	// settlement winding turn. It is never produced by ExceededBy (the gate, not a
+	// resource budget, opens the settlement); it flows into the terminal cause so
+	// a stalled run is explained honestly rather than mislabeled as a turn cap.
+	BudgetCauseStall = "stall"
 )
 
 // BudgetDecision is what the agent loop should do after one turn.

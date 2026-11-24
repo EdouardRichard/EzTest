@@ -33,6 +33,42 @@ const extractionRunColumns = `id, version_id, attachment_id, input_sha256, statu
 const extractionSegmentColumns = `id, run_id, seq, heading_path, char_start, char_end,
 	text_sha256, status, attempts, extracted_count, error, renewed_at`
 
+// H-A17: the extraction cursor's status vocabulary is bound as QUERY PARAMETERS,
+// never spelled inline in SQL. These are aliases of the application authority
+// (versionapp.ExtractionRun*/ExtractionSegment*), not a second value table: a
+// rename or a new status moves the SQL with it. TestVersionStatusSQLNoHardcodedVocabulary
+// (value-derived, occurrence-scoped) fails on any re-hardcoded occurrence.
+var (
+	extractionRunPending = string(versionapp.ExtractionRunPending)
+	extractionRunRunning = string(versionapp.ExtractionRunRunning)
+	extractionRunPaused  = string(versionapp.ExtractionRunPaused)
+	extractionRunDone    = string(versionapp.ExtractionRunDone)
+	extractionRunFailed  = string(versionapp.ExtractionRunFailed)
+
+	extractionSegmentPending = string(versionapp.ExtractionSegmentPending)
+	extractionSegmentRunning = string(versionapp.ExtractionSegmentRunning)
+	extractionSegmentDone    = string(versionapp.ExtractionSegmentDone)
+	extractionSegmentFailed  = string(versionapp.ExtractionSegmentFailed)
+	extractionSegmentSkipped = string(versionapp.ExtractionSegmentSkipped)
+)
+
+// extractionActiveRunStatuses is the LIVE generation set of a run: the same
+// three states requireWritableExtractionRunTx / requireActiveExtractionRunTx
+// accept in Go. A newer run only fences an older one while it is in this set.
+var extractionActiveRunStatuses = []string{extractionRunPending, extractionRunRunning, extractionRunPaused}
+
+// extractionSettledRunStatuses is the terminal run set the replay path revives
+// when new pending segments arrive.
+var extractionSettledRunStatuses = []string{extractionRunDone, extractionRunFailed}
+
+// extractionClaimableSegmentStatuses is the set a claim may take: never attempted
+// (pending) or failed and past its backoff.
+var extractionClaimableSegmentStatuses = []string{extractionSegmentPending, extractionSegmentFailed}
+
+// extractionErrorClearingRunStatuses is the set a transition into clears the
+// stored run error (the run is working again).
+var extractionErrorClearingRunStatuses = []string{extractionRunPending, extractionRunRunning}
+
 // ExtractionRepository persists extraction runs, their segment cursor and the
 // extracted requirement drafts.
 type ExtractionRepository struct {
@@ -116,10 +152,10 @@ func (r *ExtractionRepository) CreateRun(ctx context.Context, run versionapp.Ext
 			active, activeErr := scanExtractionRun(tx.QueryRow(ctx, `
 				SELECT `+extractionRunColumns+` FROM requirement_extraction_run
 				WHERE version_id = $1 AND attachment_id = $2 AND id <> $3
-				  AND status IN ('pending', 'running', 'paused')
+				  AND status = ANY($4::text[])
 				ORDER BY id DESC LIMIT 1
 				FOR UPDATE
-			`, run.VersionID, run.AttachmentID, existing.ID))
+			`, run.VersionID, run.AttachmentID, existing.ID, extractionActiveRunStatuses))
 			if activeErr == nil {
 				if err := tx.Commit(ctx); err != nil {
 					return versionapp.ExtractionRun{}, fmt.Errorf("create extraction run: commit replay: %w", err)
@@ -193,10 +229,10 @@ func (r *ExtractionRepository) CreateRun(ctx context.Context, run versionapp.Ext
 func archiveActiveRunsTx(ctx context.Context, tx pgx.Tx, versionID, attachmentID, keepID int64, now time.Time) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_run
-		SET status = 'failed', error = 'archived: input_sha256 changed', updated_at = $4
+		SET status = $5, error = 'archived: input_sha256 changed', updated_at = $4
 		WHERE version_id = $1 AND attachment_id = $2 AND id <> $3
-		  AND status IN ('pending', 'running', 'paused')
-	`, versionID, attachmentID, keepID, now); err != nil {
+		  AND status = ANY($6::text[])
+	`, versionID, attachmentID, keepID, now, extractionRunFailed, extractionActiveRunStatuses); err != nil {
 		return fmt.Errorf("create extraction run: archive superseded: %w", err)
 	}
 	return nil
@@ -211,12 +247,12 @@ func refreshReplayedRunTx(ctx context.Context, tx pgx.Tx, runID int64, expected 
 	if _, err := tx.Exec(ctx, `
 		WITH agg AS (
 			SELECT count(*) AS total,
-			       count(*) FILTER (WHERE status = 'done') AS done,
-			       count(*) FILTER (WHERE status = 'skipped') AS skipped,
-			       count(*) FILTER (WHERE status = 'failed') AS failed,
-			       count(*) FILTER (WHERE status = 'pending') AS pending,
-			       count(*) FILTER (WHERE status = 'running') AS running,
-			       count(*) FILTER (WHERE status = 'failed' AND attempts < $4) AS retryable
+			       count(*) FILTER (WHERE status = $5) AS done,
+			       count(*) FILTER (WHERE status = $6) AS skipped,
+			       count(*) FILTER (WHERE status = $7) AS failed,
+			       count(*) FILTER (WHERE status = $8) AS pending,
+			       count(*) FILTER (WHERE status = $9) AS running,
+			       count(*) FILTER (WHERE status = $7 AND attempts < $4) AS retryable
 			FROM requirement_extraction_segment
 			WHERE run_id = $1
 		)
@@ -226,22 +262,26 @@ func refreshReplayedRunTx(ctx context.Context, tx pgx.Tx, runID int64, expected 
 		    failed_segments = agg.failed,
 		    expected_count = COALESCE($2::int, r.expected_count),
 		    status = CASE
-		        WHEN r.status = 'paused' THEN r.status
-		        WHEN agg.pending > 0 AND r.status IN ('done', 'failed') THEN 'pending'
-		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN 'done'
-		        WHEN agg.total > 0 AND agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN 'failed'
+		        WHEN r.status = $10 THEN r.status
+		        WHEN agg.pending > 0 AND r.status = ANY($11::text[]) THEN $12
+		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN $13
+		        WHEN agg.total > 0 AND agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN $14
 		        ELSE r.status
 		    END,
 		    error = CASE
-		        WHEN r.status = 'paused' THEN r.error
-		        WHEN agg.pending > 0 AND r.status IN ('done', 'failed') THEN NULL
+		        WHEN r.status = $10 THEN r.error
+		        WHEN agg.pending > 0 AND r.status = ANY($11::text[]) THEN NULL
 		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN NULL
 		        ELSE r.error
 		    END,
 		    updated_at = $3
 		FROM agg
 		WHERE r.id = $1
-	`, runID, expected, now, versionapp.DefaultExtractionMaxAttempts); err != nil {
+	`, runID, expected, now, versionapp.DefaultExtractionMaxAttempts,
+		extractionSegmentDone, extractionSegmentSkipped, extractionSegmentFailed,
+		extractionSegmentPending, extractionSegmentRunning,
+		extractionRunPaused, extractionSettledRunStatuses, extractionRunPending,
+		extractionRunDone, extractionRunFailed); err != nil {
 		return fmt.Errorf("create extraction run: refresh replay: %w", err)
 	}
 	return nil
@@ -263,7 +303,7 @@ func (r *ExtractionRepository) upsertSegments(ctx context.Context, tx pgx.Tx, ru
 				status, attempts, extracted_count, error, renewed_at,
 				created_at, updated_at
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', 0, 0, NULL, NULL, $8, $8)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $9, 0, 0, NULL, NULL, $8, $8)
 			ON CONFLICT (run_id, seq) DO UPDATE
 			SET heading_path = EXCLUDED.heading_path,
 			    char_start = EXCLUDED.char_start,
@@ -271,7 +311,7 @@ func (r *ExtractionRepository) upsertSegments(ctx context.Context, tx pgx.Tx, ru
 			    text_sha256 = EXCLUDED.text_sha256,
 			    status = CASE WHEN requirement_extraction_segment.text_sha256
 			                       IS DISTINCT FROM EXCLUDED.text_sha256
-			                  THEN 'pending' ELSE requirement_extraction_segment.status END,
+			                  THEN $9 ELSE requirement_extraction_segment.status END,
 			    attempts = CASE WHEN requirement_extraction_segment.text_sha256
 			                         IS DISTINCT FROM EXCLUDED.text_sha256
 			                    THEN 0 ELSE requirement_extraction_segment.attempts END,
@@ -289,7 +329,7 @@ func (r *ExtractionRepository) upsertSegments(ctx context.Context, tx pgx.Tx, ru
 			                      THEN EXCLUDED.updated_at
 			                      ELSE requirement_extraction_segment.updated_at END
 		`, id, runID, segment.Seq, segment.HeadingPath, segment.CharStart,
-			segment.CharEnd, segment.TextSHA256, now); err != nil {
+			segment.CharEnd, segment.TextSHA256, now, extractionSegmentPending); err != nil {
 			return fmt.Errorf("create extraction run: upsert segment %d: %w", segment.Seq, err)
 		}
 	}
@@ -434,14 +474,15 @@ func (r *ExtractionRepository) ClaimSegments(ctx context.Context, runID int64, l
 	staleBefore := now.Add(-versionapp.DefaultExtractionLeaseTimeout)
 	staleTag, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_segment
-		SET status = CASE WHEN attempts < $3 THEN 'pending' ELSE 'failed' END,
+		SET status = CASE WHEN attempts < $3 THEN $5 ELSE $6 END,
 		    error = CASE WHEN attempts < $3 THEN NULL
 		                 ELSE 'segment lease expired after max attempts' END,
 		    renewed_at = NULL,
 		    updated_at = $2
-		WHERE run_id = $1 AND status = 'running'
+		WHERE run_id = $1 AND status = $7
 		  AND renewed_at IS NOT NULL AND renewed_at < $4
-	`, runID, now, versionapp.DefaultExtractionMaxAttempts, staleBefore)
+	`, runID, now, versionapp.DefaultExtractionMaxAttempts, staleBefore,
+		extractionSegmentPending, extractionSegmentFailed, extractionSegmentRunning)
 	if err != nil {
 		return nil, fmt.Errorf("claim extraction segments: recover stale leases: %w", err)
 	}
@@ -455,12 +496,13 @@ func (r *ExtractionRepository) ClaimSegments(ctx context.Context, runID int64, l
 		SELECT `+extractionSegmentColumns+` FROM requirement_extraction_segment
 		WHERE run_id = $1
 		  AND attempts < $2
-		  AND (status = 'pending'
-		       OR (status = 'failed' AND (renewed_at IS NULL OR renewed_at <= $3)))
+		  AND (status = $5
+		       OR (status = $6 AND (renewed_at IS NULL OR renewed_at <= $3)))
 		ORDER BY seq
 		LIMIT $4
 		FOR UPDATE SKIP LOCKED
-	`, runID, versionapp.DefaultExtractionMaxAttempts, now, limit)
+	`, runID, versionapp.DefaultExtractionMaxAttempts, now, limit,
+		extractionSegmentPending, extractionSegmentFailed)
 	if err != nil {
 		return nil, fmt.Errorf("claim extraction segments: select: %w", err)
 	}
@@ -481,11 +523,11 @@ func (r *ExtractionRepository) ClaimSegments(ctx context.Context, runID int64, l
 		segment := &claimed[index]
 		if err := tx.QueryRow(ctx, `
 			UPDATE requirement_extraction_segment
-			SET status = 'running', attempts = attempts + 1, error = NULL,
+			SET status = $4, attempts = attempts + 1, error = NULL,
 			    renewed_at = $3, updated_at = $3
-			WHERE id = $1 AND run_id = $2 AND status IN ('pending', 'failed')
+			WHERE id = $1 AND run_id = $2 AND status = ANY($5::text[])
 			RETURNING attempts, renewed_at
-		`, segment.ID, runID, now).Scan(&segment.Attempts, &segment.RenewedAt); err != nil {
+		`, segment.ID, runID, now, extractionSegmentRunning, extractionClaimableSegmentStatuses).Scan(&segment.Attempts, &segment.RenewedAt); err != nil {
 			return nil, fmt.Errorf("claim extraction segments: update %d: %w", segment.Seq, err)
 		}
 		segment.Status = versionapp.ExtractionSegmentRunning
@@ -494,9 +536,9 @@ func (r *ExtractionRepository) ClaimSegments(ctx context.Context, runID int64, l
 	// Marking the run running in the claim transaction keeps a crashed
 	// "pending run with claimed segments" impossible.
 	if _, err := tx.Exec(ctx, `
-		UPDATE requirement_extraction_run SET status = 'running', updated_at = $2
-		WHERE id = $1 AND status = 'pending'
-	`, runID, now); err != nil {
+		UPDATE requirement_extraction_run SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = $4
+	`, runID, now, extractionRunRunning, extractionRunPending); err != nil {
 		return nil, fmt.Errorf("claim extraction segments: mark run running: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -515,8 +557,8 @@ func (r *ExtractionRepository) RenewSegmentLeases(ctx context.Context, runID int
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE requirement_extraction_segment
 		SET renewed_at = $3, updated_at = $3
-		WHERE run_id = $1 AND seq = ANY($2::int[]) AND status = 'running'
-	`, runID, seqs, now)
+		WHERE run_id = $1 AND seq = ANY($2::int[]) AND status = $4
+	`, runID, seqs, now, extractionSegmentRunning)
 	if err != nil {
 		return 0, fmt.Errorf("renew extraction segment leases: %w", err)
 	}
@@ -528,10 +570,10 @@ func (r *ExtractionRepository) MarkSegmentDone(ctx context.Context, runID int64,
 	return r.markSegmentTerminal(ctx, runID, seq, now, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE requirement_extraction_segment
-			SET status = 'done', extracted_count = $3, error = NULL,
+			SET status = $5, extracted_count = $3, error = NULL,
 			    renewed_at = $4, updated_at = $4
-			WHERE run_id = $1 AND seq = $2 AND status = 'running'
-		`, runID, seq, extractedCount, now)
+			WHERE run_id = $1 AND seq = $2 AND status = $6
+		`, runID, seq, extractedCount, now, extractionSegmentDone, extractionSegmentRunning)
 		if err != nil {
 			return err
 		}
@@ -545,10 +587,10 @@ func (r *ExtractionRepository) MarkSegmentSkipped(ctx context.Context, runID int
 	return r.markSegmentTerminal(ctx, runID, seq, now, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE requirement_extraction_segment
-			SET status = 'skipped', error = NULLIF($3, ''),
+			SET status = $5, error = NULLIF($3, ''),
 			    renewed_at = $4, updated_at = $4
-			WHERE run_id = $1 AND seq = $2 AND status = 'running'
-		`, runID, seq, reason, now)
+			WHERE run_id = $1 AND seq = $2 AND status = $6
+		`, runID, seq, reason, now, extractionSegmentSkipped, extractionSegmentRunning)
 		if err != nil {
 			return err
 		}
@@ -576,9 +618,9 @@ func (r *ExtractionRepository) MarkSegmentFailed(ctx context.Context, runID int6
 		retryAt = now.Add(versionapp.SegmentRetryDelay(attempts))
 		_, err := tx.Exec(ctx, `
 			UPDATE requirement_extraction_segment
-			SET status = 'failed', error = $3, renewed_at = $4, updated_at = $5
+			SET status = $6, error = $3, renewed_at = $4, updated_at = $5
 			WHERE run_id = $1 AND seq = $2
-		`, runID, seq, message, retryAt, now)
+		`, runID, seq, message, retryAt, now, extractionSegmentFailed)
 		return err
 	}, message)
 }
@@ -638,9 +680,9 @@ func requireWritableExtractionRunTx(ctx context.Context, tx pgx.Tx, runID int64)
 		SELECT EXISTS (
 			SELECT 1 FROM requirement_extraction_run
 			WHERE version_id = $1 AND attachment_id = $2 AND id > $3
-			  AND status IN ('pending', 'running', 'paused')
+			  AND status = ANY($4::text[])
 		)
-	`, versionID, attachmentID, runID).Scan(&superseded); err != nil {
+	`, versionID, attachmentID, runID, extractionActiveRunStatuses).Scan(&superseded); err != nil {
 		return fmt.Errorf("check extraction run generation: %w", err)
 	}
 	if superseded {
@@ -723,9 +765,9 @@ func requireActiveExtractionRunTx(ctx context.Context, tx pgx.Tx, source version
 		SELECT EXISTS (
 			SELECT 1 FROM requirement_extraction_run
 			WHERE version_id = $1 AND attachment_id = $2 AND id > $3
-			  AND status IN ('pending', 'running', 'paused')
+			  AND status = ANY($4::text[])
 		)
-	`, versionID, attachmentID, source.RunID).Scan(&superseded); err != nil {
+	`, versionID, attachmentID, source.RunID, extractionActiveRunStatuses).Scan(&superseded); err != nil {
 		return fmt.Errorf("check extraction run generation: %w", err)
 	}
 	if superseded {
@@ -744,13 +786,13 @@ func recomputeExtractionRunTx(ctx context.Context, tx pgx.Tx, runID int64, now t
 		    failed_segments = agg.failed,
 		    extracted_count = (SELECT count(*) FROM requirement q WHERE q.extraction_run_id = r.id),
 		    status = CASE
-		        WHEN r.status = 'paused' THEN r.status
-		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN 'done'
-		        WHEN agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN 'failed'
+		        WHEN r.status = $5 THEN r.status
+		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN $6
+		        WHEN agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0 THEN $7
 		        ELSE r.status
 		    END,
 		    error = CASE
-		        WHEN r.status = 'paused' THEN r.error
+		        WHEN r.status = $5 THEN r.error
 		        WHEN agg.total > 0 AND agg.done + agg.skipped = agg.total THEN NULL
 		        WHEN agg.pending = 0 AND agg.running = 0 AND agg.retryable = 0
 		            THEN COALESCE(NULLIF($3, ''), r.error)
@@ -759,17 +801,20 @@ func recomputeExtractionRunTx(ctx context.Context, tx pgx.Tx, runID int64, now t
 		    updated_at = $2
 		FROM (
 		    SELECT count(*) AS total,
-		           count(*) FILTER (WHERE status = 'done') AS done,
-		           count(*) FILTER (WHERE status = 'failed') AS failed,
-		           count(*) FILTER (WHERE status = 'skipped') AS skipped,
-		           count(*) FILTER (WHERE status = 'pending') AS pending,
-		           count(*) FILTER (WHERE status = 'running') AS running,
-		           count(*) FILTER (WHERE status = 'failed' AND attempts < $4) AS retryable
+		           count(*) FILTER (WHERE status = $8) AS done,
+		           count(*) FILTER (WHERE status = $9) AS failed,
+		           count(*) FILTER (WHERE status = $10) AS skipped,
+		           count(*) FILTER (WHERE status = $11) AS pending,
+		           count(*) FILTER (WHERE status = $12) AS running,
+		           count(*) FILTER (WHERE status = $9 AND attempts < $4) AS retryable
 		    FROM requirement_extraction_segment
 		    WHERE run_id = $1
 		) agg
 		WHERE r.id = $1
-	`, runID, now, failureMessage, versionapp.DefaultExtractionMaxAttempts); err != nil {
+	`, runID, now, failureMessage, versionapp.DefaultExtractionMaxAttempts,
+		extractionRunPaused, extractionRunDone, extractionRunFailed,
+		extractionSegmentDone, extractionSegmentFailed, extractionSegmentSkipped,
+		extractionSegmentPending, extractionSegmentRunning); err != nil {
 		return fmt.Errorf("recompute extraction run: %w", err)
 	}
 	return nil
@@ -795,10 +840,10 @@ func (r *ExtractionRepository) TransitionRun(ctx context.Context, runID int64, f
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_run
 		SET status = $3,
-		    error = CASE WHEN $3 IN ('pending', 'running') THEN NULL ELSE error END,
+		    error = CASE WHEN $3 = ANY($5::text[]) THEN NULL ELSE error END,
 		    updated_at = $4
 		WHERE id = $1 AND status = ANY($2::text[])
-	`, runID, values, string(to), now)
+	`, runID, values, string(to), now, extractionErrorClearingRunStatuses)
 	if err != nil {
 		return false, fmt.Errorf("transition extraction run: %w", err)
 	}
@@ -839,9 +884,9 @@ func (r *ExtractionRepository) RetryFailedSegments(ctx context.Context, runID in
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_segment
-		SET status = 'pending', attempts = 0, error = NULL, renewed_at = NULL, updated_at = $2
-		WHERE run_id = $1 AND status = 'failed'
-	`, runID, now)
+		SET status = $3, attempts = 0, error = NULL, renewed_at = NULL, updated_at = $2
+		WHERE run_id = $1 AND status = $4
+	`, runID, now, extractionSegmentPending, extractionSegmentFailed)
 	if err != nil {
 		return 0, fmt.Errorf("retry extraction segments: %w", err)
 	}
@@ -880,18 +925,18 @@ func (r *ExtractionRepository) RetrySegment(ctx context.Context, runID int64, se
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_segment
-		SET status = 'pending', attempts = 0, error = NULL, renewed_at = NULL, updated_at = $3
+		SET status = $4, attempts = 0, error = NULL, renewed_at = NULL, updated_at = $3
 		WHERE run_id = $1 AND seq = $2
-	`, runID, seq, now); err != nil {
+	`, runID, seq, now, extractionSegmentPending); err != nil {
 		return fmt.Errorf("retry extraction segment: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE requirement_extraction_run
-		SET status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
-		    error = CASE WHEN status = 'failed' THEN NULL ELSE error END,
+		SET status = CASE WHEN status = $3 THEN $4 ELSE status END,
+		    error = CASE WHEN status = $3 THEN NULL ELSE error END,
 		    updated_at = $2
 		WHERE id = $1
-	`, runID, now); err != nil {
+	`, runID, now, extractionRunFailed, extractionRunPending); err != nil {
 		return fmt.Errorf("retry extraction segment: run: %w", err)
 	}
 	if err := recomputeExtractionRunTx(ctx, tx, runID, now, ""); err != nil {
@@ -994,10 +1039,10 @@ func (r *ExtractionRepository) ListSkippedExternalIDs(ctx context.Context, versi
 	rows, err := r.pool.Query(ctx, `
 		SELECT external_id FROM requirement
 		WHERE version_id = $1
-		  AND source_key LIKE 'extraction:%'
-		  AND status <> 'draft'
+		  AND source_key LIKE $2
+		  AND status <> $3
 		  AND external_id <> ''
-	`, versionID)
+	`, versionID, versionapp.ExtractionRequirementSourceKeyPrefix+"%", string(version.RequirementDraft))
 	if err != nil {
 		return nil, fmt.Errorf("list skipped external ids: %w", err)
 	}
@@ -1079,34 +1124,35 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 	err := tx.QueryRow(ctx, `
 		SELECT id, current_version_id, status, COALESCE(confidence, -1), COALESCE(source_quote, '')
 		FROM requirement
-		WHERE version_id = $1 AND source_key = $2 AND status <> 'obsolete'
+		WHERE version_id = $1 AND source_key = $2 AND status <> $3
 		ORDER BY id LIMIT 1
 		FOR UPDATE
-	`, source.VersionID, sourceKey).Scan(&requirementID, &currentVersionID, &currentStatus, &currentConfidence, &currentQuote)
+	`, source.VersionID, sourceKey, string(version.RequirementObsolete)).Scan(&requirementID, &currentVersionID, &currentStatus, &currentConfidence, &currentQuote)
 	switch {
 	case err == nil:
 		// C-03 product decision: extracted catalog rows never overwrite a
 		// requirement a user already clarified/closed. The skip is reported in
 		// the emit counts instead of failing the batch.
-		if currentStatus != "draft" {
+		if version.RequirementStatus(currentStatus) != version.RequirementDraft {
 			return false, true, nil
 		}
 		current := versionapp.ExtractionRequirement{
 			ExternalID: externalID, SourceQuote: currentQuote, Confidence: currentConfidence,
 		}
 		currentRevision := 0
+		var previousCriteria []version.AcceptanceCriterion
 		if currentVersionID != nil {
 			var revision int
-			var constraints []byte
-			var acceptanceCriteria string
+			var constraints, criteriaJSON []byte
 			if scanErr := tx.QueryRow(ctx, `
-				SELECT title, description, acceptance_criteria, priority, constraints, revision
+				SELECT title, COALESCE(rules, ''), acceptance_criteria, priority, constraints, revision
 				FROM requirement_version WHERE id = $1
 			`, *currentVersionID).Scan(&current.Title, &current.Description,
-				&acceptanceCriteria, &current.Priority, &constraints, &revision); scanErr != nil {
+				&criteriaJSON, &current.Priority, &constraints, &revision); scanErr != nil {
 				return false, false, fmt.Errorf("upsert extracted requirement %s: current revision: %w", externalID, scanErr)
 			}
-			current.AcceptanceCriteria = splitExtractionAcceptanceCriteria(acceptanceCriteria)
+			previousCriteria = decodeExtractionAcceptanceCriteria(criteriaJSON)
+			current.AcceptanceCriteria = flattenExtractionAcceptanceCriteria(previousCriteria)
 			current.ConstraintsJSON = append(json.RawMessage(nil), constraints...)
 			currentRevision = revision
 		}
@@ -1114,11 +1160,16 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 		if strings.TrimSpace(effective.Priority) == "" {
 			effective.Priority = version.DefaultPriority
 		}
-		acceptance := strings.Join(effective.AcceptanceCriteria, "\n")
-		contentHash, err := requirementRevisionHash(effective, acceptance)
+		// The ids are inherited from the revision already stored, so re-emitting
+		// the same statements keeps their ids -- and therefore the same
+		// ContentHash -- instead of minting a fresh set (design v1.3.1 §3.6).
+		criteria := version.AssignACIDs(previousCriteria,
+			extractionAcceptanceCriteria(previousCriteria, effective.AcceptanceCriteria))
+		inserted, err := extractionRevision(effective, criteria)
 		if err != nil {
 			return false, false, fmt.Errorf("upsert extracted requirement %s: %w", externalID, err)
 		}
+		contentHash := inserted.ContentHash
 		// Provenance is always refreshed for a draft row (the latest run owns
 		// it), even when the merge produced identical content.
 		if _, err := tx.Exec(ctx, `
@@ -1141,7 +1192,7 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 			nextRevision := currentRevision + 1
 			versionID := r.ids.Next()
 			if err := insertExtractionRevision(ctx, tx, versionID, requirementID, nextRevision,
-				effective, acceptance, effective.Priority, contentHash, now); err != nil {
+				inserted, now); err != nil {
 				return false, false, fmt.Errorf("upsert extracted requirement %s: revision insert: %w", externalID, err)
 			}
 			if _, err := tx.Exec(ctx, `
@@ -1156,26 +1207,28 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 		if strings.TrimSpace(effective.Priority) == "" {
 			effective.Priority = version.DefaultPriority
 		}
-		acceptance := strings.Join(effective.AcceptanceCriteria, "\n")
-		contentHash, err := requirementRevisionHash(effective, acceptance)
+		// A first extraction has no previous revision, so every criterion is new
+		// and the ids start at AC-1 in statement order.
+		criteria := version.AssignACIDs(nil, extractionAcceptanceCriteria(nil, effective.AcceptanceCriteria))
+		inserted, err := extractionRevision(effective, criteria)
 		if err != nil {
 			return false, false, fmt.Errorf("upsert extracted requirement %s: %w", externalID, err)
 		}
 		requirementID = r.ids.Next()
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requirement (
-				id, version_id, current_version_id, status, target_version_sut_ids,
+				id, version_id, current_version_id, status,
 				created_at, updated_at, source_key,
 				extraction_run_id, source_quote, external_id, confidence
 			)
-			VALUES ($1, $2, NULL, 'draft', '[]'::jsonb, $3, $3, $4, $5, $6, $7, $8::float8::numeric)
+			VALUES ($1, $2, NULL, $9, $3, $3, $4, $5, $6, $7, $8::float8::numeric)
 		`, requirementID, source.VersionID, now, sourceKey, source.RunID,
-			effective.SourceQuote, externalID, effective.Confidence); err != nil {
+			effective.SourceQuote, externalID, effective.Confidence, string(version.RequirementDraft)); err != nil {
 			return false, false, fmt.Errorf("upsert extracted requirement %s: insert requirement: %w", externalID, err)
 		}
 		versionID := r.ids.Next()
 		if err := insertExtractionRevision(ctx, tx, versionID, requirementID, 1,
-			effective, acceptance, effective.Priority, contentHash, now); err != nil {
+			inserted, now); err != nil {
 			return false, false, fmt.Errorf("upsert extracted requirement %s: first revision: %w", externalID, err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -1189,48 +1242,126 @@ func (r *ExtractionRepository) upsertExtractedRequirementTx(ctx context.Context,
 	}
 }
 
-// requirementRevisionHash hashes the effective (already merged) revision.
-func requirementRevisionHash(requirement versionapp.ExtractionRequirement, acceptance string) (string, error) {
+// extractionRevision builds the revision the extraction pipeline persists and
+// hashes it in one step, so the row that is written and the ContentHash stored
+// on it can never disagree about the field values.
+//
+// It calls the SAME domain hash function as every other writer of
+// requirement_version (version.RequirementVersion.ComputeContentHash) -- there is
+// deliberately no second hash implementation here (constitution 五.1/五.3). What
+// differs from the application service's normalizeDraft is only the field
+// population: extraction has no user story and no system description yet, so
+// those stay empty until clarification fills them in, and the extracted prose
+// description lands in rules, which is the §5.1 field for free text that is not
+// part of the story.
+func extractionRevision(requirement versionapp.ExtractionRequirement, criteria []version.AcceptanceCriterion) (version.RequirementVersion, error) {
 	revision := version.RequirementVersion{
-		Title:              requirement.Title,
-		Description:        requirement.Description,
-		AcceptanceCriteria: acceptance,
+		Title:              strings.TrimSpace(requirement.Title),
+		Rules:              strings.TrimSpace(requirement.Description),
+		AcceptanceCriteria: criteria,
 		Priority:           requirement.Priority,
 		Constraints:        requirement.ConstraintsJSON,
 	}
-	return revision.ComputeContentHash()
+	hash, err := revision.ComputeContentHash()
+	if err != nil {
+		return version.RequirementVersion{}, err
+	}
+	revision.ContentHash = hash
+	return revision, nil
 }
 
-// splitExtractionAcceptanceCriteria splits the persisted newline list back into
-// the criteria slice expected by the merge policy.
-func splitExtractionAcceptanceCriteria(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		return nil
+// extractionAcceptanceCriteria maps the merged flat statements of the extraction
+// emit contract onto structured criteria. A statement that is the rendering of a
+// criterion the previous revision already stored is reused as-is, so a criterion
+// that clarification completed with a Given/When survives an extraction re-emit
+// instead of being flattened to its Then; any other statement becomes a
+// Then-only criterion, which is all a flat extraction line carries. Empty
+// statements are dropped. Ids are NOT assigned here -- AssignACIDs owns them.
+func extractionAcceptanceCriteria(previous []version.AcceptanceCriterion, statements []string) []version.AcceptanceCriterion {
+	byRendered := make(map[string]version.AcceptanceCriterion, len(previous))
+	for _, criterion := range previous {
+		byRendered[renderExtractionAcceptanceCriterion(criterion)] = criterion
 	}
-	criteria := make([]string, 0, 4)
-	for _, line := range strings.Split(value, "\n") {
-		if trimmed := strings.TrimSpace(line); trimmed != "" {
-			criteria = append(criteria, trimmed)
+	criteria := make([]version.AcceptanceCriterion, 0, len(statements))
+	for _, statement := range statements {
+		text := strings.TrimSpace(statement)
+		if text == "" {
+			continue
 		}
+		if existing, ok := byRendered[text]; ok {
+			criteria = append(criteria, existing)
+			continue
+		}
+		criteria = append(criteria, version.AcceptanceCriterion{Then: text})
 	}
 	return criteria
 }
 
-func insertExtractionRevision(ctx context.Context, tx pgx.Tx, revisionID, requirementID int64, revision int, requirement versionapp.ExtractionRequirement, acceptance, priority, contentHash string, now time.Time) error {
-	constraints := requirement.ConstraintsJSON
+// flattenExtractionAcceptanceCriteria renders the stored criteria back into the
+// flat statement list the extraction merge policy (MergeExtractionRequirement)
+// works with. It replaced the newline split of the old TEXT column.
+func flattenExtractionAcceptanceCriteria(criteria []version.AcceptanceCriterion) []string {
+	if len(criteria) == 0 {
+		return nil
+	}
+	flat := make([]string, 0, len(criteria))
+	for _, criterion := range criteria {
+		flat = append(flat, renderExtractionAcceptanceCriterion(criterion))
+	}
+	return flat
+}
+
+// renderExtractionAcceptanceCriterion is the flat form of one criterion: the
+// Then alone while Given and When are still empty, which is what extraction
+// produces, and an explicit three-part line once they are filled in. The
+// separator cannot appear in a normalized Then produced by extraction, so the
+// rendering round-trips through flatten/extractionAcceptanceCriteria.
+func renderExtractionAcceptanceCriterion(criterion version.AcceptanceCriterion) string {
+	if strings.TrimSpace(criterion.Given) == "" && strings.TrimSpace(criterion.When) == "" {
+		return strings.TrimSpace(criterion.Then)
+	}
+	return "Given: " + criterion.Given + " | When: " + criterion.When + " | Then: " + criterion.Then
+}
+
+// decodeExtractionAcceptanceCriteria reads the acceptance_criteria JSONB
+// document. A malformed or absent document yields the empty set rather than an
+// error: the caller is mid-transaction and an unreadable legacy value must not
+// wedge the extraction run.
+func decodeExtractionAcceptanceCriteria(raw []byte) []version.AcceptanceCriterion {
+	if len(raw) == 0 {
+		return nil
+	}
+	var criteria []version.AcceptanceCriterion
+	if err := json.Unmarshal(raw, &criteria); err != nil {
+		return nil
+	}
+	return criteria
+}
+
+func insertExtractionRevision(ctx context.Context, tx pgx.Tx, revisionID, requirementID int64, revisionNumber int, revision version.RequirementVersion, now time.Time) error {
+	constraints := revision.Constraints
 	if len(constraints) == 0 {
 		constraints = []byte(`{}`)
 	}
-	_, err := tx.Exec(ctx, `
+	criteria, err := json.Marshal(revision.AcceptanceCriteria)
+	if err != nil {
+		return fmt.Errorf("encode acceptance criteria: %w", err)
+	}
+	story, err := json.Marshal(revision.UserStory)
+	if err != nil {
+		return fmt.Errorf("encode user story: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
 		INSERT INTO requirement_version (
-			id, requirement_id, revision, title, description, acceptance_criteria,
-			priority, constraints, target_version_suts, target_pages, target_apis,
+			id, requirement_id, revision, title, user_story, rules, acceptance_criteria,
+			priority, constraints, sut_description, scope_out, account_roles_hint,
 			content_hash, created_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, '[]'::jsonb, '[]'::jsonb,
-		        '[]'::jsonb, $9, $10)
-	`, revisionID, requirementID, revision, requirement.Title, requirement.Description,
-		acceptance, priority, string(constraints), contentHash, now)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9::jsonb, $10, $11,
+		        '[]'::jsonb, $12, $13)
+	`, revisionID, requirementID, revisionNumber, revision.Title, string(story), revision.Rules,
+		string(criteria), revision.Priority, string(constraints), revision.SutDescription,
+		revision.ScopeOut, revision.ContentHash, now)
 	return err
 }
 

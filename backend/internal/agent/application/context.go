@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	skillapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/skill"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
@@ -57,9 +58,15 @@ type VersionPack struct {
 	SUTs      []string
 	Pages     []string
 	APIs      []string
-	// Databases is the v0.22 E-1 read-only target database inventory of the
-	// bound environments (R-E1-2). It carries the decimal database_id that db
-	// assertions must reuse; the model must never infer one from a name/kind.
+	// Databases is the read-only target database inventory of the version's bound
+	// environment. It carries two ids that must not be confused:
+	//
+	//	ID    the decimal database id, for the execution db tools
+	//	      (db.query / database.schema_read). Never inferred from a name/kind.
+	//	SUTID the SUT that owns the database. This -- not ID -- is what a design
+	//	      db assertion (assertions[].kind=db) takes as its sut_id, and
+	//	      rendering it is what gives the model a legitimate sut_id source in
+	//	      the pack (v0.2.4-B; sut.list remains the primary source).
 	Databases    []tools.DatabaseSummary
 	Requirements []string
 	Attachments  []string
@@ -103,9 +110,37 @@ type ContextInput struct {
 	// suffix (never in the stable prefix), and the legacy system section keeps
 	// them for the non-cache layout.
 	Execution *ExecutionTask
-	// P4Task is the registered P4 domain task payload (JSON-ready) rendered by
+	// DeliveryTask is the registered P4 domain task payload (JSON-ready) rendered by
 	// context.task_pack. Nil for P1/P2/P3 runs and for P4 types no domain claims.
-	P4Task any
+	DeliveryTask any
+	// Skills is the resident skill metadata layer (v0.2.4-C T19 progressive
+	// disclosure): name/description of every enabled package, never a body.
+	// It renders as a pinned fact block (cache-first) / optional section
+	// (legacy layout) so compaction never drops it; bodies are read on demand
+	// through skill.read.
+	Skills []skillapp.Metadata
+}
+
+// SkillMetadataReader loads the resident skill metadata layer for one run.
+// *skillapp.Service satisfies it. A nil reader disables the layer; a read
+// failure is supplemental (log-only, the run continues without skills).
+type SkillMetadataReader interface {
+	Metadata(ctx context.Context) ([]skillapp.Metadata, error)
+}
+
+// skillMetadataForRun loads the skill metadata layer. Injection is supplemental
+// context (knowledge precedent): a retrieval failure is logged and the run
+// continues without the skill layer instead of blocking the task.
+func (r *Runner) skillMetadataForRun(ctx context.Context) []skillapp.Metadata {
+	if r.skills == nil {
+		return nil
+	}
+	metas, err := r.skills.Metadata(ctx)
+	if err != nil {
+		r.logContextWarning(ctx, "skill metadata read failed; continuing without the skill layer", err)
+		return nil
+	}
+	return metas
 }
 
 // Section and ContextPacket are aliases so the builder and the runtime
@@ -333,6 +368,9 @@ func renderSections(in ContextInput) []Section {
 	if content := knowledgeContent(in.VersionPack.Knowledge); content != "" {
 		sections = append(sections, Section{Name: knowledgeSectionName, Content: content, Optional: true})
 	}
+	if content := skillapp.RenderMetadata(in.Skills); content != "" {
+		sections = append(sections, Section{Name: "skills", Content: content, Optional: true})
+	}
 	sections = append(sections,
 		Section{Name: "conversation", Content: conversationContent(in.Conversation)},
 		Section{Name: "team_room", Content: teamRoomContent(in.TeamRoom), Optional: true},
@@ -445,26 +483,45 @@ func taskBlock(task TaskContext) string {
 }
 
 // executionBlock renders the P3 case-executor task: the pinned case, its step
-// and assertion truth, the version-SUT bindings and the already-recorded results
-// a resumed run continues from.
+// and assertion truth, the environment SUT catalog and the already-recorded
+// results a resumed run continues from.
+//
+// v0.2.4-F T12 (SC-F1): the natural-language contract is rendered here in
+// lockstep with executionTaskResult — sut_description / covered_acs /
+// per-step target_description and the SUT catalog intro / environment_id.
+// Steps carry no design-supplied target SUT/page/API id; the executor resolves
+// the prose target against the catalog. Assertion sut= is the design's live
+// case_assertion.sut_id (db assertions), not a removed step target.
 func executionBlock(task ExecutionTask) string {
 	var builder strings.Builder
 	builder.WriteString("# 执行任务\n")
 	fmt.Fprintf(&builder, "用例: %s (case_version_id=%s, case_run_id=%s)\n",
 		task.CaseTitle, idText(task.CaseVersionID), idText(task.CaseRunID))
+	if task.EnvironmentID > 0 {
+		fmt.Fprintf(&builder, "环境: environment_id=%s\n", idText(task.EnvironmentID))
+	}
 	if task.Description != "" {
 		fmt.Fprintf(&builder, "描述: %s\n", task.Description)
 	}
+	if task.SutDescription != "" {
+		fmt.Fprintf(&builder, "被测系统(sut_description): %s\n", task.SutDescription)
+	}
 	if task.Preconditions != "" {
-		fmt.Fprintf(&builder, "前置条件: %s\n", task.Preconditions)
+		fmt.Fprintf(&builder, "前置条件(preconditions，Given，须经数据准备建立): %s\n", task.Preconditions)
+	}
+	if len(task.CoveredACs) > 0 {
+		fmt.Fprintf(&builder, "覆盖验收标准(covered_acs): %s\n", strings.Join(task.CoveredACs, ", "))
 	}
 	if task.Priority != "" {
 		fmt.Fprintf(&builder, "优先级: %s\n", task.Priority)
 	}
-	if len(task.VersionSUTs) > 0 {
-		builder.WriteString("SUT 绑定:\n")
-		for _, sut := range task.VersionSUTs {
-			fmt.Fprintf(&builder, "- version_sut=%s %s (%s)", idText(sut.VersionSUTID), sut.SUTName, sut.EnvironmentName)
+	if len(task.SUTs) > 0 {
+		builder.WriteString("SUT 目录（环境内可测系统，按 sut_description 语义匹配解析目标）:\n")
+		for _, sut := range task.SUTs {
+			fmt.Fprintf(&builder, "- sut=%s %s (%s)", idText(sut.SUTID), sut.SUTName, sut.EnvironmentName)
+			if sut.Intro != "" {
+				fmt.Fprintf(&builder, " intro=%s", sut.Intro)
+			}
 			if sut.BaseURL != "" {
 				fmt.Fprintf(&builder, " base_url=%s", sut.BaseURL)
 			}
@@ -483,12 +540,15 @@ func executionBlock(task ExecutionTask) string {
 	if len(task.Steps) > 0 {
 		builder.WriteString("步骤:\n")
 		for _, step := range task.Steps {
-			fmt.Fprintf(&builder, "- step %d [version_sut=%s", step.Seq, idText(step.TargetVersionSUTID))
+			fmt.Fprintf(&builder, "- step %d", step.Seq)
 			if step.AccountRole != "" {
-				fmt.Fprintf(&builder, ", role=%s", step.AccountRole)
+				fmt.Fprintf(&builder, " [role=%s]", step.AccountRole)
 			}
-			builder.WriteString("]: ")
+			builder.WriteString(": ")
 			builder.WriteString(step.Action)
+			if step.TargetDescription != "" {
+				fmt.Fprintf(&builder, "；目标(target_description): %s", step.TargetDescription)
+			}
 			if step.Expected != "" {
 				fmt.Fprintf(&builder, "；期望: %s", step.Expected)
 			}
@@ -498,24 +558,9 @@ func executionBlock(task ExecutionTask) string {
 	if len(task.Assertions) > 0 {
 		builder.WriteString("断言:\n")
 		for _, assertion := range task.Assertions {
-			if assertion.Kind == "visual" {
-				// P5: the model can only run a visual assertion when the task
-				// context names the visual_assertion ID (spec §7.3). The
-				// finalizer makes a missing run inconclusive, never passed.
-				fmt.Fprintf(&builder, "- step %d assertion %d [kind=visual, version_sut=%s",
-					assertion.StepSeq, assertion.AssertionSeq, idText(assertion.TargetVersionSUTID))
-				if assertion.VisualAssertionID > 0 {
-					fmt.Fprintf(&builder, ", visual_assertion_id=%s", idText(assertion.VisualAssertionID))
-				}
-				if assertion.CaseAssertionID > 0 {
-					fmt.Fprintf(&builder, ", case_assertion_id=%s", idText(assertion.CaseAssertionID))
-				}
-				fmt.Fprintf(&builder, "]: %s\n", assertion.Expected)
-				continue
-			}
-			fmt.Fprintf(&builder, "- step %d assertion %d [kind=%s, version_sut=%s]: %s\n",
+			fmt.Fprintf(&builder, "- step %d assertion %d [kind=%s, sut=%s]: %s\n",
 				assertion.StepSeq, assertion.AssertionSeq, assertion.Kind,
-				idText(assertion.TargetVersionSUTID), assertion.Expected)
+				idText(assertion.TargetSUTID), assertion.Expected)
 		}
 	}
 	if len(task.PriorSteps) > 0 {
@@ -567,13 +612,38 @@ func versionPackContent(pack VersionPack) string {
 		fmt.Fprintf(&builder, "\nAPI(%d): %s", len(pack.APIs), strings.Join(pack.APIs, ", "))
 	}
 	if len(pack.Databases) > 0 {
-		// R-E1-2: db assertions must reuse a bound database_id; the list is the
-		// model's only legitimate source (no inference from names/DSNs).
-		fmt.Fprintf(&builder, "\n数据库(%d，database_id 供 db 断言使用):", len(pack.Databases))
+		// v0.2.4-B: this section serves two different id spaces and must say so,
+		// because a design db assertion takes sut_id while the execution db tools
+		// take the database id. Rendering only `id=` here used to make the
+		// database id the sole decimal id in the whole pack, and the header told
+		// the model it was the db-assertion value -- so a model that needed a
+		// sut_id would send a database id, which presence-only validation accepts
+		// (wrong-but-green, surfacing only later in execution). sut_id is now
+		// rendered alongside every row; DatabaseSummary.SUTID already carried it.
+		// M-1: the registered tool is database.schema_read (case_execution_tools.go:18), not
+		// db.schema_read. Naming a tool that does not exist sends the model
+		// looking for one it cannot call.
+		fmt.Fprintf(&builder, "\n数据库(%d，id 供执行期 db.query/database.schema_read 使用；sut_id 才是 design 的 db 断言(assertions[].kind=db)要填的值，二者不可互换):", len(pack.Databases))
 		for _, database := range pack.Databases {
-			fmt.Fprintf(&builder, "\n- id=%s name=%s kind=%s read_only=%t",
-				database.ID, database.Name, database.Kind, database.ReadOnly)
+			// M-5: mirror the guard sut.database_list uses, so the prompt section
+			// and the tool result never disagree about whether a row carries a
+			// SUT. Rendering sut_id=0 would hand the model a value that fails the
+			// design gate's positive-id presence check.
+			sutPart := ""
+			if database.SUTID > 0 {
+				sutPart = fmt.Sprintf(" sut_id=%d", database.SUTID)
+			}
+			fmt.Fprintf(&builder, "\n- id=%s%s name=%s kind=%s read_only=%t",
+				database.ID, sutPart, database.Name, database.Kind, database.ReadOnly)
 		}
+	} else if len(pack.SUTs) > 0 {
+		// The section's absence used to be the model's ONLY signal that no
+		// database is bound, and it was implicit: with no 数据库 header there is
+		// nothing to tell the model that a db assertion cannot be executed here,
+		// so it may still emit one and burn a turn on the rejection. Say it
+		// outright. Gated on SUTs being present so a pack with no bound
+		// environment at all does not grow a spurious database line.
+		builder.WriteString("\n数据库: 本版本未绑定数据库，执行期无库可查，不要写 kind=db 的断言（sut_id 仍取自 sut.list，但无数据库可断言）")
 	}
 	if len(pack.Requirements) > 0 {
 		builder.WriteString("\n需求:")

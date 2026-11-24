@@ -30,34 +30,31 @@ const (
 )
 
 // Metric names of spec §5.3. The impact KPI reports recall and precision
-// separately; the optional visual metric is the "+1". The v0.22 snapshot track
-// (W2-14) reuses design_coverage/visual_classification_accuracy, promotes the
-// operational execution pass rate into an eval metric and adds case_coverage
+// separately. The v0.22 snapshot track (W2-14) reuses design_coverage, promotes
+// the operational execution pass rate into an eval metric and adds case_coverage
 // (confirmed case versions over confirmed requirements, capped at 1).
 const (
-	MetricDesignCoverage               = "design_coverage"
-	MetricImpactRecall                 = "impact_recall"
-	MetricImpactPrecision              = "impact_precision"
-	MetricClassificationAccuracy       = "classification_accuracy"
-	MetricIssueFalsePositiveRate       = "issue_false_positive_rate"
-	MetricSupplementHitRate            = "supplement_hit_rate"
-	MetricVisualClassificationAccuracy = "visual_classification_accuracy"
-	MetricExecutionPassRate            = "execution_pass_rate"
-	MetricCaseCoverage                 = "case_coverage"
+	MetricDesignCoverage         = "design_coverage"
+	MetricImpactRecall           = "impact_recall"
+	MetricImpactPrecision        = "impact_precision"
+	MetricClassificationAccuracy = "classification_accuracy"
+	MetricIssueFalsePositiveRate = "issue_false_positive_rate"
+	MetricSupplementHitRate      = "supplement_hit_rate"
+	MetricExecutionPassRate      = "execution_pass_rate"
+	MetricCaseCoverage           = "case_coverage"
 )
 
 // Real-LLM report thresholds of spec §5.3. They are observable quality
 // signals only; they never block the phase acceptance (P6-D-12).
 const (
-	ThresholdDesignCoverage               = 0.80
-	ThresholdImpactRecall                 = 0.70
-	ThresholdImpactPrecision              = 0.60
-	ThresholdClassificationAccuracy       = 0.80
-	ThresholdIssueFalsePositiveRate       = 0.15
-	ThresholdSupplementHitRate            = 0.50
-	ThresholdVisualClassificationAccuracy = 0.80
-	ThresholdExecutionPassRate            = 0.80
-	ThresholdCaseCoverage                 = 0.80
+	ThresholdDesignCoverage         = 0.80
+	ThresholdImpactRecall           = 0.70
+	ThresholdImpactPrecision        = 0.60
+	ThresholdClassificationAccuracy = 0.80
+	ThresholdIssueFalsePositiveRate = 0.15
+	ThresholdSupplementHitRate      = 0.50
+	ThresholdExecutionPassRate      = 0.80
+	ThresholdCaseCoverage           = 0.80
 )
 
 // Metric failure reasons recorded in MetricDetail (contract enum).
@@ -83,7 +80,7 @@ var ErrNotFound = errors.New("quality: eval run not found")
 // Sample is one real-LLM evaluation observation. It carries counts only: the
 // runner derives them from the real API data and the committed ground truth, so
 // stored metrics stay auditable without persisting prompts, evidence or corpus
-// text. VisualInjected/VisualCorrect are optional and must be provided together.
+// text.
 type Sample struct {
 	ConfirmedRequirements  int
 	CoveredRequirements    int
@@ -96,23 +93,18 @@ type Sample struct {
 	TruePositiveIssues     int
 	SupplementCases        int
 	SupplementHits         int
-	VisualInjected         *int
-	VisualCorrect          *int
 }
 
 // SnapshotSample is one server-derived mode=snapshot observation (W2-14). The
 // service builds it from the other contexts' read ports, never from a client
 // payload: requirements closed/total (version), finished case runs passed/total
-// (execution), confirmed case versions and requirement total (design) and the
-// visual diff classification passed/failed counters (visual).
+// (execution) and confirmed case versions and requirement total (design).
 type SnapshotSample struct {
 	ConfirmedRequirements int
 	CoveredRequirements   int
 	ConfirmedCases        int
 	ExecutionPassed       int
 	ExecutionFinished     int
-	VisualPassed          int
-	VisualEvaluated       int
 }
 
 // ValidateSnapshot rejects a physically impossible snapshot observation. It is
@@ -128,8 +120,6 @@ func ValidateSnapshot(sample SnapshotSample) error {
 		{"confirmed_cases", sample.ConfirmedCases},
 		{"execution_passed", sample.ExecutionPassed},
 		{"execution_finished", sample.ExecutionFinished},
-		{"visual_passed", sample.VisualPassed},
-		{"visual_evaluated", sample.VisualEvaluated},
 	}
 	for _, item := range nonNegative {
 		if item.value < 0 {
@@ -142,19 +132,16 @@ func ValidateSnapshot(sample SnapshotSample) error {
 	if sample.ExecutionPassed > sample.ExecutionFinished {
 		return platform.Invalid("execution_passed", "must not exceed execution_finished")
 	}
-	if sample.VisualPassed > sample.VisualEvaluated {
-		return platform.Invalid("visual_passed", "must not exceed visual_evaluated")
-	}
 	return nil
 }
 
-// EvaluateSnapshot derives the four mode=snapshot metrics from one validated
+// EvaluateSnapshot derives the three mode=snapshot metrics from one validated
 // observation. baseline is the previous snapshot of the same version; it only
 // marks regressions (warn-only, never a block). case_coverage is the confirmed
 // case-version count over the confirmed requirement count with the numerator
 // capped at the denominator (the W2-14 brief: a requirement needs at least one
 // confirmed case, and extra case versions cannot push coverage above 100%). The
-// status is passed only when all four metrics pass their threshold and none
+// status is passed only when all three metrics pass their threshold and none
 // regressed.
 func EvaluateSnapshot(sample SnapshotSample, baseline map[string]float64, regressionTolerance float64) (string, []Metric) {
 	if regressionTolerance < 0 {
@@ -168,7 +155,6 @@ func EvaluateSnapshot(sample SnapshotSample, baseline map[string]float64, regres
 		evaluateRatio(MetricDesignCoverage, sample.CoveredRequirements, sample.ConfirmedRequirements, baseline, regressionTolerance),
 		evaluateRatio(MetricExecutionPassRate, sample.ExecutionPassed, sample.ExecutionFinished, baseline, regressionTolerance),
 		evaluateRatio(MetricCaseCoverage, caseNumerator, sample.ConfirmedRequirements, baseline, regressionTolerance),
-		evaluateRatio(MetricVisualClassificationAccuracy, sample.VisualPassed, sample.VisualEvaluated, baseline, regressionTolerance),
 	}
 	status := StatusPassed
 	for _, metric := range metrics {
@@ -207,25 +193,22 @@ type threshold struct {
 }
 
 var realLLMThresholds = map[string]threshold{
-	MetricDesignCoverage:               {value: ThresholdDesignCoverage},
-	MetricImpactRecall:                 {value: ThresholdImpactRecall},
-	MetricImpactPrecision:              {value: ThresholdImpactPrecision},
-	MetricClassificationAccuracy:       {value: ThresholdClassificationAccuracy},
-	MetricIssueFalsePositiveRate:       {value: ThresholdIssueFalsePositiveRate, max: true},
-	MetricSupplementHitRate:            {value: ThresholdSupplementHitRate},
-	MetricVisualClassificationAccuracy: {value: ThresholdVisualClassificationAccuracy},
-	MetricExecutionPassRate:            {value: ThresholdExecutionPassRate},
-	MetricCaseCoverage:                 {value: ThresholdCaseCoverage},
+	MetricDesignCoverage:         {value: ThresholdDesignCoverage},
+	MetricImpactRecall:           {value: ThresholdImpactRecall},
+	MetricImpactPrecision:        {value: ThresholdImpactPrecision},
+	MetricClassificationAccuracy: {value: ThresholdClassificationAccuracy},
+	MetricIssueFalsePositiveRate: {value: ThresholdIssueFalsePositiveRate, max: true},
+	MetricSupplementHitRate:      {value: ThresholdSupplementHitRate},
+	MetricExecutionPassRate:      {value: ThresholdExecutionPassRate},
+	MetricCaseCoverage:           {value: ThresholdCaseCoverage},
 }
 
 // SnapshotMetricOrder is the stable metric order of a mode=snapshot run
-// (W2-14): design coverage, execution pass rate, case coverage and visual
-// classification accuracy.
+// (W2-14): design coverage, execution pass rate and case coverage.
 var SnapshotMetricOrder = []string{
 	MetricDesignCoverage,
 	MetricExecutionPassRate,
 	MetricCaseCoverage,
-	MetricVisualClassificationAccuracy,
 }
 
 // IsKnownMetric reports whether name is a metric this context derives. The
@@ -262,20 +245,6 @@ func ValidateSample(sample Sample) error {
 			return platform.Invalid(item.field, "must not be negative")
 		}
 	}
-	if sample.VisualInjected != nil && *sample.VisualInjected < 0 {
-		return platform.Invalid("visual_injected", "must not be negative")
-	}
-	if sample.VisualCorrect != nil && *sample.VisualCorrect < 0 {
-		return platform.Invalid("visual_correct", "must not be negative")
-	}
-	// The optional visual counters form a pair; half an observation cannot be
-	// evaluated into a ratio.
-	if sample.VisualInjected == nil && sample.VisualCorrect != nil {
-		return platform.Invalid("visual_injected", "must be provided together with visual_correct")
-	}
-	if sample.VisualInjected != nil && sample.VisualCorrect == nil {
-		return platform.Invalid("visual_correct", "must be provided together with visual_injected")
-	}
 
 	if sample.CoveredRequirements > sample.ConfirmedRequirements {
 		return platform.Invalid("covered_requirements", "must not exceed confirmed_requirements")
@@ -295,14 +264,10 @@ func ValidateSample(sample Sample) error {
 	if sample.SupplementHits > sample.SupplementCases {
 		return platform.Invalid("supplement_hits", "must not exceed supplement_cases")
 	}
-	if sample.VisualInjected != nil && sample.VisualCorrect != nil &&
-		*sample.VisualCorrect > *sample.VisualInjected {
-		return platform.Invalid("visual_correct", "must not exceed visual_injected")
-	}
 	return nil
 }
 
-// Evaluate derives the 6+1 metrics from one validated sample and returns the
+// Evaluate derives the six metrics from one validated sample and returns the
 // run status together with the metrics in stable order. baseline may be nil and
 // is only used to mark regressions; regressionTolerance is the configured
 // quality.eval_baseline_regression tolerance. A metric with a zero denominator
@@ -312,7 +277,7 @@ func Evaluate(sample Sample, baseline map[string]float64, regressionTolerance fl
 	if regressionTolerance < 0 {
 		regressionTolerance = 0
 	}
-	metrics := make([]Metric, 0, 7)
+	metrics := make([]Metric, 0, 6)
 	metrics = append(metrics,
 		evaluateRatio(MetricDesignCoverage, sample.CoveredRequirements, sample.ConfirmedRequirements, baseline, regressionTolerance),
 		evaluateRatio(MetricImpactRecall, sample.ImpactHit, sample.ImpactExpected, baseline, regressionTolerance),
@@ -321,10 +286,6 @@ func Evaluate(sample Sample, baseline map[string]float64, regressionTolerance fl
 		evaluateRatio(MetricIssueFalsePositiveRate, sample.AIIssues-sample.TruePositiveIssues, sample.AIIssues, baseline, regressionTolerance),
 		evaluateRatio(MetricSupplementHitRate, sample.SupplementHits, sample.SupplementCases, baseline, regressionTolerance),
 	)
-	if sample.VisualInjected != nil && sample.VisualCorrect != nil {
-		metrics = append(metrics,
-			evaluateRatio(MetricVisualClassificationAccuracy, *sample.VisualCorrect, *sample.VisualInjected, baseline, regressionTolerance))
-	}
 	status := StatusPassed
 	for _, metric := range metrics {
 		if !metric.Passed {

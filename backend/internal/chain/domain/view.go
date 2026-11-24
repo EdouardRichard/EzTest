@@ -52,12 +52,12 @@ func NodeID(kind NodeKind, refID int64) string {
 // when set: zero means "unset" and lets the service apply the configured
 // budget. Normalize should run before the filter is applied.
 type ChainFilter struct {
-	VersionSUTID *int64
-	PageID       *int64
-	WaveID       *int64
-	Status       string
-	Result       string
-	FocusNode    string
+	SUTID     *int64
+	PageID    *int64
+	WaveID    *int64
+	Status    string
+	Result    string
+	FocusNode string
 	// Q is the P6 fuzzy title filter over requirement/scenario/case-version
 	// labels (max 100 characters, enforced by the HTTP layer). The domain keeps
 	// the trimmed value and matches it case-insensitively.
@@ -93,7 +93,7 @@ const maxChainFilterLimit = 1000
 // unset, and a reversed event interval is put in chronological order. The
 // receiver is not modified.
 func (f ChainFilter) Normalize() ChainFilter {
-	f.VersionSUTID = positiveID(f.VersionSUTID)
+	f.SUTID = positiveID(f.SUTID)
 	f.PageID = positiveID(f.PageID)
 	f.WaveID = positiveID(f.WaveID)
 	f.EventFrom = positiveID(f.EventFrom)
@@ -134,18 +134,18 @@ func positiveID(id *int64) *int64 {
 // RefID is the decimal identifier of the underlying entity. The typed link
 // fields let the builder attach the induced edges without parsing Meta.
 type Node struct {
-	ID           string
-	Kind         NodeKind
-	RefID        string
-	Label        string
-	Status       string
-	Result       string
-	VersionSUTID *int64
-	// VersionSUTIDs lists every version SUT the node's case version uses, for
-	// multi-SUT labels. VersionSUTID stays the single SUT that owns the failing
+	ID     string
+	Kind   NodeKind
+	RefID  string
+	Label  string
+	Status string
+	Result string
+	SUTID  *int64
+	// SUTIDs lists every SUT the node's case version uses, for
+	// multi-SUT labels. SUTID stays the single SUT that owns the failing
 	// step/assertion (or the node's only target) when one exists.
-	VersionSUTIDs []int64
-	PageID        *int64
+	SUTIDs []int64
+	PageID *int64
 	// RequirementID, ScenarioID, CaseVersionID, WaveID, CaseRunID, IssueID,
 	// ReportID and MergedIntoID are the typed edge endpoints of the node.
 	RequirementID *int64
@@ -158,6 +158,16 @@ type Node struct {
 	MergedIntoID  *int64
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	// SutDescription is the case version's natural-language description of the
+	// system under test (design v1.3.1 §5.1). v0.2.4-B: it replaces the SUT/page
+	// id arrays a case node used to carry. It is a typed field rather than a Meta
+	// entry so the builder and every reader share one shape (constitution 五.1);
+	// only case_version nodes set it.
+	SutDescription string
+	// CoveredACs is the case version's covered acceptance-criterion id set
+	// ("AC-<n>"), typed for the same reason as SutDescription. Only case_version
+	// nodes set it.
+	CoveredACs []string
 	// Meta carries kind-specific details (counts, failure_class, close_round,
 	// as_of, ...). It never carries evidence bytes.
 	Meta map[string]any

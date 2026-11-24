@@ -28,12 +28,12 @@ const (
 )
 
 type fakeCodeVersionReader struct {
-	bindings []codeintelapp.VersionSUTBinding
+	bindings []codeintelapp.SUTRepoBinding
 	err      error
 	version  int64
 }
 
-func (f *fakeCodeVersionReader) VersionSUTBindings(_ context.Context, versionID int64) ([]codeintelapp.VersionSUTBinding, error) {
+func (f *fakeCodeVersionReader) SUTRepoBindings(_ context.Context, versionID int64) ([]codeintelapp.SUTRepoBinding, error) {
 	f.version = versionID
 	return f.bindings, f.err
 }
@@ -236,14 +236,14 @@ func (f *fakeSutProposalWriter) ProposeSUTResource(_ context.Context, versionID 
 
 func singleRepoDeps(t *testing.T) (tools.Deps, *fakeCodeVersionReader, *fakeCodeIndexReader, *fakeCodeQueryReader, *fakeCodeAnalysisReader) {
 	t.Helper()
-	bindings := &fakeCodeVersionReader{bindings: []codeintelapp.VersionSUTBinding{{
-		VersionSUTID: 5001, VersionID: testVersionID, SUTID: 6001, RepoID: testRepoID,
+	bindings := &fakeCodeVersionReader{bindings: []codeintelapp.SUTRepoBinding{{
+		SUTID: 6001, VersionID: testVersionID, RepoID: testRepoID,
 		Branch: "main", CodeBaselineCommit: baselineCommit,
 	}}}
 	index := &fakeCodeIndexReader{latest: codeintel.IndexRun{CommitSHA: latestCommit, Status: "done"}}
 	query := &fakeCodeQueryReader{}
 	analysis := &fakeCodeAnalysisReader{}
-	deps := tools.Deps{P5: tools.P5Deps{
+	deps := tools.Deps{CodeIntel: tools.CodeIntelDeps{
 		Versions: bindings,
 		Index:    index,
 		Query:    query,
@@ -274,7 +274,7 @@ func TestCodeTreeResolvesScopeRepositoryAndBaseline(t *testing.T) {
 	}
 	index.next = "src/app.ts"
 	index.hasMore = true
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{}`)
 	if err != nil {
@@ -301,11 +301,11 @@ func TestCodeTreeResolvesScopeRepositoryAndBaseline(t *testing.T) {
 
 func TestCodeTreeRequiresExplicitRepoForMultiRepoVersion(t *testing.T) {
 	deps, _, _, _, _ := singleRepoDeps(t)
-	bindings := deps.P5.Versions.(*fakeCodeVersionReader)
-	bindings.bindings = append(bindings.bindings, codeintelapp.VersionSUTBinding{
-		VersionSUTID: 5002, VersionID: testVersionID, RepoID: testOtherRepoID, Branch: "main",
+	bindings := deps.CodeIntel.Versions.(*fakeCodeVersionReader)
+	bindings.bindings = append(bindings.bindings, codeintelapp.SUTRepoBinding{
+		SUTID: 6002, VersionID: testVersionID, RepoID: testOtherRepoID, Branch: "main",
 	})
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	_, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{}`)
 	toolErr := toolError(t, err)
@@ -329,7 +329,7 @@ func TestCodeTreeRequiresExplicitRepoForMultiRepoVersion(t *testing.T) {
 
 func TestCodeToolsRequireInjectedVersionScope(t *testing.T) {
 	deps, _, _, _, _ := singleRepoDeps(t)
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 	for _, name := range []string{tools.ToolCodeTree, tools.ToolCodeSearch, tools.ToolCodeFacts} {
 		_, err := execute(t, registry, tools.Scope{}, name, `{}`)
 		if err == nil {
@@ -343,7 +343,7 @@ func TestCodeToolsRequireInjectedVersionScope(t *testing.T) {
 
 func TestCodeToolSchemasRejectVersionIDArgument(t *testing.T) {
 	deps, _, _, _, _ := singleRepoDeps(t)
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 	_, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{"versionId":"9"}`)
 	if toolErr := toolError(t, err); toolErr.Code != tools.CodeInvalidArgument {
 		t.Fatalf("code.tree versionId error = %+v", toolErr)
@@ -352,7 +352,7 @@ func TestCodeToolSchemasRejectVersionIDArgument(t *testing.T) {
 
 func TestCodeTreeClampsLimit(t *testing.T) {
 	deps, _, index, _, _ := singleRepoDeps(t)
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 	if _, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{"limit":500}`); err != nil {
 		t.Fatalf("code.tree: %v", err)
 	}
@@ -371,7 +371,7 @@ func TestCodeReadReturnsBoundedFileWindow(t *testing.T) {
 		Path: "src/main.tsx", Commit: baselineCommit, Lines: []string{"line1", "line2"},
 		StartLine: 10, EndLine: 11, TotalLines: 50, Truncated: false,
 	}
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeRead,
 		`{"path":"src/main.tsx","startLine":10,"endLine":11}`)
@@ -402,7 +402,7 @@ func TestCodeReadReturnsBoundedFileWindow(t *testing.T) {
 func TestCodeSearchClampsLimit(t *testing.T) {
 	deps, _, _, _, analysis := singleRepoDeps(t)
 	analysis.entities = []codeintel.Entity{{Kind: codeintel.EntityRoute, Path: "src/routes.ts", Name: "orders"}}
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeSearch,
 		`{"q":"orders","limit":500}`)
@@ -425,7 +425,7 @@ func TestCodeFactsPagesAndCapsAt100(t *testing.T) {
 		Confidence: codeintel.ConfidenceHigh, FactKey: "route:orders", Version: 2,
 	}}
 	analysis.factsNext, analysis.factsMore = "route:orders", true
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeFacts,
 		`{"kind":"route","path":"src/routes.ts","cursor":"prev","limit":500}`)
@@ -451,7 +451,7 @@ func TestCodeFactsPagesAndCapsAt100(t *testing.T) {
 func TestCodeRoutesAndAPIsMergeKinds(t *testing.T) {
 	deps, _, _, _, analysis := singleRepoDeps(t)
 	analysis.facts = []codeintel.Fact{{ID: 3001, Kind: codeintel.EntityRoute, Path: "src/routes.ts", Name: "orders"}}
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	if _, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeRoutes, `{}`); err != nil {
 		t.Fatalf("code.routes: %v", err)
@@ -476,7 +476,7 @@ func TestCodeDiffUsesVersionBaselineAndLatestIndex(t *testing.T) {
 		{Path: "src/old.tsx", OldPath: "src/old2.tsx", Status: "R"},
 	}}
 	query.diffMore = true
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeDiff, `{}`)
 	if err != nil {
@@ -507,10 +507,10 @@ func TestCodeImpactUsesUnionWhenAnalysisOmitted(t *testing.T) {
 			SubjectID: 41, Reason: "changed", Confidence: codeintel.ConfidenceHigh,
 			Source: codeintel.CandidateDirect, Selected: true,
 		},
-		RepoID: testRepoID, VersionSUTIDs: []int64{5001},
+		RepoID: testRepoID, SUTIDs: []int64{6001},
 	}}}
-	deps.P5.Impact = impact
-	registry := tools.NewP5Registry(deps)
+	deps.CodeIntel.Impact = impact
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeImpact, `{}`)
 	if err != nil {
@@ -523,6 +523,14 @@ func TestCodeImpactUsesUnionWhenAnalysisOmitted(t *testing.T) {
 	if len(candidates) != 1 || candidates[0]["subject_kind"] != "case_version" ||
 		candidates[0]["subject_id"] != "41" || candidates[0]["repo_id"] != "7001" {
 		t.Fatalf("code.impact candidates = %#v", candidates)
+	}
+	// U28 (v0.2.4-C T14): the SUT key is sut_ids and it CARRIES the view's SUT
+	// ids; the stale version_sut_ids key must be gone.
+	if _, stale := candidates[0]["version_sut_ids"]; stale {
+		t.Fatalf("code.impact candidate still carries version_sut_ids: %#v", candidates[0])
+	}
+	if sutIDs, ok := candidates[0]["sut_ids"].([]string); !ok || len(sutIDs) != 1 || sutIDs[0] != "6001" {
+		t.Fatalf("code.impact candidate sut_ids = %#v, want [6001]", candidates[0]["sut_ids"])
 	}
 
 	impact.unionCalls = nil
@@ -547,8 +555,8 @@ func TestCodeAnchorsFilterByRepo(t *testing.T) {
 		{ID: 5001, VersionID: testVersionID, RepoID: testRepoID, SubjectKind: codeintel.AnchorSubjectCaseVersion, SubjectID: 41, FilePath: "src/main.tsx", Status: "valid"},
 		{ID: 5002, VersionID: testVersionID, RepoID: testOtherRepoID, SubjectKind: codeintel.AnchorSubjectIssue, SubjectID: 51, FilePath: "src/other.tsx", Status: "valid"},
 	}}
-	deps.P5.Anchors = anchors
-	registry := tools.NewP5Registry(deps)
+	deps.CodeIntel.Anchors = anchors
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeAnchors,
 		`{"repoId":"7001","subjectKind":"case_version","subjectId":"41"}`)
@@ -568,7 +576,7 @@ func TestCodeAnchorsFilterByRepo(t *testing.T) {
 func TestCodeToolMapsServiceErrors(t *testing.T) {
 	deps, bindings, _, _, _ := singleRepoDeps(t)
 	bindings.err = platform.NotFound("version")
-	registry := tools.NewP5Registry(deps)
+	registry := tools.NewCodeIntelRegistry(deps)
 	_, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{}`)
 	if toolErr := toolError(t, err); toolErr.Code != tools.CodeNotFound {
 		t.Fatalf("not_found mapping = %+v", toolErr)
@@ -582,7 +590,7 @@ func TestCodeToolMapsServiceErrors(t *testing.T) {
 }
 
 func TestCodeToolsFailWhenPortsAreNotWired(t *testing.T) {
-	registry := tools.NewP5Registry(tools.Deps{})
+	registry := tools.NewCodeIntelRegistry(tools.Deps{})
 	_, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolCodeTree, `{}`)
 	if err == nil {
 		t.Fatal("code.tree without wired deps succeeded")
@@ -599,8 +607,8 @@ func TestCodeToolsFailWhenPortsAreNotWired(t *testing.T) {
 func TestSutPageProposeWritesCandidateOnly(t *testing.T) {
 	deps, _, _, _, _ := singleRepoDeps(t)
 	writer := &fakeSutProposalWriter{result: tools.SutProposalResult{Created: true, ID: 12001, Status: "proposed"}}
-	deps.P5.Propose = writer
-	registry := tools.NewP5Registry(deps)
+	deps.CodeIntel.Propose = writer
+	registry := tools.NewCodeIntelRegistry(deps)
 
 	value, err := execute(t, registry, tools.Scope{VersionID: testVersionID}, tools.ToolSUTPagePropose,
 		`{"kind":"page","name":"订单列表","url":"http://127.0.0.1:13338/orders","routeTemplate":"/orders","reason":"route fact"}`)

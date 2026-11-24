@@ -298,13 +298,13 @@ func TestClosureTerminalStatusMatrix(t *testing.T) {
 	}
 }
 
-// TestInconclusiveVisualBlocksClose reproduces REL-Q3: FR-025's latest case
-// run was terminal but inconclusive because its visual assertion had no
-// approved baseline. An inconclusive run verified nothing, so it must not
+// TestInconclusiveBlocksClose reproduces REL-Q3: FR-025's latest case
+// run was terminal but inconclusive (it produced no verified result). An
+// inconclusive run verified nothing, so it must not
 // satisfy the closure predicate; blocked runs are the same non-verification
 // class (the case is waiting on a human/environment instead of producing a
 // definitive result).
-func TestInconclusiveVisualBlocksClose(t *testing.T) {
+func TestInconclusiveBlocksClose(t *testing.T) {
 	for _, status := range []string{version.CaseRunInconclusive, version.CaseRunBlocked} {
 		t.Run(status, func(t *testing.T) {
 			in := passingClosureInput()

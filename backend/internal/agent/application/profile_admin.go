@@ -81,9 +81,13 @@ type AgentToolView struct {
 }
 
 // ToolRegistry is the P5 tool registry surface. *tools.Registry satisfies it.
+// NamesInDomain exposes the capability-domain membership used to validate
+// "namespace.*" whitelist entries (Ruling T11-A); the registry stays the single
+// authority on which tools exist.
 type ToolRegistry interface {
 	Names() []string
 	Get(name string) (tools.Tool, bool)
+	NamesInDomain(domain string) []string
 }
 
 // ModelCatalog is the default LLM model catalog surface. *llmapp.Service
@@ -202,6 +206,16 @@ func (s *ProfileAdminService) Patch(ctx context.Context, actor platform.Actor, k
 	update := agent.ProfileUpdate{}
 	fields := make([]string, 0, 3)
 	if input.SetModel {
+		// v0.2.4-E T13 fix round 1: the design.judge_model SETTING is the single
+		// authority for the design_judge model (constitution V); wireJudgeModel
+		// applies it at assembly. An admin Model PATCH here would be a competing
+		// write path silently clobbered on the next restart, so it is rejected
+		// with a field error pointing at the setting. Other profiles keep the
+		// admin Model surface; design_judge non-model fields stay editable.
+		if key == ProfileKeyDesignJudge {
+			return ProfileView{}, false, platform.Invalid("model",
+				"design_judge model is configured via the design.judge_model setting; edit that setting instead")
+		}
 		var next *string
 		if input.Model != nil {
 			trimmed := strings.TrimSpace(*input.Model)
@@ -474,12 +488,14 @@ func (s *ProfileAdminService) validateModel(ctx context.Context, model string) e
 	return nil
 }
 
-// validateAllowedTools applies the two independent admin-edit guards. A tool
-// must exist in the runtime registry (P5/P6 contract), and when the profile
-// executes one of the seven role-catalog roles it must also stay inside that
-// role's frozen whitelist. A role violation is a typed 400 on the
-// allowed_tools field, audited and rejected before any write (Task 8 fix
-// round 1: the registry-membership check alone let an admin bind
+// validateAllowedTools applies the two independent admin-edit guards. An entry
+// must be a registered tool name OR a "namespace.*" capability-domain wildcard
+// whose namespace has registered members (Ruling T11-A, v0.2.4-C T13 — the
+// domain-level case_executor whitelist is edited through the same surface);
+// and when the profile executes one of the seven role-catalog roles it must
+// also stay inside that role's frozen whitelist. A role violation is a typed
+// 400 on the allowed_tools field, audited and rejected before any write (Task 8
+// fix round 1: the registry-membership check alone let an admin bind
 // execution.case_finish to the assistant's clarification_host profile).
 func (s *ProfileAdminService) validateAllowedTools(
 	ctx context.Context,
@@ -507,7 +523,14 @@ func (s *ProfileAdminService) validateAllowedTools(
 		if trimmed == "" {
 			return nil, platform.Invalid("allowed_tools", "must not contain empty items")
 		}
-		if _, ok := s.tools.Get(trimmed); !ok {
+		if domain, wildcard := strings.CutSuffix(trimmed, ".*"); wildcard {
+			// The wildcard is validated against the registry's domain
+			// membership, never a hand-maintained domain list; runtime
+			// resolution still goes through tools.ToolSet.Allows + the registry.
+			if domain == "" || len(s.tools.NamesInDomain(domain)) == 0 {
+				return nil, platform.Invalid("allowed_tools", "unknown tool domain: "+trimmed)
+			}
+		} else if _, ok := s.tools.Get(trimmed); !ok {
 			return nil, platform.Invalid("allowed_tools", "unknown tool: "+trimmed)
 		}
 		if roleScoped && !roleTools.Allows(trimmed) {

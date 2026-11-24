@@ -66,13 +66,13 @@ func TestStepDeviationCreatesApplicationIssue(t *testing.T) {
 	})
 	deps.Design.(*fakeDesign).cases[7] = append(deps.Design.(*fakeDesign).cases[7], designapp.ExecutableCaseView{
 		CaseID: 204, CaseVersionID: caseVersion, RequirementID: 102, RequirementVersionID: 1002,
-		Title: "AC-FR-011-02 登录失败提示（负向）", Priority: "P0", VersionSUTIDs: []int64{sutRef},
+		Title: "AC-FR-011-02 登录失败提示（负向）", Priority: "P0",
 	})
 	deps.Results.(*fakeResults).steps[caseRunID] = []execution.StepResult{
 		{ID: 6003, CaseRunID: caseRunID, Seq: 1, Status: execution.StepPassed},
 		{
 			ID: stepID, CaseRunID: caseRunID, Seq: 2, Status: execution.StepFailed,
-			TargetVersionSUTID: &sutRef,
+			TargetSUTID: &sutRef,
 			Observed: map[string]any{
 				"summary": "弹窗内展示的提示文案为「登录已过期，请重新登录」，与需求要求的统一提示「账号或密码错误，请重试」不一致。",
 			},
@@ -82,7 +82,7 @@ func TestStepDeviationCreatesApplicationIssue(t *testing.T) {
 		{ID: 6504, CaseRunID: caseRunID, StepSeq: 1, AssertionSeq: 1, Kind: "ui", Verdict: execution.AssertionPassed},
 	}
 	deps.Evidence.(*fakeEvidence).rows[caseRunID] = []execution.Evidence{
-		{ID: evidenceID, CaseRunID: caseRunID, VersionSUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "ccdd", SizeBytes: 64},
+		{ID: evidenceID, CaseRunID: caseRunID, SUTID: &sutRef, Kind: execution.EvidenceScreenshot, SHA256: "ccdd", SizeBytes: 64},
 	}
 	// An application claim with no failed assertion and no observed requirement
 	// deviation must stay out of the issue scan (no gate widening).

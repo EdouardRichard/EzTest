@@ -40,32 +40,24 @@ const maxExecutorErrorLength = 500
 // implemented by the executor HTTP client wrapper so the application layer does
 // not import the executor infrastructure.
 type ExecutorHealth struct {
-	Status         string
-	Version        string
-	Contexts       int
-	MaxContexts    int
-	BrowserVersion string
-	Error          string
-	// Creating is the number of in-flight context creations and
-	// LastContextCreateError the last failed creation's sanitized diagnostic
-	// (v0.2.3 X-01); both come from the executor's unauthenticated /healthz.
-	Creating               int
-	LastContextCreateError string
+	Status  string
+	Version string
+	// Sessions/MaxSessions are the v2 session counts. They feed the registry's
+	// active/capacity accounting (the executor_instance columns keep their
+	// published names; only the semantics moved from contexts to sessions).
+	Sessions          int
+	MaxSessions       int
+	Draining          bool
+	ReclaimedSessions int
+	Error             string
 }
 
-// ExecutorContextRef is one executor-side browser context as listed by
-// GET /v1/contexts (orphan reconciliation / TTL cleanup).
-type ExecutorContextRef struct {
-	ID     string
-	Key    string
-	Status string
-}
-
-// ExecutorProbe is the executor health/inventory surface. The infra adapter
-// binds the endpoint and token from settings.
+// ExecutorProbe is the executor health surface. The infra adapter binds the
+// endpoint and token from settings. Session inventory belongs to
+// ExecutorControl — the only port with a production reader (orphan
+// reconciliation) — so the probe carries no second copy of it.
 type ExecutorProbe interface {
 	Health(ctx context.Context) (ExecutorHealth, error)
-	ListContexts(ctx context.Context) ([]ExecutorContextRef, error)
 }
 
 // ExecutorRegistration is the push register payload (executor-protocol §12.1).
@@ -212,10 +204,10 @@ func (r *Registry) pollEndpoint(ctx context.Context, endpoint, token string, pro
 
 	instance.Endpoint = endpoint
 	instance.TokenHash = hashExecutorToken(token)
-	if health.MaxContexts > 0 {
-		instance.Capacity = health.MaxContexts
+	if health.MaxSessions > 0 {
+		instance.Capacity = health.MaxSessions
 	}
-	instance.ActiveContexts = health.Contexts
+	instance.ActiveContexts = health.Sessions
 	instance.Version = health.Version
 	instance.LastHeartbeat = &now
 	instance.UpdatedAt = now
@@ -255,6 +247,87 @@ func (r *Registry) recordProbeFailure(ctx context.Context, endpoint string, prob
 		existing.Status = execution.ExecutorOffline
 	}
 	return r.repo.UpsertHeartbeat(ctx, existing)
+}
+
+// MaxDispatchableCapacity implements ExecutorRegistry. It answers a different
+// question from Select: not "which executor should this run go to right now" but
+// "could ANY executor Select is allowed to reach -- now or later -- serve a run
+// needing N contexts".
+//
+// The invariant (review round 5): the result must be an UPPER BOUND on what
+// Select can return, computed over exactly the rows Select is allowed to reach.
+// So a filter is dropped only when it is BOTH transient AND still proof of
+// capacity, and kept when it defines the reachable set:
+//
+//   - DROPPED, fullness (ActiveContexts >= Capacity). Load is momentary: contexts
+//     are released as runs finish, so a full executor is still proof the fleet can
+//     serve a larger run.
+//   - DROPPED, the degraded health label. It is a marker on a still-active row,
+//     set by a single failed probe and cleared by the next poll
+//     (RegistryPollInterval is one second), and the executor keeps its Capacity
+//     throughout. Review round 5, Important A: keeping this filter contradicted
+//     four places in my own docs that call degraded transient, and it was
+//     decisive -- one dropped healthz packet on the largest executor made
+//     MaxDispatchableCapacity report the SECOND largest, so a run the fleet could
+//     serve was terminally blocked. A permanent verdict must not hinge on a
+//     one-second health blip.
+//   - KEPT, Status.Dispatchable() (active only; draining and offline are out).
+//     The compelling reason is PERMANENCE, the same argument that keeps the
+//     endpoint restriction: a row that leaves the active set is never polled again
+//     -- PollOnce iterates only the configured primary plus extras -- and
+//     ExecutorRepository has no Delete, so its Capacity would inflate this ceiling
+//     forever and a genuinely impossible run would sit pending with no attempts, no
+//     lease and no watchdog. Status is fleet membership rather than a condition on
+//     a member, so it defines the reachable set. (The weaker formulation -- that
+//     draining is an operator decision and offline is positive evidence of not
+//     serving, so neither proves currently usable capacity -- does not hold on its
+//     own: draining is reversible via Activate, exactly as degraded is reversible
+//     via the next poll. Permanence is what distinguishes this filter from the two
+//     above, and it is the reason to keep it.)
+//   - KEPT, the single-endpoint restriction. In endpoint-less single mode Select
+//     only considers rows whose endpoint normalizes to the configured primary, so
+//     that restriction DEFINES the reachable set rather than under-reporting it
+//     (review round 5, Important B). Dropping it re-opened the original silent
+//     wedge: RegisterPush (HTTP-exposed at POST /api/internal/executors/register)
+//     creates an active row for any self-reported endpoint, PollOnce only iterates
+//     primary+extras so recordProbeFailure -- the only code that degrades or
+//     offlines a row -- never touches it, and ExecutorRepository has no Delete.
+//     Such a row would therefore inflate the maximum PERMANENTLY,
+//     fleetCapacityCeiling would return false forever, and a genuinely
+//     impossible run would sit pending with no attempts, no lease and no watchdog.
+//     In multi-endpoint mode Select considers every row, so no restriction applies
+//     here either.
+//
+// Returns 0 when nothing is reachable. Callers must treat an error or a zero as
+// "cannot prove impossibility" and fall back to the transient path: a run that
+// waits is recoverable, a run wrongly terminally blocked is not.
+func (r *Registry) MaxDispatchableCapacity(ctx context.Context) (int, error) {
+	if r.repo == nil {
+		return 0, errors.New("execution registry is not configured")
+	}
+	endpoint, _, extras, err := r.executorConfig(ctx)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := r.repo.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	singleEndpoint := len(extras) == 0
+	maximum := 0
+	for i := range rows {
+		row := rows[i]
+		if !row.Status.Dispatchable() {
+			continue
+		}
+		if singleEndpoint && endpoint != "" && normalizeExecutorEndpoint(row.Endpoint) != endpoint {
+			continue
+		}
+		if row.Capacity > maximum {
+			maximum = row.Capacity
+		}
+	}
+	return maximum, nil
 }
 
 // Select returns the best dispatchable executor, or nil when none is
@@ -596,14 +669,28 @@ func validatePushEndpoint(raw string) (string, error) {
 	return endpoint, nil
 }
 
-func (r *Registry) offlineWindow(ctx context.Context) time.Duration {
+// executionOfflineWindow is the single source of truth for the executor
+// offline window: the configured execution.executor_offline_seconds, or the
+// default when settings are missing, unreadable or non-positive.
+func executionOfflineWindow(ctx context.Context, settings SettingsReader) time.Duration {
 	seconds := int64(execution.DefaultExecutorOfflineSeconds)
-	if r.settings != nil {
-		if value, err := r.settings.Int(ctx, SettingExecutorOfflineSeconds); err == nil && value > 0 {
+	if settings != nil {
+		if value, err := settings.Int(ctx, SettingExecutorOfflineSeconds); err == nil && value > 0 {
 			seconds = value
 		}
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// OfflineWindow reports the executor offline window from the same settings
+// source the registry poller uses. Recovery shares this window so a run is not
+// reclaimed while its executor is still heartbeating under an enlarged setting.
+func (r *Registry) OfflineWindow(ctx context.Context) time.Duration {
+	return executionOfflineWindow(ctx, r.settings)
+}
+
+func (r *Registry) offlineWindow(ctx context.Context) time.Duration {
+	return r.OfflineWindow(ctx)
 }
 
 func (r *Registry) now() time.Time {

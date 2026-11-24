@@ -29,7 +29,7 @@ func newFakeVersionCloseRepo() *fakeVersionCloseRepo {
 	return &fakeVersionCloseRepo{versions: map[int64]version.Version{}}
 }
 
-func (f *fakeVersionCloseRepo) Get(_ context.Context, id int64) (version.Version, []version.Binding, error) {
+func (f *fakeVersionCloseRepo) Get(_ context.Context, id int64) (version.Version, []version.AccountBinding, error) {
 	stored, ok := f.versions[id]
 	if !ok {
 		return version.Version{}, nil, version.ErrNotFound
@@ -37,7 +37,7 @@ func (f *fakeVersionCloseRepo) Get(_ context.Context, id int64) (version.Version
 	return stored, nil, nil
 }
 
-func (f *fakeVersionCloseRepo) Close(ctx context.Context, id int64, fields version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
+func (f *fakeVersionCloseRepo) Close(ctx context.Context, id int64, fields *version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
 	f.closeCalls++
 	if f.closeErr != nil {
 		return version.Version{}, f.closeErr
@@ -62,6 +62,11 @@ func (f *fakeVersionCloseRepo) Close(ctx context.Context, id int64, fields versi
 	stored.ClosedAt = &fields.ClosedAt
 	stored.CloseReason = fields.CloseReason
 	stored.CloseRunID = cloneCloseInt64(fields.CloseRunID)
+	stored.ClosureKind = fields.ClosureKind
+	if stored.ClosureKind == "" {
+		stored.ClosureKind = version.ClosureKindNormal
+	}
+	stored.Unverified = fields.Unverified
 	stored.UpdatedAt = fields.ClosedAt
 	f.versions[id] = stored
 	return stored, nil
@@ -83,6 +88,8 @@ func (f *fakeVersionCloseRepo) ReopenIfCompleted(_ context.Context, id int64, re
 	stored.ClosedAt = nil
 	stored.CloseReason = ""
 	stored.CloseRunID = nil
+	stored.ClosureKind = version.ClosureKindNormal
+	stored.Unverified = false
 	stored.UpdatedAt = reopenedAt
 	f.versions[id] = stored
 	return stored, true, nil
@@ -203,26 +210,6 @@ func (f *fakeVersionReportStaler) MarkVersionReportStale(_ context.Context, vers
 	return f.err
 }
 
-type versionCloseTaskCall struct {
-	versionID            int64
-	reportRevisionID     int64
-	predicateFingerprint string
-}
-
-type fakeVersionCloseTasks struct {
-	calls []versionCloseTaskCall
-	err   error
-}
-
-func (f *fakeVersionCloseTasks) EnsureVersionClose(_ context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error {
-	f.calls = append(f.calls, versionCloseTaskCall{
-		versionID:            versionID,
-		reportRevisionID:     reportRevisionID,
-		predicateFingerprint: predicateFingerprint,
-	})
-	return f.err
-}
-
 // ---------- environment ----------
 
 type versionCloseEnv struct {
@@ -234,7 +221,6 @@ type versionCloseEnv struct {
 	requirements *fakeVersionCloseRequirements
 	reports      *fakeVersionReportStatus
 	staler       *fakeVersionReportStaler
-	tasks        *fakeVersionCloseTasks
 	audit        *fakeAudit
 	events       *fakePublisher
 }
@@ -248,7 +234,6 @@ func newVersionCloseEnv(t *testing.T) *versionCloseEnv {
 	requirements := &fakeVersionCloseRequirements{}
 	reports := &fakeVersionReportStatus{report: publishedVersionReportStatus()}
 	staler := &fakeVersionReportStaler{}
-	tasks := &fakeVersionCloseTasks{}
 	audit := &fakeAudit{}
 	events := &fakePublisher{}
 	svc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
@@ -259,7 +244,6 @@ func newVersionCloseEnv(t *testing.T) *versionCloseEnv {
 		Requirements:  requirements,
 		Reports:       reports,
 		ReportStaler:  staler,
-		Tasks:         tasks,
 		Audit:         audit,
 		Events:        events,
 		Clock:         fixedClock{at: testTime},
@@ -267,7 +251,7 @@ func newVersionCloseEnv(t *testing.T) *versionCloseEnv {
 	return &versionCloseEnv{
 		svc: svc, versions: versions, work: work, execution: execution,
 		human: human, requirements: requirements, reports: reports,
-		staler: staler, tasks: tasks, audit: audit, events: events,
+		staler: staler, audit: audit, events: events,
 	}
 }
 
@@ -384,6 +368,64 @@ func TestVersionCloseServiceCloseWritesProjectionEventAndAudit(t *testing.T) {
 	}
 }
 
+// TestVersionCloseNormalWithWaivedRequirementMarksUnverified pins final fix wave
+// #1 (SC-G11): a NORMAL full-predicate close whose requirements include an
+// admin-waived requirement is NOT fully verified — the requirement waiver
+// overrode closure completeness, so the version closes closure_kind=normal but
+// unverified=true (the closure must never be labeled fully-verified normal while
+// an admin overrode completeness). The decision comes from the under-lock
+// evaluation. A close with no waived requirement stays verified (control).
+func TestVersionCloseNormalWithWaivedRequirementMarksUnverified(t *testing.T) {
+	env := newVersionCloseEnv(t)
+	configurePassingVersionClose(env, 701)
+	// Requirement 1001 closed VIA WAIVER (the admin override persisted on the row).
+	env.requirements.items[0].Waived = true
+
+	closed, err := env.svc.Close(requestContext(), 701, 0, "all delivery work is done")
+	if err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if closed.Status != version.StatusCompleted {
+		t.Fatalf("closed status = %q, want completed", closed.Status)
+	}
+	if closed.ClosureKind != version.ClosureKindNormal {
+		t.Fatalf("closure_kind = %q, want normal (the version itself was not waive-closed)", closed.ClosureKind)
+	}
+	if !closed.Unverified {
+		t.Fatal("a normal close with a waived requirement must be unverified=true (completeness was overridden)")
+	}
+	// The version.closed event discloses the unverified classification.
+	if env.events.events[0].Payload["unverified"] != true {
+		t.Fatalf("version.closed payload unverified = %#v, want true", env.events.events[0].Payload["unverified"])
+	}
+
+	// Control: no waived requirement → a fully-verified normal close.
+	control := newVersionCloseEnv(t)
+	configurePassingVersionClose(control, 702)
+	verified, err := control.svc.Close(requestContext(), 702, 0, "all delivery work is done")
+	if err != nil {
+		t.Fatalf("control Close: %v", err)
+	}
+	if verified.Unverified || verified.ClosureKind != version.ClosureKindNormal {
+		t.Fatalf("control close = %q/unverified=%v, want normal/false (no waiver)", verified.ClosureKind, verified.Unverified)
+	}
+}
+
+// TestVersionCloseWaivedStillUnverified is the regression guard: the version-level
+// waive close still writes closure_kind=waived + unverified=true through the same
+// terminal entry (the pointer-field change must not regress the waived path).
+func TestVersionCloseWaivedStillUnverified(t *testing.T) {
+	env := newVersionCloseEnv(t)
+	configurePassingVersionClose(env, 701)
+	closed, err := env.svc.CloseWaived(requestContext(), 701, "owner approved the residual risk")
+	if err != nil {
+		t.Fatalf("CloseWaived: %v", err)
+	}
+	if closed.ClosureKind != version.ClosureKindWaived || !closed.Unverified {
+		t.Fatalf("waived close = %q/unverified=%v, want waived/true", closed.ClosureKind, closed.Unverified)
+	}
+}
+
 func TestVersionCloseServiceClosePredicateFailureKeepsState(t *testing.T) {
 	env := newVersionCloseEnv(t)
 	configurePassingVersionClose(env, 701)
@@ -418,26 +460,28 @@ func TestVersionCloseServiceClosePredicateFailureKeepsState(t *testing.T) {
 	}
 }
 
-func TestVersionClosePredicateExcludesOwnTask(t *testing.T) {
+// TestVersionClosePredicateCountsBlockingWork pins the GD-17 work-item leg: with
+// the version.close self task removed, every open/claimed/running work item counts
+// toward NoBlockingWorkItems. One blocking item rejects the close; zero closes.
+func TestVersionClosePredicateCountsBlockingWork(t *testing.T) {
 	env := newVersionCloseEnv(t)
 	configurePassingVersionClose(env, 701)
-	env.work.counts = versionapp.BlockingWorkItemCounts{Total: 1, VersionClose: 1}
+	env.work.counts = versionapp.BlockingWorkItemCounts{Total: 1}
 
-	if _, err := env.svc.Close(requestContext(), 701, 0, "own task only"); err != nil {
-		t.Fatalf("Close with only the version.close task open: %v", err)
-	}
-	if env.versions.versions[701].Status != version.StatusCompleted {
-		t.Fatalf("version = %#v", env.versions.versions[701])
-	}
-
-	// A non-close task still blocks.
-	env2 := newVersionCloseEnv(t)
-	configurePassingVersionClose(env2, 702)
-	env2.work.counts = versionapp.BlockingWorkItemCounts{Total: 2, VersionClose: 1}
-	_, err := env2.svc.Close(requestContext(), 702, 0, "blocked")
+	_, err := env.svc.Close(requestContext(), 701, 0, "blocked")
 	var predicateErr *version.ErrVersionClosePredicateFailed
 	if !errors.As(err, &predicateErr) || predicateErr.Failed[version.VersionCloseCheckNoBlockingWorkItems] != 1 {
 		t.Fatalf("Close error = %v, want no_blocking_work_items=1", err)
+	}
+
+	env2 := newVersionCloseEnv(t)
+	configurePassingVersionClose(env2, 702)
+	env2.work.counts = versionapp.BlockingWorkItemCounts{Total: 0}
+	if _, err := env2.svc.Close(requestContext(), 702, 0, "no blocking work"); err != nil {
+		t.Fatalf("Close with no blocking work: %v", err)
+	}
+	if env2.versions.versions[702].Status != version.StatusCompleted {
+		t.Fatalf("version = %#v, want completed", env2.versions.versions[702])
 	}
 }
 
@@ -598,53 +642,47 @@ func TestVersionCloseServiceEnsureVersionClose(t *testing.T) {
 	env := newVersionCloseEnv(t)
 	configurePassingVersionClose(env, 701)
 
+	// GD-17: a passing predicate closes the version DIRECTLY through the terminal
+	// Close entry — no version.close work item, no Steward run.
 	if err := env.svc.EnsureVersionClose(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureVersionClose: %v", err)
 	}
-	if len(env.tasks.calls) != 1 {
-		t.Fatalf("task ensures = %#v", env.tasks.calls)
+	if env.versions.closeCalls != 1 {
+		t.Fatalf("version Close calls = %d, want 1", env.versions.closeCalls)
 	}
-	call := env.tasks.calls[0]
-	if call.versionID != 701 || call.reportRevisionID != 9001 {
-		t.Fatalf("task call = %#v", call)
-	}
-	if len(call.predicateFingerprint) != 64 || strings.Trim(call.predicateFingerprint, "0123456789abcdef") != "" {
-		t.Fatalf("predicate fingerprint = %q", call.predicateFingerprint)
+	closed := env.versions.versions[701]
+	if closed.Status != version.StatusCompleted || closed.CloseRunID != nil {
+		t.Fatalf("closed version = %#v, want completed with no close run", closed)
 	}
 
-	// A changed predicate input naturally produces a different dedupe key.
-	env.requirements.items[0].Status = version.RequirementClarified
-	env.tasks.calls = nil
-	if err := env.svc.EnsureVersionClose(requestContext(), 701); err != nil {
-		t.Fatalf("EnsureVersionClose after state change: %v", err)
+	// A blocked predicate (open requirement) is a benign no-op, not a close.
+	env2 := newVersionCloseEnv(t)
+	configurePassingVersionClose(env2, 702)
+	env2.requirements.items[0].Status = version.RequirementClarified
+	if err := env2.svc.EnsureVersionClose(requestContext(), 702); err != nil {
+		t.Fatalf("EnsureVersionClose blocked: %v", err)
 	}
-	if len(env.tasks.calls) != 0 {
-		t.Fatalf("blocked predicate still ensured a task: %#v", env.tasks.calls)
+	if env2.versions.closeCalls != 0 || env2.versions.versions[702].Status != version.StatusRunning {
+		t.Fatalf("blocked predicate closed the version: %#v", env2.versions.versions[702])
 	}
-	env.requirements.items[0].Status = version.RequirementClosed
-	env.execution.intents = 1
-	env.tasks.calls = nil
-	if err := env.svc.EnsureVersionClose(requestContext(), 701); err != nil {
+
+	// An active intent also blocks the direct close.
+	env3 := newVersionCloseEnv(t)
+	configurePassingVersionClose(env3, 703)
+	env3.execution.intents = 1
+	if err := env3.svc.EnsureVersionClose(requestContext(), 703); err != nil {
 		t.Fatalf("EnsureVersionClose with intents: %v", err)
 	}
-	if len(env.tasks.calls) != 0 {
-		t.Fatalf("predicate with active intent still ensured a task: %#v", env.tasks.calls)
+	if env3.versions.closeCalls != 0 {
+		t.Fatalf("predicate with active intent closed the version")
 	}
 
-	env.execution.intents = 0
-	env.tasks.calls = nil
-	env.reports.report.RevisionID = 9002
-	if err := env.svc.EnsureVersionClose(requestContext(), 701); err != nil {
-		t.Fatalf("EnsureVersionClose passing: %v", err)
-	}
-	if len(env.tasks.calls) != 1 || env.tasks.calls[0].reportRevisionID != 9002 ||
-		env.tasks.calls[0].predicateFingerprint == call.predicateFingerprint {
-		t.Fatalf("new report revision did not produce a new ensure key: %#v", env.tasks.calls)
-	}
-
-	wantErr := errors.New("task board down")
-	env.tasks.err = wantErr
-	if err := env.svc.EnsureVersionClose(requestContext(), 701); !errors.Is(err, wantErr) {
+	// A real port failure propagates to the reconciler error aggregate.
+	env4 := newVersionCloseEnv(t)
+	configurePassingVersionClose(env4, 704)
+	wantErr := errors.New("version store down")
+	env4.versions.closeErr = wantErr
+	if err := env4.svc.EnsureVersionClose(requestContext(), 704); !errors.Is(err, wantErr) {
 		t.Fatalf("EnsureVersionClose error = %v, want %v", err, wantErr)
 	}
 	if err := env.svc.EnsureVersionClose(requestContext(), 0); err == nil {

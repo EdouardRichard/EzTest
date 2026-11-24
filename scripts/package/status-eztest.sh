@@ -213,10 +213,10 @@ if response="$(http_req "$exec_base/healthz" 2>/dev/null)"; then
     status="${response%%$'\n'*}"
     body="${response#*$'\n'}"
     exec_status="$(printf '%s' "$body" | json_field 'status' 2>/dev/null || true)"
-    browser="$(printf '%s' "$body" | json_field 'browserVersion' 2>/dev/null || true)"
+    browser="$(printf '%s' "$body" | json_field 'browserCli.cli_version' 2>/dev/null || true)"
     error_text="$(printf '%s' "$body" | json_field 'error' 2>/dev/null || true)"
     if [ "$status" = "200" ] && [ "$exec_status" = "ok" ]; then
-        row "executor /healthz" "OK" "browser=$browser"
+        row "executor /healthz" "OK" "cli=$browser"
     else
         row "executor /healthz" "DEGRADED" "HTTP $status status=$exec_status ${error_text}"
         failures=$((failures + 1))

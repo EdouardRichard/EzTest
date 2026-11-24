@@ -184,6 +184,9 @@ func TestDesignCoversAllP0Requirements(t *testing.T) {
 	// Convergence still requires real, traceable coverage for the whole scope.
 	converger := &fakeDesignConverger{}
 	planner.SetDesignConverger(converger)
+	// T9: convergence now also requires the shared review gate; this test pins the
+	// legacy coverage/queue behavior, so inject a pass gate.
+	planner.SetReviewGate(fakeReviewGate{})
 	// Every requirement is covered except one P0 requirement, whose authoring
 	// run finished without writing a case.
 	repo.coverage = task79Coverage(refs, map[int64]bool{refs[0].ID: true})
@@ -255,6 +258,9 @@ func TestDesignRequirementQueueDrainsBounded(t *testing.T) {
 	repo.coverage = task79Coverage(refs, uncovered)
 	converger := &fakeDesignConverger{}
 	planner.SetDesignConverger(converger)
+	// T9: convergence now also requires the shared review gate; this test pins the
+	// legacy coverage/queue behavior, so inject a pass gate.
+	planner.SetReviewGate(fakeReviewGate{})
 	ctx := context.Background()
 
 	if err := planner.Reconcile(ctx); err != nil {

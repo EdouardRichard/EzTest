@@ -30,19 +30,17 @@ type createEvalRunRequest struct {
 }
 
 type evalSampleRequest struct {
-	ConfirmedRequirements  int  `json:"confirmed_requirements"`
-	CoveredRequirements    int  `json:"covered_requirements"`
-	ImpactExpected         int  `json:"impact_expected"`
-	ImpactHit              int  `json:"impact_hit"`
-	ImpactSelected         int  `json:"impact_selected"`
-	InjectedFailures       int  `json:"injected_failures"`
-	CorrectClassifications int  `json:"correct_classifications"`
-	AIIssues               int  `json:"ai_issues"`
-	TruePositiveIssues     int  `json:"true_positive_issues"`
-	SupplementCases        int  `json:"supplement_cases"`
-	SupplementHits         int  `json:"supplement_hits"`
-	VisualInjected         *int `json:"visual_injected"`
-	VisualCorrect          *int `json:"visual_correct"`
+	ConfirmedRequirements  int `json:"confirmed_requirements"`
+	CoveredRequirements    int `json:"covered_requirements"`
+	ImpactExpected         int `json:"impact_expected"`
+	ImpactHit              int `json:"impact_hit"`
+	ImpactSelected         int `json:"impact_selected"`
+	InjectedFailures       int `json:"injected_failures"`
+	CorrectClassifications int `json:"correct_classifications"`
+	AIIssues               int `json:"ai_issues"`
+	TruePositiveIssues     int `json:"true_positive_issues"`
+	SupplementCases        int `json:"supplement_cases"`
+	SupplementHits         int `json:"supplement_hits"`
 }
 
 func (r createEvalRunRequest) toInput() qualityapp.RecordInput {
@@ -69,8 +67,6 @@ func (r createEvalRunRequest) toInput() qualityapp.RecordInput {
 			TruePositiveIssues:     r.Sample.TruePositiveIssues,
 			SupplementCases:        r.Sample.SupplementCases,
 			SupplementHits:         r.Sample.SupplementHits,
-			VisualInjected:         r.Sample.VisualInjected,
-			VisualCorrect:          r.Sample.VisualCorrect,
 		}
 	}
 	return input

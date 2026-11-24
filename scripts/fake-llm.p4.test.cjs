@@ -533,7 +533,7 @@ test("P1 fallback still answers the diagnostic scenario", async () => {
   });
   assert.equal(res.status, 200, res.text);
   const message = res.json.choices[0].message;
-  assert.equal(message.tool_calls[0].function.name, "file_read");
+  assert.equal(message.tool_calls[0].function.name, "file.read");
   assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { path: "README.md" });
   assert.equal(typeof message.reasoning_content, "string");
 });

@@ -31,7 +31,10 @@ func (s *CaseRunner) Wait(ctx context.Context, scope tools.Scope, in tools.WaitI
 		return nil, waitInterruptedError(ctx)
 	}
 
-	caseTimeout := time.Duration(s.intSetting("execution.case_timeout_seconds", 900)) * time.Second
+	// P6 (design §4.5): the case timeout is opt-in. execution.case_timeout_seconds
+	// =0 (the default) disables it, so a wait is never rejected for exceeding a
+	// timeout that is off. A positive value enforces the cumulative case timeout.
+	caseTimeoutSeconds := s.intSetting("execution.case_timeout_seconds", 0)
 	now := s.now()
 	s.mu.Lock()
 	started, ok := s.waitStarted[caseRun.ID]
@@ -41,9 +44,12 @@ func (s *CaseRunner) Wait(ctx context.Context, scope tools.Scope, in tools.WaitI
 	}
 	spent := s.waitTotals[caseRun.ID]
 	requested := time.Duration(in.Seconds) * time.Second
-	if spent+requested > caseTimeout || now.Sub(started) > caseTimeout {
-		s.mu.Unlock()
-		return nil, platform.StateConflict("execution.wait would exceed the case timeout")
+	if caseTimeoutSeconds > 0 {
+		caseTimeout := time.Duration(caseTimeoutSeconds) * time.Second
+		if spent+requested > caseTimeout || now.Sub(started) > caseTimeout {
+			s.mu.Unlock()
+			return nil, platform.StateConflict("execution.wait would exceed the case timeout")
+		}
 	}
 	s.waitTotals[caseRun.ID] = spent + requested
 	s.mu.Unlock()

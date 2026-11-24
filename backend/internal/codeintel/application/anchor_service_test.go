@@ -159,8 +159,8 @@ func newAnchorHarness() *anchorHarness {
 	now := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
 	ctx := platform.WithActor(context.Background(), platform.Actor{ID: 42, Role: "admin"})
 	git := &fakeGit{windows: map[string]codeintel.FileWindow{}}
-	versions := &fakeVersionReader{bindings: []VersionSUTBinding{{
-		VersionSUTID: 11, VersionID: 1, SUTID: 21, RepoID: 10, Branch: "main",
+	versions := &fakeVersionReader{bindings: []SUTRepoBinding{{
+		SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main",
 		CodeBaselineCommit: anchorCommitA,
 	}}}
 	resources := &fakeResourceReader{repos: map[int64]RepoRef{10: {
@@ -247,12 +247,12 @@ func TestAnchorCreateComputesExcerptAndAudits(t *testing.T) {
 }
 
 // TestAnchorCreatePrefersLatestDoneCommitForMultiRepo pins that an anchor on a
-// second repository resolves the latest done index commit instead of the
-// version_sut baseline that belongs to another repository.
+// second repository resolves that repository's latest done index commit rather
+// than its pinned (SUT, repository) baseline.
 func TestAnchorCreatePrefersLatestDoneCommitForMultiRepo(t *testing.T) {
 	h := newAnchorHarness()
-	h.versions.bindings = append(h.versions.bindings, VersionSUTBinding{
-		VersionSUTID: 11, VersionID: 1, SUTID: 21, RepoID: 20, Branch: "main",
+	h.versions.bindings = append(h.versions.bindings, SUTRepoBinding{
+		SUTID: 21, VersionID: 1, RepoID: 20, Branch: "main",
 		CodeBaselineCommit: anchorCommitA,
 	})
 	h.resource.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/web", Branch: "main"}
@@ -303,11 +303,11 @@ func TestAnchorCreateUsesVersionScopedLatestDone(t *testing.T) {
 	}
 }
 
-// TestAnchorCreateSkipsSharedBaselineThatDoesNotResolveInRepo pins the
-// multi-repo baseline guard: without a local done run the shared version_sut
-// baseline may belong to another repository and must be resolved here before
-// use; otherwise the target is the repository's own branch head.
-func TestAnchorCreateSkipsSharedBaselineThatDoesNotResolveInRepo(t *testing.T) {
+// TestAnchorCreateSkipsBaselineThatDoesNotResolveInRepo pins the baseline
+// guard: without a local done run the pinned (SUT, repository) baseline must
+// still resolve in this repository's clone before use; otherwise the target is
+// the repository's own branch head.
+func TestAnchorCreateSkipsBaselineThatDoesNotResolveInRepo(t *testing.T) {
 	h := newAnchorHarness()
 	h.git.resolveErrRefs = map[string]error{anchorCommitA: errors.New("unknown revision")}
 	h.git.head = anchorCommitB
@@ -330,7 +330,7 @@ func TestAnchorCreateSkipsSharedBaselineThatDoesNotResolveInRepo(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("shared baseline %q was not resolved in the target repository: %v", anchorCommitA, h.git.resolvedRefs)
+		t.Fatalf("pinned baseline %q was not resolved in the target repository: %v", anchorCommitA, h.git.resolvedRefs)
 	}
 }
 

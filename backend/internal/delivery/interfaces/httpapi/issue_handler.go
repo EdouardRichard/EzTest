@@ -102,7 +102,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	versionSUTID, err := optionalQueryID(r, "version_sut_id")
+	sutID, err := optionalQueryID(r, "sut_id")
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -114,12 +114,12 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filter := deliveryapp.IssueFilter{
-		Status:       status,
-		Category:     category,
-		Severity:     severity,
-		VersionSUTID: versionSUTID,
-		Before:       before,
-		Limit:        limit + 1,
+		Status:   status,
+		Category: category,
+		Severity: severity,
+		SUTID:    sutID,
+		Before:   before,
+		Limit:    limit + 1,
 	}
 	if filter.Limit > pagination.MaxLimit {
 		filter.Limit = pagination.MaxLimit

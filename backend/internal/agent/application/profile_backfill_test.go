@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 )
@@ -138,8 +139,22 @@ func (f *fakeBackfillRepo) ApplyProfileSeedBackfill(
 		return profile, false, nil
 	}
 	f.applied = append(f.applied, update)
-	if len(update.AddAllowedTools) > 0 {
-		profile.AllowedTools = unionProfileTools(profile.AllowedTools, update.AddAllowedTools)
+	if len(update.AddAllowedTools) > 0 || len(update.RemoveAllowedTools) > 0 {
+		// Mirror the repository's single UPDATE: union the increment against the
+		// live row, then drop the exact removal names — both in one fenced write.
+		merged := unionProfileTools(profile.AllowedTools, update.AddAllowedTools)
+		removed := make(map[string]struct{}, len(update.RemoveAllowedTools))
+		for _, name := range update.RemoveAllowedTools {
+			removed[name] = struct{}{}
+		}
+		kept := make([]string, 0, len(merged))
+		for _, name := range merged {
+			if _, drop := removed[name]; drop {
+				continue
+			}
+			kept = append(kept, name)
+		}
+		profile.AllowedTools = kept
 	}
 	if upgrade := update.BudgetUpgrade; upgrade != nil && profile.Budgets == upgrade.Legacy {
 		profile.Budgets = upgrade.Current
@@ -526,3 +541,151 @@ func TestBackfillProfilesPropagatesRepositoryErrors(t *testing.T) {
 }
 
 var _ auditapp.Recorder = (*fakeProfileAudit)(nil)
+
+// seedLegacyCaseExecutor plants a v0.2.3 (seed_version=2) case_executor row whose
+// allowed_tools still carry the retired browser.* atomic actions plus one
+// administrator-added tool, on the legacy 150-turn budget envelope.
+func seedLegacyCaseExecutor(repo *fakeBackfillRepo) agent.AgentProfile {
+	prompt, ok := agentapp.DefaultPrompt(agentapp.ProfileKeyCaseExecutor)
+	if !ok {
+		panic("case_executor seed prompt missing")
+	}
+	profile := agent.AgentProfile{
+		ID:           21,
+		Key:          agentapp.ProfileKeyCaseExecutor,
+		Name:         "用例执行器",
+		SystemPrompt: prompt,
+		AllowedTools: []string{
+			"context.version_pack", "context.task_pack",
+			"browser.goto", "browser.snapshot", "browser.screenshot",
+			"http.request", "db.query", "execution.step_record",
+			"admin.custom_tool",
+		},
+		Budgets:     agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400},
+		Enabled:     true,
+		SeedVersion: 2,
+	}
+	repo.profiles[profile.Key] = profile
+	return profile
+}
+
+// TestBackfillProfilesRemovesRetiredBrowserTools pins the v0.2.4-C seed-3
+// cleanup contract (task 13): a legacy row seeded at version 2 loses every
+// retired browser.* action, gains the current domain-level increment, keeps
+// administrator-added tools, and moves its legacy default budget to the
+// unlimited-turn seed — all in one seed_version-fenced write.
+func TestBackfillProfilesRemovesRetiredBrowserTools(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	seedLegacyCaseExecutor(repo)
+	audit := &fakeProfileAudit{}
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, audit); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	got := repo.profiles[agentapp.ProfileKeyCaseExecutor]
+	for _, name := range got.AllowedTools {
+		if tools.ToolDomain(name) == "browser" && name != tools.ToolBrowserCLI {
+			t.Fatalf("retired browser tool survived the backfill: %q in %v", name, got.AllowedTools)
+		}
+	}
+	// The increment is the contract: every domain-level seed entry must land.
+	for _, name := range agentapp.V022ProfileTools()[agentapp.ProfileKeyCaseExecutor] {
+		if !toolListContains(got.AllowedTools, name) {
+			t.Fatalf("backfilled case_executor is missing increment entry %q: %v", name, got.AllowedTools)
+		}
+	}
+	if !toolListContains(got.AllowedTools, "exec.*") {
+		t.Fatalf("backfilled case_executor lacks the exec domain wildcard: %v", got.AllowedTools)
+	}
+	if !toolListContains(got.AllowedTools, "admin.custom_tool") {
+		t.Fatalf("admin-added tool lost: %v", got.AllowedTools)
+	}
+	if !toolListContains(got.AllowedTools, "http.request") || !toolListContains(got.AllowedTools, "db.query") {
+		t.Fatalf("still-registered legacy tools lost: %v", got.AllowedTools)
+	}
+	if got.Budgets != (agent.ProfileBudgets{MaxTurns: 0, SoftSeconds: 1200, HardSeconds: 2400}) {
+		t.Fatalf("legacy default budgets not upgraded to the unlimited-turn seed: %+v", got.Budgets)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+	if len(audit.events) != 1 || audit.events[0].Action != "agent_profile.backfilled" {
+		t.Fatalf("audit events = %#v", audit.events)
+	}
+	fields, _ := audit.events[0].Metadata["fields"].([]string)
+	if !containsString(fields, "allowed_tools") || !containsString(fields, "budgets") {
+		t.Fatalf("audit fields = %#v, want allowed_tools and budgets", audit.events[0].Metadata["fields"])
+	}
+
+	// The marker fences a second pass: an administrator who re-adds a browser
+	// name after the cleanup is never rewritten again.
+	admin := repo.profiles[agentapp.ProfileKeyCaseExecutor]
+	admin.AllowedTools = append(append([]string(nil), admin.AllowedTools...), "browser.goto")
+	repo.profiles[admin.Key] = admin
+	if err := agentapp.BackfillProfiles(context.Background(), repo, audit); err != nil {
+		t.Fatalf("second BackfillProfiles: %v", err)
+	}
+	second := repo.profiles[admin.Key]
+	if !toolListContains(second.AllowedTools, "browser.goto") {
+		t.Fatalf("second pass rewrote an already-marked row: %v", second.AllowedTools)
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("second pass audited again: %#v", audit.events)
+	}
+}
+
+// TestBackfillProfilesKeepsAdminCaseExecutorBudget pins that the seed-3 budget
+// upgrade only touches the known legacy default triple, never an admin budget.
+func TestBackfillProfilesKeepsAdminCaseExecutorBudget(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	profile := seedLegacyCaseExecutor(repo)
+	custom := agent.ProfileBudgets{MaxTurns: 40, SoftSeconds: 500, HardSeconds: 800}
+	profile.Budgets = custom
+	repo.profiles[profile.Key] = profile
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, nil); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	got := repo.profiles[profile.Key]
+	if got.Budgets != custom {
+		t.Fatalf("admin budgets overwritten: %+v, want %+v", got.Budgets, custom)
+	}
+	for _, name := range got.AllowedTools {
+		if tools.ToolDomain(name) == "browser" && name != tools.ToolBrowserCLI {
+			t.Fatalf("browser cleanup must still run alongside an admin budget: %v", got.AllowedTools)
+		}
+	}
+}
+
+// TestBackfillProfilesSeedThreeRowKeepsBrowserCli pins the transition fence: the
+// browser-domain removal belongs to the seed-2→3 cleanup only. Seed 4 (T14)
+// re-reconciles a seed-3 row to upgrade its stale seed-2 prompt, but the
+// browser-retirement fence stays at 3, so a legitimately re-added browser-domain
+// tool (browser.cli) is never stripped by the retired-domain rule.
+func TestBackfillProfilesSeedThreeRowKeepsBrowserCli(t *testing.T) {
+	repo := newFakeBackfillRepo()
+	profile := seedLegacyCaseExecutor(repo)
+	profile.SeedVersion = 3
+	profile.AllowedTools = []string{"context.task_pack", "browser.cli", "exec.*"}
+	repo.profiles[profile.Key] = profile
+	audit := &fakeProfileAudit{}
+
+	if err := agentapp.BackfillProfiles(context.Background(), repo, audit); err != nil {
+		t.Fatalf("BackfillProfiles: %v", err)
+	}
+	got := repo.profiles[profile.Key]
+	if !toolListContains(got.AllowedTools, "browser.cli") {
+		t.Fatalf("seed-3 row lost browser.cli when re-reconciled by seed 4: %v", got.AllowedTools)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+	// The fence: the seed-3 row is reconciled once (prompt upgrade), but the
+	// retired-browser removal must NOT fire on it.
+	if len(repo.applied) != 1 {
+		t.Fatalf("seed-3 row should be reconciled once by seed 4: applied=%d", len(repo.applied))
+	}
+	if len(repo.applied[0].RemoveAllowedTools) != 0 {
+		t.Fatalf("browser-retirement fence fired on a seed-3 row: %v", repo.applied[0].RemoveAllowedTools)
+	}
+}

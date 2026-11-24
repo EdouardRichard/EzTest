@@ -250,6 +250,41 @@ describe("CaseRunDetail incomplete cause", () => {
     expect(usage).toHaveTextContent("180000")
     expect(usage).toHaveTextContent("12 轮")
   })
+
+  it("shows a capacity cause and remedy for a context-capacity blocked run", () => {
+    const detail: CaseRunDetail = {
+      ...caseRunDetailFixture,
+      case_run: {
+        ...caseRunDetailFixture.case_run,
+        status: "blocked",
+        failure_class: "blocked",
+        summary: {
+          terminal_cause: "context_requirement_exceeds_capacity",
+          next_action: "resolve_blocker",
+          last_error:
+            "the case needs 3 executor browser context(s) but no dispatchable executor has that much capacity",
+          evidence_count: 0,
+        },
+      },
+    }
+
+    render(
+      <CaseRunDetailView
+        versionId="2001"
+        detail={detail}
+        loading={false}
+        error={null}
+        onRetry={() => {}}
+      />,
+    )
+
+    expect(screen.getByTestId("case-run-terminal-cause")).toHaveTextContent(
+      "用例所需上下文数超过机群最大容量",
+    )
+    const nextAction = screen.getByTestId("case-run-next-action")
+    expect(nextAction).toHaveTextContent("提高执行器容量（max_contexts）")
+    expect(nextAction).not.toHaveTextContent("先解决阻塞条件")
+  })
 })
 
 describe("CaseRunDetail telemetry pending (R2-OBS-01)", () => {

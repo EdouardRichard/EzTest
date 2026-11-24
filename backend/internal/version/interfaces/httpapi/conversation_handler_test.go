@@ -641,3 +641,39 @@ func TestConversationMessageExposesActualModel(t *testing.T) {
 		t.Fatalf("user actual_model = %#v", message["actual_model"])
 	}
 }
+
+// TestConversationMessageSnapshotCarriesStreamState pins the additive REST field
+// (v0.2.4-D fix wave, M-1): a thread loaded over HTTP mid-reply must be legible as
+// still streaming, exactly like the SSE full frame. Expectations come from the
+// shared stream-state authority, not from observed output.
+func TestConversationMessageSnapshotCarriesStreamState(t *testing.T) {
+	for _, state := range version.MessageStreamStates() {
+		t.Run(state, func(t *testing.T) {
+			handler, stub := newConversationServer(t)
+			view := sampleMessageView()
+			view.StreamState = state
+			stub.messages = []versionapp.MessageView{view}
+
+			recorder := call(t, handler, http.MethodGet, "/api/versions/101/conversations/8001/messages", "", actor())
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			message := dataList(t, recorder)[0].(map[string]any)
+			if message["stream_state"] != state {
+				t.Fatalf("stream_state = %#v, want %q", message["stream_state"], state)
+			}
+		})
+	}
+
+	// A legacy/batch row with no stored state normalizes to complete: an existing
+	// client never sees a finished message reported as streaming.
+	handler, stub := newConversationServer(t)
+	legacy := sampleMessageView()
+	legacy.StreamState = ""
+	stub.messages = []versionapp.MessageView{legacy}
+	recorder := call(t, handler, http.MethodGet, "/api/versions/101/conversations/8001/messages", "", actor())
+	message := dataList(t, recorder)[0].(map[string]any)
+	if message["stream_state"] != version.MessageStreamStateComplete {
+		t.Fatalf("legacy stream_state = %#v, want complete", message["stream_state"])
+	}
+}

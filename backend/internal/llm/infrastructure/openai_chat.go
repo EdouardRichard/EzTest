@@ -94,13 +94,25 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 	return adapter.Chat(ctx, req)
 }
 
+// Stream performs one streaming completion using the protocol adapter selected
+// from cfg.Protocol, forwarding normalized deltas. Both protocols implement
+// Stream; a streaming failure is returned to the caller, never silently
+// retried through the non-streaming Chat path.
+func (c *Client) Stream(ctx context.Context, cfg llm.Config, req llmapp.ChatRequest, onDelta func(llmapp.Delta)) error {
+	adapter, err := newAdapter(cfg, c)
+	if err != nil {
+		return err
+	}
+	return adapter.Stream(ctx, req, onDelta)
+}
+
 // Chat performs one OpenAI-compatible chat completion with tools. Transient
 // failures (network, timeout, HTTP 429 and 5xx) are retried up to
 // cfg.MaxRetries; other 4xx responses are returned immediately. Context-window
 // overflows are wrapped with llmapp.ErrContextOverflow so the runtime can
 // compact and retry. The configured API key is never included in errors.
 func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
-	payload, names, err := buildChatPayload(a.cfg, req)
+	payload, names, err := buildChatPayload(a.cfg, req, false)
 	if err != nil {
 		return llmapp.ChatResponse{}, err
 	}
@@ -134,12 +146,170 @@ func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatReques
 	return llmapp.ChatResponse{}, lastErr
 }
 
-// Stream is not implemented for the chat-completions adapter yet: the P1
-// gateway only requires non-streaming completions. It fails closed with
-// ErrNotImplemented instead of pretending to stream; the Responses adapter in
-// responses.go implements streaming on its own wire protocol.
-func (a *chatCompletionsAdapter) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
-	return fmt.Errorf("llm chat completions streaming is not implemented yet: %w", llmapp.ErrNotImplemented)
+// Stream performs one streaming POST /chat/completions call and forwards
+// normalized deltas. Transient failures (network, timeout, HTTP 429/5xx, an
+// empty or broken stream) are retried up to cfg.MaxRetries ONLY until the first
+// delta reaches the caller (R-D7): once content was emitted a retry would
+// duplicate it, so any later failure is returned directly. Protocol rejections
+// and context overflows are never retried, and no retry switches model (D24).
+// The configured API key is never included in errors.
+func (a *chatCompletionsAdapter) Stream(ctx context.Context, req llmapp.ChatRequest, onDelta func(llmapp.Delta)) error {
+	payload, names, err := buildChatPayload(a.cfg, req, true)
+	if err != nil {
+		return err
+	}
+	attempts := a.cfg.MaxRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	firstDeltaSeen := false
+	tracked := func(delta llmapp.Delta) {
+		firstDeltaSeen = true
+		onDelta(delta)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			if err := waitRetry(ctx, attempt-2); err != nil {
+				return contextErr(ctx, err)
+			}
+		}
+		err := a.doStream(ctx, payload, names, tracked)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// R-D7: after the first delta a retry would duplicate content, so stop.
+		// Only transient failures before the first delta are replayed; a 4xx
+		// rejection or a cancelled context is never retried (parity with Chat).
+		if firstDeltaSeen || !errors.Is(err, llmapp.ErrTransient) || ctx.Err() != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("llm chat stream request failed")
+	}
+	return lastErr
+}
+
+// doStream performs one streaming attempt with the per-config request timeout.
+// Non-2xx replies are classified exactly like the non-streaming path
+// (classifyChatFailure); a 2xx reply is consumed as server-sent events.
+func (a *chatCompletionsAdapter) doStream(ctx context.Context, payload chatRequestPayload, names *toolNameMapping, onDelta func(llmapp.Delta)) error {
+	timeout := time.Duration(a.cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	request, err := a.client.newRequest(attemptCtx, a.cfg, http.MethodPost, "/chat/completions", payload)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Accept", "text/event-stream")
+	response, err := a.client.http.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return contextErr(ctx, err)
+		}
+		if isTimeout(err) {
+			return &TransientError{Err: errors.New("llm provider request timed out")}
+		}
+		return &TransientError{Err: errors.New("llm provider request failed")}
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes))
+		return classifyChatFailure(response.StatusCode, raw)
+	}
+	return consumeChatStream(response.Body, names, onDelta, payload.MaxTokens)
+}
+
+// chatStreamState tracks function-call metadata announced by the first fragment
+// of each tool call so later argument fragments carry the call id/name, plus the
+// finish_reason and usage captured from the trailing chunks (last wins: each
+// usage chunk is a cumulative provider snapshot, not an additive fragment).
+type chatStreamState struct {
+	names        *toolNameMapping
+	calls        map[int]streamCallRef
+	finishReason string
+	usage        map[string]int
+	sawChoice    bool
+}
+
+// consumeChatStream reads chat-completions SSE chunks, emits normalized deltas
+// and classifies empty/truncated/malformed streams as transient failures instead
+// of silently returning success. The terminal delta (finish_reason + usage) is
+// emitted when the [DONE] sentinel arrives. The SSE framing is the shared
+// consumeSSE scanner; only the chunk semantics live here. maxOutputTokens is the
+// request's forwarded output limit, used to scale the streaming byte budget
+// (H-E12) so a configured long turn is not starved.
+func consumeChatStream(body io.Reader, names *toolNameMapping, onDelta func(llmapp.Delta), maxOutputTokens int) error {
+	state := chatStreamState{names: names, calls: make(map[int]streamCallRef)}
+	return consumeSSE(body, func(data string) (bool, error) {
+		return state.handleChunk(data, onDelta)
+	}, "read llm chat stream failed", maxOutputTokens)
+}
+
+// handleChunk maps one SSE data payload to zero or more normalized deltas and
+// reports whether it was the terminal [DONE] sentinel. Malformed payloads are
+// transient stream failures; an empty completion is transient too. Tool names
+// are reverse-mapped to the internal names (parity with parseChatCompletion).
+func (s *chatStreamState) handleChunk(data string, onDelta func(llmapp.Delta)) (bool, error) {
+	if strings.TrimSpace(data) == "[DONE]" {
+		if !s.sawChoice {
+			return false, &TransientError{Err: errors.New("llm provider returned an empty stream")}
+		}
+		onDelta(llmapp.Delta{FinishReason: s.finishReason, Usage: s.usage})
+		return true, nil
+	}
+	var chunk chatStreamChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		return false, &TransientError{Err: fmt.Errorf("decode llm chat stream event failed: %w", err)}
+	}
+	// usage may arrive in a trailing chunk whose choices array is empty
+	// (stream_options.include_usage), or alongside the finish_reason chunk.
+	if chunk.Usage != nil {
+		s.usage = chatUsageMap(chunk.Usage)
+	}
+	if len(chunk.Choices) == 0 {
+		return false, nil
+	}
+	choice := chunk.Choices[0]
+	if choice.FinishReason != "" {
+		s.finishReason = choice.FinishReason
+		s.sawChoice = true
+	}
+	if choice.Delta.Content != "" {
+		s.sawChoice = true
+		onDelta(llmapp.Delta{Content: choice.Delta.Content})
+	}
+	if choice.Delta.ReasoningContent != "" {
+		s.sawChoice = true
+		onDelta(llmapp.Delta{ReasoningContent: choice.Delta.ReasoningContent})
+	}
+	for _, call := range choice.Delta.ToolCalls {
+		s.sawChoice = true
+		ref := s.calls[call.Index]
+		if call.ID != "" {
+			ref.id = call.ID
+		}
+		if call.Function.Name != "" {
+			ref.name = s.names.originalName(call.Function.Name)
+		}
+		s.calls[call.Index] = ref
+		onDelta(llmapp.Delta{ToolCall: &llmapp.ToolCallDelta{
+			Index:     call.Index,
+			ID:        ref.id,
+			Name:      ref.name,
+			Arguments: call.Function.Arguments,
+		}})
+	}
+	return false, nil
 }
 
 // doChat performs one attempt with the per-config request timeout. Failures are
@@ -173,7 +343,7 @@ func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequest
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes))
-		return llmapp.ChatResponse{}, classifyChatFailure(cfg, response.StatusCode, raw)
+		return llmapp.ChatResponse{}, classifyChatFailure(response.StatusCode, raw)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
@@ -187,9 +357,10 @@ func (a *chatCompletionsAdapter) doChat(ctx context.Context, payload chatRequest
 	return parsed, nil
 }
 
-// classifyChatFailure turns a non-2xx upstream response into a safe typed error.
-// 429/5xx are transient; other 4xx are non-retryable protocol rejections.
-func classifyChatFailure(cfg llm.Config, status int, raw []byte) error {
+// classifyChatFailure turns a non-2xx upstream response into a typed error.
+// 429/5xx are transient; other 4xx are non-retryable protocol rejections. The
+// upstream message is kept verbatim (GD-01: credentials are plaintext).
+func classifyChatFailure(status int, raw []byte) error {
 	var payload chatErrorPayload
 	message := ""
 	code := ""
@@ -200,12 +371,9 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) error {
 	if strings.TrimSpace(message) == "" {
 		message = string(raw)
 	}
-	for _, value := range cfg.Headers {
-		if strings.TrimSpace(value) != "" {
-			message = strings.ReplaceAll(message, value, "[redacted]")
-		}
-	}
-	message = sanitizeUpstreamMessage(message, cfg.APIKey, 300)
+	// GD-01 (Q05=B): the upstream message is kept verbatim (credentials are
+	// plaintext by design); only a size bound is applied before it is echoed.
+	message = boundUpstreamMessage(message, 300)
 	if isChatContextOverflow(status, code, message) {
 		return fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)
 	}
@@ -222,7 +390,7 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) error {
 // provider-specific thinking object; the auto/none defaults add no keys so the
 // legacy payload stays byte-compatible. Assistant history replays
 // reasoning_content only when the application captured it (spec §7.2).
-func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapping, error) {
+func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) (chatRequestPayload, *toolNameMapping, error) {
 	messages := make([]chatMessagePayload, 0, len(req.Messages))
 	for _, message := range req.Messages {
 		item := chatMessagePayload{
@@ -262,7 +430,13 @@ func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayloa
 		Messages:    messages,
 		Temperature: 0,
 		MaxTokens:   req.MaxOutputTokens,
-		Stream:      false,
+		Stream:      stream,
+	}
+	if stream {
+		// OpenAI chat-completions only emits the usage object in the stream when
+		// stream_options.include_usage is set; request it so the streaming path
+		// keeps usage/cache telemetry parity with the non-streaming path.
+		payload.StreamOptions = &chatStreamOptions{IncludeUsage: true}
 	}
 	applyChatThinking(&payload, cfg)
 	if payload.MaxTokens <= 0 {
@@ -431,13 +605,11 @@ func isChatContextOverflow(status int, code, message string) bool {
 	return status == http.StatusBadRequest && strings.Contains(strings.ToLower(message), "context")
 }
 
-// sanitizeUpstreamMessage redacts the configured key and bounds the text that
-// may be echoed into errors/events.
-func sanitizeUpstreamMessage(message, secret string, limit int) string {
+// boundUpstreamMessage trims and bounds the upstream text that may be echoed
+// into errors/events. GD-01 (Q05=B): credentials are plaintext by design, so the
+// message is never redacted — only a size bound is applied.
+func boundUpstreamMessage(message string, limit int) string {
 	message = strings.TrimSpace(message)
-	if secret != "" {
-		message = strings.ReplaceAll(message, secret, "[redacted]")
-	}
 	runes := []rune(message)
 	if limit > 0 && len(runes) > limit {
 		message = string(runes[:limit]) + "..."
@@ -470,6 +642,7 @@ type chatRequestPayload struct {
 	Temperature     float64              `json:"temperature"`
 	MaxTokens       int                  `json:"max_tokens"`
 	Stream          bool                 `json:"stream"`
+	StreamOptions   *chatStreamOptions   `json:"stream_options,omitempty"`
 	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
 	Thinking        *chatThinkingPayload `json:"thinking,omitempty"`
 }
@@ -479,6 +652,13 @@ type chatRequestPayload struct {
 // Qwen uses enable_thinking instead and is not covered by this switch.
 type chatThinkingPayload struct {
 	Type string `json:"type"`
+}
+
+// chatStreamOptions is the OpenAI stream_options object. include_usage asks the
+// provider to emit the usage object in a trailing stream chunk so the streaming
+// path keeps usage telemetry parity with the non-streaming path.
+type chatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessagePayload struct {
@@ -609,4 +789,44 @@ type chatErrorPayload struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 	} `json:"error"`
+}
+
+// chatStreamChunk is one OpenAI chat-completions streaming chunk
+// (object "chat.completion.chunk"). Usage may arrive in a final chunk whose
+// choices array is empty when stream_options.include_usage is set.
+type chatStreamChunk struct {
+	Choices []chatStreamChoice   `json:"choices"`
+	Usage   *chatCompletionUsage `json:"usage"`
+}
+
+// chatStreamChoice is one streamed choice: the incremental delta plus the
+// finish_reason that stays null until the final content chunk.
+type chatStreamChoice struct {
+	Index        int             `json:"index"`
+	Delta        chatStreamDelta `json:"delta"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+// chatStreamDelta is the incremental message fragment of a streamed choice.
+type chatStreamDelta struct {
+	Role             string               `json:"role"`
+	Content          string               `json:"content"`
+	ReasoningContent string               `json:"reasoning_content"`
+	ToolCalls        []chatStreamToolCall `json:"tool_calls"`
+}
+
+// chatStreamToolCall is one streamed function-call fragment. The first fragment
+// carries id/name; later fragments carry only the arguments fragment, keyed by
+// index so parallel calls stay distinct.
+type chatStreamToolCall struct {
+	Index    int                        `json:"index"`
+	ID       string                     `json:"id"`
+	Type     string                     `json:"type"`
+	Function chatStreamToolCallFunction `json:"function"`
+}
+
+// chatStreamToolCallFunction is the function fragment of a streamed tool call.
+type chatStreamToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }

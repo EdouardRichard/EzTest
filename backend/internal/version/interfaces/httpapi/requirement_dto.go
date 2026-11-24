@@ -11,10 +11,20 @@ import (
 
 // ---------- response DTOs (OpenAPI P1 Requirement* schemas) ----------
 
-type requirementTargetsDTO struct {
-	VersionSUTs []string `json:"version_suts"`
-	Pages       []string `json:"pages"`
-	APIs        []string `json:"apis"`
+// userStoryDTO is the §5.1 three-part user story on a response body.
+type userStoryDTO struct {
+	AsA    string `json:"as_a"`
+	IWant  string `json:"i_want"`
+	SoThat string `json:"so_that"`
+}
+
+// acceptanceCriterionDTO is one structured acceptance criterion. The id is
+// server-assigned ("AC-<n>") and stable across revisions.
+type acceptanceCriterionDTO struct {
+	ID    string `json:"id"`
+	Given string `json:"given"`
+	When  string `json:"when"`
+	Then  string `json:"then"`
 }
 
 type requirementSummaryDTO struct {
@@ -24,11 +34,11 @@ type requirementSummaryDTO struct {
 	Title            string                 `json:"title"`
 	Status           string                 `json:"status"`
 	Priority         string                 `json:"priority"`
-	Targets          requirementTargetsDTO  `json:"targets"`
 	UpdatedAt        string                 `json:"updated_at"`
 	ConfirmedAt      *string                `json:"confirmed_at"`
 	ClosedAt         *string                `json:"closed_at"`
 	Closure          *requirementClosureDTO `json:"closure"`
+	Waived           bool                   `json:"waived"`
 }
 
 // requirementClosureDTO is the P4 latest-closure projection (ClosureSummary).
@@ -40,19 +50,20 @@ type requirementClosureDTO struct {
 }
 
 type requirementVersionDTO struct {
-	ID                 string          `json:"id"`
-	RequirementID      string          `json:"requirement_id"`
-	Revision           int             `json:"revision"`
-	Title              string          `json:"title"`
-	Description        string          `json:"description"`
-	AcceptanceCriteria string          `json:"acceptance_criteria"`
-	Priority           string          `json:"priority"`
-	Constraints        json.RawMessage `json:"constraints"`
-	TargetVersionSUTs  []string        `json:"target_version_suts"`
-	TargetPages        []string        `json:"target_pages"`
-	TargetAPIs         []string        `json:"target_apis"`
-	ContentHash        string          `json:"content_hash"`
-	CreatedAt          string          `json:"created_at"`
+	ID                 string                   `json:"id"`
+	RequirementID      string                   `json:"requirement_id"`
+	Revision           int                      `json:"revision"`
+	Title              string                   `json:"title"`
+	UserStory          userStoryDTO             `json:"user_story"`
+	Rules              string                   `json:"rules"`
+	AcceptanceCriteria []acceptanceCriterionDTO `json:"acceptance_criteria"`
+	Priority           string                   `json:"priority"`
+	Constraints        json.RawMessage          `json:"constraints"`
+	SutDescription     string                   `json:"sut_description"`
+	ScopeOut           string                   `json:"scope_out"`
+	AccountRolesHint   []string                 `json:"account_roles_hint"`
+	ContentHash        string                   `json:"content_hash"`
+	CreatedAt          string                   `json:"created_at"`
 }
 
 type requirementConfirmationDTO struct {
@@ -125,29 +136,45 @@ type requirementMergeDTO struct {
 
 // ---------- request payloads ----------
 
-type requirementTargetsInput struct {
-	VersionSUTs []string `json:"version_suts"`
-	Pages       []string `json:"pages"`
-	APIs        []string `json:"apis"`
+// userStoryInput and acceptanceCriterionInput are the request-side shapes.
+// acceptanceCriterionInput has no id field on purpose: ids are server-assigned
+// and inherited by content, so a client cannot pick one or resurrect a deleted
+// one.
+type userStoryInput struct {
+	AsA    string `json:"as_a"`
+	IWant  string `json:"i_want"`
+	SoThat string `json:"so_that"`
+}
+
+type acceptanceCriterionInput struct {
+	Given string `json:"given"`
+	When  string `json:"when"`
+	Then  string `json:"then"`
 }
 
 type createRequirementRequest struct {
-	Title              string                   `json:"title"`
-	Description        string                   `json:"description"`
-	AcceptanceCriteria string                   `json:"acceptance_criteria"`
-	Priority           string                   `json:"priority"`
-	Constraints        json.RawMessage          `json:"constraints"`
-	Targets            *requirementTargetsInput `json:"targets"`
+	Title              string                     `json:"title"`
+	UserStory          userStoryInput             `json:"user_story"`
+	Rules              string                     `json:"rules"`
+	AcceptanceCriteria []acceptanceCriterionInput `json:"acceptance_criteria"`
+	Priority           string                     `json:"priority"`
+	Constraints        json.RawMessage            `json:"constraints"`
+	SutDescription     string                     `json:"sut_description"`
+	ScopeOut           string                     `json:"scope_out"`
+	AccountRolesHint   []string                   `json:"account_roles_hint"`
 }
 
 type updateRequirementRequest struct {
-	Title              string                   `json:"title"`
-	Description        string                   `json:"description"`
-	AcceptanceCriteria string                   `json:"acceptance_criteria"`
-	Priority           string                   `json:"priority"`
-	Constraints        json.RawMessage          `json:"constraints"`
-	Targets            *requirementTargetsInput `json:"targets"`
-	Reason             string                   `json:"reason"`
+	Title              string                     `json:"title"`
+	UserStory          userStoryInput             `json:"user_story"`
+	Rules              string                     `json:"rules"`
+	AcceptanceCriteria []acceptanceCriterionInput `json:"acceptance_criteria"`
+	Priority           string                     `json:"priority"`
+	Constraints        json.RawMessage            `json:"constraints"`
+	SutDescription     string                     `json:"sut_description"`
+	ScopeOut           string                     `json:"scope_out"`
+	AccountRolesHint   []string                   `json:"account_roles_hint"`
+	Reason             string                     `json:"reason"`
 }
 
 type batchConfirmRequest struct {
@@ -181,38 +208,41 @@ type mergeRequirementsRequest struct {
 func (r createRequirementRequest) draft() versionapp.RequirementDraft {
 	return versionapp.RequirementDraft{
 		Title:              r.Title,
-		Description:        r.Description,
-		AcceptanceCriteria: r.AcceptanceCriteria,
+		UserStory:          versionapp.RequirementUserStoryView{AsA: r.UserStory.AsA, IWant: r.UserStory.IWant, SoThat: r.UserStory.SoThat},
+		Rules:              r.Rules,
+		AcceptanceCriteria: acceptanceCriterionInputs(r.AcceptanceCriteria),
 		Priority:           r.Priority,
 		Constraints:        r.Constraints,
-		TargetVersionSUTs:  targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.VersionSUTs }),
-		TargetPages:        targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.Pages }),
-		TargetAPIs:         targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.APIs }),
+		SutDescription:     r.SutDescription,
+		ScopeOut:           r.ScopeOut,
+		AccountRolesHint:   nonNil(r.AccountRolesHint),
 	}
 }
 
 func (r updateRequirementRequest) draft() versionapp.RequirementDraft {
 	return versionapp.RequirementDraft{
 		Title:              r.Title,
-		Description:        r.Description,
-		AcceptanceCriteria: r.AcceptanceCriteria,
+		UserStory:          versionapp.RequirementUserStoryView{AsA: r.UserStory.AsA, IWant: r.UserStory.IWant, SoThat: r.UserStory.SoThat},
+		Rules:              r.Rules,
+		AcceptanceCriteria: acceptanceCriterionInputs(r.AcceptanceCriteria),
 		Priority:           r.Priority,
 		Constraints:        r.Constraints,
-		TargetVersionSUTs:  targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.VersionSUTs }),
-		TargetPages:        targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.Pages }),
-		TargetAPIs:         targetValues(r.Targets, func(t *requirementTargetsInput) []string { return t.APIs }),
+		SutDescription:     r.SutDescription,
+		ScopeOut:           r.ScopeOut,
+		AccountRolesHint:   nonNil(r.AccountRolesHint),
 	}
 }
 
-func targetValues(targets *requirementTargetsInput, pick func(*requirementTargetsInput) []string) []string {
-	if targets == nil {
-		return []string{}
+func acceptanceCriterionInputs(criteria []acceptanceCriterionInput) []versionapp.RequirementAcceptanceCriterionInput {
+	inputs := make([]versionapp.RequirementAcceptanceCriterionInput, 0, len(criteria))
+	for _, criterion := range criteria {
+		inputs = append(inputs, versionapp.RequirementAcceptanceCriterionInput{
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
 	}
-	values := pick(targets)
-	if values == nil {
-		return []string{}
-	}
-	return values
+	return inputs
 }
 
 // parseBatchIDs parses the decimal string IDs of the batch request.
@@ -249,14 +279,6 @@ func (r mergeRequirementsRequest) ids() (int64, []int64, error) {
 
 // ---------- view -> DTO conversions ----------
 
-func toRequirementTargetsDTO(versionSUTs, pages, apis []string) requirementTargetsDTO {
-	return requirementTargetsDTO{
-		VersionSUTs: nonNil(versionSUTs),
-		Pages:       nonNil(pages),
-		APIs:        nonNil(apis),
-	}
-}
-
 func toRequirementSummaryDTO(view versionapp.RequirementView) requirementSummaryDTO {
 	return requirementSummaryDTO{
 		ID:               strconv.FormatInt(view.ID, 10),
@@ -265,11 +287,11 @@ func toRequirementSummaryDTO(view versionapp.RequirementView) requirementSummary
 		Title:            view.Title,
 		Status:           view.Status,
 		Priority:         view.Priority,
-		Targets:          toRequirementTargetsDTO(view.TargetVersionSUTs, view.TargetPages, view.TargetAPIs),
 		UpdatedAt:        formatTime(view.UpdatedAt),
 		ConfirmedAt:      formatOptionalTime(view.ConfirmedAt),
 		ClosedAt:         formatOptionalTime(view.ClosedAt),
 		Closure:          toRequirementClosureDTO(view.Closure),
+		Waived:           view.Waived,
 	}
 }
 
@@ -290,18 +312,32 @@ func toRequirementVersionDTO(view versionapp.RequirementVersionView) requirement
 	if len(constraints) == 0 {
 		constraints = json.RawMessage(`{}`)
 	}
+	criteria := make([]acceptanceCriterionDTO, 0, len(view.AcceptanceCriteria))
+	for _, criterion := range view.AcceptanceCriteria {
+		criteria = append(criteria, acceptanceCriterionDTO{
+			ID:    criterion.ID,
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
+	}
 	return requirementVersionDTO{
-		ID:                 strconv.FormatInt(view.ID, 10),
-		RequirementID:      strconv.FormatInt(view.RequirementID, 10),
-		Revision:           view.Revision,
-		Title:              view.Title,
-		Description:        view.Description,
-		AcceptanceCriteria: view.AcceptanceCriteria,
+		ID:            strconv.FormatInt(view.ID, 10),
+		RequirementID: strconv.FormatInt(view.RequirementID, 10),
+		Revision:      view.Revision,
+		Title:         view.Title,
+		UserStory: userStoryDTO{
+			AsA:    view.UserStory.AsA,
+			IWant:  view.UserStory.IWant,
+			SoThat: view.UserStory.SoThat,
+		},
+		Rules:              view.Rules,
+		AcceptanceCriteria: criteria,
 		Priority:           view.Priority,
 		Constraints:        constraints,
-		TargetVersionSUTs:  nonNil(view.TargetVersionSUTs),
-		TargetPages:        nonNil(view.TargetPages),
-		TargetAPIs:         nonNil(view.TargetAPIs),
+		SutDescription:     view.SutDescription,
+		ScopeOut:           view.ScopeOut,
+		AccountRolesHint:   nonNil(view.AccountRolesHint),
 		ContentHash:        view.ContentHash,
 		CreatedAt:          formatTime(view.CreatedAt),
 	}

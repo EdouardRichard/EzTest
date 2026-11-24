@@ -360,6 +360,25 @@ func insertKnowledgeItem(t *testing.T, repo *memoryKnowledgeRepository, item kno
 
 /* ------------------------- success hook integration ----------------------- */
 
+// reviewNotRequiredSettings is a knowledgeapp.SettingsReader that turns the
+// knowledge.review_required human-judgment gate off, so the success-hook
+// auto-approval pipeline can be exercised end to end. A nil reader (the previous
+// wiring) fails closed to review required, which correctly leaves sedimented
+// knowledge as a draft; these tests opt in to the auto-approve path explicitly.
+// Other keys return an error so the service applies its documented defaults.
+type reviewNotRequiredSettings struct{}
+
+func (reviewNotRequiredSettings) Int(context.Context, string) (int64, error) {
+	return 0, errors.New("setting not configured in this fake")
+}
+
+func (reviewNotRequiredSettings) Bool(_ context.Context, key string) (bool, error) {
+	if key == knowledgeapp.SettingReviewRequired {
+		return false, nil
+	}
+	return false, errors.New("setting not configured in this fake")
+}
+
 // TestCaseSuccessHookEndToEnd drives a passed-case observation through the
 // adapter, the real knowledge application service (success hooks +
 // auto-approval), the real repository contract, and the audit recorder.
@@ -368,7 +387,7 @@ func TestCaseSuccessHookEndToEnd(t *testing.T) {
 	repo := newMemoryKnowledgeRepository()
 	audit := &recordingKnowledgeAudit{}
 	service := knowledgeapp.NewService(
-		repo, nil, nil, audit, nil, nil,
+		repo, nil, reviewNotRequiredSettings{}, audit, nil, nil,
 		fixedKnowledgeClock{}, &sequenceKnowledgeIDs{next: 7000},
 	)
 	systems := &fakeVersionSystemReader{keys: []string{"shop"}}

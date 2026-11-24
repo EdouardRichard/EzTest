@@ -114,6 +114,7 @@ func TestRealMissingControlStillApplication(t *testing.T) {
 	fixture := newAnalysisFixture()
 	fixture.addCase(43, 503, 603, "P2")
 	fixture.addRun(9003, 1003, 43, execution.CaseRunBlocked, execution.FailureClassBlocked)
+	fixture.addEvidenceRows(9003, 1)
 	fixture.results.steps[9003] = []execution.StepResult{{
 		CaseRunID: 9003, Seq: 1, Status: execution.StepBlocked,
 		Observed: map[string]any{"summary": "编辑页没有「发布时间」控件，无法设置定时发布"},

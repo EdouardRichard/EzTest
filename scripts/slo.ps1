@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Measures the P8 SLO gate (design spec section 1.5/10.1).
@@ -27,41 +27,36 @@
     .tmp/p8-slo/fixture-repo is bound to the measured version so
     `/code/changes` returns 200 with a real diff.
 
-    The 8-concurrent batch execution and the analysis non-model overhead are
-    measured with a deterministic local model harness that must be up when the
-    API starts: scripts/fake-llm.cjs behind a small timing proxy on loopback,
-    wired into the API through llm_base_url/llm_key/llm_model_name (the P4
-    analysis LLM gateway snapshots its configuration at startup, so a runtime
-    config change would only cover the execution agent). Pass
-    -LlmCallLogPath <proxy-jsonl> so the analysis row can sum real model-call
-    time and subtract it from the analysis wall time; without the proxy log the
-    analysis row reports the wall time as an upper bound. The concurrency row
-    creates eight fixture execution cases in an executing version, imports
-    eight fixture sessions, runs one real batch through the running
-    API/executor, waits for the terminal state and counts case errors and the
-    maximum observed concurrently running case runs. The API must be started
-    with the executor configured (EZTEST_EXECUTOR_URL/TOKEN) and with
-    EZTEST_EXEC_MAX_CONCURRENT_CASES=8; a lower cap is a recorded FAIL, not a
-    pass. Genuinely missing environment (no API, database, executor, fixture or
-    loopback/fake LLM) is an explicit SKIP, so a run can still be INCOMPLETE,
-    but an attempted measurement never silently degrades to a pass. A configured
-    non-loopback LLM is never called by this local measurement unless
-    -AllowRealLlm is passed explicitly.
+    The analysis non-model overhead is measured with a deterministic local
+    model harness that must be up when the API starts: scripts/fake-llm.cjs
+    behind a small timing proxy on loopback, wired into the API through
+    llm_base_url/llm_key/llm_model_name (the P4 analysis LLM gateway snapshots
+    its configuration at startup). Pass -LlmCallLogPath <proxy-jsonl> so the
+    analysis row can sum real model-call time and subtract it from the analysis
+    wall time; without the proxy log the analysis row reports the wall time as
+    an upper bound. The former 8-concurrency batch execution row is RETIRED: it
+    drove deleted resource-session/batch/mindmap APIs and is never run or
+    reported as PASS (its row is always marked RETIRED). Genuinely missing
+    environment (no API, database or loopback/fake LLM) is an explicit SKIP, so
+    a run can still be INCOMPLETE, but an attempted measurement never silently
+    degrades to a pass. A configured non-loopback LLM is never called by this
+    local measurement unless -AllowRealLlm is passed explicitly.
 
     -DryRun performs static preflight only: it checks that the limiter, the SLO
     script, the measured routes, the chain dataset/assertion code, the fixture
-    repository binding, the overview browser probe, the concurrency/analysis
-    measurement harness, the environment keys and the report paths are present,
-    writes docs/acceptance/p8/slo.md and docs/acceptance/p8/slo-metrics.json
-    with the measurement rows marked SKIP, and exits 0 when the static checks
-    pass.
+    repository binding, the overview browser probe, the retired concurrency-row
+    declaration, the analysis measurement harness, the environment keys and the
+    report paths are present, writes docs/acceptance/p8/slo.md and
+    docs/acceptance/p8/slo-metrics.json with the measurable rows marked SKIP
+    and the retired row marked RETIRED, and exits 0 when the static checks pass.
 
-    Every measurement row is PASS, FAIL or SKIP and every row is always present.
-    A measured value above its threshold, a chain shape assertion failure, or a
-    failed request is a FAIL and the script exits 1. A missing API, browser,
-    fixture repository or executor harness is an explicit SKIP (exit 0) and is
-    written to the report; it is never reported as a pass. The report is a local
-    acceptance measurement, not a production SLA promise.
+    Every measurement row is PASS, FAIL, SKIP or RETIRED and every row is
+    always present. A measured value above its threshold, a chain shape
+    assertion failure, or a failed request is a FAIL and the script exits 1. A
+    missing API, browser, fixture repository or analysis harness is an explicit
+    SKIP (exit 0) and is written to the report; it is never reported as a pass.
+    The retired 8-concurrency row is always RETIRED, never a pass or a fail. The
+    report is a local acceptance measurement, not a production SLA promise.
 
     The script never prints .env credentials, the database URL or the LLM key.
 
@@ -91,13 +86,13 @@
     .env path (default <repo>/.env).
 
 .PARAMETER ExecutionFixtureBaseUrl
-    Base URL of the deterministic P6 fixture target used by the 8-concurrency
-    execution measurement (default http://127.0.0.1:13335). The script starts
-    scripts/fixture-target.cjs there when nothing is listening on that loopback
-    port; an unreachable non-loopback target is a SKIP.
+    Retained for CLI compatibility. The 8-concurrency execution row is RETIRED
+    and no longer uses the fixture target; the value is still recorded in the
+    llmHarness snapshot but does not drive a measurement.
 
 .PARAMETER ExecutionTimeoutSeconds
-    Upper bound for one 8-case batch to reach a terminal state (default 600).
+    Retained for CLI compatibility. The 8-concurrency execution row is RETIRED;
+    this bound is no longer applied to any measurement.
 
 .PARAMETER AnalysisTimeoutSeconds
     Upper bound for the P4 analysis run to reach a terminal state (default 240).
@@ -1030,61 +1025,6 @@ function Test-LoopbackUpstream {
 }
 
 # ---------------------------------------------------------------------------
-# Fixture login/session import used by the 8-concurrency measurement.
-# ---------------------------------------------------------------------------
-function Get-FixtureCookie {
-    param([string]$FixtureBaseUrl)
-    $request = [System.Net.HttpWebRequest]::Create(($FixtureBaseUrl.TrimEnd("/") + "/p6/login"))
-    $request.Method = "POST"
-    $request.AllowAutoRedirect = $false
-    $request.ContentType = "application/x-www-form-urlencoded"
-    $body = [System.Text.Encoding]::UTF8.GetBytes("username=fixture&password=fixture-pass")
-    $request.ContentLength = $body.Length
-    $stream = $request.GetRequestStream()
-    try { $stream.Write($body, 0, $body.Length) } finally { $stream.Close() }
-    $response = $null
-    try {
-        $response = $request.GetResponse()
-    } catch [System.Net.WebException] {
-        $response = $_.Exception.Response
-    }
-    if ($null -eq $response) { throw "fixture P6 login returned no response" }
-    try {
-        $status = [int]$response.StatusCode
-        $cookieHeader = [string]$response.Headers["Set-Cookie"]
-    } finally {
-        $response.Close()
-    }
-    if ($status -ne 302) { throw "fixture P6 login returned HTTP $status, expected 302" }
-    if ($cookieHeader -notmatch 'p6_session=([^;]+)') { throw "fixture P6 login did not set the p6_session cookie" }
-    return $Matches[1]
-}
-
-function Get-FixtureStorageState {
-    param([string]$FixtureBaseUrl)
-    $cookie = Get-FixtureCookie -FixtureBaseUrl $FixtureBaseUrl
-    $uri = [System.Uri]$FixtureBaseUrl
-    $origin = "{0}://{1}" -f $uri.Scheme, $uri.Authority
-    return @{
-        cookies = @(@{
-                name     = "p6_session"
-                value    = $cookie
-                domain   = $uri.Host
-                path     = "/"
-                expires  = -1
-                httpOnly = $true
-                secure   = $false
-                sameSite = "Lax"
-            })
-        origins = @(@{
-                origin         = $origin
-                localStorage   = @()
-                sessionStorage = @()
-            })
-    }
-}
-
-# ---------------------------------------------------------------------------
 # Deterministic LLM measurement harness: the fake upstream and the loopback
 # timing proxy are started before the API (see the report Reproduce section)
 # because the analysis gateway snapshots its configuration at API startup.
@@ -1222,235 +1162,18 @@ function Get-SloLlmSkipReason {
 }
 
 # ---------------------------------------------------------------------------
-# Measurement 5: one real batch with 8 fixture cases and 8 sessions.
+# Measurement 5: 8-concurrency execution — RETIRED.
+# The former harness drove the deleted resource-system/access/session APIs and
+# the deleted manual mindmap design chain, and polled /batches, which no longer
+# exists. The current execution surface uses design-agent cases plus wave/intent
+# endpoints and is exercised by the execution E2E/acceptance drivers; this SLO
+# row is recorded as RETIRED (never PASS, never silently skipped).
 # ---------------------------------------------------------------------------
-function New-SloExecutingVersion {
-    param($Headers, [string]$Name, $SystemId, $EnvironmentId, [string]$FixtureBaseUrl, [int]$CaseCount)
-    $version = Invoke-ApiJson -Method Post -Path "/api/versions" -Headers $Headers -Body @{
-        name        = $Name
-        description = "P8 SLO 8-concurrency execution measurement version"
-        systemId    = [int64]$SystemId
-        environmentId = [int64]$EnvironmentId
-    }
-    if ($version.Status -ne 201) {
-        throw "POST /api/versions answered HTTP $($version.Status) $($version.Error.Code)/$($version.Error.Reason)"
-    }
-    $versionId = [string]$version.Data.id
-    $requirement = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/requirements" -Headers $Headers -Body @{
-        title              = "$Name requirement"
-        description        = "The fixture order form is reachable and renders the expected content."
-        acceptanceCriteria = "The fixture page renders the order form navigation."
-        priority           = "must"
-    }
-    if ($requirement.Status -ne 201) {
-        throw "POST requirement answered HTTP $($requirement.Status) $($requirement.Error.Code)/$($requirement.Error.Reason)"
-    }
-    $requirementId = [string]$requirement.Data.id
-    $clarify = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/start-clarification" -Headers $Headers
-    if ($clarify.Status -ne 200) { throw "POST start-clarification answered HTTP $($clarify.Status)" }
-    $confirm = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/requirements/$requirementId/confirm" -Headers $Headers
-    if ($confirm.Status -ne 200) { throw "POST requirement confirm answered HTTP $($confirm.Status)" }
-    $enter = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/enter-design" -Headers $Headers -Body @{ acknowledgeUnclarified = $true }
-    if ($enter.Status -ne 200) { throw "POST enter-design answered HTTP $($enter.Status)" }
-
-    $scenario = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/nodes" -Headers $Headers -Body @{
-        kind  = "scenario"
-        title = "$Name scenario"
-    }
-    if ($scenario.Status -ne 201) { throw "POST scenario node answered HTTP $($scenario.Status)" }
-    $scenarioId = [string]$scenario.Data.id
-    $caseIds = New-Object System.Collections.ArrayList
-    for ($index = 1; $index -le $CaseCount; $index++) {
-        $case = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/nodes" -Headers $Headers -Body @{
-            kind           = "case"
-            parentId       = $scenarioId
-            title          = "$Name case $index"
-            priority       = "P0"
-            requirementIds = @($requirementId)
-        }
-        if ($case.Status -ne 201) { throw "POST case node answered HTTP $($case.Status) $($case.Error.Code)/$($case.Error.Reason)" }
-        $caseId = [string]$case.Data.id
-        $step = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/nodes/$caseId/steps" -Headers $Headers -Body @{
-            action   = "Open $($FixtureBaseUrl.TrimEnd('/'))/p6/orders/new"
-            expected = "The fixture new-order form is shown"
-        }
-        if ($step.Status -ne 201) { throw "POST case step answered HTTP $($step.Status)" }
-        $assertion = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/nodes/$caseId/assertions" -Headers $Headers -Body @{
-            stepId     = [string]$step.Data.id
-            kind       = "ui"
-            target     = "body"
-            expression = "text contains Order"
-            expected   = "The fixture page renders order navigation"
-        }
-        if ($assertion.Status -ne 201) { throw "POST case assertion answered HTTP $($assertion.Status)" }
-        [void]$caseIds.Add($caseId)
-    }
-    $submit = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/submit-review" -Headers $Headers -Body @{}
-    if ($submit.Status -ne 200) { throw "POST submit-review answered HTTP $($submit.Status)" }
-    $review = Invoke-ApiJson -Method Post -Path "/api/versions/$versionId/mindmap/review" -Headers $Headers -Body @{
-        decision            = "approve"
-        acknowledgeFindings = $true
-    }
-    if ($review.Status -ne 200) { throw "POST review answered HTTP $($review.Status) $($review.Error.Code)/$($review.Error.Reason)" }
-    if ([string]$review.Data.version.status -ne "executing") {
-        throw "the review left the version in '$($review.Data.version.status)', expected executing"
-    }
-    if ($null -eq $review.Data.baseline) { throw "the review did not freeze a case baseline" }
-    return [pscustomobject]@{ VersionId = $versionId; CaseIds = @($caseIds) }
-}
-
-function Wait-SloBatchTerminal {
-    param($Headers, [string]$VersionId, [string]$BatchId, [int]$TimeoutSeconds)
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $maxRunning = 0
-    $batch = $null
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $batchResponse = Invoke-ApiJson -Method Get -Path "/api/versions/$VersionId/batches/$BatchId" -Headers $Headers
-        if ($batchResponse.Status -ne 200) { throw "GET batch answered HTTP $($batchResponse.Status)" }
-        $batch = $batchResponse.Data
-        $runsResponse = Invoke-ApiJson -Method Get -Path "/api/versions/$VersionId/batches/$BatchId/case-runs?limit=100" -Headers $Headers
-        if ($runsResponse.Status -eq 200) {
-            $running = @($runsResponse.Data | Where-Object { [string]$_.status -eq "running" }).Count
-            if ($running -gt $maxRunning) { $maxRunning = $running }
-        }
-        if (@("done", "failed", "cancelled") -contains [string]$batch.status) {
-            $stopwatch.Stop()
-            return [pscustomobject]@{ Batch = $batch; MaxRunning = $maxRunning; TimedOut = $false; DurationMs = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 1) }
-        }
-        Start-Sleep -Milliseconds 150
-    }
-    $stopwatch.Stop()
-    return [pscustomobject]@{ Batch = $batch; MaxRunning = $maxRunning; TimedOut = $true; DurationMs = [math]::Round($stopwatch.Elapsed.TotalMilliseconds, 1) }
-}
-
-function Invoke-ExecutionConcurrencyMeasurement {
-    param($Headers, [string]$FixtureBaseUrl)
-    $workers = [int]$thresholds.executionWorkers
-    if (-not $script:llmHarness.FixtureReady) {
-        return [pscustomobject]@{ Status = "SKIP"; Value = $null; Detail = "SKIP: the fixture target at $FixtureBaseUrl is not reachable; the 8-concurrency execution measurement needs the real P6 fixture executor. This row is not a PASS." }
-    }
-    if (-not (Test-SloLlmMeasurementAllowed -Config $script:defaultLlmConfig)) {
-        return [pscustomobject]@{ Status = "SKIP"; Value = $null; Detail = "SKIP: $((Get-SloLlmSkipReason)); the execution agent needs a model. This row is not a PASS." }
-    }
-    try {
-        $stamp = Get-Date -Format "yyyyMMddHHmmssfff"
-        $system = Invoke-ApiJson -Method Post -Path "/api/resources/systems" -Headers $Headers -Body @{
-            key     = "sloexec$stamp"
-            name    = "P8 SLO execution system"
-            kind    = "web"
-            baseUrl = $FixtureBaseUrl.TrimEnd("/")
-        }
-        if ($system.Status -ne 201) {
-            throw "POST system answered HTTP $($system.Status) $($system.Error.Code)/$($system.Error.Reason)"
-        }
-        $systemId = $system.Data.id
-        $environment = Invoke-ApiJson -Method Post -Path "/api/resources/systems/$systemId/environments" -Headers $Headers -Body @{
-            key          = "sloexecenv$stamp"
-            name         = "P8 SLO execution environment"
-            baseUrl      = $FixtureBaseUrl.TrimEnd("/")
-            kind         = "dev"
-            allowedHosts = @("127.0.0.1")
-            loginCheck   = @{
-                url          = $FixtureBaseUrl.TrimEnd("/") + "/p6/home"
-                expectStatus = @(200)
-                bodyContains = "New order"
-            }
-        }
-        if ($environment.Status -ne 201) {
-            throw "POST environment answered HTTP $($environment.Status) $($environment.Error.Code)/$($environment.Error.Reason)"
-        }
-        $environmentId = $environment.Data.id
-        $account = Invoke-ApiJson -Method Post -Path "/api/resources/accounts" -Headers $Headers -Body @{
-            key      = "sloexecaccount$stamp"
-            label    = "P8 SLO execution account"
-            username = "fixture"
-            kind     = "human"
-        }
-        if ($account.Status -ne 201) {
-            throw "POST account answered HTTP $($account.Status) $($account.Error.Code)/$($account.Error.Reason)"
-        }
-        $access = Invoke-ApiJson -Method Post -Path "/api/resources/accounts/$($account.Data.id)/accesses" -Headers $Headers -Body @{
-            systemId         = [int64]$systemId
-            authType         = "manual"
-            concurrencyLimit = $workers
-            enabled          = $true
-        }
-        if ($access.Status -ne 201) {
-            throw "POST access answered HTTP $($access.Status) $($access.Error.Code)/$($access.Error.Reason)"
-        }
-        $accessId = $access.Data.id
-
-        $storageState = Get-FixtureStorageState -FixtureBaseUrl $FixtureBaseUrl
-        $imported = 0
-        for ($index = 1; $index -le $workers; $index++) {
-            $import = Invoke-ApiJson -Method Post -Path "/api/resources/accesses/$accessId/sessions" -Headers $Headers -Body @{
-                environmentId = [int64]$environmentId
-                kind          = "storage_state"
-                storageState  = $storageState
-                note          = "P8 SLO 8-concurrency fixture session $index"
-            }
-            if ($import.Status -ne 201) {
-                throw "POST session import answered HTTP $($import.Status) $($import.Error.Code)/$($import.Error.Reason)"
-            }
-            if ([string]$import.Data.state -ne "valid") {
-                return [pscustomobject]@{
-                    Status = "SKIP"; Value = $null
-                    Detail = "SKIP: the imported fixture session is '$($import.Data.state)' (expected valid), so the executor or fixture target is unavailable for the 8-concurrency measurement. This row is not a PASS."
-                }
-            }
-            $imported++
-        }
-
-        $version = New-SloExecutingVersion -Headers $Headers -Name "P8 SLO concurrency $stamp" `
-            -SystemId $systemId -EnvironmentId $environmentId -FixtureBaseUrl $FixtureBaseUrl -CaseCount $workers
-        $created = Invoke-ApiJson -Method Post -Path "/api/versions/$($version.VersionId)/batches" -Headers $Headers -Body @{
-            caseIds = @($version.CaseIds)
-        }
-        if ($created.Status -eq 503 -and
-            ($created.Error.Reason -eq "executor_unavailable" -or $created.Error.Code -eq "unavailable")) {
-            return [pscustomobject]@{
-                Status = "SKIP"; Value = $null
-                Detail = "SKIP: the API has no healthy executor configured (HTTP 503 executor_unavailable); start it with EZTEST_EXECUTOR_URL/EZTEST_EXECUTOR_TOKEN to measure 8-concurrency. This row is not a PASS."
-            }
-        }
-        if ($created.Status -ne 201) {
-            throw "POST batch answered HTTP $($created.Status) $($created.Error.Code)/$($created.Error.Reason)"
-        }
-        $batchId = [string]$created.Data.id
-        $terminal = Wait-SloBatchTerminal -Headers $Headers -VersionId $version.VersionId -BatchId $batchId `
-            -TimeoutSeconds $ExecutionTimeoutSeconds
-        if ($terminal.TimedOut) {
-            return [pscustomobject]@{
-                Status = "FAIL"; Value = $null
-                Detail = "FAIL: batch $batchId did not reach a terminal state within $ExecutionTimeoutSeconds s (observed max $($terminal.MaxRunning) running case(s)); the 8-concurrency run is not proven."
-            }
-        }
-        $batch = $terminal.Batch
-        $runsResponse = Invoke-ApiJson -Method Get -Path "/api/versions/$($version.VersionId)/batches/$batchId/case-runs?limit=100" -Headers $Headers
-        if ($runsResponse.Status -ne 200) { throw "GET case runs answered HTTP $($runsResponse.Status)" }
-        $runs = @($runsResponse.Data)
-        $passed = @($runs | Where-Object { [string]$_.status -eq "passed" }).Count
-        $errors = $runs.Count - $passed
-        $statusCounts = ($runs | Group-Object -Property status | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ", "
-        $value = "$passed/$($runs.Count) passed, max concurrency $($terminal.MaxRunning)"
-        $detail = "batch $batchId status '$($batch.status)'; $($runs.Count) case runs ($statusCounts); imported $imported fixture sessions; observed max $($terminal.MaxRunning) concurrently running case runs; wall $($terminal.DurationMs) ms"
-        $errorsOk = ($errors -le [int]$thresholds.executionErrors)
-        $concurrencyOk = ($terminal.MaxRunning -ge $workers)
-        $batchOk = ([string]$batch.status -eq "done")
-        if ($batchOk -and $errorsOk -and $concurrencyOk -and $runs.Count -eq $workers) {
-            return [pscustomobject]@{ Status = "PASS"; Value = $value; Detail = $detail }
-        }
-        $reasons = New-Object System.Collections.ArrayList
-        if (-not $batchOk) { [void]$reasons.Add("batch status is '$($batch.status)'") }
-        if (-not $errorsOk) { [void]$reasons.Add("$errors case error(s)") }
-        if (-not $concurrencyOk) {
-            [void]$reasons.Add("observed max concurrency $($terminal.MaxRunning) < $workers (check EZTEST_EXEC_MAX_CONCURRENT_CASES=$workers on the API)")
-        }
-        if ($runs.Count -ne $workers) { [void]$reasons.Add("$($runs.Count) case runs instead of $workers") }
-        return [pscustomobject]@{ Status = "FAIL"; Value = $value; Detail = "$detail; FAIL: $($reasons -join '; ')" }
-    } catch {
-        return [pscustomobject]@{ Status = "FAIL"; Value = $null; Detail = "the 8-concurrency execution measurement failed: $($_.Exception.Message)" }
+function Get-RetiredExecutionConcurrencyMeasurement {
+    return [pscustomobject]@{
+        Status = "RETIRED"
+        Value  = $null
+        Detail = "RETIRED executionConcurrency: the 8-concurrency batch harness used deleted APIs (/resources/systems, /accesses/{id}/sessions, /versions/{id}/batches, /mindmap/*); the current design-agent + wave/intent execution surface has no drop-in equivalent for this SLO fixture"
     }
 }
 
@@ -1547,7 +1270,7 @@ function Ensure-MeasurementRows {
             "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $FailureDetail }
             "chainP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail $FailureDetail }
             "changesP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail $FailureDetail }
-            "executionConcurrency" { Add-Measurement -Name $name -Status "FAIL" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail $FailureDetail }
+            "executionConcurrency" { Add-Measurement -Name $name -Status "RETIRED" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "RETIRED executionConcurrency: deleted resource-session/batch/mindmap APIs have no drop-in equivalent on the current execution surface; this row is not measured and is never reported as PASS" }
             "analysisNonModelOverheadMs" { Add-Measurement -Name $name -Status "FAIL" -Threshold "non-model <= $($thresholds.analysisNonModelOverheadMs) ms" -Value $null -Detail $FailureDetail }
         }
     }
@@ -1571,32 +1294,37 @@ function Write-Outputs {
     $failed = @($checks | Where-Object { $_.Status -eq "FAIL" })
     $failedMeasurements = @($measurementOrder | Where-Object { $measurements[$_].status -eq "FAIL" })
     $skipMeasurements = @($measurementOrder | Where-Object { $measurements[$_].status -eq "SKIP" })
+    $retiredMeasurements = @($measurementOrder | Where-Object { $measurements[$_].status -eq "RETIRED" })
     $total = $measurementOrder.Count
-    $measured = $total - $skipMeasurements.Count
+    $measured = $total - $skipMeasurements.Count - $retiredMeasurements.Count
     $status = "passed"
     if ($failed.Count -gt 0 -or $failedMeasurements.Count -gt 0) {
         $status = "failed"
-    } elseif ($Mode -eq "dry-run" -and $skipMeasurements.Count -gt 0) {
+    } elseif ($Mode -eq "dry-run" -and ($skipMeasurements.Count -gt 0 -or $retiredMeasurements.Count -gt 0)) {
         $status = "static-check-passed-measurements-skipped"
-    } elseif ($skipMeasurements.Count -gt 0) {
-        # Missing measurements are recorded, never rounded up to a pass.
+    } elseif ($skipMeasurements.Count -gt 0 -or $retiredMeasurements.Count -gt 0) {
+        # Missing and retired measurements are recorded, never rounded up to a pass.
         $status = "incomplete"
     }
 
     $skippedLabels = @($skipMeasurements | ForEach-Object { $measurementLabels[$_] })
+    $retiredLabels = @($retiredMeasurements | ForEach-Object { $measurementLabels[$_] })
     $coverageNote = "$measured/$total measurement rows measured"
     if ($skipMeasurements.Count -gt 0) {
         $coverageNote += "; $($skipMeasurements.Count) NOT MEASURED (" + ($skippedLabels -join ", ") + ")"
+    }
+    if ($retiredMeasurements.Count -gt 0) {
+        $coverageNote += "; $($retiredMeasurements.Count) RETIRED (" + ($retiredLabels -join ", ") + ")"
+    }
+    if ($skipMeasurements.Count -gt 0 -or $retiredMeasurements.Count -gt 0) {
         if ($Mode -ne "dry-run") { $coverageNote += ". INCOMPLETE is not an SLO PASS." }
     }
 
     $measurementMethod = [ordered]@{
         executionConcurrency = [ordered]@{
-            workers         = $thresholds.executionWorkers
-            cases           = $thresholds.executionWorkers
-            sessions        = $thresholds.executionWorkers
-            observation     = "one real batch through the running API/executor; case-runs polled every 150 ms; PASS requires a done batch, 0 non-passed case runs and observed max running >= $($thresholds.executionWorkers)"
-            apiRequirement  = "API started with EZTEST_EXECUTOR_URL/EZTEST_EXECUTOR_TOKEN and EZTEST_EXEC_MAX_CONCURRENT_CASES=$($thresholds.executionWorkers)"
+            status          = "RETIRED"
+            reason          = "The former harness created resource systems/accesses/sessions and a version via the manual mindmap design chain, then polled /versions/{id}/batches. All of those APIs were deleted; the current execution surface uses design-agent cases plus wave/intent endpoints and is covered by the execution E2E/acceptance drivers, not by a drop-in SLO fixture."
+            notAPass        = $true
         }
         analysisNonModelOverhead = [ordered]@{
             budgetMs      = $thresholds.analysisNonModelOverheadMs
@@ -1633,6 +1361,8 @@ function Write-Outputs {
             measured    = $measured
             notMeasured = $skipMeasurements.Count
             missing     = $skippedLabels
+            retired     = $retiredMeasurements.Count
+            retiredRows = $retiredLabels
         }
         checks       = @($checks)
         measurements = $measurements
@@ -1688,17 +1418,17 @@ function Write-Outputs {
     [void]$builder.AppendLine("| --- | --- | --- | --- | --- |")
     foreach ($name in $measurementOrder) {
         $row = $measurements[$name]
-        $value = "SKIP"
+        $value = if ($row.status -eq "RETIRED") { "" } else { "SKIP" }
         if ($null -ne $row.value) { $value = [string]$row.value }
         [void]$builder.AppendLine("| $($measurementLabels[$name]) | $($row.threshold) | $value | $($row.status) | $($row.detail) |")
     }
     [void]$builder.AppendLine("")
     [void]$builder.AppendLine("## Measurement method")
     [void]$builder.AppendLine("")
-    [void]$builder.AppendLine("- **8-concurrency batch execution**: the script creates one executing version with $($thresholds.executionWorkers) fixture cases and $($thresholds.executionWorkers) imported fixture sessions, starts one real batch through the running API/executor, polls the batch and case-run endpoints during the run and requires a ``done`` batch, $($thresholds.executionErrors) non-passed case run(s) and an observed maximum of at least $($thresholds.executionWorkers) concurrently running case runs. The API must be started with the executor configured and ``EZTEST_EXEC_MAX_CONCURRENT_CASES=$($thresholds.executionWorkers)``; a lower cap produces an observed-concurrency FAIL.")
+    [void]$builder.AppendLine("- **8-concurrency batch execution — RETIRED**: the former harness created a resource system/account/access, eight sessions, a manual mindmap design and one ``/batches`` run. Those APIs were deleted; the current execution surface uses design-agent cases plus wave/intent endpoints and is covered by the execution E2E/acceptance drivers. This row is reported as RETIRED and is never an SLO PASS.")
     [void]$builder.AppendLine("- **Analysis non-model overhead**: one real P4 analysis is triggered (``force=true``) on the seeded fixture repository. The wall time from the trigger to the terminal state is measured; the model-call time is summed from the JSONL log of the loopback timing proxy placed in front of the deterministic fake LLM (``-LlmCallLogPath``) that the API was started against, and the difference is the non-model overhead. The local acceptance budget is $($thresholds.analysisNonModelOverheadMs) ms for this one-file fixture; the configured analysis timeout ($AnalysisTimeoutSeconds s) bounds the run. When the proxy log is not supplied or records no model call, the wall time itself is reported as an upper bound. Unrelated model calls sharing the same proxy during the window would be subtracted too, so the method can only under-report (never inflate) non-model overhead; measure a quiet local API for the exact figure.")
     [void]$builder.AppendLine("- The P4 analysis gateway snapshots its LLM configuration at API startup, so the fake LLM/proxy must be wired at startup; this script does not patch the configuration. Only a local acceptance measurement is claimed - never a production SLA.")
-    [void]$builder.AppendLine("- The 8-concurrency row creates a ``P8 SLO concurrency <stamp>`` fixture version, system/environment/account/access, eight sessions and one batch in the local database. They are left in place after the run (the autonomous follow-up chain may reference the batch); the e2e/acceptance database reset owns cleanup.")
+    [void]$builder.AppendLine("- The retired 8-concurrency row no longer creates fixture data; the remaining rows create only the measured read-model/analysis fixtures.")
     [void]$builder.AppendLine("")
     [void]$builder.AppendLine("## Static checks")
     [void]$builder.AppendLine("")
@@ -1783,7 +1513,7 @@ if ($DryRun) {
     $readmePath = Join-Path $repoRoot "DEVELOPMENT_STATUS.md"
     $readme = ""
     if (Test-Path -LiteralPath $readmePath) { $readme = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8 }
-    foreach ($key in @("EZTEST_RATE_LIMIT_RPS", "EZTEST_RATE_LIMIT_BURST", "EZTEST_RATE_LIMIT_SSE_MAX", "EZTEST_GC_ENABLED")) {
+    foreach ($key in @("EZTEST_RATE_LIMIT_RPS", "EZTEST_RATE_LIMIT_BURST", "EZTEST_RATE_LIMIT_SSE_MAX")) {
         if ($envExample.Contains($key) -and $readme.Contains($key)) {
             Add-Check -Area "docs" -Check $key -Status "PASS" -Detail "documented in .env.example and DEVELOPMENT_STATUS.md"
         } else {
@@ -1833,13 +1563,12 @@ if ($DryRun) {
     } else {
         Add-Check -Area "dataset" -Check "browser probe opens ?tab=overview" -Status "FAIL" -Detail "the overview browser probe is missing or mis-targeted"
     }
-    if ($sloSource.Contains("Invoke-ExecutionConcurrencyMeasurement") -and
-        $sloSource.Contains("Wait-SloBatchTerminal") -and
-        $sloSource.Contains("maxRunning") -and
-        $sloSource.Contains("executionWorkers")) {
-        Add-Check -Area "measurement" -Check "8-concurrency execution measurement" -Status "PASS" -Detail "real batch of 8 fixture cases; observed concurrency and case errors are checked; the API cap must be 8"
+    if ($sloSource.Contains("Get-RetiredExecutionConcurrencyMeasurement") -and
+        $sloSource.Contains("RETIRED executionConcurrency") -and
+        $sloSource.Contains('Status = "RETIRED"')) {
+        Add-Check -Area "measurement" -Check "8-concurrency execution measurement (RETIRED)" -Status "PASS" -Detail "explicitly retired: the deleted resource-session/batch/mindmap APIs have no drop-in equivalent on the current execution surface; the row is never a PASS"
     } else {
-        Add-Check -Area "measurement" -Check "8-concurrency execution measurement" -Status "FAIL" -Detail "the 8-concurrency measurement harness is missing"
+        Add-Check -Area "measurement" -Check "8-concurrency execution measurement (RETIRED)" -Status "FAIL" -Detail "the retired 8-concurrency row is not declared"
     }
     if ($sloSource.Contains("Invoke-AnalysisOverheadMeasurement") -and
         $sloSource.Contains("LlmCallLogPath") -and
@@ -1865,7 +1594,7 @@ if ($DryRun) {
     Add-Measurement -Name "overviewBrowserP95Ms" -Status "SKIP" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail "dry-run: needs Playwright and a running web app; probes ?tab=overview"
     Add-Measurement -Name "chainP95Ms" -Status "SKIP" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail "dry-run: measurement not executed; the run asserts nodes>=200/edges>=400 first"
     Add-Measurement -Name "changesP95Ms" -Status "SKIP" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail "dry-run: measurement not executed; the run binds a real Git fixture repository and verifies HTTP 200 first"
-    Add-Measurement -Name "executionConcurrency" -Status "SKIP" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "dry-run: needs a running API with the executor configured and EZTEST_EXEC_MAX_CONCURRENT_CASES=8; the run creates 8 fixture cases and one real batch"
+    Add-Measurement -Name "executionConcurrency" -Status "RETIRED" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "RETIRED: deleted resource-session/batch/mindmap APIs have no drop-in equivalent on the current execution surface; this row is never a PASS"
     Add-Measurement -Name "analysisNonModelOverheadMs" -Status "SKIP" -Threshold "non-model <= $($thresholds.analysisNonModelOverheadMs) ms" -Value $null -Detail "dry-run: needs a running API and the deterministic fake LLM/timing proxy; the run triggers one real P4 analysis on the fixture repository"
 
     $status = Write-Outputs -Mode "dry-run" -ApiBase "(not probed)" -WebBase "(not probed)" -DatasetJSON "" `
@@ -1906,7 +1635,7 @@ if ($null -eq $probe) {
             "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail "API is not reachable; measurement skipped" }
             "chainP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail "API is not reachable; measurement skipped" }
             "changesP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail "API is not reachable; measurement skipped" }
-            "executionConcurrency" { Add-Measurement -Name $name -Status "SKIP" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "API is not reachable; the 8-concurrency batch measurement cannot run. This row is not a PASS." }
+            "executionConcurrency" { Add-Measurement -Name $name -Status "RETIRED" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "RETIRED: deleted resource-session/batch/mindmap APIs have no drop-in equivalent; this row is never a PASS" }
             "analysisNonModelOverheadMs" { Add-Measurement -Name $name -Status "SKIP" -Threshold "non-model <= $($thresholds.analysisNonModelOverheadMs) ms" -Value $null -Detail "API is not reachable; the analysis measurement cannot run. This row is not a PASS." }
         }
     }
@@ -2068,8 +1797,8 @@ try {
                 -Detail "SKIP: the fixture Git repository could not be prepared ($($datasetState.RepoError)); the P4 analysis was not measured. This row is not a PASS."
         }
 
-        # 6. One real batch with 8 fixture cases and 8 concurrent sessions.
-        $executionMeasurement = Invoke-ExecutionConcurrencyMeasurement -Headers $authHeaders -FixtureBaseUrl $ExecutionFixtureBaseUrl
+        # 6. Execution concurrency: RETIRED (the resource-session/batch/mindmap APIs it measured were removed in v0.2.4-B); this row is not a real batch.
+        $executionMeasurement = Get-RetiredExecutionConcurrencyMeasurement
         Add-Measurement -Name "executionConcurrency" -Status $executionMeasurement.Status `
             -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" `
             -Value $executionMeasurement.Value -Detail $executionMeasurement.Detail
@@ -2082,7 +1811,7 @@ try {
                     "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $failure }
                     "chainP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail $failure }
                     "changesP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail $failure }
-                    "executionConcurrency" { Add-Measurement -Name $name -Status "FAIL" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail $failure }
+                    "executionConcurrency" { Add-Measurement -Name $name -Status "RETIRED" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "RETIRED: deleted resource-session/batch/mindmap APIs have no drop-in equivalent; this row is never a PASS" }
                     "analysisNonModelOverheadMs" { Add-Measurement -Name $name -Status "FAIL" -Threshold "non-model <= $($thresholds.analysisNonModelOverheadMs) ms" -Value $null -Detail $failure }
                 }
             }
@@ -2097,7 +1826,7 @@ try {
                     "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
                     "chainP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
                     "changesP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
-                    "executionConcurrency" { Add-Measurement -Name $name -Status "SKIP" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "SKIP: $reason; the 8-concurrency batch measurement was not executed. This row is not a PASS." }
+                    "executionConcurrency" { Add-Measurement -Name $name -Status "RETIRED" -Threshold "$($thresholds.executionWorkers) workers / $($thresholds.executionErrors) errors" -Value $null -Detail "RETIRED: deleted resource-session/batch/mindmap APIs have no drop-in equivalent; this row is never a PASS" }
                     "analysisNonModelOverheadMs" { Add-Measurement -Name $name -Status "SKIP" -Threshold "non-model <= $($thresholds.analysisNonModelOverheadMs) ms" -Value $null -Detail "SKIP: $reason; the analysis measurement was not executed. This row is not a PASS." }
                 }
             }
@@ -2132,6 +1861,6 @@ if ($null -ne $datasetState) {
 }
 
 $status = Write-Outputs -Mode "measure" -ApiBase $script:apiBase -WebBase $webBase -DatasetJSON $datasetJSON `
-    -Note "Local measurement; the 8-concurrency row ran one real batch of $($thresholds.executionWorkers) fixture cases and the analysis row split P4 wall time into instrumented model time and non-model overhead. SKIP only marks genuinely missing environment and is reported as INCOMPLETE, never as an SLO PASS."
+    -Note "Local measurement; the analysis row split P4 wall time into instrumented model time and non-model overhead. The 8-concurrency row is RETIRED (not measured, never a pass). SKIP only marks genuinely missing environment and is reported as INCOMPLETE, never as an SLO PASS."
 if ($status -eq "failed") { exit 1 }
 exit 0

@@ -62,15 +62,62 @@ func (s CaseRunStatus) Active() bool {
 	}
 }
 
+// terminalStatuses is the single authoritative list of final case_run states
+// (no possible redispatch). Terminal() and TerminalStatuses() both derive from
+// it so the SQL guards and the domain predicate can never drift apart.
+// interrupted is excluded because §5.5 redispatches it to pending.
+var terminalStatuses = []CaseRunStatus{
+	CaseRunPassed, CaseRunFailed, CaseRunBlocked, CaseRunInconclusive, CaseRunSkipped, CaseRunSuperseded,
+}
+
+// TerminalStatuses returns a copy of the authoritative terminal status set.
+// Repository guards bind it as a query parameter (never inline SQL literals).
+func TerminalStatuses() []CaseRunStatus {
+	return append([]CaseRunStatus(nil), terminalStatuses...)
+}
+
 // Terminal reports whether the case_run is in a final state with no possible
 // redispatch. interrupted is excluded because §5.5 redispatches it to pending.
 func (s CaseRunStatus) Terminal() bool {
-	switch s {
-	case CaseRunPassed, CaseRunFailed, CaseRunBlocked, CaseRunInconclusive, CaseRunSkipped, CaseRunSuperseded:
-		return true
-	default:
-		return false
+	for _, status := range terminalStatuses {
+		if s == status {
+			return true
+		}
 	}
+	return false
+}
+
+// reclassifiableStatuses is the single authoritative set of terminal verdicts
+// the analysis fallback may reclassify (failed/blocked/inconclusive). passed is
+// a clean result and the process states (skipped/superseded) carry no verdict;
+// none of them may be rewritten by reclassification, and reclassification can
+// never produce them.
+var reclassifiableStatuses = []CaseRunStatus{CaseRunFailed, CaseRunBlocked, CaseRunInconclusive}
+
+// ReclassifiableStatuses returns a copy of the authoritative reclassifiable
+// terminal verdict set. Repository guards bind it as a query parameter.
+func ReclassifiableStatuses() []CaseRunStatus {
+	return append([]CaseRunStatus(nil), reclassifiableStatuses...)
+}
+
+func (s CaseRunStatus) reclassifiable() bool {
+	for _, status := range reclassifiableStatuses {
+		if s == status {
+			return true
+		}
+	}
+	return false
+}
+
+// CanReclassifyTo is the sanctioned terminal->terminal reclassification rule
+// (V-0022, constitution art.3.5/3.6): only a failed/blocked/inconclusive verdict
+// may be reclassified, only into another failed/blocked/inconclusive verdict
+// (same status included — the analyst may refine the failure class alone), and
+// never into passed or a process state. It is the single domain authority for
+// the reclassification mode of the terminal write entry; the settlement state
+// machine (CanTransitionTo) still refuses every terminal source.
+func (s CaseRunStatus) CanReclassifyTo(next CaseRunStatus) bool {
+	return s.reclassifiable() && next.reclassifiable()
 }
 
 // Finished reports whether the case_run no longer needs scheduler attention,
@@ -99,7 +146,10 @@ func (s CaseRunStatus) CanTransitionTo(next CaseRunStatus) bool {
 			next == CaseRunBlocked || next == CaseRunInconclusive || next == CaseRunInterrupted ||
 			next == CaseRunSuperseded
 	case CaseRunPaused:
-		return next == CaseRunPending || next == CaseRunFailed || next == CaseRunSuperseded
+		// V-0022: a paused run settles through the single terminal entry with
+		// the Aggregate verdict — failed(session) when evidence exists,
+		// inconclusive when the evidence gate degrades a zero-evidence failure.
+		return next == CaseRunPending || next == CaseRunFailed || next == CaseRunInconclusive || next == CaseRunSuperseded
 	case CaseRunInterrupted:
 		return next == CaseRunPending || next == CaseRunFailed || next == CaseRunSuperseded
 	default:
@@ -138,12 +188,11 @@ const (
 // NextAction is the stable suggested human next step of a terminal run. The
 // system never auto-retries a terminal incomplete run: the human decides to
 // rerun with a fresh execution budget, resolve the blocker first, review the
-// failure, repair the case/visual baseline, or reconfirm a superseded case.
+// failure, repair the case, or reconfirm a superseded case.
 const (
 	NextActionRerun          = "rerun"
 	NextActionResolveBlocker = "resolve_blocker"
 	NextActionReviewFailure  = "review_failure"
-	NextActionRepairVisual   = "repair_visual_baseline"
 	NextActionRepairCase     = "repair_case_version"
 	NextActionReconfirm      = "reconfirm_case_version"
 	// NextActionReplanned is written on a superseded run whose replacement was
@@ -212,8 +261,6 @@ func terminalNextAction(status CaseRunStatus, cause string) string {
 		return NextActionReviewFailure
 	case VerdictReasonEmptyCase, VerdictReasonNoAssertions:
 		return NextActionRepairCase
-	case VerdictReasonVisualAssertionNotRun, "missing_visual_baseline", "visual_environment_mismatch":
-		return NextActionRepairVisual
 	case TerminalCauseCaseVersionSuperseded:
 		return NextActionReconfirm
 	}
@@ -299,20 +346,50 @@ type CaseRunDispatchDiagnostic struct {
 	ClaimedAt string `json:"claimed_at,omitempty"`
 }
 
+// CaseRunReplay marks a server-side command-log replay verification run
+// (v0.2.4-C EV-006). A replay re-executes a source run's recorded command log
+// under the same environment fingerprint + workspace snapshot and re-validates
+// the assertions server-side (no model run). It is a VERIFICATION, not a retest:
+// the replay run carries the superseded process state so coverage and reports
+// keep the authoritative source verdict (replay ≠ retest), while its
+// server-validated replay verdict and provenance live here.
+//
+// InputFingerprint satisfies constitution art.4.6: the replay input fingerprint
+// folds the environment fingerprint, code baseline AND the evidence versions
+// (id+sha256 of the source command/file evidence) the conclusion depends on, so
+// an evidence change makes a prior replay input stale.
+type CaseRunReplay struct {
+	SourceCaseRunID        int64  `json:"source_case_run_id"`
+	InputFingerprint       string `json:"input_fingerprint"`
+	EnvironmentFingerprint string `json:"environment_fingerprint"`
+	CodeBaseline           string `json:"code_baseline,omitempty"`
+	// Verdict is the server-validated four-state replay verdict (Aggregate over
+	// the replayed step/assertion results). It is a verification conclusion, not
+	// the case_run.status of this process-anchor row.
+	Verdict string `json:"verdict"`
+	// SourceVerdict is the source run's authoritative terminal verdict; Consistent
+	// reports whether the replay confirms it (a faithfully reproduced failure
+	// confirms failed, never a guessed pass — constitution art.3.4/7.6).
+	SourceVerdict  string `json:"source_verdict"`
+	Consistent     bool   `json:"consistent"`
+	CommandTotal   int    `json:"command_total"`
+	CommandMatched int    `json:"command_matched"`
+}
+
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
-	VerdictReason      string `json:"verdict_reason,omitempty"`
-	AssertionTotal     int    `json:"assertion_total"`
-	AssertionFailed    int    `json:"assertion_failed"`
-	StepTotal          int    `json:"step_total"`
-	StepFailed         int    `json:"step_failed"`
-	EvidenceCount      int    `json:"evidence_count"`
-	VisualSkipped      int    `json:"visual_skipped"`
-	VisualPassed       int    `json:"visual_passed"`
-	VisualFailed       int    `json:"visual_failed"`
-	VisualInconclusive int    `json:"visual_inconclusive"`
-	HumanRequestID     int64  `json:"human_request_id,omitempty"`
-	LastError          string `json:"last_error,omitempty"`
+	VerdictReason   string `json:"verdict_reason,omitempty"`
+	AssertionTotal  int    `json:"assertion_total"`
+	AssertionFailed int    `json:"assertion_failed"`
+	StepTotal       int    `json:"step_total"`
+	StepFailed      int    `json:"step_failed"`
+	EvidenceCount   int    `json:"evidence_count"`
+	// EvidenceDropped mirrors the case_run.evidence_dropped fact for the API/UI
+	// and the report annotation. The verdict gate reads the fact column, never
+	// this projection (constitution art.5.8).
+	EvidenceDropped int64  `json:"evidence_dropped,omitempty"`
+	HumanRequestID  int64  `json:"human_request_id,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
 	// RetryReason is the stable cause of a retryable run error persisted by a
 	// Finalize/Recovery retry (v0.2.3 X-01). It is a retry reason, not a
 	// terminal failure class: a pending/running row never carries one as its
@@ -326,6 +403,9 @@ type CaseRunSummary struct {
 	Usage *CaseRunUsage `json:"usage,omitempty"`
 	// Dispatch is the latest dispatch-time executor snapshot (v0.2.3 X-01).
 	Dispatch *CaseRunDispatchDiagnostic `json:"dispatch,omitempty"`
+	// Replay marks a command-log replay verification run (EV-006). Nil for an
+	// ordinary execution run; non-nil only on a server-side replay anchor row.
+	Replay *CaseRunReplay `json:"replay,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.
@@ -351,6 +431,13 @@ type CaseRun struct {
 	PausedAt        *time.Time
 	PausedBy        *int64
 	PauseReason     string
+	// EvidenceDropped counts the evidence items this run lost (configured cap
+	// overflow, an artifact the executor could not transfer, a recording failure
+	// or a settlement cursor that fell behind the executor's bounded buffer).
+	// It is a FACT column, not a projection: the verdict aggregation reads it to
+	// degrade the terminal state to inconclusive (constitution art.4.5), so it
+	// must exist independently of the evidence.skipped event stream (art.5.7).
+	EvidenceDropped int64
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -365,26 +452,38 @@ const (
 	SUTContextFailed   SUTContextStatus = "failed"
 )
 
-// CaseRunSUTContext is one executor context reserved for a (version_sut,
-// account_role) pair of a case_run. storage_state is sensitive and never
-// returned by the API.
+// CaseRunSUTContext is one executor v2 session reserved for a (SUT,
+// account_role) pair of a case_run. Each binding owns its own session so
+// concurrent account roles never share a browser context or a workspace
+// watcher. storage_state is sensitive and never returned by the API.
 type CaseRunSUTContext struct {
-	ID               int64
-	CaseRunID        int64
-	VersionSUTID     int64
-	AccountRole      string
-	AccountID        *int64
-	BrowserContextID string
-	// ExecutorID is the executor_instance that owns BrowserContextID (P8
+	ID          int64
+	CaseRunID   int64
+	SUTID       int64
+	AccountRole string
+	AccountID   *int64
+	// SessionID is the executor v2 session id (protocol v2 replaced the v1
+	// browser context id; the column was renamed in the same change set).
+	SessionID string
+	// ArtifactCursor is the absolute recording-ledger sequence already settled
+	// as evidence for this session. It is durable so a restarted API neither
+	// re-settles nor skips artifacts.
+	ArtifactCursor int64
+	// ExecutorID is the executor_instance that owns SessionID (P8
 	// per-executor routing). Nil for historical rows created before P8; those
 	// fall back to the primary executor endpoint.
 	ExecutorID   *int64
 	StorageState map[string]any
-	LeaseEpoch   int64
-	Status       SUTContextStatus
-	ClosedAt     *time.Time
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// SessionFixtureID is the cross-case reuse link (v0.2.4-F P18, SC-F5): the
+	// append-only session_fixture fact this session saved or injected via CLI
+	// state-save/state-load. Nil when the session never touched the fixture
+	// library. Within-context real FK; the fixture row is never rewritten.
+	SessionFixtureID *int64
+	LeaseEpoch       int64
+	Status           SUTContextStatus
+	ClosedAt         *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // Valid reports whether status is a persisted SUT context status.

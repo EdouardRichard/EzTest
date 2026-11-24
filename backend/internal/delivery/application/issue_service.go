@@ -50,13 +50,16 @@ const (
 const (
 	// issueReasonMax is the issue action reason bound of the API contract.
 	issueReasonMax = 2000
-	// issueActorKindUser is the actor kind persisted for human transitions.
-	issueActorKindUser = "user"
-	// issueActorKindSystem is the actor kind persisted for system transitions.
-	issueActorKindSystem = "system"
-	// issueReasonRecurrence is the status-history reason of a recurrence
-	// redirect (spec §4.6); the status itself does not change.
-	issueReasonRecurrence = "recurrence"
+	// IssueActorKindUser is the actor kind persisted for human transitions.
+	// EXPORTED (H T11e-1, 五.1/五.4): with IssueActorKindSystem it is the single
+	// authority for delivery_issue_status_history.actor_kind, whose CHECK is
+	// ('user','agent','system') (delivery_0001_issue_lifecycle.sql:68). The
+	// postgres adapter reads these instead of re-writing the literals; an
+	// unexported authority was unreachable from the adapter and had left a
+	// hand-written second truth there. 'agent' has no producer today.
+	IssueActorKindUser = "user"
+	// IssueActorKindSystem is the actor kind persisted for system transitions.
+	IssueActorKindSystem = "system"
 )
 
 // CreateManualIssueInput is the v0.22 W2-4 manual create command. CaseRunID and
@@ -169,7 +172,7 @@ func (s *IssueService) CreateManual(ctx context.Context, in CreateManualIssueInp
 			To:        delivery.IssueStatusOpen,
 			Reason:    reason,
 			ActorID:   &actorID,
-			ActorKind: issueActorKindUser,
+			ActorKind: IssueActorKindUser,
 			CreatedAt: now,
 			UpdatedAt: now,
 		},
@@ -284,7 +287,7 @@ func (s *IssueService) UpdateManual(ctx context.Context, versionID, issueID int6
 			To:        current.Status,
 			Reason:    reason,
 			ActorID:   &actorID,
-			ActorKind: issueActorKindUser,
+			ActorKind: IssueActorKindUser,
 			CreatedAt: now,
 			UpdatedAt: now,
 		},
@@ -1153,7 +1156,13 @@ func (s *IssueService) resolveManualIssueInput(ctx context.Context, versionID in
 	in.CaseRunID = snapshot.ID
 	in.CaseVersionID = snapshot.CaseVersionID
 	in.RequirementID = snapshot.RequirementID
-	in.VersionSUTID = snapshot.VersionSUTID
+	in.SUTID = snapshot.SUTID
+	// Structured failure detail of the linked run (v0.2.4-G SC-G3): a manual
+	// issue referencing a run carries the same assertion-derived elements as a
+	// candidate issue.
+	in.FailedExpected = snapshot.FailedExpected
+	in.FailedActual = snapshot.FailedActual
+	in.FailedReason = snapshot.FailedReason
 	return in, nil
 }
 
@@ -1215,7 +1224,7 @@ func (s *IssueService) transition(ctx context.Context, spec issueTransition) (de
 		To:               spec.to,
 		Reason:           reason,
 		ActorID:          spec.actorID,
-		ActorKind:        issueActorKindUser,
+		ActorKind:        IssueActorKindUser,
 		ExpectedRevision: spec.expected,
 	})
 	if err != nil {
@@ -1325,7 +1334,7 @@ func issueCandidateInput(snapshot CaseRunSnapshot) delivery.CandidateInput {
 		FailedActual:             snapshot.FailedActual,
 		FailedReason:             snapshot.FailedReason,
 		DedupeHint:               snapshot.DedupeHint,
-		VersionSUTID:             snapshot.VersionSUTID,
+		SUTID:                    snapshot.SUTID,
 		WaveID:                   waveID,
 		EvidenceIDs:              snapshot.EvidenceIDs,
 	}
@@ -1520,8 +1529,8 @@ func validateIssueFilter(f IssueFilter) error {
 	if f.Severity != "" && !validIssueFilterSeverity(f.Severity) {
 		return invalidArgumentf("severity must be one of major, minor, trivial")
 	}
-	if f.VersionSUTID != nil && *f.VersionSUTID <= 0 {
-		return invalidArgumentf("version SUT id must be a positive decimal ID")
+	if f.SUTID != nil && *f.SUTID <= 0 {
+		return invalidArgumentf("SUT id must be a positive decimal ID")
 	}
 	if f.Before < 0 {
 		return invalidArgumentf("before must not be negative")

@@ -18,12 +18,12 @@ type fakeProposalTargets struct {
 	calls   []int64
 }
 
-func (f *fakeProposalTargets) ProposalTarget(_ context.Context, versionSUTID int64) (ProposalTarget, error) {
-	f.calls = append(f.calls, versionSUTID)
+func (f *fakeProposalTargets) ProposalTarget(_ context.Context, sutID int64) (ProposalTarget, error) {
+	f.calls = append(f.calls, sutID)
 	if f.err != nil {
 		return ProposalTarget{}, f.err
 	}
-	target, ok := f.targets[versionSUTID]
+	target, ok := f.targets[sutID]
 	if !ok {
 		return ProposalTarget{}, codeintel.ErrNotFound
 	}
@@ -75,8 +75,8 @@ func (f *fakeProposalWriter) ProposeAPI(_ context.Context, in ProposalAPIInput) 
 	}, created, nil
 }
 
-func (f *fakeProposalWriter) ListProposals(_ context.Context, environmentIDs []int64) ([]ProposalItem, error) {
-	f.listCalls = append(f.listCalls, environmentIDs)
+func (f *fakeProposalWriter) ListProposals(_ context.Context, sutIDs []int64) ([]ProposalItem, error) {
+	f.listCalls = append(f.listCalls, sutIDs)
 	return f.items, f.listErr
 }
 
@@ -112,11 +112,11 @@ func newProposalHarness(t *testing.T) *proposalHarness {
 	t.Helper()
 	ctx := platform.WithActor(context.Background(), platform.Actor{ID: 42, Role: "user"})
 	now := testProposalTime
-	versions := &fakeVersionReader{bindings: []VersionSUTBinding{
-		{VersionSUTID: 11, VersionID: 1, SUTID: 1001, RepoID: 10, CodeBaselineCommit: impactBaseCommit},
+	versions := &fakeVersionReader{bindings: []SUTRepoBinding{
+		{SUTID: 1001, VersionID: 1, RepoID: 10, CodeBaselineCommit: impactBaseCommit},
 	}}
 	targets := &fakeProposalTargets{targets: map[int64]ProposalTarget{
-		11: {VersionSUTID: 11, SUTID: 1001, EnvironmentID: 1101, BaseURL: "https://staging.example.test"},
+		1001: {SUTID: 1001, BaseURL: "https://staging.example.test"},
 	}}
 	analyses := newFakeAnalysisRepo()
 	if _, err := analyses.Create(ctx, codeintel.Analysis{
@@ -197,7 +197,7 @@ func TestProposalGenerateFromCodeFacts(t *testing.T) {
 	if ordersPage == nil {
 		t.Fatalf("orders page missing: %+v", h.writer.pageCalls)
 	}
-	if ordersPage.EnvironmentID != 1101 || ordersPage.SUTID != 1001 || ordersPage.Source != "ai" ||
+	if ordersPage.SUTID != 1001 || ordersPage.Source != "ai" ||
 		ordersPage.URL != "https://staging.example.test/orders" {
 		t.Fatalf("page input = %+v", ordersPage)
 	}
@@ -211,7 +211,7 @@ func TestProposalGenerateFromCodeFacts(t *testing.T) {
 		t.Fatalf("page fact missing: %+v", h.writer.pageCalls)
 	}
 	api := h.writer.apiCalls[0]
-	if api.EnvironmentID != 1101 || api.Method != "POST" || api.PathTemplate != "/api/refund" ||
+	if api.SUTID != 1001 || api.Method != "POST" || api.PathTemplate != "/api/refund" ||
 		api.Source != "ai" || api.Name != "POST /api/refund" {
 		t.Fatalf("api input = %+v", api)
 	}
@@ -240,9 +240,9 @@ func TestProposalGenerateFromCodeFacts(t *testing.T) {
 func TestProposalGenerateNetworkEvidenceAndDedupe(t *testing.T) {
 	h := newProposalHarness(t)
 	h.exec.network = []NetworkRequest{
-		{ID: 1, CaseRunID: 9, VersionSUTID: int64Ptr(11), Method: "GET", URL: "https://staging.example.test/api/orders/123", Status: 200},
-		{ID: 2, CaseRunID: 9, VersionSUTID: int64Ptr(11), Method: "GET", URL: "https://evil.example.test/api/orders/123", Status: 200},
-		{ID: 3, CaseRunID: 9, VersionSUTID: nil, Method: "GET", URL: "https://staging.example.test/api/orders/456", Status: 200},
+		{ID: 1, CaseRunID: 9, SUTID: int64Ptr(1001), Method: "GET", URL: "https://staging.example.test/api/orders/123", Status: 200},
+		{ID: 2, CaseRunID: 9, SUTID: int64Ptr(1001), Method: "GET", URL: "https://evil.example.test/api/orders/123", Status: 200},
+		{ID: 3, CaseRunID: 9, SUTID: nil, Method: "GET", URL: "https://staging.example.test/api/orders/456", Status: 200},
 	}
 	h.writer.apiCreated["POST /api/refund"] = true // an approved/proposed API already exists
 	result, err := h.service.Generate(h.ctx, 1, 10)
@@ -283,11 +283,108 @@ func TestProposalGenerateRequiresBindingsAndAnalysis(t *testing.T) {
 	_, err = h.service.Generate(h.ctx, 1, 0)
 	assertPlatformError(t, err, 422, "repo_not_bound")
 
-	h.versions.bindings = []VersionSUTBinding{{VersionSUTID: 11, VersionID: 1, RepoID: 10}}
+	h.versions.bindings = []SUTRepoBinding{{SUTID: 1001, VersionID: 1, RepoID: 10}}
 	h.analyses.runs = map[int64]codeintel.Analysis{}
 	h.analyses.order = nil
 	_, err = h.service.Generate(h.ctx, 1, 0)
 	assertPlatformError(t, err, 422, "analysis_not_found")
+}
+
+// TestProposalGenerateRoutesRepositoryToOwningSUT pins the GD-03 union: the
+// environment code pool assigns each repository to one SUT, so a repository's
+// code facts are proposed against that SUT (its id and its base URL), never
+// against every SUT of the environment.
+func TestProposalGenerateRoutesRepositoryToOwningSUT(t *testing.T) {
+	h := newProposalHarness(t)
+	h.versions.bindings = append(h.versions.bindings, SUTRepoBinding{
+		SUTID: 1002, VersionID: 1, RepoID: 11, CodeBaselineCommit: impactBaseCommit,
+	})
+	h.targets.targets[1002] = ProposalTarget{SUTID: 1002, BaseURL: "https://web.example.test"}
+	if _, err := h.analyses.Create(h.ctx, codeintel.Analysis{
+		ID: 6, VersionID: 1, RepoID: 11, BaseCommitSHA: impactBaseCommit,
+		HeadCommitSHA: anchorCommitB, Status: codeintel.AnalysisDone, AnalysisVersion: 1,
+		ChangedFiles: []byte(`[]`), Stats: []byte(`{}`), Unmapped: []byte(`[]`),
+		Errors: []byte(`[]`), FactVersions: []byte(`{}`), CreatedAt: testProposalTime, UpdatedAt: testProposalTime,
+	}); err != nil {
+		t.Fatalf("seed second analysis: %v", err)
+	}
+	if _, _, err := h.facts.InsertVersion(h.ctx, codeintel.Fact{
+		RepoID: 11, CommitSHA: anchorCommitB, FactKey: "route:/billing", Version: 1,
+		Kind: codeintel.EntityRoute, Path: "src/billing.ts", Name: "/billing",
+		Source: "ai", Confidence: codeintel.ConfidenceHigh,
+		Body: []byte(`{}`), Evidence: []byte(`[]`),
+		CreatedAt: testProposalTime, UpdatedAt: testProposalTime,
+	}); err != nil {
+		t.Fatalf("seed second fact: %v", err)
+	}
+
+	if _, err := h.service.Generate(h.ctx, 1, 11); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(h.writer.pageCalls) != 1 {
+		t.Fatalf("page calls = %+v, want only the owning SUT's proposal", h.writer.pageCalls)
+	}
+	page := h.writer.pageCalls[0]
+	if page.SUTID != 1002 || page.RouteTemplate != "/billing" || page.URL != "https://web.example.test/billing" {
+		t.Fatalf("page input = %+v", page)
+	}
+}
+
+// TestU9ProposalScopePin pins the R-E8 ruling (owner 2026-11-18, spec SC-E11):
+// code-fact proposals target ONLY SUTs with an indexed pool repository
+// (RepoID > 0). A SUT without a repository is excluded from proposal generation
+// -- its pages/APIs are covered by F's autonomous exploration instead. This is
+// a behavior pin of proposal_service.go's selection predicate, NOT a behavior
+// change: mutation-verified by deleting the `binding.RepoID <= 0` clause (the
+// no-repo SUT then reaches ProposalTarget and the calls assertion fails).
+func TestU9ProposalScopePin(t *testing.T) {
+	h := newProposalHarness(t)
+	// SUT 1002 has NO pool repository (RepoID 0). It has a resolvable target so
+	// that a broken selection predicate would visibly route work to it, not
+	// fail on a missing target for an unrelated reason.
+	h.versions.bindings = append(h.versions.bindings, SUTRepoBinding{
+		SUTID: 1002, VersionID: 1, RepoID: 0,
+	})
+	h.targets.targets[1002] = ProposalTarget{SUTID: 1002, BaseURL: "https://norepo.example.test"}
+
+	result, err := h.service.Generate(h.ctx, 1, 0)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if result.PagesCreated != 2 || result.APIsCreated != 1 {
+		t.Fatalf("result = %+v, want the with-repo SUT's proposals only", result)
+	}
+	// The no-repo SUT must never even be resolved as a proposal target.
+	for _, sutID := range h.targets.calls {
+		if sutID != 1001 {
+			t.Fatalf("U9: no-repo SUT %d entered proposal scope (target calls = %v)", sutID, h.targets.calls)
+		}
+	}
+	if len(h.targets.calls) != 1 {
+		t.Fatalf("target calls = %v, want exactly the with-repo SUT 1001", h.targets.calls)
+	}
+	for _, call := range h.writer.pageCalls {
+		if call.SUTID != 1001 {
+			t.Fatalf("U9: page proposed against no-repo SUT %d", call.SUTID)
+		}
+	}
+	for _, call := range h.writer.apiCalls {
+		if call.SUTID != 1001 {
+			t.Fatalf("U9: API proposed against no-repo SUT %d", call.SUTID)
+		}
+	}
+
+	// A version whose only SUT has no repository has no proposable code scope:
+	// the existing repo_not_bound contract applies, not a silent empty pass.
+	h2 := newProposalHarness(t)
+	h2.versions.bindings = []SUTRepoBinding{{SUTID: 1002, VersionID: 1, RepoID: 0}}
+	h2.targets.targets[1002] = ProposalTarget{SUTID: 1002, BaseURL: "https://norepo.example.test"}
+	_, err = h2.service.Generate(h2.ctx, 1, 0)
+	assertPlatformError(t, err, 422, "repo_not_bound")
+	if len(h2.targets.calls) != 0 || len(h2.writer.pageCalls) != 0 || len(h2.writer.apiCalls) != 0 {
+		t.Fatalf("U9: no-repo-only version produced proposal work: targets=%v pages=%d apis=%d",
+			h2.targets.calls, len(h2.writer.pageCalls), len(h2.writer.apiCalls))
+	}
 }
 
 func TestProposalList(t *testing.T) {
@@ -305,7 +402,7 @@ func TestProposalList(t *testing.T) {
 	if len(views) != 2 || views[0].Kind != "api" || views[1].RouteTemplate != "/orders" {
 		t.Fatalf("views = %+v", views)
 	}
-	if len(h.writer.listCalls) != 1 || len(h.writer.listCalls[0]) != 1 || h.writer.listCalls[0][0] != 1101 {
+	if len(h.writer.listCalls) != 1 || len(h.writer.listCalls[0]) != 1 || h.writer.listCalls[0][0] != 1001 {
 		t.Fatalf("list calls = %+v", h.writer.listCalls)
 	}
 }

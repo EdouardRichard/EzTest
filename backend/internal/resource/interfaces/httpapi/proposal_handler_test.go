@@ -20,7 +20,7 @@ func proposalRequest(method, target string, actor *platform.Actor) *http.Request
 func TestConfirmAndRejectPageRoutes(t *testing.T) {
 	handler, svc := newHandler()
 	page := resourceapp.PageView{
-		ID: "1003", SUTID: "1001", EnvironmentID: "1002", Name: "Orders",
+		ID: "1003", SUTID: "1001", Name: "Orders",
 		URL: "https://app.example.com/orders", RouteTemplate: "/orders",
 		Status: "approved", Source: "ai", CreatedAt: testNow, UpdatedAt: testNow,
 	}
@@ -99,7 +99,7 @@ func TestConfirmAndRejectPageRoutes(t *testing.T) {
 func TestConfirmAndRejectAPIRoutes(t *testing.T) {
 	handler, svc := newHandler()
 	api := resourceapp.APIView{
-		ID: "1004", SUTID: "1001", EnvironmentID: "1002", Method: "POST",
+		ID: "1004", SUTID: "1001", Method: "POST",
 		PathTemplate: "/api/refund", Name: "Refund", Status: "approved", Source: "code",
 		CreatedAt: testNow, UpdatedAt: testNow,
 	}

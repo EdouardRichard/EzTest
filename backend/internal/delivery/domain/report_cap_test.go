@@ -15,7 +15,7 @@ func capTestSnapshot() ReportSnapshot {
 			{ID: 2, VersionID: 9, Title: "需求二", Status: "closed"},
 			{ID: 1, VersionID: 9, Title: "需求一", Status: "obsolete"},
 		},
-		VersionSUTs: []VersionSUTSnapshot{{ID: 31, SUTID: 300, SUTName: "API"}},
+		SUTs: []SUTSnapshot{{ID: 31, SUTID: 300, SUTName: "API"}},
 	}
 	for id := int64(MaxReportIssues + 2); id >= 1; id-- {
 		snapshot.Issues = append(snapshot.Issues, IssueSnapshot{ID: id, VersionID: 9, Title: "issue"})
@@ -64,8 +64,8 @@ func TestCapReportSnapshotCapsFirstNByID(t *testing.T) {
 	if !reflect.DeepEqual(capped.TruncatedSections, wantSections) {
 		t.Fatalf("TruncatedSections = %v, want %v", capped.TruncatedSections, wantSections)
 	}
-	if len(capped.Requirements) != 2 || len(capped.VersionSUTs) != 1 {
-		t.Fatalf("uncapped lists changed: requirements=%d version_suts=%d", len(capped.Requirements), len(capped.VersionSUTs))
+	if len(capped.Requirements) != 2 || len(capped.SUTs) != 1 {
+		t.Fatalf("uncapped lists changed: requirements=%d suts=%d", len(capped.Requirements), len(capped.SUTs))
 	}
 	if len(snapshot.Issues) != MaxReportIssues+2 {
 		t.Fatalf("CapReportSnapshot mutated the input issues: %d", len(snapshot.Issues))

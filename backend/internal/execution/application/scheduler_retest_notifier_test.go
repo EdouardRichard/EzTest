@@ -60,7 +60,7 @@ func (f *task6Fixture) schedulerWithRetest(notifier WaveTerminalRetestNotifier) 
 		Versions:       f.versions,
 		Executors:      f.registry,
 		WorkQueue:      f.queue,
-		Quota:          domainQuota(3, 2, 1),
+		Settings:       &fakeSettings{values: map[string]any{SettingMaxConcurrentCaseRuns: int64(3), settingAgentMaxConcurrentRuns: int64(4)}},
 		QuotaReader:    f.quota,
 		Analyzer:       f.analysis,
 		Replanner:      f.intent,
@@ -107,7 +107,7 @@ func TestSchedulerNotifiesRetestOnEmptyWaveFailure(t *testing.T) {
 	now := f.clock.Now()
 	empty := execution.RunWave{
 		ID: 900, VersionID: 100, Status: execution.WavePlanned,
-		Counts:    execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}},
+		Counts:    execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}},
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := f.waves.CreateWithCaseRuns(ctx, empty, nil, nil); err != nil {

@@ -17,8 +17,12 @@ import (
 	"testing"
 	"time"
 
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	resource "github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // ---------- fakes ----------
@@ -86,7 +90,11 @@ type fakeHandoffReader struct {
 	qa           []versionapp.HandoffQAItem
 	facts        []versionapp.HandoffFact
 	plan         versionapp.HandoffPlan
-	resources    versionapp.HandoffResources
+	// scope is the VERSION-OWNED input to the resources block; resources is the
+	// injected RESOURCE port fake (H-B1: the catalog is read through the port,
+	// not through this reader).
+	scope     versionapp.HandoffResourceScope
+	resources *fakeHandoffResourceReader
 }
 
 func (f *fakeHandoffReader) VersionExists(_ context.Context, _ int64) (bool, error) {
@@ -124,14 +132,44 @@ func (f *fakeHandoffReader) Plan(_ context.Context, _ int64) (versionapp.Handoff
 	return f.plan, nil
 }
 
-func (f *fakeHandoffReader) Resources(_ context.Context, _ int64) (versionapp.HandoffResources, error) {
+func (f *fakeHandoffReader) ResourceScope(_ context.Context, _ int64) (versionapp.HandoffResourceScope, error) {
 	if f.readErr != nil {
-		return versionapp.HandoffResources{}, f.readErr
+		return versionapp.HandoffResourceScope{}, f.readErr
 	}
-	return f.resources, nil
+	return f.scope, nil
 }
 
 var _ versionapp.HandoffReader = (*fakeHandoffReader)(nil)
+
+// fakeHandoffResourceReader is the injected resource port (H-B1). It records the
+// environment id and the account ids it was asked for, so a test can prove the
+// assembly really goes through the port with the version-owned scope.
+type fakeHandoffResourceReader struct {
+	bundle   resourceapp.HandoffResourceBundle
+	accounts []resourceapp.HandoffAccount
+	err      error
+
+	environmentCalls []int64
+	accountCalls     [][]int64
+}
+
+func (f *fakeHandoffResourceReader) HandoffResources(_ context.Context, environmentID int64) (resourceapp.HandoffResourceBundle, error) {
+	f.environmentCalls = append(f.environmentCalls, environmentID)
+	if f.err != nil {
+		return resourceapp.HandoffResourceBundle{}, f.err
+	}
+	return f.bundle, nil
+}
+
+func (f *fakeHandoffResourceReader) HandoffAccounts(_ context.Context, accountIDs []int64) ([]resourceapp.HandoffAccount, error) {
+	f.accountCalls = append(f.accountCalls, accountIDs)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.accounts, nil
+}
+
+var _ resourceapp.HandoffResourceReader = (*fakeHandoffResourceReader)(nil)
 
 // ---------- fixture ----------
 
@@ -152,22 +190,36 @@ func newHandoffTest(t *testing.T) (
 		requirements: []versionapp.HandoffRequirement{
 			{
 				ID: 101, CurrentVersionID: 201, Revision: 2,
-				Title:              "退款到账时效",
-				Description:        "用户申请退款后，款项应在约定时效内到账。",
-				AcceptanceCriteria: "退款成功后 T+1 到账；到账后订单状态为已退款。",
-				Priority:           "P1",
-				Status:             "clarified",
-				SourceQuote:        "退款到账时间按 T+1 验收",
-				ConfirmedAt:        &confirmedAt,
+				Title: "退款到账时效",
+				UserStory: versionapp.HandoffUserStory{
+					AsA: "买家", IWant: "申请退款后在约定时效内收到款项", SoThat: "我能确认退款已完成",
+				},
+				Rules: "退款后约定时效到账。",
+				AcceptanceCriteria: []versionapp.HandoffAcceptanceCriterion{
+					{ID: "AC-1", Given: "买家已申请退款", When: "退款成功", Then: "T+1 到账且订单状态为已退款"},
+				},
+				Priority:         "P1",
+				SutDescription:   "订单中心的退款流程",
+				ScopeOut:         "不覆盖跨境退款",
+				AccountRolesHint: []string{"admin"},
+				Status:           string(version.RequirementClarified),
+				SourceQuote:      "退款到账时间按 T+1 验收",
+				ConfirmedAt:      &confirmedAt,
 			},
 			{
 				ID: 102, CurrentVersionID: 202, Revision: 1,
-				Title:              "退款失败重试",
-				Description:        "退款失败时允许用户重试。",
-				AcceptanceCriteria: "重试不产生重复退款。",
-				Priority:           "P2",
-				Status:             "draft",
-				SourceQuote:        "退款失败可重试",
+				Title: "退款失败重试",
+				UserStory: versionapp.HandoffUserStory{
+					AsA: "买家", IWant: "退款失败后重试", SoThat: "我不必重新发起退款",
+				},
+				Rules: "退款失败允许重试。",
+				AcceptanceCriteria: []versionapp.HandoffAcceptanceCriterion{
+					{ID: "AC-1", Given: "退款失败", When: "买家重试", Then: "不产生重复退款"},
+				},
+				Priority:       "P2",
+				SutDescription: "订单中心的退款重试",
+				Status:         string(version.RequirementDraft),
+				SourceQuote:    "退款失败可重试",
 			},
 		},
 		qa: []versionapp.HandoffQAItem{
@@ -179,7 +231,7 @@ func newHandoffTest(t *testing.T) (
 					{ID: "b", Label: "T+3"},
 				},
 				SourceRefs:      []string{"requirement:101", "attachment:7"},
-				Status:          "answered",
+				Status:          string(execution.HumanAnswered),
 				AnswerSelected:  []string{"a"},
 				AskedAt:         testTime,
 				AnsweredAt:      &confirmedAt,
@@ -190,23 +242,23 @@ func newHandoffTest(t *testing.T) (
 				RequestID: 502, MessageID: 9002, ConversationID: 301,
 				QuestionKey: "q1", Question: "是否需要覆盖退款失败场景？",
 				Options: []versionapp.HandoffQAOption{{ID: "yes", Label: "需要"}, {ID: "no", Label: "不需要"}},
-				Status:  "pending",
+				Status:  string(execution.HumanPending),
 				AskedAt: testTime.Add(time.Minute),
 			},
 		},
 		facts: []versionapp.HandoffFact{
 			{
-				ID: 601, Kind: "decision", Key: "refund.sla",
+				ID: 601, Kind: version.FactKindDecision, Key: "refund.sla",
 				Summary: "退款 SLA 采用 T+1", Confidence: &confidence,
 				Source: "clarification_host", SourceRef: "requirement:101", CreatedAt: testTime,
 			},
 			{
-				ID: 602, Kind: "constraint", Key: "refund.region",
+				ID: 602, Kind: version.FactKindConstraint, Key: "refund.region",
 				Summary: "仅中国大陆订单支持退款", Confidence: &confidence,
 				Source: "clarification_host", CreatedAt: testTime,
 			},
 			{
-				ID: 603, Kind: "gap", Key: "refund.failure",
+				ID: 603, Kind: version.FactKindGap, Key: "refund.failure",
 				Summary: "退款失败场景尚未覆盖", Source: "p9", CreatedAt: testTime,
 			},
 		},
@@ -215,30 +267,36 @@ func newHandoffTest(t *testing.T) (
 			Current: handoffPlanItem(701, "designing", "输出退款用例设计", "in_progress"),
 			Next:    handoffPlanItem(702, "designing", "评审退款用例", "pending"),
 		},
-		resources: versionapp.HandoffResources{
-			SUTs: []versionapp.HandoffSUT{
-				{VersionSUTID: 801, SUTID: 901, Name: "订单中心", EnvironmentID: 1001, Environment: "staging", BaseURL: "https://orders.example.test"},
+		scope: versionapp.HandoffResourceScope{EnvironmentID: 1001, AccountIDs: []int64{1301}},
+		resources: &fakeHandoffResourceReader{
+			bundle: resourceapp.HandoffResourceBundle{
+				Environment: resourceapp.HandoffEnvironment{ID: 1001, Name: "staging", Status: resource.StatusActive},
+				SUTs: []resourceapp.HandoffSUT{
+					{
+						ID: 901, Name: "订单中心", BaseURL: "https://orders.example.test",
+						Pages: []resourceapp.HandoffPage{
+							{ID: 1101, Name: "退款页", URL: "https://orders.example.test/refund", RouteTemplate: "/refund"},
+						},
+						APIs: []resourceapp.HandoffAPI{
+							{ID: 1201, Name: "创建退款", Method: "POST", Path: "/api/refunds"},
+						},
+						Databases: []resourceapp.HandoffDatabase{
+							{ID: 1401, SUTID: 901, Name: "orders", Kind: "postgres", ReadOnly: true},
+						},
+					},
+				},
+				Repositories: []resourceapp.HandoffRepo{
+					{ID: 1501, Name: "order-backend", Role: "backend", Branch: "main"},
+				},
 			},
-			Pages: []versionapp.HandoffPage{
-				{ID: 1101, VersionSUTID: 801, Name: "退款页", URL: "https://orders.example.test/refund", RouteTemplate: "/refund"},
-			},
-			APIs: []versionapp.HandoffAPI{
-				{ID: 1201, VersionSUTID: 801, Name: "创建退款", Method: "POST", Path: "/api/refunds"},
-			},
-			Accounts: []versionapp.HandoffAccount{
-				{ID: 1301, Username: "qa-refund", Roles: []string{"admin"}, Role: "primary"},
-			},
-			Databases: []versionapp.HandoffDatabase{
-				{ID: 1401, Name: "orders", Kind: "postgres", ReadOnly: true},
-			},
-			Repositories: []versionapp.HandoffRepository{
-				{ID: 1501, Name: "order-backend", Role: "backend", Branch: "main", Source: "sut"},
+			accounts: []resourceapp.HandoffAccount{
+				{ID: 1301, Username: "qa-refund", Roles: []string{"admin"}},
 			},
 		},
 	}
 	store := &fakeHandoffStore{}
 	publisher := &fakePublisher{}
-	service := versionapp.NewHandoffService(store, reader, &seqIDs{}, publisher)
+	service := versionapp.NewHandoffService(store, reader, reader.resources, &seqIDs{}, publisher)
 	return service, store, reader, publisher
 }
 
@@ -292,14 +350,14 @@ func TestHandoffGeneratedOnDesigning(t *testing.T) {
 	if len(document.Requirements) != 2 {
 		t.Fatalf("requirements = %d, want 2", len(document.Requirements))
 	}
-	if document.Requirements[0].AcceptanceCriteria == "" || document.Requirements[0].SourceQuote == "" ||
+	if len(document.Requirements[0].AcceptanceCriteria) == 0 || document.Requirements[0].SourceQuote == "" ||
 		document.Requirements[0].Priority != "P1" {
 		t.Fatalf("confirmed requirement is missing acceptance/priority/source_quote: %+v", document.Requirements[0])
 	}
 	if len(document.QA) != 2 {
 		t.Fatalf("qa = %d, want 2", len(document.QA))
 	}
-	if document.QA[0].AnswerSelected[0] != "a" || document.QA[1].Status != "pending" {
+	if document.QA[0].AnswerSelected[0] != "a" || document.QA[1].Status != string(execution.HumanPending) {
 		t.Fatalf("qa answers/status = %+v", document.QA)
 	}
 	if len(document.Decisions) != 2 {
@@ -315,8 +373,9 @@ func TestHandoffGeneratedOnDesigning(t *testing.T) {
 		t.Fatalf("plan block = %+v, want stage/current/next", document.Plan)
 	}
 	resources := document.Resources
-	if len(resources.SUTs) == 0 || len(resources.Pages) == 0 || len(resources.APIs) == 0 ||
-		len(resources.Accounts) == 0 || len(resources.Databases) == 0 || len(resources.Repositories) == 0 {
+	if resources.Environment.ID == 0 || len(resources.SUTs) == 0 ||
+		len(resources.SUTs[0].Pages) == 0 || len(resources.SUTs[0].APIs) == 0 || len(resources.SUTs[0].Databases) == 0 ||
+		len(resources.Accounts) == 0 || len(resources.Repositories) == 0 {
 		t.Fatalf("resources block is missing a summary: %+v", resources)
 	}
 
@@ -449,22 +508,22 @@ func TestHandoffOpenKeepsAllPendingQuestionsOfBatch(t *testing.T) {
 	reader.qa = []versionapp.HandoffQAItem{
 		{
 			RequestID: 601, MessageID: 9601, ConversationID: 301,
-			QuestionKey: "q1", Question: "第一个问题", Status: "pending",
+			QuestionKey: "q1", Question: "第一个问题", Status: string(execution.HumanPending),
 			AskedAt: testTime,
 		},
 		{
 			RequestID: 601, MessageID: 9601, ConversationID: 301,
-			QuestionKey: "q2", Question: "第二个问题", Status: "pending",
+			QuestionKey: "q2", Question: "第二个问题", Status: string(execution.HumanPending),
 			AskedAt: testTime.Add(time.Minute),
 		},
 		{
 			RequestID: 601, MessageID: 9601, ConversationID: 301,
-			QuestionKey: "q3", Question: "第三个问题", Status: "expired",
+			QuestionKey: "q3", Question: "第三个问题", Status: string(execution.HumanExpired),
 			AskedAt: testTime.Add(2 * time.Minute),
 		},
 		{
 			RequestID: 602, MessageID: 9602, ConversationID: 301,
-			QuestionKey: "q1", Question: "已回答的问题", Status: "answered",
+			QuestionKey: "q1", Question: "已回答的问题", Status: string(execution.HumanAnswered),
 			AskedAt: testTime,
 		},
 	}
@@ -503,7 +562,7 @@ func TestHandoffOpenKeepsAllPendingQuestionsOfBatch(t *testing.T) {
 			t.Fatalf("open question %d JSON = %s, want question_key %q", index, raw, expectedKeys[index])
 		}
 	}
-	if questions[0].Status != "pending" || questions[2].Status != "expired" {
+	if questions[0].Status != string(execution.HumanPending) || questions[2].Status != string(execution.HumanExpired) {
 		t.Fatalf("open question statuses = %q/%q, want pending/expired", questions[0].Status, questions[2].Status)
 	}
 }
@@ -515,7 +574,7 @@ func TestHandoffRequirementsExcludeClosed(t *testing.T) {
 	service, _, reader, _ := newHandoffTest(t)
 	reader.requirements = append(reader.requirements, versionapp.HandoffRequirement{
 		ID: 103, CurrentVersionID: 203, Revision: 1,
-		Title: "已关闭需求", Status: "closed",
+		Title: "已关闭需求", Status: string(version.RequirementClosed),
 	})
 	document, err := service.Generate(context.Background(), 7)
 	if err != nil {
@@ -525,7 +584,7 @@ func TestHandoffRequirementsExcludeClosed(t *testing.T) {
 		t.Fatalf("requirements = %d (%+v), want only the draft+clarified pair", len(document.Requirements), document.Requirements)
 	}
 	for _, item := range document.Requirements {
-		if item.Status != "draft" && item.Status != "clarified" {
+		if !versionapp.HandoffRequirementStatusIncluded(item.Status) {
 			t.Fatalf("requirements block contains status %q: %+v", item.Status, item)
 		}
 	}
@@ -548,18 +607,18 @@ func TestHandoffCapsKeepNewestRequirementsAndFacts(t *testing.T) {
 	for index := 1; index <= 250; index++ {
 		reader.requirements = append(reader.requirements, versionapp.HandoffRequirement{
 			ID: int64(index), CurrentVersionID: int64(1000 + index), Revision: 1,
-			Title: "需求", Status: "clarified",
+			Title: "需求", Status: string(version.RequirementClarified),
 		})
 	}
 	reader.facts = make([]versionapp.HandoffFact, 0, 300)
 	for index := 1; index <= 150; index++ {
 		reader.facts = append(reader.facts, versionapp.HandoffFact{
-			ID: int64(index), Kind: "decision", Key: "decision", Summary: "决策", CreatedAt: testTime,
+			ID: int64(index), Kind: version.FactKindDecision, Key: "decision", Summary: "决策", CreatedAt: testTime,
 		})
 	}
 	for index := 1; index <= 150; index++ {
 		reader.facts = append(reader.facts, versionapp.HandoffFact{
-			ID: int64(1000 + index), Kind: "gap", Key: "gap", Summary: "缺口", CreatedAt: testTime,
+			ID: int64(1000 + index), Kind: version.FactKindGap, Key: "gap", Summary: "缺口", CreatedAt: testTime,
 		})
 	}
 	document, err := service.Generate(context.Background(), 7)
@@ -582,7 +641,7 @@ func TestHandoffCapsKeepNewestRequirementsAndFacts(t *testing.T) {
 	}
 	openGaps := make([]versionapp.HandoffOpenItem, 0, 100)
 	for _, item := range document.Open {
-		if item.Kind == "gap" {
+		if item.Kind == version.FactKindGap {
 			openGaps = append(openGaps, item)
 		}
 	}
@@ -592,6 +651,155 @@ func TestHandoffCapsKeepNewestRequirementsAndFacts(t *testing.T) {
 	if openGaps[0].ReferenceID != 1051 || openGaps[len(openGaps)-1].ReferenceID != 1150 {
 		t.Fatalf("open gaps keep IDs %d..%d, want the newest 1051..1150",
 			openGaps[0].ReferenceID, openGaps[len(openGaps)-1].ReferenceID)
+	}
+}
+
+// TestHandoffRequirementV1Projection pins R-B1: the requirements block is a
+// faithful V1 structural projection of the requirement contract (user_story +
+// structured acceptance_criteria + sut_description, plus the optional
+// rules/scope_out/account_roles_hint), and the resources block is an environment
+// summary with no version_sut binding id and no credentials.
+func TestHandoffRequirementV1Projection(t *testing.T) {
+	service, _, reader, _ := newHandoffTest(t)
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	want := reader.requirements[0]
+	got := document.Requirements[0]
+	if got.UserStory != want.UserStory {
+		t.Fatalf("user_story = %+v, want the projected %+v", got.UserStory, want.UserStory)
+	}
+	if got.SutDescription != want.SutDescription || got.Rules != want.Rules || got.ScopeOut != want.ScopeOut {
+		t.Fatalf("sut_description/rules/scope_out = %+v, want %+v", got, want)
+	}
+	if len(got.AcceptanceCriteria) != len(want.AcceptanceCriteria) {
+		t.Fatalf("acceptance_criteria = %+v, want %+v", got.AcceptanceCriteria, want.AcceptanceCriteria)
+	}
+	for index, criterion := range got.AcceptanceCriteria {
+		if criterion != want.AcceptanceCriteria[index] {
+			t.Fatalf("acceptance_criteria[%d] = %+v, want %+v", index, criterion, want.AcceptanceCriteria[index])
+		}
+	}
+	if len(got.AccountRolesHint) != 1 || got.AccountRolesHint[0] != "admin" {
+		t.Fatalf("account_roles_hint = %+v, want [admin]", got.AccountRolesHint)
+	}
+
+	// The persisted document carries the V1 JSON keys and no version_sut binding
+	// id, no flat description, no password and no DSN.
+	raw := string(mustJSON(t, document))
+	for _, key := range []string{
+		`"user_story"`, `"as_a"`, `"i_want"`, `"so_that"`, `"acceptance_criteria"`,
+		`"given"`, `"when"`, `"then"`, `"sut_description"`, `"scope_out"`,
+		`"account_roles_hint"`, `"environment"`,
+	} {
+		if !strings.Contains(raw, key) {
+			t.Fatalf("handoff JSON missing V1 key %s: %s", key, raw)
+		}
+	}
+	for _, forbidden := range []string{`"version_sut_id"`, `"description"`, "password", "dsn"} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("handoff JSON carries forbidden %q: %s", forbidden, raw)
+		}
+	}
+	// The resources block is headed by the environment and nests assets under SUTs.
+	if document.Resources.Environment.ID != 1001 || document.Resources.Environment.Name != "staging" {
+		t.Fatalf("environment summary = %+v", document.Resources.Environment)
+	}
+	if len(document.Resources.SUTs) != 1 || document.Resources.SUTs[0].SUTID != 901 {
+		t.Fatalf("suts = %+v", document.Resources.SUTs)
+	}
+}
+
+// TestHandoffResourcesAggregateBudget pins the C4 ruling: HandoffMaxResources is
+// ONE shared budget across every SUT and kind (not a per-SUT cap), consumed in
+// catalog order, and truncation is recorded explicitly so the Design Host knows
+// the set is partial.
+func TestHandoffResourcesAggregateBudget(t *testing.T) {
+	service, _, reader, _ := newHandoffTest(t)
+	// Three SUTs with 120 pages each = 360 pages, over the single 200 budget.
+	reader.resources.bundle = resourceapp.HandoffResourceBundle{
+		Environment: resourceapp.HandoffEnvironment{ID: 1, Name: "env", Status: resource.StatusActive},
+		SUTs: []resourceapp.HandoffSUT{
+			{ID: 1, Name: "a"},
+			{ID: 2, Name: "b"},
+			{ID: 3, Name: "c"},
+		},
+	}
+	for s := range reader.resources.bundle.SUTs {
+		for p := 0; p < 120; p++ {
+			reader.resources.bundle.SUTs[s].Pages = append(reader.resources.bundle.SUTs[s].Pages, resourceapp.HandoffPage{
+				ID: int64(1000*(s+1) + p), Name: "p",
+			})
+		}
+	}
+	document, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	total := 0
+	for _, sut := range document.Resources.SUTs {
+		total += len(sut.Pages) + len(sut.APIs) + len(sut.Databases)
+	}
+	if total != versionapp.HandoffMaxResources {
+		t.Fatalf("total assets = %d, want the shared budget %d (not a per-SUT cap)", total, versionapp.HandoffMaxResources)
+	}
+	if !document.Resources.Truncated {
+		t.Fatal("Truncated = false, want true (the budget dropped rows)")
+	}
+	// Minor 2: the Host reads the stored JSONB verbatim, so the observable signal
+	// is the JSON key, not the Go field. Pin "truncated":true in the marshalled
+	// document (and that it cannot be erased on read).
+	if raw := string(mustJSON(t, document)); !strings.Contains(raw, `"truncated":true`) {
+		t.Fatalf("handoff JSON missing \"truncated\":true (the Host's partial-set signal): %s", raw)
+	}
+	// Catalog order: SUT 1 keeps all 120, SUT 2 keeps the next 80, SUT 3 keeps 0.
+	if len(document.Resources.SUTs[0].Pages) != 120 ||
+		len(document.Resources.SUTs[1].Pages) != 80 ||
+		len(document.Resources.SUTs[2].Pages) != 0 {
+		t.Fatalf("per-SUT pages = %d/%d/%d, want 120/80/0 in catalog order",
+			len(document.Resources.SUTs[0].Pages), len(document.Resources.SUTs[1].Pages), len(document.Resources.SUTs[2].Pages))
+	}
+	// SUT 2 keeps its 80 lowest-id pages (deterministic catalog order).
+	for i, page := range document.Resources.SUTs[1].Pages {
+		if page.ID != int64(2000+i) {
+			t.Fatalf("SUT 2 page[%d] id = %d, want the lowest-id page %d", i, page.ID, 2000+i)
+		}
+	}
+
+	// The budget is shared across KINDS too: one SUT with 150 pages + 100 APIs
+	// keeps 150 pages + 50 APIs = 200, and records truncation.
+	reader.resources.bundle = resourceapp.HandoffResourceBundle{
+		Environment: resourceapp.HandoffEnvironment{ID: 1, Name: "env", Status: resource.StatusActive},
+		SUTs:        []resourceapp.HandoffSUT{{ID: 1, Name: "a"}},
+	}
+	for p := 0; p < 150; p++ {
+		reader.resources.bundle.SUTs[0].Pages = append(reader.resources.bundle.SUTs[0].Pages, resourceapp.HandoffPage{ID: int64(p + 1), Name: "p"})
+	}
+	for a := 0; a < 100; a++ {
+		reader.resources.bundle.SUTs[0].APIs = append(reader.resources.bundle.SUTs[0].APIs, resourceapp.HandoffAPI{ID: int64(a + 1), Name: "a", Method: "GET", Path: "/x"})
+	}
+	mixed, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate mixed: %v", err)
+	}
+	if len(mixed.Resources.SUTs[0].Pages) != 150 || len(mixed.Resources.SUTs[0].APIs) != 50 {
+		t.Fatalf("mixed kinds = %d pages / %d apis, want 150/50 (pages first, then APIs)",
+			len(mixed.Resources.SUTs[0].Pages), len(mixed.Resources.SUTs[0].APIs))
+	}
+	if !mixed.Resources.Truncated {
+		t.Fatal("mixed Truncated = false, want true")
+	}
+
+	// Under the budget: nothing dropped, Truncated stays false.
+	reader.resources.bundle.SUTs[0].Pages = reader.resources.bundle.SUTs[0].Pages[:50]
+	reader.resources.bundle.SUTs[0].APIs = nil
+	under, err := service.Generate(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("Generate under: %v", err)
+	}
+	if under.Resources.Truncated {
+		t.Fatal("Truncated = true under the budget, want false")
 	}
 }
 
@@ -629,12 +837,12 @@ func TestHandoffRetriesRevisionConflict(t *testing.T) {
 	reader := &fakeHandoffReader{
 		versionExists: true,
 		requirements: []versionapp.HandoffRequirement{{
-			ID: 101, CurrentVersionID: 201, Revision: 1, Title: "并发目标", Status: "clarified",
+			ID: 101, CurrentVersionID: 201, Revision: 1, Title: "并发目标", Status: string(version.RequirementClarified),
 		}},
 	}
 	store := &conflictOnceHandoffStore{conflicts: 1}
 	publisher := &fakePublisher{}
-	service := versionapp.NewHandoffService(store, reader, &seqIDs{}, publisher)
+	service := versionapp.NewHandoffService(store, reader, &fakeHandoffResourceReader{}, &seqIDs{}, publisher)
 	document, err := service.Generate(context.Background(), 7)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -658,14 +866,21 @@ func TestHandoffRetriesRevisionConflict(t *testing.T) {
 func TestHandoffBoundsOversizedContent(t *testing.T) {
 	service, _, reader, _ := newHandoffTest(t)
 	reader.requirements[0].Title = strings.Repeat("标", 5000)
-	reader.requirements[0].Description = strings.Repeat("述", 50000)
-	reader.requirements[0].AcceptanceCriteria = strings.Repeat("验", 50000)
+	reader.requirements[0].UserStory.AsA = strings.Repeat("角", 5000)
+	reader.requirements[0].UserStory.IWant = strings.Repeat("望", 5000)
+	reader.requirements[0].UserStory.SoThat = strings.Repeat("因", 5000)
+	reader.requirements[0].Rules = strings.Repeat("规", 50000)
+	reader.requirements[0].SutDescription = strings.Repeat("述", 50000)
+	reader.requirements[0].ScopeOut = strings.Repeat("外", 50000)
+	reader.requirements[0].AcceptanceCriteria = []versionapp.HandoffAcceptanceCriterion{
+		{ID: "AC-1", Given: strings.Repeat("前", 50000), When: strings.Repeat("作", 50000), Then: strings.Repeat("验", 50000)},
+	}
 	reader.requirements[0].SourceQuote = strings.Repeat("源", 5000)
 	reader.qa[0].Question = strings.Repeat("问", 9000)
 	reader.qa[0].AnswerText = strings.Repeat("答", 9000)
 	reader.facts[0].Summary = strings.Repeat("决", 9000)
 	for index := 0; index < 300; index++ {
-		reader.resources.Pages = append(reader.resources.Pages, versionapp.HandoffPage{
+		reader.resources.bundle.SUTs[0].Pages = append(reader.resources.bundle.SUTs[0].Pages, resourceapp.HandoffPage{
 			ID: int64(2000 + index), Name: strings.Repeat("页", 2000),
 			URL: "https://example.test/" + strings.Repeat("u", 2000),
 		})
@@ -677,11 +892,30 @@ func TestHandoffBoundsOversizedContent(t *testing.T) {
 	if runes := len([]rune(document.Requirements[0].Title)); runes > versionapp.HandoffTitleMax {
 		t.Fatalf("requirement title runes = %d, want <= %d", runes, versionapp.HandoffTitleMax)
 	}
-	if runes := len([]rune(document.Requirements[0].Description)); runes > versionapp.HandoffDescriptionMax {
-		t.Fatalf("requirement description runes = %d", runes)
+	for _, part := range []string{
+		document.Requirements[0].UserStory.AsA,
+		document.Requirements[0].UserStory.IWant,
+		document.Requirements[0].UserStory.SoThat,
+	} {
+		if runes := len([]rune(part)); runes > versionapp.HandoffUserStoryPartMax {
+			t.Fatalf("user story part runes = %d, want <= %d", runes, versionapp.HandoffUserStoryPartMax)
+		}
 	}
-	if runes := len([]rune(document.Requirements[0].AcceptanceCriteria)); runes > versionapp.HandoffAcceptanceMax {
-		t.Fatalf("requirement acceptance runes = %d", runes)
+	if runes := len([]rune(document.Requirements[0].Rules)); runes > versionapp.HandoffRulesMax {
+		t.Fatalf("requirement rules runes = %d", runes)
+	}
+	if runes := len([]rune(document.Requirements[0].SutDescription)); runes > versionapp.HandoffSutDescriptionMax {
+		t.Fatalf("requirement sut_description runes = %d", runes)
+	}
+	if runes := len([]rune(document.Requirements[0].ScopeOut)); runes > versionapp.HandoffScopeOutMax {
+		t.Fatalf("requirement scope_out runes = %d", runes)
+	}
+	for _, criterion := range document.Requirements[0].AcceptanceCriteria {
+		for _, part := range []string{criterion.Given, criterion.When, criterion.Then} {
+			if runes := len([]rune(part)); runes > versionapp.HandoffACPartMax {
+				t.Fatalf("acceptance criterion part runes = %d", runes)
+			}
+		}
 	}
 	if runes := len([]rune(document.Requirements[0].SourceQuote)); runes > versionapp.HandoffSourceQuoteMax {
 		t.Fatalf("requirement source quote runes = %d", runes)
@@ -695,13 +929,17 @@ func TestHandoffBoundsOversizedContent(t *testing.T) {
 	if runes := len([]rune(document.Decisions[0].Summary)); runes > versionapp.HandoffFactSummaryMax {
 		t.Fatalf("fact summary runes = %d", runes)
 	}
-	if len(document.Resources.Pages) > versionapp.HandoffMaxResources {
-		t.Fatalf("pages = %d, want <= %d", len(document.Resources.Pages), versionapp.HandoffMaxResources)
+	pages := document.Resources.SUTs[0].Pages
+	if len(pages) != versionapp.HandoffMaxResources {
+		t.Fatalf("pages = %d, want the shared budget %d", len(pages), versionapp.HandoffMaxResources)
 	}
-	if runes := len([]rune(document.Resources.Pages[0].Name)); runes > versionapp.HandoffResourceNameMax {
+	if !document.Resources.Truncated {
+		t.Fatal("Truncated = false, want true (300 pages over the 200 budget)")
+	}
+	if runes := len([]rune(pages[0].Name)); runes > versionapp.HandoffResourceNameMax {
 		t.Fatalf("page name runes = %d", runes)
 	}
-	if runes := len([]rune(document.Resources.Pages[0].URL)); runes > versionapp.HandoffResourceURLMax {
+	if runes := len([]rune(pages[0].URL)); runes > versionapp.HandoffResourceURLMax {
 		t.Fatalf("page URL runes = %d", runes)
 	}
 }

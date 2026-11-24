@@ -28,10 +28,13 @@ func TestConversationWriterLeaseIntegration(t *testing.T) {
 	// references columns dropped by the W0 schema tasks (hazard H1, owned by
 	// Task 29), which is unrelated to the conversation lease under test.
 	v := sampleVersion(ids, 42)
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO version (id, title, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`, v.ID, "Writer lease", int64(42), testTime, testTime); err != nil {
+		INSERT INTO version (id, title, created_by, created_at, updated_at, environment_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, v.ID, "Writer lease", int64(42), testTime, testTime, int64(990001)); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
 	conversation := version.Conversation{

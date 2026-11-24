@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func p6SeedEventChannel(t *testing.T, pool *pgxpool.Pool, channel string, lastSeq int64) {
+func readModelSeedEventChannel(t *testing.T, pool *pgxpool.Pool, channel string, lastSeq int64) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO event_channel (channel, last_seq) VALUES ($1, $2)
@@ -19,7 +19,7 @@ func p6SeedEventChannel(t *testing.T, pool *pgxpool.Pool, channel string, lastSe
 	}
 }
 
-func p6SeedEvent(t *testing.T, pool *pgxpool.Pool, channel string, seq int64, eventType string) {
+func readModelSeedEvent(t *testing.T, pool *pgxpool.Pool, channel string, seq int64, eventType string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO event (channel, seq, type) VALUES ($1, $2, $3)
@@ -28,7 +28,7 @@ func p6SeedEvent(t *testing.T, pool *pgxpool.Pool, channel string, seq int64, ev
 	}
 }
 
-func TestP6EventingQueryReaderCountEvents(t *testing.T) {
+func TestEventingQueryReaderCountEvents(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -36,13 +36,13 @@ func TestP6EventingQueryReaderCountEvents(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	p6SeedEventChannel(t, pool, "version:7", 3)
-	p6SeedEventChannel(t, pool, "system", 2)
-	p6SeedEvent(t, pool, "version:7", 1, "context.compacted")
-	p6SeedEvent(t, pool, "version:7", 2, "context.compacted")
-	p6SeedEvent(t, pool, "version:7", 3, "wave.started")
-	p6SeedEvent(t, pool, "system", 1, "context.compacted")
-	p6SeedEvent(t, pool, "system", 2, "wave.started")
+	readModelSeedEventChannel(t, pool, "version:7", 3)
+	readModelSeedEventChannel(t, pool, "system", 2)
+	readModelSeedEvent(t, pool, "version:7", 1, "context.compacted")
+	readModelSeedEvent(t, pool, "version:7", 2, "context.compacted")
+	readModelSeedEvent(t, pool, "version:7", 3, "wave.started")
+	readModelSeedEvent(t, pool, "system", 1, "context.compacted")
+	readModelSeedEvent(t, pool, "system", 2, "wave.started")
 
 	count, err := reader.CountEvents(ctx, "context.compacted", "")
 	if err != nil {
@@ -85,7 +85,7 @@ func TestP6EventingQueryReaderCountEvents(t *testing.T) {
 	}
 }
 
-func TestP6EventingQueryReaderRequiresPool(t *testing.T) {
+func TestEventingQueryReaderRequiresPool(t *testing.T) {
 	if _, err := NewQueryReader(nil); err == nil {
 		t.Fatal("expected an error for a nil pool")
 	}

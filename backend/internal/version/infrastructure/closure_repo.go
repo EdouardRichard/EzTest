@@ -127,9 +127,10 @@ func (r *ClosureRepository) Close(ctx context.Context, closure version.Requireme
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement
-		SET status = 'closed', closed_at = $3, closed_by_run_id = $4, updated_at = $5
-		WHERE id = $1 AND version_id = $2 AND status = 'clarified'
-	`, requirement.ID, requirement.VersionID, requirement.ClosedAt, requirement.ClosedByRunID, requirement.UpdatedAt)
+		SET status = $6, closed_at = $3, closed_by_run_id = $4, updated_at = $5
+		WHERE id = $1 AND version_id = $2 AND status = $7
+	`, requirement.ID, requirement.VersionID, requirement.ClosedAt, requirement.ClosedByRunID, requirement.UpdatedAt,
+		string(version.RequirementClosed), string(version.RequirementClarified))
 	if err != nil {
 		return version.RequirementClosure{}, wrapDB("close requirement", err)
 	}
@@ -146,8 +147,9 @@ func (r *ClosureRepository) Close(ctx context.Context, closure version.Requireme
 }
 
 // Reopen increments the newest closure's reopen_count and flips the requirement
-// closed -> draft in one transaction, clearing the close projection fields. It
-// returns the updated closure row.
+// closed -> draft in one transaction, clearing the close projection fields
+// (including the admin waiver flag, R-G8 lifecycle). It returns the updated
+// closure row.
 func (r *ClosureRepository) Reopen(ctx context.Context, requirement version.Requirement, reopenedAt time.Time) (version.RequirementClosure, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -189,9 +191,10 @@ func (r *ClosureRepository) Reopen(ctx context.Context, requirement version.Requ
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement
-		SET status = 'draft', closed_at = NULL, closed_by_run_id = NULL, updated_at = $3
-		WHERE id = $1 AND version_id = $2 AND status = 'closed'
-	`, requirement.ID, requirement.VersionID, reopenedAt)
+		SET status = $4, closed_at = NULL, closed_by_run_id = NULL, waived = false, updated_at = $3
+		WHERE id = $1 AND version_id = $2 AND status = $5
+	`, requirement.ID, requirement.VersionID, reopenedAt,
+		string(version.RequirementDraft), string(version.RequirementClosed))
 	if err != nil {
 		return version.RequirementClosure{}, wrapDB("reopen requirement", err)
 	}

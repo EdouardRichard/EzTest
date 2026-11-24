@@ -15,11 +15,15 @@ RUN go mod download
 
 COPY backend/ ./
 
+# VERSION defaults to "dev" to match the composition-root default
+# (backend/cmd/eztest/main.go). Pass --build-arg VERSION=<value> (e.g.
+# VERSION=$(cat VERSION)) to stamp the real release identity. There is no Commit
+# stamp: package main declares no commit variable, and -X on a missing symbol is
+# silently ignored, so a Commit ldflag would be a phantom.
 ARG VERSION=dev
-ARG COMMIT=
 
 RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w -X github.com/EdouardRichard/EzTest/backend/internal/server.Version=${VERSION} -X github.com/EdouardRichard/EzTest/backend/internal/server.Commit=${COMMIT}" \
+    -ldflags "-s -w -X github.com/EdouardRichard/EzTest/backend/cmd/eztest.version=${VERSION}" \
     -o /out/eztest ./cmd/eztest
 
 FROM alpine:3.21

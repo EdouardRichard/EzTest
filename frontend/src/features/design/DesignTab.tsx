@@ -46,6 +46,7 @@ import {
 import { ExportCasesDialog } from "./ExportCasesDialog"
 import { ExportDetailPanel } from "./ExportDetailPanel"
 import { HandoffPanel } from "./HandoffPanel"
+import { JudgmentReport } from "./JudgmentReport"
 import {
   DEFAULT_WORKBENCH_SPLIT,
   DESIGN_SPLIT_STORAGE_KEYS,
@@ -201,6 +202,7 @@ export function DesignTab({
   const [chatCaseReferences, setChatCaseReferences] = useState<CaseCardPart[]>([])
   const [exportOpen, setExportOpen] = useState(false)
   const [handoffOpen, setHandoffOpen] = useState(false)
+  const [judgmentOpen, setJudgmentOpen] = useState(false)
   const [activities, setActivities] = useState<AgentActivity[]>([])
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
   const [teamRoomToken, setTeamRoomToken] = useState(0)
@@ -383,8 +385,8 @@ export function DesignTab({
     onDesignCaseChanged: (event) => {
       scheduleGraphRefresh()
       if (event.type === "case.revision.auto_confirmed") {
-        // EV-12/W2-12: show the auto-confirmed or rollback replacement revision
-        // and keep the case detail/graph in sync.
+        // EV-12/W2-12 (R-E2r): the event now only announces a rollback DRAFT
+        // replacement; show the notice and keep the case detail/graph in sync.
         const next = discoveryRevisionFromEventPayload(event.payload)
         if (next !== null) setDiscoveryRevision(next)
       }
@@ -615,7 +617,9 @@ export function DesignTab({
           caseId: result.case_id,
           caseVersionId: result.case_version_id,
           revision: result.revision,
-          status: "confirmed",
+          // R-E2r: pass through the actual returned status (a new replacement is
+          // draft; confirmed only on idempotent replay) — never assume confirmed.
+          status: result.status,
           trigger: "rollback",
           rollbackOf: result.rolled_back_from,
           inferred: false,
@@ -627,6 +631,13 @@ export function DesignTab({
     },
     [refreshOverview, scheduleGraphRefresh],
   )
+
+  // After a human override the review_state projection changes server-side;
+  // refetch the graph/detail so the badges and report reflect the new fact.
+  const handleJudgmentOverridden = useCallback(() => {
+    scheduleGraphRefresh()
+    setDetailToken((token) => token + 1)
+  }, [scheduleGraphRefresh])
 
   // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
   // see new callback identities on every parent render, or it re-resets the
@@ -883,6 +894,7 @@ export function DesignTab({
             discoveryRevision={selectedDiscoveryRevision}
             readOnly={!isAdmin}
             onRolledBack={handleDiscoveryRolledBack}
+            onJudgmentOverridden={handleJudgmentOverridden}
             onConfirm={confirmCase}
             onRequestChange={setChatDraft}
             onRequestAiChange={requestAiChangeForCase}
@@ -943,6 +955,16 @@ export function DesignTab({
           )}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          {canReviewCases ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="design-judgment-report"
+              onClick={() => setJudgmentOpen(true)}
+            >
+              裁判报告
+            </Button>
+          ) : null}
           <Button
             size="sm"
             variant="secondary"
@@ -1113,6 +1135,24 @@ export function DesignTab({
       >
         <div className="max-h-[70vh] overflow-y-auto pr-1">
           <HandoffPanel versionId={versionId} />
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={judgmentOpen}
+        onClose={() => setJudgmentOpen(false)}
+        title="裁判报告"
+        description="按审查状态分组/筛选的逐用例裁判结论（verdict / findings / AC 覆盖 / 轮次）；升级失败或裁判不可用的用例可由管理员人工决断。"
+        className="max-w-3xl"
+      >
+        <div className="max-h-[70vh] overflow-y-auto pr-1">
+          {judgmentOpen ? (
+            <JudgmentReport
+              versionId={versionId}
+              isAdmin={isAdmin}
+              onOverridden={handleJudgmentOverridden}
+            />
+          ) : null}
         </div>
       </Dialog>
     </div>

@@ -38,31 +38,82 @@ export function getSut(id: string): Promise<Sut> {
 export type SutInput = {
   name: string
   intro: string
-  /** Optional P7 family slug; omitted when blank. */
+  /**
+   * Optional P7 family slug. Create and patch have DIFFERENT blank semantics: for
+   * create a blank value is omitted (server default); for patch a PRESENT blank
+   * value clears it and an absent value leaves it unchanged, mirroring the backend
+   * `resource/application.SUTPatch` pointer (`Family *string`: "" clears, nil keeps).
+   */
   family?: string
+  /** SUT base URL (v0.2.4-B: base_url lives on the SUT, not the environment). */
+  baseUrl?: string
 }
 
-/** Builds the SUT create/patch body, omitting the optional family when blank. */
-function sutPayload(input: SutInput): Record<string, unknown> {
+/**
+ * Builds the SUT CREATE body. Optional keys are omitted when blank so the server
+ * applies its defaults. (`base_url` is required on create — a blank one yields a
+ * server 400; that is a create-validation gap reported separately, not silently
+ * worked around here.)
+ */
+function sutCreatePayload(input: SutInput): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     name: input.name.trim(),
     intro: input.intro.trim(),
   }
   const family = input.family?.trim() ?? ""
   if (family.length > 0) payload.family = family
+  const baseUrl = input.baseUrl?.trim() ?? ""
+  if (baseUrl.length > 0) payload.base_url = baseUrl
   return payload
 }
 
-export function createSut(input: SutInput): Promise<Sut> {
-  return apiPost<Sut>("/api/resources/suts", sutPayload(input))
+/**
+ * Builds the SUT PATCH body. Both optional keys treat presence (undefined = leave
+ * unchanged) like the backend `*string`, but their EMPTY-string meaning differs:
+ *   - family: "" CLEARS the stored family — the backend accepts a blank family
+ *     (`Family *string`; `normalizeFamilyInput`), so a present blank is sent as "".
+ *   - base_url: "" is INVALID, not a clear — base_url is required
+ *     (`resource/domain/sut.go` `SUT.Validate` → `validation.URL` rejects a blank
+ *     URL with 400), so there is no "clear": a blank/absent value is OMITTED (leave
+ *     unchanged). Sending "" would fail the request.
+ * Sharing the create payload builder made the UI's "clear family" a silent no-op
+ * (H-C2): the key was dropped and the backend saw nil = no change.
+ */
+function sutPatchPayload(input: SutInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    name: input.name.trim(),
+    intro: input.intro.trim(),
+  }
+  if (input.family !== undefined) payload.family = input.family.trim()
+  const baseUrl = input.baseUrl?.trim() ?? ""
+  if (baseUrl.length > 0) payload.base_url = baseUrl
+  return payload
+}
+
+/** v0.2.4-B: a SUT is created under an environment (`POST /environments/{id}/suts`). */
+export function createSut(environmentId: string, input: SutInput): Promise<Sut> {
+  return apiPost<Sut>(
+    `/api/resources/environments/${encodeURIComponent(environmentId)}/suts`,
+    sutCreatePayload(input),
+  )
 }
 
 export function updateSut(id: string, input: SutInput): Promise<Sut> {
-  return apiPatch<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`, sutPayload(input))
+  return apiPatch<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`, sutPatchPayload(input))
 }
 
 export function deleteSut(id: string): Promise<void> {
   return apiDelete<void>(`/api/resources/suts/${encodeURIComponent(id)}`)
+}
+
+/**
+ * Admin-only post-hoc audit/reject of an Agent-registered SUT (v0.2.4-F R-B4/R-F1).
+ * The Agent auto-approves a new SUT on evidence; an admin can reject it afterwards,
+ * or reject a proposed SUT the gate did not approve. proposed/approved → rejected
+ * (409 when already rejected). A rejected SUT leaves the version's effective scope.
+ */
+export function rejectSut(id: string): Promise<Sut> {
+  return apiPost<Sut>(`/api/resources/suts/${encodeURIComponent(id)}/reject`)
 }
 
 export type CreateSutWithDefaultEnvironmentInput = {
@@ -79,42 +130,49 @@ export type CreateSutWithDefaultEnvironmentResult = {
 }
 
 /**
- * A SUT create that stores the SUT but fails to create its default environment.
- * The SUT exists at this point; the UI refreshes the list and lets the user add
- * the environment from the environment section instead of retrying the create.
+ * A SUT create that stores the environment but fails to create the SUT under it.
+ * The environment exists at this point; the UI refreshes the list and lets the
+ * user add the SUT from the SUT section instead of retrying the whole flow.
  */
 export class DefaultEnvironmentError extends Error {
-  readonly sut: Sut
+  readonly environment: SutEnvironment
   readonly originalError: unknown
 
-  constructor(sut: Sut, originalError: unknown) {
+  constructor(environment: SutEnvironment, originalError: unknown) {
     const detail = originalError instanceof Error ? originalError.message : "未知错误"
-    super(`SUT「${sut.name}」已创建，但默认环境创建失败：${detail}。请在环境列表中补建环境。`)
+    super(
+      `环境「${environment.name}」已创建，但 SUT 创建失败：${detail}。请在 SUT 列表中补建 SUT。`,
+    )
     this.name = "DefaultEnvironmentError"
-    this.sut = sut
+    this.environment = environment
     this.originalError = originalError
   }
 }
 
 /**
- * Creates a SUT and its first default environment in one user flow. The API has
- * no atomic SUT+environment create, so a partial failure is surfaced with the
- * created SUT attached.
+ * Creates a top-level environment and then the SUT under it in one user flow
+ * (v0.2.4-B: environments own SUTs; base_url lives on the SUT). The API has no
+ * atomic environment+SUT create, so a partial failure is surfaced with the
+ * created environment attached.
  */
 export async function createSutWithDefaultEnvironment(
   input: CreateSutWithDefaultEnvironmentInput,
 ): Promise<CreateSutWithDefaultEnvironmentResult> {
-  const sut = await createSut(input.sut)
+  const environment = await createEnvironment({
+    name: input.environment.name,
+    description: "",
+    status: "active",
+  })
   try {
-    const environment = await createEnvironment(sut.id, {
-      name: input.environment.name,
+    const sut = await createSut(environment.id, {
+      name: input.sut.name,
+      intro: input.sut.intro,
+      ...(input.sut.family !== undefined ? { family: input.sut.family } : {}),
       baseUrl: input.environment.base_url,
-      isDefault: true,
-      status: "active",
     })
     return { sut, environment }
   } catch (error) {
-    throw new DefaultEnvironmentError(sut, error)
+    throw new DefaultEnvironmentError(environment, error)
   }
 }
 
@@ -123,20 +181,19 @@ export async function createSutWithDefaultEnvironment(
 function environmentPayload(values: EnvironmentFormValues): Record<string, unknown> {
   return {
     name: values.name.trim(),
-    base_url: values.baseUrl.trim(),
-    is_default: values.isDefault,
+    description: values.description.trim(),
     status: values.status,
   }
 }
 
-export function createEnvironment(
-  sutId: string,
-  values: EnvironmentFormValues,
-): Promise<SutEnvironment> {
-  return apiPost<SutEnvironment>(
-    `/api/resources/suts/${encodeURIComponent(sutId)}/environments`,
-    environmentPayload(values),
-  )
+/** First page of top-level environments (v0.2.4-B: environments own SUTs). */
+export async function listEnvironments(): Promise<SutEnvironment[]> {
+  const page = await apiGetPage<SutEnvironment>(`/api/resources/environments?limit=${PAGE_LIMIT}`)
+  return page.items
+}
+
+export function createEnvironment(values: EnvironmentFormValues): Promise<SutEnvironment> {
+  return apiPost<SutEnvironment>("/api/resources/environments", environmentPayload(values))
 }
 
 export function updateEnvironment(
@@ -166,9 +223,9 @@ function pagePayload(values: PageFormValues): Record<string, unknown> {
   }
 }
 
-export function createPage(environmentId: string, values: PageFormValues): Promise<SutPage> {
+export function createPage(sutId: string, values: PageFormValues): Promise<SutPage> {
   return apiPost<SutPage>(
-    `/api/resources/environments/${encodeURIComponent(environmentId)}/pages`,
+    `/api/resources/suts/${encodeURIComponent(sutId)}/pages`,
     pagePayload(values),
   )
 }
@@ -182,11 +239,11 @@ export function deletePage(id: string): Promise<void> {
 }
 
 export function importPages(
-  environmentId: string,
+  sutId: string,
   items: PageFormValues[],
 ): Promise<ImportResult<SutPage>> {
   return apiPost<ImportResult<SutPage>>(
-    `/api/resources/environments/${encodeURIComponent(environmentId)}/pages/import`,
+    `/api/resources/suts/${encodeURIComponent(sutId)}/pages/import`,
     { items: items.map(pagePayload) },
   )
 }
@@ -203,9 +260,9 @@ function apiPayload(values: ApiFormValues): Record<string, unknown> {
   }
 }
 
-export function createApi(environmentId: string, values: ApiFormValues): Promise<SutApi> {
+export function createApi(sutId: string, values: ApiFormValues): Promise<SutApi> {
   return apiPost<SutApi>(
-    `/api/resources/environments/${encodeURIComponent(environmentId)}/apis`,
+    `/api/resources/suts/${encodeURIComponent(sutId)}/apis`,
     apiPayload(values),
   )
 }
@@ -218,12 +275,9 @@ export function deleteApi(id: string): Promise<void> {
   return apiDelete<void>(`/api/resources/apis/${encodeURIComponent(id)}`)
 }
 
-export function importApis(
-  environmentId: string,
-  items: ApiFormValues[],
-): Promise<ImportResult<SutApi>> {
+export function importApis(sutId: string, items: ApiFormValues[]): Promise<ImportResult<SutApi>> {
   return apiPost<ImportResult<SutApi>>(
-    `/api/resources/environments/${encodeURIComponent(environmentId)}/apis/import`,
+    `/api/resources/suts/${encodeURIComponent(sutId)}/apis/import`,
     { items: items.map(apiPayload) },
   )
 }
@@ -241,7 +295,6 @@ export type DatabasePatch = {
 
 export function createDatabase(sutId: string, values: DatabaseFormValues): Promise<TargetDatabase> {
   return apiPost<TargetDatabase>(`/api/resources/suts/${encodeURIComponent(sutId)}/databases`, {
-    environment_id: values.environmentId,
     name: values.name.trim(),
     dsn: values.dsn.trim(),
     username: values.username.trim(),
@@ -275,9 +328,19 @@ export type AccountPatch = {
   password?: string
 }
 
+/** The global test-account pool (v0.2.4-B: accounts are not SUT-scoped). */
+export async function listAccounts(): Promise<TestAccount[]> {
+  const page = await apiGetPage<TestAccount>(`/api/resources/accounts?limit=${PAGE_LIMIT}`)
+  return page.items
+}
+
+/**
+ * Creates a row of the global account pool. `sutId` is the optional SUT affinity
+ * hint (empty means no affinity); the account is not owned by the SUT.
+ */
 export function createAccount(sutId: string, values: AccountFormValues): Promise<TestAccount> {
-  return apiPost<TestAccount>(`/api/resources/suts/${encodeURIComponent(sutId)}/accounts`, {
-    environment_id: values.environmentId,
+  return apiPost<TestAccount>("/api/resources/accounts", {
+    sut_id: sutId,
     username: values.username.trim(),
     password: values.password,
     roles: splitList(values.roles),

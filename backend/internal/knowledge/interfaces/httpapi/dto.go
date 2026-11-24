@@ -120,10 +120,20 @@ type knowledgeItemView struct {
 }
 
 // knowledgeItemDetailView is the GET detail: the item fields plus the
-// append-only content history (p7-api.md §1).
+// append-only content history (p7-api.md §1) and the read-time knowledge_usage
+// aggregates (injection count / last used).
 type knowledgeItemDetailView struct {
 	knowledgeItemView
 	Revisions []knowledgeRevisionView `json:"revisions"`
+	Usage     knowledgeUsageStatsView `json:"usage"`
+}
+
+// knowledgeUsageStatsView projects the per-item knowledge_usage aggregates.
+// injection_count is a derived COUNT (never a stored counter); last_used_at is
+// null for an item that has never been injected.
+type knowledgeUsageStatsView struct {
+	InjectionCount int64   `json:"injection_count"`
+	LastUsedAt     *string `json:"last_used_at"`
 }
 
 // knowledgeBindingsView is the 0.2.1 structured SUT binding projection. IDs are
@@ -175,12 +185,19 @@ func toItemView(item knowledge.Item) knowledgeItemView {
 	}
 }
 
-func toItemDetailView(item knowledge.Item, revisions []knowledge.Revision) knowledgeItemDetailView {
+func toItemDetailView(item knowledge.Item, revisions []knowledge.Revision, usage knowledgeapp.UsageStats) knowledgeItemDetailView {
 	views := make([]knowledgeRevisionView, 0, len(revisions))
 	for _, revision := range revisions {
 		views = append(views, toRevisionView(revision))
 	}
-	return knowledgeItemDetailView{knowledgeItemView: toItemView(item), Revisions: views}
+	return knowledgeItemDetailView{
+		knowledgeItemView: toItemView(item),
+		Revisions:         views,
+		Usage: knowledgeUsageStatsView{
+			InjectionCount: usage.InjectionCount,
+			LastUsedAt:     timeStringPointer(usage.LastUsedAt),
+		},
+	}
 }
 
 func toRevisionView(revision knowledge.Revision) knowledgeRevisionView {

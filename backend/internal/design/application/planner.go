@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -53,6 +54,50 @@ type Planner struct {
 	versions      VersionStarter
 	staler        Staler
 	converger     DesignConverger
+	// judgments and judgeSettings wire the independent-judge scheduling path
+	// (T8). They are injected by SetJudgeScheduler at the composition root
+	// (T13); until then ensureJudgeTasks is a no-op so degraded assemblies and
+	// the legacy planner tests keep working.
+	judgments     JudgmentRepository
+	judgeSettings SettingsReader
+	// reworkBudget is the OPTIONAL escalation-budget read (terminal
+	// design.rework work items of one logical case, spec SC-E4). Nil keeps the
+	// round-derived CountReworks as the only budget source, so degraded
+	// assemblies and the legacy planner paths behave exactly as before.
+	reworkBudget ReworkBudgetReader
+	// authorBatch is the OPTIONAL authoring-batch settle read the judge
+	// scheduling predicate gates on (H-F6). Nil keeps the pre-H-F6 predicate
+	// (coverage union + pending drafts) so degraded assemblies and the legacy
+	// planner paths behave exactly as before; production wires the targeted
+	// work-item adapter at the composition root.
+	authorBatch AuthorBatchReader
+	// reviewGate is the shared designing -> case_review review predicate (T9).
+	// The composition root (T13) wires the SAME *ReviewGateService instance here
+	// and into the version stage service's manual advance, so the two paths share
+	// one truth. An unwired gate fails closed: converge does not advance.
+	reviewGate DesignReviewGate
+	// logger attributes automatic-path degradation (constitution VII.6/VII.7).
+	// A nil logger falls back to slog.Default(), so a degraded assembly still
+	// logs; the composition root injects the process logger.
+	logger *slog.Logger
+}
+
+// SetLogger wires the planner's diagnostic logger. It is a setter for the same
+// reason as the other collaborators: the composition root builds the logger
+// alongside the rest of the assembly. A nil logger keeps slog.Default().
+func (p *Planner) SetLogger(logger *slog.Logger) *Planner {
+	if p != nil {
+		p.logger = logger
+	}
+	return p
+}
+
+// log returns the planner's logger, never nil.
+func (p *Planner) log() *slog.Logger {
+	if p != nil && p.logger != nil {
+		return p.logger
+	}
+	return slog.Default()
 }
 
 // NewPlanner wires the design planner. Sinks and collaborators may be nil in
@@ -144,7 +189,7 @@ func (p *Planner) StartRound(ctx context.Context, versionID, conversationID, act
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
+		if err := p.ensureCriticTasks(ctx, versionID); err != nil {
 			return err
 		}
 		p.markRunning(ctx, versionID)
@@ -250,7 +295,7 @@ func (p *Planner) StartStageRound(ctx context.Context, versionID int64, requeste
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
+		if err := p.ensureCriticTasks(ctx, versionID); err != nil {
 			return err
 		}
 		p.markRunning(ctx, versionID)
@@ -606,9 +651,13 @@ func (p *Planner) ensureCoverageRepairTasks(ctx context.Context, versionID int64
 	return nil
 }
 
-// ensureCriticAndDataPlanTasks enqueues the per-requirement-version critic and
-// data-planner tasks derived from the current coverage.
-func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID int64) error {
+// ensureCriticTasks enqueues the per-requirement-version critic tasks derived
+// from the current coverage, then runs the independent-judge scheduling pass
+// (T8). Judge scheduling rides the same activation/reconcile paths that ensure
+// critics, so a judge run is scheduled (and a judge fail observed) wherever the
+// design graph is reconciled. ensureJudgeTasks is a no-op until the judge ports
+// are wired (T13).
+func (p *Planner) ensureCriticTasks(ctx context.Context, versionID int64) error {
 	if p.enqueuer == nil {
 		return nil
 	}
@@ -637,20 +686,8 @@ func (p *Planner) ensureCriticAndDataPlanTasks(ctx context.Context, versionID in
 				return err
 			}
 		}
-		if item.DraftCount > 0 {
-			if _, err := p.enqueuer.Ensure(ctx, TaskInput{
-				VersionID: versionID,
-				Team:      TeamDesign,
-				Type:      TaskTypeDesignDataPlan,
-				DedupeKey: fmt.Sprintf("dataplan:%d:%d", item.Requirement.ID, item.Requirement.CurrentVersionID),
-				Payload:   payload,
-				Priority:  priority,
-			}); err != nil {
-				return err
-			}
-		}
 	}
-	return nil
+	return p.ensureJudgeTasks(ctx, versionID)
 }
 
 // markRunning projects the version to running. Best effort: the reconciler is

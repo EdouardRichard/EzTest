@@ -23,7 +23,7 @@ func TestResourceDecisionObserverWiredToBothDeliveryPaths(t *testing.T) {
 	for _, fragment := range []string{
 		"decisionObserver := executionapp.NewResourceDecisionObserver(",
 		"eventSvc.Observe(decisionObserver)",
-		"p7rt.Listener.Observe(decisionObserver)",
+		"orchRuntime.Listener.Observe(decisionObserver)",
 	} {
 		if !strings.Contains(content, fragment) {
 			t.Errorf("main.go is missing the W1-14B decision-observer wiring %q", fragment)

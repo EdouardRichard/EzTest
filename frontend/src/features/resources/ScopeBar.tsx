@@ -56,7 +56,6 @@ export function ScopeBar({
             {environments.map((environment) => (
               <option key={environment.id} value={environment.id}>
                 {environment.name}
-                {environment.is_default ? "（默认）" : ""}
               </option>
             ))}
           </Select>

@@ -4,7 +4,11 @@ import "@testing-library/jest-dom/vitest"
 
 import { ApiError } from "@/lib/api-client"
 
-import { DiscoveryRevisionNotice } from "./DiscoveryRevisionNotice"
+import {
+  DiscoveryRevisionNotice,
+  discoveryRevisionFromCaseVersion,
+  discoveryRevisionFromEventPayload,
+} from "./DiscoveryRevisionNotice"
 import type { CaseRevisionRollbackView } from "./types"
 
 const rollbackResult: CaseRevisionRollbackView = {
@@ -164,6 +168,72 @@ describe("DiscoveryRevisionNotice", () => {
     )
 
     expect(screen.getByText(/只读/)).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "回滚" })).not.toBeInTheDocument()
+  })
+})
+
+describe("discovery draft semantics (R-E2r, v0.2.4-E)", () => {
+  afterEach(cleanup)
+
+  it("models the auto_confirmed event as a rollback DRAFT, never a confirmation", () => {
+    const parsed = discoveryRevisionFromEventPayload({
+      case_id: "7001",
+      case_version_id: "7010",
+      trigger: "rollback",
+      rollback_of: "7009",
+      source_observation_id: "501",
+      resource_id: "2301",
+      confidence: "high",
+      actor: "1",
+    })
+    expect(parsed).not.toBeNull()
+    expect(parsed?.status).toBe("draft")
+    expect(parsed?.trigger).toBe("rollback")
+    expect(parsed?.rollbackOf).toBe("7009")
+  })
+
+  it("reads the authoritative payload status instead of hard-coding draft", () => {
+    // Additive hardening (final review fix wave): the producer now publishes the
+    // replacement's lifecycle status. It is always draft today, but the consumer
+    // must not infer lifecycle from the misleading event name.
+    const base = { case_id: "7001", case_version_id: "7010", trigger: "rollback" }
+    expect(discoveryRevisionFromEventPayload({ ...base, status: "draft" })?.status).toBe("draft")
+    expect(discoveryRevisionFromEventPayload({ ...base, status: "confirmed" })?.status).toBe(
+      "confirmed",
+    )
+    // Missing / unknown values fall back to draft (older producers, malformed rows).
+    expect(discoveryRevisionFromEventPayload(base)?.status).toBe("draft")
+    expect(discoveryRevisionFromEventPayload({ ...base, status: "nonsense" })?.status).toBe("draft")
+    expect(discoveryRevisionFromEventPayload({ ...base, status: 7 })?.status).toBe("draft")
+  })
+
+  it("infers judgment_pending for a discovery draft from its sources", () => {
+    const inferred = discoveryRevisionFromCaseVersion({
+      case_version_id: "7010",
+      revision: 2,
+      status: "draft",
+      sources: [{ path: "discovery_delta" }],
+    })
+    expect(inferred?.inferred).toBe(true)
+    expect(inferred?.lowConfidenceReason).toBe("judgment_pending")
+  })
+
+  it("renders a judgment_pending draft as awaiting judge review, not auto-confirmed", () => {
+    render(
+      <DiscoveryRevisionNotice
+        revision={{
+          caseId: "7001",
+          caseVersionId: "7010",
+          status: "draft",
+          trigger: "discovery_delta",
+          lowConfidenceReason: "judgment_pending",
+          inferred: true,
+        }}
+      />,
+    )
+    expect(screen.getByText("待裁判审查")).toBeInTheDocument()
+    expect(screen.getByText(/等待裁判审查后由人工确认/)).toBeInTheDocument()
+    expect(screen.queryByText("自动确认")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "回滚" })).not.toBeInTheDocument()
   })
 })

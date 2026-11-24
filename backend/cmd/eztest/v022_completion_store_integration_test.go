@@ -30,9 +30,15 @@ func TestPGCompletionStoreCommitsPlanAndFactAtomically(t *testing.T) {
 
 	versionID := ids.Next()
 	versionRepo := versioninfra.New(pool, ids)
+	// v0.2.4-B: version.environment_id is NOT NULL. It stays a logical
+	// cross-context reference (no physical foreign key), so the fixture seeds the
+	// environment row the version points at to stay internally consistent.
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (990001, 'completion fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
 	if err := versionRepo.Create(ctx, versiondomain.Version{
 		ID: versionID, Title: "Completion version", Status: versiondomain.StatusInitial,
-		CreatedBy: 42, CreatedAt: now, UpdatedAt: now,
+		CreatedBy: 42, CreatedAt: now, UpdatedAt: now, EnvironmentID: 990001,
 	}, nil); err != nil {
 		t.Fatalf("create version: %v", err)
 	}

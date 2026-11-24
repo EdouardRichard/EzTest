@@ -12,6 +12,7 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // IntentService creates and cancels execution intents. The automatic initial
@@ -65,10 +66,31 @@ func NewIntentService(deps IntentServiceDeps) *IntentService {
 // startup/leader scan's version list (the newest versions regardless of status,
 // so completed ones can be included) reaches that branch; R49 scans running
 // versions only and never repairs or reopens a completed version.
+//
+// GATE VOCABULARY (v0.2.4-G T3, SC-G12, unified across intent/supersede):
+//   - STAGE gates (these constants, derived from the version stage authority)
+//     decide whether an AUTOMATIC/batch intent may be created at this workflow
+//     point. Stage "completed" and status "completed" are different enums that
+//     happen to share a string; they must never be conflated.
+//   - STATUS gates (version.StatusCompleted) decide whether creating a genuinely
+//     new intent must REOPEN the version. That decision is made ONLY under the
+//     version advisory lock inside the repository (dedup/conflicts first, R-G9)
+//     and acted on ONLY by the createIntent loop — no service entry point
+//     pre-reopens from its own out-of-lock status read.
+//   - CreateManual (explicit human retest/manual) deliberately has NO stage
+//     gate: a user may retest from any stage (e.g. reporting); its only status
+//     interaction is the same lock-internal reopen decision.
 const (
-	intentExecutableStage = "executing"
-	intentCompletedStage  = "completed"
+	intentExecutableStage = string(versiondomain.StageExecuting)
+	intentCompletedStage  = string(versiondomain.StageCompleted)
 )
+
+// intentStageAllowsCreate is the ONE automatic-path stage predicate shared by
+// the initial-intent scan and the supersede re-plan (single source for the
+// "executing, or completed where a new intent reopens" rule).
+func intentStageAllowsCreate(stage string) bool {
+	return stage == intentExecutableStage || stage == intentCompletedStage
+}
 
 // EnsureInitialIntents is the startup/leader repair scan (P3 §5.1/§5.7). It
 // refreshes initial intents only for the case selection frozen by the
@@ -165,7 +187,7 @@ func (s *IntentService) ensureInitialIntents(
 		return 0, mapExecutionError(err, "version")
 	}
 	executableStage := binding.Stage == intentExecutableStage ||
-		(!explicit && binding.Stage == intentCompletedStage)
+		(!explicit && intentStageAllowsCreate(binding.Stage))
 	if !executableStage {
 		if explicit {
 			return 0, invalidStageForExecution(binding.Stage)
@@ -231,13 +253,19 @@ func (s *IntentService) ensureInitialIntents(
 	if err := ensureExecutableCaseCompleteness(cases); err != nil {
 		return 0, err
 	}
+	// SC-F7: intent creation keeps the LIVE catalog read — it precedes any wave,
+	// and the live read is precisely the change-detection mechanism (a catalog
+	// change yields a new fingerprint -> a new intent -> the next wave). Freezing
+	// it here would kill detection; only wave-level consumers use the frozen scope.
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
 		return 0, err
 	}
-	baseline := CodeBaseline(binding)
+	baseline, err := CodeBaseline(binding)
+	if err != nil {
+		return 0, err
+	}
 	now := s.now()
-	reopened := false
 	created := 0
 	for _, snapshot := range cases {
 		existing, err := s.intents.CountInitialFor(ctx, snapshot.CaseVersionID, fingerprint, baseline)
@@ -247,18 +275,17 @@ func (s *IntentService) ensureInitialIntents(
 		if existing > 0 {
 			continue
 		}
-		if !reopened && binding.Status == "completed" {
-			if err := s.versions.Reopen(ctx, versionID); err != nil {
-				return created, mapExecutionError(err, "version")
-			}
-			binding.Status = "running"
-			reopened = true
-		}
+		// R-G9 (SC-G12): no pre-reopen here. The count above is an out-of-lock
+		// fast path; the authoritative dedup and the completed-version reopen
+		// decision happen under the version advisory lock inside createIntent
+		// (conflicts first, reopen only for a genuinely new intent). Reopening
+		// from this stale status read would mis-reopen a completed version when
+		// a concurrent scan already owns the natural key.
 		intent := execution.ExecutionIntent{
 			ID:                     s.ids.Next(),
 			VersionID:              versionID,
 			CaseVersionID:          snapshot.CaseVersionID,
-			VersionSUTIDs:          caseIntentVersionSUTIDs(snapshot),
+			SUTIDs:                 SUTIDs(binding),
 			EnvironmentFingerprint: fingerprint,
 			CodeBaseline:           baseline,
 			Purpose:                execution.PurposeInitial,
@@ -316,22 +343,29 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 	if err := ensureExecutableCaseCompleteness([]execution.CaseSnapshot{snapshot}); err != nil {
 		return execution.ExecutionIntent{}, err
 	}
+	// SC-F7: the retest/manual entry point also keeps the LIVE read (it creates an
+	// intent before any wave exists), so a catalog change is detected as a new
+	// fingerprint rather than masked by a frozen snapshot.
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
 		return execution.ExecutionIntent{}, err
 	}
-	baseline := CodeBaseline(binding)
-	if binding.Status == "completed" {
-		if err := s.versions.Reopen(ctx, versionID); err != nil {
-			return execution.ExecutionIntent{}, mapExecutionError(err, "version")
-		}
+	baseline, err := CodeBaseline(binding)
+	if err != nil {
+		return execution.ExecutionIntent{}, err
 	}
+	// R-G9 (SC-G12): no pre-reopen from this out-of-lock status read. The
+	// repository resolves dedup/conflicts under the version advisory lock
+	// BEFORE it reports a completed version; only a genuinely new,
+	// non-conflicting intent reaches the createIntent loop's reopen+retry.
+	// A duplicate retest or a closed requirement must never flip a completed
+	// version to running.
 	now := s.now()
 	intent := execution.ExecutionIntent{
 		ID:                     s.ids.Next(),
 		VersionID:              versionID,
 		CaseVersionID:          caseVersionID,
-		VersionSUTIDs:          caseIntentVersionSUTIDs(snapshot),
+		SUTIDs:                 SUTIDs(binding),
 		EnvironmentFingerprint: fingerprint,
 		CodeBaseline:           baseline,
 		Purpose:                purpose,
@@ -411,13 +445,18 @@ var activeIntentStatuses = []execution.IntentStatus{execution.IntentOpen, execut
 const intentCreateAttempts = 3
 
 // createIntent inserts an intent through the repository, which serializes with
-// version close/requirement closure on the version advisory lock. When a
-// concurrent close committed first the repository reports ErrVersionCompleted;
-// the service reopens the version through the version port (P4
-// version.reopened, trigger=execution_intent) and retries so the final state is
-// never a completed version with an active intent. A closed requirement is
-// returned as-is: the callers decide between skipping (reconciler) and a state
-// conflict (manual API).
+// version close/requirement closure on the version advisory lock. Under that
+// lock the repository resolves conflicts FIRST (R-G9, SC-G12): a duplicate
+// natural key returns ErrDuplicate and a closed requirement returns
+// ErrRequirementClosed, neither of which is a reopen trigger. Only a genuinely
+// new, non-conflicting intent whose version close committed first gets
+// ErrVersionCompleted; the service then reopens the version through the version
+// port (P4 version.reopened, trigger=execution_intent) and retries so the final
+// state is never a completed version with an active intent. This loop is the
+// ONLY reopen actor on the intent creation path — the service entry points do
+// not pre-reopen, so a duplicate/conflicting intent can never mis-reopen a
+// completed version. A closed requirement is returned as-is: the callers decide
+// between skipping (reconciler) and a state conflict (manual API).
 func (s *IntentService) createIntent(ctx context.Context, intent execution.ExecutionIntent) error {
 	for attempt := 0; attempt < intentCreateAttempts; attempt++ {
 		err := s.intents.Create(ctx, intent)
@@ -440,7 +479,7 @@ func (s *IntentService) publishCreated(ctx context.Context, intent execution.Exe
 		"intent_id":       platformid.Format(intent.ID),
 		"case_version_id": platformid.Format(intent.CaseVersionID),
 		"purpose":         string(intent.Purpose),
-		"version_sut_ids": idsToStrings(intent.VersionSUTIDs),
+		"sut_ids":         idsToStrings(intent.SUTIDs),
 		"version_id":      versionRef,
 	}
 	if replannedFromCaseVersionID > 0 {
@@ -548,22 +587,4 @@ func invalidStageForExecution(current string) error {
 			"next_action":    "confirm the selected cases at the case gate and execute the batch again",
 		},
 	}
-}
-
-// caseIntentVersionSUTIDs is the §5.1 intent SUT set: every step's resolved
-// target plus the case default, deduplicated and sorted.
-func caseIntentVersionSUTIDs(snapshot execution.CaseSnapshot) []int64 {
-	ids := make([]int64, 0, len(snapshot.Steps)+1)
-	ids = append(ids, snapshot.DefaultVersionSUTID)
-	for _, step := range snapshot.Steps {
-		ids = append(ids, step.TargetVersionSUTID)
-	}
-	if len(ids) == 0 || (len(ids) == 1 && ids[0] <= 0) {
-		ids = append(ids, snapshot.VersionSUTIDs...)
-	}
-	normalized, err := uniqueSortedIDs(ids)
-	if err != nil {
-		return append([]int64(nil), snapshot.VersionSUTIDs...)
-	}
-	return normalized
 }

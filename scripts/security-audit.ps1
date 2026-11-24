@@ -783,16 +783,32 @@ function Invoke-StaticPermissionMatrix {
         }
     }
 
-    $authWiring = [regex]::IsMatch($flatServer, 'authenticatedAPI\(deps\.Auth\)\(handler\)')
-    $authExclusions = [regex]::IsMatch($flatServer, 'case "/api/health", "/api/openapi.yaml":') -and
-        [regex]::IsMatch($flatServer, 'strings\.HasPrefix\(r\.URL\.Path, "/api/"\)') -and
-        [regex]::IsMatch($flatServer, '!strings\.HasPrefix\(r\.URL\.Path, "/api/auth/"\)')
+    # The server enforces auth per route group (`RequireAuth`/`RequireAdmin`
+    # closures passed to each Register function), not through one global /api
+    # wrapper. The only unauthenticated routes are the health probes and login;
+    # the executor-internal endpoints use the API<->executor Bearer pipe
+    # (`InternalTokenAuth`). This is the real route set read from the handlers
+    # (server/health.go, orchestration routes.go, identity handler.go, execution
+    # routes.go). The former expectation of a global `authenticatedAPI` wrapper
+    # plus an `/api/openapi.yaml` exclusion was a phantom: no such route exists.
+    $authWiring = [regex]::IsMatch($flatServer, 'authenticated := RequireAuth\(') -and
+        [regex]::IsMatch($flatServer, 'admin := RequireAdmin\(')
+    $publicRoutePatterns = @(
+        'mux\.HandleFunc\("GET /healthz"',
+        'mux\.HandleFunc\("GET /api/health"',
+        'mux\.Handle\("GET /api/health/ready", http\.HandlerFunc\(h\.Ready\)\)',
+        'mux\.Handle\("POST /api/auth/login", http\.HandlerFunc\(h\.Login\)\)'
+    )
+    $publicRoutesPresent = @($publicRoutePatterns | Where-Object { -not [regex]::IsMatch($script:flatGoText, $_) }).Count -eq 0
+    $authExclusions = $publicRoutesPresent -and
+        [regex]::IsMatch($flatServer, 'executionhttp\.RegisterInternalRoutes\(mux, tokenAuth, execution\)') -and
+        (-not [regex]::IsMatch($script:flatGoText, '"/api/openapi\.yaml"'))
     if ($authWiring -and $authExclusions) {
-        Add-Result -Area "permissions" -Check "global bearer auth" -Status "PASS" `
-            -Detail "every /api route except health/openapi/auth requires a bearer token"
+        Add-Result -Area "permissions" -Check "bearer auth wiring" -Status "PASS" `
+            -Detail "every /api route requires a bearer token except the health probes, login, and the executor-internal Bearer pipe; no /api/openapi.yaml route"
     } else {
-        Add-Result -Area "permissions" -Check "global bearer auth" -Status "FAIL" `
-            -Detail ("authenticatedAPI={0}; route exclusions={1}" -f $authWiring, $authExclusions)
+        Add-Result -Area "permissions" -Check "bearer auth wiring" -Status "FAIL" `
+            -Detail ("auth wiring={0}; public route set={1}; exclusions={2}" -f $authWiring, $publicRoutesPresent, $authExclusions)
     }
 
     if ([regex]::IsMatch($flatServer, 'agentChannelAdminOnly') -and

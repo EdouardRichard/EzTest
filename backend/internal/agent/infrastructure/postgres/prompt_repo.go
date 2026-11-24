@@ -111,11 +111,11 @@ func (r *RuntimeRepository) EnsurePromptRevision(ctx context.Context, profileKey
 	if _, err := r.pool.Exec(ctx, `
 		INSERT INTO agent_profile_prompt_revision
 			(id, profile_key, version, system_prompt, note, source, actor_id, created_at)
-		SELECT $1, $2, 1, $3, NULL, 'seed', NULL, now()
+		SELECT $1, $2, 1, $3, NULL, $4, NULL, now()
 		WHERE NOT EXISTS (
 			SELECT 1 FROM agent_profile_prompt_revision WHERE profile_key = $2
 		)
-	`, r.ids.Next(), profileKey, prompt); err != nil {
+	`, r.ids.Next(), profileKey, prompt, agent.PromptSourceSeed); err != nil {
 		return wrapDB("backfill prompt revision", err)
 	}
 	return nil

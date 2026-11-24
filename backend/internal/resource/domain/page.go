@@ -22,11 +22,10 @@ const (
 	PageSourceImport = "import"
 )
 
-// Page is one UI page of a SUT environment.
+// Page is one UI page of a SUT.
 type Page struct {
 	ID            int64
 	SUTID         int64
-	EnvironmentID int64
 	Name          string
 	URL           string
 	RouteTemplate string
@@ -79,7 +78,7 @@ func (p Page) Validate() error {
 	return nil
 }
 
-// ErrPageURLDuplicate reports a collision on (environment_id, normalized_url).
+// ErrPageURLDuplicate reports a collision on (sut_id, normalized_url).
 var ErrPageURLDuplicate = fmt.Errorf("page url already exists: %w", ErrDuplicate)
 
 var (

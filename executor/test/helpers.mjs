@@ -1,7 +1,6 @@
+import crypto from "node:crypto"
 import http from "node:http"
 import { once } from "node:events"
-
-import { MAX_ARTIFACT_BYTES } from "../src/security.mjs"
 
 const HOME_HTML = `<!doctype html>
 <html>
@@ -20,7 +19,6 @@ const HOME_HTML = `<!doctype html>
     <div class="dup">duplicate value</div>
     <a id="next" href="/second">Next page</a>
     <a id="download" href="/download">Download</a>
-    <a id="download-large" href="/download-large">Large download</a>
     <div id="clicked"></div>
     <input id="upload" type="file" aria-label="Upload" />
     <input id="upload-hidden" type="file" aria-label="Hidden upload" style="display:none" />
@@ -77,6 +75,40 @@ const SPAM_HTML = `<!doctype html>
 <script>for (let i = 0; i < 600; i += 1) { console.log('spam-' + i) }</script>
 </body></html>`
 
+// AC-010 (T15): the browser CLI capability fixtures. cli-home carries a
+// double-click target, a file input (chooser flow), a same-origin iframe with an
+// interactive button (cross-frame snapshot refs), a target=_blank popup link, and
+// a button that appears after a delay (explicit wait strategies via run-code).
+const CLI_HOME_HTML = `<!doctype html>
+<html><head><title>CLI Home</title></head>
+<body>
+<h1>CLI Home</h1>
+<button id="dbl" ondblclick="document.getElementById('dbl-out').textContent='double-clicked'">Double me</button>
+<div id="dbl-out"></div>
+<input id="text" aria-label="Text" />
+<input id="file" type="file" aria-label="File" />
+<div id="file-out"></div>
+<iframe id="frame" src="/cli-child" width="320" height="140"></iframe>
+<a id="popup" target="_blank" href="/cli-popup">Open tab</a>
+<button id="late" style="display:none">Late button</button>
+<script>
+  document.getElementById('file').addEventListener('change', (e) => {
+    document.getElementById('file-out').textContent = 'uploaded:' + [...e.target.files].map(f => f.name).join(',');
+  });
+  setTimeout(() => { document.getElementById('late').style.display = 'block'; }, 600);
+</script>
+</body></html>`
+
+const CLI_CHILD_HTML = `<!doctype html>
+<html><head><title>CLI Child</title></head>
+<body>
+<button id="inner" onclick="document.getElementById('inner-out').textContent='inner-clicked'">Inner button</button>
+<div id="inner-out"></div>
+</body></html>`
+
+const CLI_POPUP_HTML = `<!doctype html>
+<html><head><title>CLI Popup</title></head><body><h1>CLI Popup page</h1></body></html>`
+
 /**
  * Starts a local http server that serves the self-test pages. Tests must never
  * depend on the repository fixture scripts.
@@ -122,8 +154,8 @@ export async function startLocalPage() {
         res.end("download-body")
         return
       case "/redirect-blocked":
-        // Same server, different hostname: resolves locally, but the executor
-        // allow list only contains 127.0.0.1, so the redirect must be blocked.
+        // Same server, different hostname: resolves locally. GD-01 removed the
+        // host allow list, so the cross-host redirect is followed.
         res.writeHead(302, { location: `http://localhost:${req.socket.localPort}/second` })
         res.end()
         return
@@ -132,7 +164,8 @@ export async function startLocalPage() {
         res.end()
         return
       case "/popup":
-        // localhost is intentionally not in allowedHosts while 127.0.0.1 is.
+        // localhost is a different hostname than 127.0.0.1; GD-01 removed the
+        // host allow list, so the popup navigation is allowed.
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
           `<!doctype html><html><head><title>Popup</title></head><body><h1>Popup</h1>` +
@@ -141,7 +174,7 @@ export async function startLocalPage() {
         )
         return
       case "/popup-redirect":
-        // Opens an allowed URL that redirects to the disallowed localhost host.
+        // Opens a URL that redirects to a different hostname (localhost).
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
           `<!doctype html><html><head><title>Popup redirect</title></head><body><h1>Popup redirect</h1>` +
@@ -166,8 +199,8 @@ export async function startLocalPage() {
         res.end(`<!doctype html><html><body><h1>Iframe target</h1></body></html>`)
         return
       case "/swtest":
-        // A service worker would otherwise be able to request hosts that the
-        // page-level allow list guard never sees.
+        // GD-01: service workers are no longer blocked; registration succeeds
+        // and the worker may issue its own requests.
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
           `<!doctype html><html><head><title>SW</title></head><body><h1>SW</h1>` +
@@ -207,8 +240,8 @@ export async function startLocalPage() {
         res.end("sw-fetch")
         return
       case "/wstest":
-        // Opened from the page itself: the context WebSocket guard must block
-        // localhost (not in allowedHosts) and close the socket with 1008.
+        // Opened from the page itself: GD-01 removed the WebSocket guard, so
+        // the cross-hostname handshake reaches the server and opens.
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
           `<!doctype html><html><head><title>WS</title></head><body><h1>WS</h1>` +
@@ -221,10 +254,9 @@ export async function startLocalPage() {
         )
         return
       case "/workertest":
-        // A page-created Worker/SharedWorker is not covered by Playwright's
-        // routeWebSocket (it only routes page WebSockets), so the executor must
-        // block worker creation itself. The blob worker would open a WebSocket
-        // to an allowed host; a successful upgrade would prove the bypass.
+        // GD-01: page-created Worker/SharedWorker instances are no longer
+        // blocked. The blob worker opens a WebSocket whose handshake reaches
+        // the server, proving worker traffic is not intercepted.
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
           `<!doctype html><html><head><title>Worker</title></head><body><h1>Worker</h1>` +
@@ -292,6 +324,20 @@ export async function startLocalPage() {
         res.writeHead(200, { "content-type": "text/plain" })
         res.end("ok")
         return
+      // AC-010 browser CLI fixtures (T15): double-click, file chooser, cross-frame
+      // iframe, multi-tab popup, and a late-appearing element for wait strategies.
+      case "/cli-home":
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(CLI_HOME_HTML)
+        return
+      case "/cli-child":
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(CLI_CHILD_HTML)
+        return
+      case "/cli-popup":
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(CLI_POPUP_HTML)
+        return
       case "/slow":
         setTimeout(() => {
           res.writeHead(200, { "content-type": "text/plain" })
@@ -303,14 +349,6 @@ export async function startLocalPage() {
           }
         })
         return
-      case "/download-large":
-        res.writeHead(200, {
-          "content-type": "application/octet-stream",
-          "content-disposition": 'attachment; filename="large.bin"',
-          "content-length": String(MAX_ARTIFACT_BYTES + 1),
-        })
-        res.end(Buffer.alloc(MAX_ARTIFACT_BYTES + 1, 0x61))
-        return
       case "/boom":
         res.writeHead(500, { "content-type": "text/plain" })
         res.end("boom")
@@ -321,10 +359,27 @@ export async function startLocalPage() {
     }
   })
   server.on("upgrade", (req, socket) => {
-    // A WebSocket handshake that reaches the server proves the allow-list guard
-    // was bypassed (for example from a worker). Refuse it and record the path.
+    // GD-01: the executor installs no WebSocket guard, so handshakes reach the
+    // server. Complete the handshake so pages/workers observe a real open event;
+    // the recorded path proves the connection was not intercepted.
     upgrades.push(req.url)
-    socket.destroy()
+    const key = req.headers["sec-websocket-key"]
+    if (typeof key !== "string" || key.length === 0) {
+      socket.destroy()
+      return
+    }
+    const accept = crypto
+      .createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64")
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n` +
+        "\r\n",
+    )
+    socket.on("error", () => {})
   })
   server.listen(0, "127.0.0.1")
   await once(server, "listening")
@@ -367,6 +422,6 @@ export function httpClient(baseUrl, token) {
     } catch {
       json = undefined
     }
-    return { status: response.status, json, text }
+    return { status: response.status, json, text, headers: response.headers }
   }
 }

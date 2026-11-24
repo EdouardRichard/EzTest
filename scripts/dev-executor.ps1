@@ -167,8 +167,8 @@ if ($tokenSource -ne "") {
 if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_ADDR)) {
     $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:13336"
 }
-if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_MAX_CONTEXTS)) {
-    $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "8"
+if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_MAX_SESSIONS)) {
+    $env:EZTEST_EXECUTOR_MAX_SESSIONS = "8"
 }
 
 $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
@@ -189,7 +189,7 @@ if (-not $SkipInstall -and -not (Test-Path -LiteralPath (Join-Path $executorDir 
     }
 }
 
-Write-Host "Starting EzTest executor on http://$($env:EZTEST_EXECUTOR_ADDR) (max contexts $($env:EZTEST_EXECUTOR_MAX_CONTEXTS))..." -ForegroundColor Cyan
+Write-Host "Starting EzTest executor on http://$($env:EZTEST_EXECUTOR_ADDR) (max sessions $($env:EZTEST_EXECUTOR_MAX_SESSIONS))..." -ForegroundColor Cyan
 Write-Host "Health: http://$($env:EZTEST_EXECUTOR_ADDR)/healthz (no token required)" -ForegroundColor Cyan
 Write-Host "The API needs the same EZTEST_EXECUTOR_TOKEN (see scripts\dev-api.ps1)." -ForegroundColor Yellow
 Write-Host "Press Ctrl+C to stop." -ForegroundColor Cyan

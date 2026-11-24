@@ -86,7 +86,7 @@ const nodes: ChainNodeView[] = [
     ref_id: "7001",
     label: "退款 T+1 到账",
     status: "confirmed",
-    version_sut_id: "3001",
+    sut_id: "3001",
     requirement_id: "6001",
     created_at: created,
     meta: { result: "failed", revision: 2 },
@@ -97,7 +97,7 @@ const nodes: ChainNodeView[] = [
     ref_id: "9201",
     label: "波次 #9201",
     status: "done",
-    version_sut_id: "3001",
+    sut_id: "3001",
     created_at: created,
     meta: { total: 3, passed: 2, failed: 1 },
   },
@@ -107,7 +107,7 @@ const nodes: ChainNodeView[] = [
     ref_id: "9301",
     label: "退款 T+1 到账 · run",
     status: "failed",
-    version_sut_id: "3001",
+    sut_id: "3001",
     wave_id: "9201",
     case_version_id: "7001",
     created_at: created,
@@ -125,7 +125,7 @@ const nodes: ChainNodeView[] = [
     ref_id: "9101",
     label: "退款金额与订单金额不一致",
     status: "open",
-    version_sut_id: "3001",
+    sut_id: "3001",
     case_run_id: "9301",
     issue_id: "9101",
     created_at: created,
@@ -391,11 +391,11 @@ describe("ChainTab", () => {
   it("passes SUT, page, wave, status and result filters to the chain API", async () => {
     await renderChain()
 
-    fireEvent.change(screen.getByLabelText("SUT"), { target: { value: "3001" } })
+    fireEvent.change(screen.getByLabelText("SUT"), { target: { value: "1001" } })
     await waitFor(() =>
       expect(api.getChain).toHaveBeenLastCalledWith(
         "2001",
-        expect.objectContaining({ sutId: "3001" }),
+        expect.objectContaining({ sutId: "1001" }),
       ),
     )
 
@@ -403,7 +403,7 @@ describe("ChainTab", () => {
     await waitFor(() =>
       expect(api.getChain).toHaveBeenLastCalledWith(
         "2001",
-        expect.objectContaining({ sutId: "3001", pageId: "1301" }),
+        expect.objectContaining({ sutId: "1001", pageId: "1301" }),
       ),
     )
 

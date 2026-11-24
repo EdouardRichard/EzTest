@@ -155,6 +155,33 @@ func TestStepExecutorLimitationRejectsUnknownCode(t *testing.T) {
 	}
 }
 
+// TestBrowserCliUnavailableIsExecutorCapability pins the final-review finding 2
+// allowlist decision: browser_cli_unavailable is a CONCRETE executor capability
+// code (the official playwright CLI runtime is missing on the executor host,
+// executor/src/browser_cli.mjs) — it can never describe a SUT defect, unlike a
+// generic *_unavailable suffix. It therefore earns the X-02 protection: the run
+// blocks with terminal_cause=executor_capability and no issue candidate.
+func TestBrowserCliUnavailableIsExecutorCapability(t *testing.T) {
+	if !IsExecutorLimitationCode("browser_cli_unavailable") {
+		t.Fatal("browser_cli_unavailable must be a known executor capability code")
+	}
+	code, ok := ExecutorLimitationCodeFromError(
+		"browser_cli_unavailable: playwright-cli is not installed; install @playwright/cli@latest (npm install -g @playwright/cli@latest) or set EZTEST_PLAYWRIGHT_CLI_JS")
+	if !ok || code != "browser_cli_unavailable" {
+		t.Fatalf("ExecutorLimitationCodeFromError = %q/%v, want browser_cli_unavailable/true", code, ok)
+	}
+	step := StepResult{
+		Status: StepBlocked,
+		Observed: map[string]any{
+			"summary":             "页面上没有上传按钮",
+			ExecutorLimitationKey: map[string]any{"code": "browser_cli_unavailable"},
+		},
+	}
+	if StepShowsApplicationDeviation(step) {
+		t.Fatal("a missing-CLI blocked step was read as application evidence")
+	}
+}
+
 func TestExecutorLimitationStepFindsFirstMarkedStep(t *testing.T) {
 	steps := []StepResult{
 		{Seq: 1, Status: StepPassed},

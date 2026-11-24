@@ -102,7 +102,7 @@ func TestRunnerAppendsJobCardPart(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.conv.kind = "design"
 	fixture.chat.responses = []llmapp.ChatResponse{{Content: "本轮设计范围：1 个待设计需求。"}}
-	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
+	item := fakeWorkItem("design.round", agentapp.WorkItemPayload{
 		ConversationID: 20, RoundID: 9001,
 	})
 	item.Kind = "design.cases"
@@ -179,10 +179,12 @@ func TestRunnerAppendsToolErrorPart(t *testing.T) {
 	}
 }
 
-// TestRunnerAppendsPartsNoSecrets is the secret/arguments guard: tool arguments,
-// tool results and reasoning text can carry credentials, so the produced parts
-// must redact them and bound the payload instead of persisting raw secrets.
-func TestRunnerAppendsPartsNoSecrets(t *testing.T) {
+// TestRunnerAppendsPartsKeepsCredentialsPlaintext is the GD-01 (Q05=B) contract:
+// tool arguments, tool results and reasoning text can carry credentials, and the
+// produced parts keep them verbatim — credentials are plaintext by design and may
+// enter logs/evidence/prompt. The legacy part-secret redaction is removed; the
+// payload is still size/depth bounded (an operational bound, not redaction).
+func TestRunnerAppendsPartsKeepsCredentialsPlaintext(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{
 		{
@@ -205,25 +207,28 @@ func TestRunnerAppendsPartsNoSecrets(t *testing.T) {
 		t.Fatalf("encode parts: %v", err)
 	}
 	for _, secret := range []string{"hunter2", "sk-secret-123"} {
-		if strings.Contains(string(encoded), secret) {
-			t.Fatalf("produced parts leak credential %q: %s", secret, encoded)
+		if !strings.Contains(string(encoded), secret) {
+			t.Fatalf("produced parts must keep credential %q verbatim (GD-01 plaintext): %s", secret, encoded)
 		}
+	}
+	if strings.Contains(string(encoded), "[redacted]") {
+		t.Fatalf("produced parts still carry the legacy redaction marker: %s", encoded)
 	}
 	call, ok := partOfType(parts, "tool_call")
 	if !ok {
 		t.Fatalf("tool call part missing: %v", partTypes(parts))
 	}
-	if arguments, ok := call.Data["arguments"].(json.RawMessage); ok && strings.Contains(string(arguments), "hunter2") {
-		t.Fatalf("tool call arguments leak credential: %s", arguments)
+	if arguments, ok := call.Data["arguments"].(json.RawMessage); !ok || !strings.Contains(string(arguments), "hunter2") {
+		t.Fatalf("tool call arguments must keep credential verbatim: %s", arguments)
 	}
-	if result, ok := call.Data["result"].(json.RawMessage); ok && strings.Contains(string(result), "hunter2") {
-		t.Fatalf("tool call result leak credential: %s", result)
+	if result, ok := call.Data["result"].(json.RawMessage); !ok || !strings.Contains(string(result), "hunter2") {
+		t.Fatalf("tool call result must keep credential verbatim: %s", result)
 	}
 	thinking, ok := partOfType(parts, "thinking")
 	if !ok {
 		t.Fatalf("thinking part missing: %v", partTypes(parts))
 	}
-	if strings.Contains(thinking.Text, "hunter2") {
-		t.Fatalf("thinking text leaks credential: %q", thinking.Text)
+	if !strings.Contains(thinking.Text, "hunter2") {
+		t.Fatalf("thinking text must keep credential verbatim: %q", thinking.Text)
 	}
 }

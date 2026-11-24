@@ -1193,7 +1193,7 @@ function Invoke-StaticChecks {
         [void]$problems.Add("missing .env")
     } else {
         $values = Read-DotEnv -Path $script:EnvPath
-        foreach ($key in @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD", "EZTEST_SECRET_KEYS")) {
+        foreach ($key in @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD")) {
             if (-not $values.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$values[$key])) {
                 [void]$problems.Add("missing .env key $key")
             }
@@ -1646,22 +1646,6 @@ function Invoke-Acceptance {
     if ($envValues.ContainsKey("llm_key") -and -not [string]::IsNullOrWhiteSpace([string]$envValues["llm_key"])) {
         [void]$script:secretValues.Add([string]$envValues["llm_key"])
     }
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawKeys)) {
-            [void]$script:secretValues.Add($rawKeys)
-            try {
-                $parsedKeys = $rawKeys | ConvertFrom-Json
-                foreach ($property in $parsedKeys.PSObject.Properties) {
-                    if (-not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                        [void]$script:secretValues.Add([string]$property.Value)
-                    }
-                }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
 
     $script:psqlExe = Resolve-ToolPath -LocalPath (Join-Path $script:RepoRoot ".tools\pgsql\bin\psql.exe") -CommandName "psql.exe"
     $script:goExe = Resolve-ToolPath -LocalPath (Join-Path $script:RepoRoot ".tools\go\bin\go.exe") -CommandName "go.exe"
@@ -1742,9 +1726,7 @@ function Invoke-Acceptance {
     $logsDir = Get-EvidencePath -Name "logs"
     New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
     $storageDir = Join-Path $script:EvidenceRoot "storage"
-    $reportDir = Join-Path $script:EvidenceRoot "reports"
-    $evidenceStore = Join-Path $script:EvidenceRoot "evidence-store"
-    foreach ($dir in @($storageDir, $reportDir, $evidenceStore)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    New-Item -ItemType Directory -Force -Path $storageDir | Out-Null
 
     $fixtureOut = Join-Path $logsDir "fixture-target.out.log"
     $fixtureErr = Join-Path $logsDir "fixture-target.err.log"
@@ -1799,8 +1781,6 @@ server.listen(port, "127.0.0.1");
     $env:EZTEST_WEB_ORIGIN = "http://localhost:6868"
     $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
     $env:EZTEST_STORAGE_DIR = $storageDir
-    $env:EZTEST_REPORT_DIR = $reportDir
-    $env:EZTEST_EVIDENCE_DIR = $evidenceStore
     $env:EZTEST_OPENAPI_PATH = (Join-Path $script:RepoRoot "docs\openapi\api.yaml")
     $env:EZTEST_EXECUTOR_URL = "http://127.0.0.1:$ExecutorPort"
     $env:EZTEST_EXECUTOR_TOKEN = $script:ExecutorToken
@@ -1814,8 +1794,6 @@ server.listen(port, "127.0.0.1");
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
     $env:EZTEST_LOG_LEVEL = "info"
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) { $env:EZTEST_SECRET_KEYS = [string]$envValues["EZTEST_SECRET_KEYS"] }
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEY_ACTIVE")) { $env:EZTEST_SECRET_KEY_ACTIVE = [string]$envValues["EZTEST_SECRET_KEY_ACTIVE"] }
     $env:llm_base_url = "http://127.0.0.1:$LlmPort"
     $env:llm_key = "p7-db-scripted-llm-key"
     $env:llm_model_name = "p7-db-fake-model"

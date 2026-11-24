@@ -67,11 +67,11 @@ func (r *QueryReader) ListDeadWorkItems(ctx context.Context, limit int) ([]agent
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, version_id, type, created_at
 		FROM work_item
-		WHERE status = 'dead'
+		WHERE status = $3
 		  `+cancelMarkerExclusionSQL("last_error", 2)+`
 		ORDER BY created_at DESC, id DESC
 		LIMIT $1
-	`, limit, agentapp.JobCanceledReason)
+	`, limit, agentapp.JobCanceledReason, string(agent.WorkItemDead))
 	if err != nil {
 		return nil, fmt.Errorf("list dead work items: %w", err)
 	}
@@ -117,19 +117,20 @@ func (r *QueryReader) ListWorkItems(ctx context.Context, query agentapp.WorkItem
 		  AND ($2 = '' OR kind = $2)
 		  AND (
 		        $3 = ''
-		     OR ($3 = 'cancelled' AND status = 'failed' AND last_error IS NOT DISTINCT FROM $6)
-		     OR ($3 = 'failed' AND (
-		             status = 'dead'
-		          OR (status = 'failed' AND last_error IS DISTINCT FROM $6)
+		     OR ($3 = $8 AND status = $9 AND last_error IS NOT DISTINCT FROM $6)
+		     OR ($3 = $10 AND (
+		             status = $11
+		          OR (status = $9 AND last_error IS DISTINCT FROM $6)
 		        ))
-		     OR ($3 NOT IN ('cancelled', 'failed') AND status = $3)
+		     OR ($3 NOT IN ($8, $10) AND status = $3)
 		  )
 		  AND ($4 = '' OR created_by = $4)
 		  AND ($5::bigint IS NULL OR id < $5)
 		ORDER BY id DESC
 		LIMIT $7
 	`, query.VersionID, query.Kind, query.State, query.CreatedBy, query.BeforeID,
-		agentapp.JobCanceledReason, limit+1)
+		agentapp.JobCanceledReason, limit+1,
+		agentapp.JobStateCancelled, string(agent.WorkItemFailed), string(agent.WorkItemFailed), string(agent.WorkItemDead))
 	if err != nil {
 		return nil, false, fmt.Errorf("list work items: %w", err)
 	}

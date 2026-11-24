@@ -110,20 +110,22 @@ type chainFilterDTO struct {
 // chainNodeDTO is one chain node. Optional ids stay null when the node does not
 // carry them.
 type chainNodeDTO struct {
-	ID            string         `json:"id"`
-	Kind          string         `json:"kind"`
-	RefID         string         `json:"ref_id"`
-	Label         string         `json:"label"`
-	Status        *string        `json:"status"`
-	VersionSUTID  *string        `json:"version_sut_id"`
-	RequirementID *string        `json:"requirement_id"`
-	CaseVersionID *string        `json:"case_version_id"`
-	WaveID        *string        `json:"wave_id"`
-	CaseRunID     *string        `json:"case_run_id"`
-	IssueID       *string        `json:"issue_id"`
-	ReportID      *string        `json:"report_id"`
-	CreatedAt     string         `json:"created_at"`
-	Meta          map[string]any `json:"meta,omitempty"`
+	ID             string         `json:"id"`
+	Kind           string         `json:"kind"`
+	RefID          string         `json:"ref_id"`
+	Label          string         `json:"label"`
+	Status         *string        `json:"status"`
+	SUTID          *string        `json:"sut_id"`
+	RequirementID  *string        `json:"requirement_id"`
+	CaseVersionID  *string        `json:"case_version_id"`
+	WaveID         *string        `json:"wave_id"`
+	CaseRunID      *string        `json:"case_run_id"`
+	IssueID        *string        `json:"issue_id"`
+	ReportID       *string        `json:"report_id"`
+	CreatedAt      string         `json:"created_at"`
+	SutDescription string         `json:"sut_description,omitempty"`
+	CoveredACs     []string       `json:"covered_acs,omitempty"`
+	Meta           map[string]any `json:"meta,omitempty"`
 }
 
 // chainEdgeDTO is one directed chain edge.
@@ -238,7 +240,7 @@ func toChainCountsDTO(view chain.ChainView) chainCountsDTO {
 
 func toChainFilterDTO(filter chain.ChainFilter) chainFilterDTO {
 	return chainFilterDTO{
-		SUTID:            formatChainID(filter.VersionSUTID),
+		SUTID:            formatChainID(filter.SUTID),
 		PageID:           formatChainID(filter.PageID),
 		WaveID:           formatChainID(filter.WaveID),
 		Status:           formatChainText(filter.Status),
@@ -263,20 +265,22 @@ func nonNilStrings(values []string) []string {
 
 func toChainNodeDTO(node chain.Node, generatedAt time.Time) chainNodeDTO {
 	return chainNodeDTO{
-		ID:            node.ID,
-		Kind:          string(node.Kind),
-		RefID:         node.RefID,
-		Label:         node.Label,
-		Status:        formatChainText(node.Status),
-		VersionSUTID:  formatChainID(node.VersionSUTID),
-		RequirementID: formatChainID(node.RequirementID),
-		CaseVersionID: formatChainID(node.CaseVersionID),
-		WaveID:        formatChainID(node.WaveID),
-		CaseRunID:     formatChainID(node.CaseRunID),
-		IssueID:       formatChainID(node.IssueID),
-		ReportID:      formatChainID(node.ReportID),
-		CreatedAt:     formatChainTime(chainNodeDisplayCreatedAt(node, generatedAt)),
-		Meta:          sanitizeChainMeta(node.Meta),
+		ID:             node.ID,
+		Kind:           string(node.Kind),
+		RefID:          node.RefID,
+		Label:          node.Label,
+		Status:         formatChainText(node.Status),
+		SUTID:          formatChainID(node.SUTID),
+		RequirementID:  formatChainID(node.RequirementID),
+		CaseVersionID:  formatChainID(node.CaseVersionID),
+		WaveID:         formatChainID(node.WaveID),
+		CaseRunID:      formatChainID(node.CaseRunID),
+		IssueID:        formatChainID(node.IssueID),
+		ReportID:       formatChainID(node.ReportID),
+		CreatedAt:      formatChainTime(chainNodeDisplayCreatedAt(node, generatedAt)),
+		SutDescription: node.SutDescription,
+		CoveredACs:     node.CoveredACs,
+		Meta:           sanitizeChainMeta(node.Meta),
 	}
 }
 

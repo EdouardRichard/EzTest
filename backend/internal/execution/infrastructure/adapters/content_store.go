@@ -31,6 +31,7 @@ func NewContentStore(storage ContentService) *ContentStoreAdapter {
 }
 
 var _ executionapp.ContentStore = (*ContentStoreAdapter)(nil)
+var _ executionapp.FixtureContentStore = (*ContentStoreAdapter)(nil)
 
 // PutEvidence uploads the evidence bytes (content-addressed) and records the
 // evidence owner reference with the evidence kind as the ref role.
@@ -42,7 +43,31 @@ func (c *ContentStoreAdapter) PutEvidence(ctx context.Context, evidenceID int64,
 	if err != nil {
 		return executionapp.ContentRef{}, err
 	}
-	ref, err := c.storage.AddRef(ctx, object.SHA256, "evidence", evidenceID, string(kind))
+	ref, err := c.storage.AddRef(ctx, object.SHA256, storageapp.OwnerKindEvidence, evidenceID, string(kind))
+	if err != nil {
+		return executionapp.ContentRef{}, err
+	}
+	return executionapp.ContentRef{
+		ID:        ref.ID,
+		SHA256:    object.SHA256,
+		SizeBytes: object.Size,
+		MIME:      object.MIME,
+	}, nil
+}
+
+// PutFixture stores one session fixture's storage-state bytes (v0.2.4-F P18,
+// SC-F5): content-addressed upload + a session_fixture owner reference. The
+// live content_ref keeps the blob GC-protected while the fixture fact exists
+// (fixture facts are append-only and never deleted).
+func (c *ContentStoreAdapter) PutFixture(ctx context.Context, fixtureID int64, filename string, data []byte) (executionapp.ContentRef, error) {
+	if c.storage == nil {
+		return executionapp.ContentRef{}, errNotConfigured("content service")
+	}
+	object, err := c.storage.Upload(ctx, filename, "application/json", bytes.NewReader(data), storageapp.MaxUploadBytes, 0)
+	if err != nil {
+		return executionapp.ContentRef{}, err
+	}
+	ref, err := c.storage.AddRef(ctx, object.SHA256, "session_fixture", fixtureID, "storage_state")
 	if err != nil {
 		return executionapp.ContentRef{}, err
 	}

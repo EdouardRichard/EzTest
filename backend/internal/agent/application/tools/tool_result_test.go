@@ -245,7 +245,7 @@ func TestSpillToolResultNoteExplainsEnvelope(t *testing.T) {
 func TestToolResultReadPaginationAndLimitCap(t *testing.T) {
 	content := strings.Repeat("中", 25000)
 	spilled, store := spillWithStore(t, content)
-	registry := NewP7Registry(Deps{ToolResult: ToolResultDeps{Content: store}})
+	registry := NewKnowledgeRegistry(Deps{ToolResult: ToolResultDeps{Content: store}})
 
 	result, err := execute(t, registry, Scope{VersionID: 10}, ToolToolResultRead,
 		fmt.Sprintf(`{"content_ref":%q}`, spilled.ContentRef))
@@ -301,7 +301,7 @@ func TestToolResultReadDescriptionDistinguishesEnvelopeFromBusinessObject(t *tes
 func TestToolResultRead95kPagination(t *testing.T) {
 	content := strings.Repeat("中", 95000)
 	spilled, store := spillWithStore(t, content)
-	registry := NewP7Registry(Deps{ToolResult: ToolResultDeps{Content: store}})
+	registry := NewKnowledgeRegistry(Deps{ToolResult: ToolResultDeps{Content: store}})
 
 	var rebuilt strings.Builder
 	offset := 0
@@ -346,7 +346,7 @@ func TestToolResultRead95kPagination(t *testing.T) {
 func TestToolResultReadRejectsInvalidArguments(t *testing.T) {
 	store := newFakeContentStore()
 	store.objects["ref"] = "abc"
-	registry := NewP7Registry(Deps{ToolResult: ToolResultDeps{Content: store}})
+	registry := NewKnowledgeRegistry(Deps{ToolResult: ToolResultDeps{Content: store}})
 	for _, params := range []string{
 		`{}`,
 		`{"content_ref":""}`,
@@ -439,7 +439,7 @@ func TestPrunerKeepsRecentTwoToolPairs(t *testing.T) {
 		pruned[6].ToolCallID, pruned[8].ToolCallID, refs[0], refs[1],
 		utf8.RuneCountInString(old1), utf8.RuneCountInString(old2))
 
-	registry := NewP7Registry(Deps{ToolResult: ToolResultDeps{Content: store}})
+	registry := NewKnowledgeRegistry(Deps{ToolResult: ToolResultDeps{Content: store}})
 	result, err := execute(t, registry, Scope{VersionID: 10}, ToolToolResultRead,
 		fmt.Sprintf(`{"content_ref":%q,"limit":20000}`, refs[0]))
 	if err != nil {

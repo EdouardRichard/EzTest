@@ -10,12 +10,20 @@ import type { ConversationMessage, VersionEvent } from "./types"
 import {
   type JobEventType,
   mergePartsBySeq,
+  publishConversationDelta,
+  publishConversationFrame,
   publishJobEvent,
   publishStreamReset,
 } from "./useConversation"
 
 export type VersionEventHandlers = {
-  /** `conversation.message` payload (the full message object, spec §9). */
+  /**
+   * `conversation.message` payload (the full message object, spec §9).
+   * Passing this handler marks the subscription as the conversation owner:
+   * `conversation.message.delta` increments are then accumulated into the
+   * conversation stream projection that `useConversation` renders. Pass it ONLY
+   * on the workspace subscription (defect 039 — never on the page-level one).
+   */
   onConversationMessage?: (message: ConversationMessage) => void
   /** `agent.activity` payload; shape is not pinned by the contract yet. */
   onAgentActivity?: (payload: Record<string, unknown>) => void
@@ -51,7 +59,11 @@ export type VersionEventHandlers = {
   onAttachmentImageChanged?: (event: VersionEvent) => void
   /** `design.graph_delta`: refetch the design graph snapshot. */
   onDesignGraphChanged?: (event: VersionEvent) => void
-  /** `design.case_version_*` / `design.case_confirmed`: refresh graph and case detail. */
+  /**
+   * `design.case_version_*` / `design.case_confirmed` and the v0.2.4-E judge
+   * events (`design.judgment_submitted|judgment_overridden|rework_requested|
+   * judge_exhausted`): refresh graph and case detail (review_state).
+   */
   onDesignCaseChanged?: (event: VersionEvent) => void
   /** `design.round_started` / `design.scope_activated`: refresh overview and conversations. */
   onDesignRoundChanged?: (event: VersionEvent) => void
@@ -77,8 +89,6 @@ export type VersionEventHandlers = {
   onDiscoveryChanged?: (event: VersionEvent) => void
   /** `version.scope.snapshot_created`: refresh the frozen wave scope projection. */
   onScopeSnapshotChanged?: (event: VersionEvent) => void
-  /** P5 `visual.baseline_approved` / `visual.diff_created`: refresh visual projections. */
-  onVisualChanged?: (event: VersionEvent) => void
   /** Synthetic `stream.reset`: refetch every snapshot instead of reconnecting. */
   onStreamReset?: (data: unknown) => void
   /** Connection state for the status indicator. */
@@ -125,10 +135,27 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
       }
 
       const payload = isRecord(event.payload) ? event.payload : {}
+      // Defect 039: the version channel has documented-intentional concurrent
+      // subscriptions (page-level header projection + tab workspace). Only the
+      // instance that owns conversation state — the one whose handlers include
+      // onConversationMessage — feeds the conversation stream projection; the
+      // page-level subscription must NOT accumulate, or the same increment
+      // delivered by two connections would double-append.
+      const ownsConversation = handlersRef.current.onConversationMessage !== undefined
       switch (event.type) {
         case "conversation.message": {
           const message = toMessage(payload)
-          if (message !== null) handlersRef.current.onConversationMessage?.(message)
+          if (message !== null) {
+            handlersRef.current.onConversationMessage?.(message)
+            // The full frame also feeds the projection: the workspace handler
+            // may dedupe by id (Begin placeholder already seen), but the
+            // terminal snapshot must still reach the thread to heal gaps.
+            if (ownsConversation) publishConversationFrame(versionId, message)
+          }
+          break
+        }
+        case "conversation.message.delta": {
+          if (ownsConversation) publishConversationDelta(versionId, payload)
           break
         }
         case "agent.activity":
@@ -223,6 +250,17 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "design.case_confirmed":
         case "design.review_submitted":
         case "case.revision.auto_confirmed":
+        // v0.2.4-E quality gate: the four judge events change a case's
+        // review_state / round, so they refresh exactly like the other design
+        // case events (the design page's handler refetches the graph AND the
+        // selected case detail). Without these cases they fell through to the
+        // default branch, which only forwards requirement.* / team_room.*:
+        // review_state never updated live and the judge-unavailable badge never
+        // appeared.
+        case "design.judgment_submitted":
+        case "design.judgment_overridden":
+        case "design.rework_requested":
+        case "design.judge_exhausted":
           // W2-11 R-EX-6: an additive discovery case revision was auto-confirmed
           // or rolled back; the design page refetches the case.
           handlersRef.current.onDesignCaseChanged?.(event)
@@ -300,10 +338,6 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           // W2-14 R-W2-6: snapshot evaluation lifecycle; the quality page
           // refetches the run list and trend series on the terminal state.
           handlersRef.current.onEvalChanged?.(event)
-          break
-        case "visual.baseline_approved":
-        case "visual.diff_created":
-          handlersRef.current.onVisualChanged?.(event)
           break
         case "resource.delta":
           // One delta pass can publish several discovered resources; the panel

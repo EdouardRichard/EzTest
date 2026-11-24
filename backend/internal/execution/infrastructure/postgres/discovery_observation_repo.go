@@ -17,11 +17,17 @@ type DiscoveryObservationRepository struct{ base }
 // discoveryObservationUpsert writes only the DB-29 columns. The natural key
 // dedupe is the ON CONFLICT clause; query/header/cookie/body have no column at
 // all. version_id is resolved from run_wave when the observation does not carry
-// it and environment_id from version_sut; a row with no resolvable version is
-// skipped (best effort) and logged, never a panic.
+// it and environment_id from the owning sut row; a row with no resolvable
+// version is skipped (best effort) and logged, never a panic.
+//
+// v0.2.4-B: $5 is a SUT id and the environment is read off sut.environment_id
+// (resource_0004 inverted the catalog, so the binding row that used to supply it
+// is gone). The join stays a LEFT JOIN: an observation whose SUT is not in the
+// catalog still stores, with environment_id NULL when the caller did not supply
+// one, exactly as before.
 const discoveryObservationUpsert = `
 	INSERT INTO execution_discovery_observation
-		(id, version_id, wave_id, case_run_id, version_sut_id, environment_id,
+		(id, version_id, wave_id, case_run_id, sut_id, environment_id,
 		 kind, method, host, resource_template, status_code, mime,
 		 source_kind, occurrences, decision)
 	SELECT $1,
@@ -31,12 +37,12 @@ const discoveryObservationUpsert = `
 	       $5::BIGINT,
 	       COALESCE(NULLIF($6::BIGINT, 0), binding.environment_id),
 	       $7, $8, $9, $10, $11, $12,
-	       'execution', $13, 'new'
+	       'execution', $13, $14
 	FROM (SELECT 1) AS anchor
 	LEFT JOIN run_wave wave ON wave.id = NULLIF($3::BIGINT, 0)
-	LEFT JOIN version_sut binding ON binding.id = $5::BIGINT
+	LEFT JOIN sut binding ON binding.id = $5::BIGINT
 	WHERE COALESCE(NULLIF($2::BIGINT, 0), wave.version_id) IS NOT NULL
-	ON CONFLICT (version_id, version_sut_id, kind, method, resource_template)
+	ON CONFLICT (version_id, sut_id, kind, method, resource_template)
 	DO UPDATE SET
 		occurrences = execution_discovery_observation.occurrences + EXCLUDED.occurrences,
 		last_seen_at = now(),
@@ -50,9 +56,9 @@ const discoveryObservationUpsert = `
 func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context, observations []executionapp.DiscoveryObservation) error {
 	ctx = contextOrBackground(ctx)
 	for _, observation := range observations {
-		if observation.VersionSUTID <= 0 || observation.ResourceTemplate == "" {
+		if observation.SUTID <= 0 || observation.ResourceTemplate == "" {
 			slog.Warn("execution discovery: skip observation without identity",
-				"version_sut_id", observation.VersionSUTID,
+				"sut_id", observation.SUTID,
 				"kind", observation.Kind, "template", observation.ResourceTemplate)
 			continue
 		}
@@ -65,7 +71,7 @@ func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context,
 			observation.VersionID,
 			observation.WaveID,
 			observation.CaseRunID,
-			observation.VersionSUTID,
+			observation.SUTID,
 			observation.EnvironmentID,
 			observation.Kind,
 			observation.Method,
@@ -74,6 +80,7 @@ func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context,
 			observation.StatusCode,
 			observation.MIME,
 			occurrences,
+			execution.ObservationDecisionNew,
 		)
 		if err != nil {
 			return wrapDB("upsert discovery observation", err)
@@ -81,7 +88,7 @@ func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context,
 		if tag.RowsAffected() == 0 {
 			slog.Warn("execution discovery: skip observation without a resolvable version",
 				"version_id", observation.VersionID, "wave_id", observation.WaveID,
-				"version_sut_id", observation.VersionSUTID,
+				"sut_id", observation.SUTID,
 				"kind", observation.Kind, "template", observation.ResourceTemplate)
 		}
 	}
@@ -95,11 +102,11 @@ func (r *DiscoveryObservationRepository) UpsertObservations(ctx context.Context,
 // already classified resource.
 const discoveryObservationDeltaQuery = `
 	SELECT id, version_id, COALESCE(wave_id, 0), COALESCE(case_run_id, 0),
-	       version_sut_id, COALESCE(environment_id, 0), kind, method, host,
+	       sut_id, COALESCE(environment_id, 0), kind, method, host,
 	       resource_template, decision, COALESCE(resource_id, 0), COALESCE(fact_id, 0)
 	FROM execution_discovery_observation
 	WHERE version_id = $1
-	  AND ($2::BIGINT = 0 OR wave_id = $2::BIGINT OR decision = 'new')
+	  AND ($2::BIGINT = 0 OR wave_id = $2::BIGINT OR decision = $3)
 	ORDER BY id ASC
 `
 
@@ -108,7 +115,7 @@ const discoveryObservationDeltaQuery = `
 // version never touches this table directly (Agent.md §6.2).
 func (r *DiscoveryObservationRepository) ListForDelta(ctx context.Context, versionID, waveID int64) ([]executionapp.DiscoveryDeltaObservation, error) {
 	ctx = contextOrBackground(ctx)
-	rows, err := r.pool.Query(ctx, discoveryObservationDeltaQuery, versionID, waveID)
+	rows, err := r.pool.Query(ctx, discoveryObservationDeltaQuery, versionID, waveID, execution.ObservationDecisionNew)
 	if err != nil {
 		return nil, wrapDB("list discovery observations for delta", err)
 	}
@@ -118,7 +125,7 @@ func (r *DiscoveryObservationRepository) ListForDelta(ctx context.Context, versi
 	for rows.Next() {
 		var observation executionapp.DiscoveryDeltaObservation
 		if err := rows.Scan(&observation.ObservationID, &observation.VersionID, &observation.WaveID,
-			&observation.CaseRunID, &observation.VersionSUTID, &observation.EnvironmentID,
+			&observation.CaseRunID, &observation.SUTID, &observation.EnvironmentID,
 			&observation.Kind, &observation.Method, &observation.Host, &observation.ResourceTemplate,
 			&observation.Decision, &observation.ResourceID, &observation.FactID); err != nil {
 			return nil, wrapDB("scan discovery observation for delta", err)
@@ -169,7 +176,7 @@ const discoveryObservationResourceDecisionUpdate = `
 	    updated_at = now()
 	WHERE resource_id = $1
 	  AND kind = $2
-	  AND decision = 'proposed'
+	  AND decision = $4
 `
 
 // MarkDecisionByResource implements executionapp.ResourceDecisionMarker. It
@@ -179,7 +186,7 @@ func (r *DiscoveryObservationRepository) MarkDecisionByResource(ctx context.Cont
 	if resourceID <= 0 {
 		return 0, execution.ErrNotFound
 	}
-	tag, err := r.pool.Exec(ctx, discoveryObservationResourceDecisionUpdate, resourceID, kind, decision)
+	tag, err := r.pool.Exec(ctx, discoveryObservationResourceDecisionUpdate, resourceID, kind, decision, execution.ObservationDecisionProposed)
 	if err != nil {
 		return 0, wrapDB("mark discovery observation decision by resource", err)
 	}
@@ -193,7 +200,7 @@ func (r *DiscoveryObservationRepository) MarkDecisionByResource(ctx context.Cont
 // source_kind/created_at/updated_at are part of the read projection; the
 // fingerprint is deliberately not exposed.
 const discoveryObservationListQuery = `
-	SELECT id, version_sut_id, environment_id, wave_id, case_run_id, kind, method,
+	SELECT id, sut_id, environment_id, wave_id, case_run_id, kind, method,
 	       host, resource_template, status_code, mime, source_kind, occurrences,
 	       decision, resource_id, fact_id, first_seen_at, last_seen_at,
 	       created_at, updated_at
@@ -223,7 +230,7 @@ func (r *DiscoveryObservationRepository) ListByVersion(ctx context.Context, vers
 	observations := make([]executionapp.DiscoveryObservationRow, 0)
 	for rows.Next() {
 		var observation executionapp.DiscoveryObservationRow
-		if err := rows.Scan(&observation.ID, &observation.VersionSUTID, &observation.EnvironmentID,
+		if err := rows.Scan(&observation.ID, &observation.SUTID, &observation.EnvironmentID,
 			&observation.WaveID, &observation.CaseRunID, &observation.Kind, &observation.Method,
 			&observation.Host, &observation.ResourceTemplate, &observation.StatusCode,
 			&observation.MIME, &observation.SourceKind, &observation.Occurrences, &observation.Decision,
@@ -240,9 +247,9 @@ func (r *DiscoveryObservationRepository) ListByVersion(ctx context.Context, vers
 	return observations, nil
 }
 
-// DiscoverySUTHostResolver resolves the allowed hosts of one version_sut
-// binding: the SUT environment base URL host plus the hosts of its registered
-// pages. It implements executionapp.SUTHostResolver.
+// DiscoverySUTHostResolver resolves the allowed hosts of one bound SUT: the
+// SUT's base URL host plus the hosts of its registered pages. It implements
+// executionapp.SUTHostResolver.
 type DiscoverySUTHostResolver struct{ pool *pgxpool.Pool }
 
 // NewDiscoverySUTHostResolver wires the resolver over the shared pool.
@@ -250,19 +257,27 @@ func NewDiscoverySUTHostResolver(pool *pgxpool.Pool) *DiscoverySUTHostResolver {
 	return &DiscoverySUTHostResolver{pool: pool}
 }
 
-// AllowedHosts returns the lowercased host set of the binding. The caller treats
+// AllowedHosts returns the lowercased host set of the SUT. The caller treats
 // an empty set/error as "no filtering" (the capture is best effort).
-func (r *DiscoverySUTHostResolver) AllowedHosts(ctx context.Context, versionSUTID int64) (map[string]bool, error) {
+//
+// v0.2.4-B: resource_0004 inverted the catalog, so base_url moved from the
+// dropped sut_environment onto sut and sut_page is owned by sut_id alone. The
+// query is the same projection re-expressed over the new shape: one row per
+// page of the SUT, each carrying the SUT base URL. Page status is deliberately
+// NOT filtered here — it never was, and this set is the host allowlist for
+// best-effort capture, not a scope decision; effective scope (approved pages /
+// approved APIs / active databases) is enforced by version_adapter and
+// credential_adapter through EnvironmentSUTCatalog.EffectiveSUTs().
+func (r *DiscoverySUTHostResolver) AllowedHosts(ctx context.Context, sutID int64) (map[string]bool, error) {
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
-		SELECT environment.base_url, page.url
-		FROM version_sut binding
-		JOIN sut_environment environment ON environment.id = binding.environment_id
-		LEFT JOIN sut_page page ON page.environment_id = binding.environment_id
-		WHERE binding.id = $1
-	`, versionSUTID)
+		SELECT sut.base_url, page.url
+		FROM sut
+		LEFT JOIN sut_page page ON page.sut_id = sut.id
+		WHERE sut.id = $1
+	`, sutID)
 	if err != nil {
-		return nil, wrapDB("resolve version_sut hosts", err)
+		return nil, wrapDB("resolve SUT hosts", err)
 	}
 	defer rows.Close()
 	hosts := make(map[string]bool)
@@ -270,7 +285,7 @@ func (r *DiscoverySUTHostResolver) AllowedHosts(ctx context.Context, versionSUTI
 		var baseURL string
 		var pageURL *string
 		if err := rows.Scan(&baseURL, &pageURL); err != nil {
-			return nil, wrapDB("scan version_sut host", err)
+			return nil, wrapDB("scan SUT host", err)
 		}
 		addDiscoveryHost(hosts, baseURL)
 		if pageURL != nil {
@@ -278,7 +293,7 @@ func (r *DiscoverySUTHostResolver) AllowedHosts(ctx context.Context, versionSUTI
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, wrapDB("read version_sut hosts", err)
+		return nil, wrapDB("read SUT hosts", err)
 	}
 	return hosts, nil
 }

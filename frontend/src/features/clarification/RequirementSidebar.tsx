@@ -11,11 +11,10 @@ import {
   REQUIREMENT_STATUS_LABEL,
   REQUIREMENT_STATUS_TONE,
 } from "./labels"
-import type { Requirement, RequirementFilter, TargetOptions } from "./types"
+import type { Requirement, RequirementFilter } from "./types"
 
 export type RequirementSidebarProps = {
   requirements: Requirement[]
-  targetOptions?: TargetOptions
   filter: RequirementFilter
   onFilterChange: (filter: RequirementFilter) => void
   selectedIds: string[]
@@ -34,24 +33,9 @@ type FilterItem = {
   count: number
 }
 
-function targetLabels(requirement: Requirement, targetOptions?: TargetOptions): string[] {
-  if (targetOptions === undefined) return []
-  const labels = new Map<string, string>()
-  for (const option of [...targetOptions.suts, ...targetOptions.pages, ...targetOptions.apis]) {
-    labels.set(`${option.id}`, option.label)
-  }
-  const ids = [
-    ...requirement.targets.version_suts,
-    ...requirement.targets.pages,
-    ...requirement.targets.apis,
-  ]
-  return ids.map((id) => labels.get(id)).filter((label): label is string => label !== undefined)
-}
-
 /** Requirement list with counts, status filters and multi-select for batch confirm. */
 export function RequirementSidebar({
   requirements,
-  targetOptions,
   filter,
   onFilterChange,
   selectedIds,
@@ -134,7 +118,6 @@ export function RequirementSidebar({
         ) : (
           visible.map((requirement) => {
             const active = requirement.id === activeRequirementId
-            const chips = targetLabels(requirement, targetOptions)
             return (
               <div
                 key={requirement.id}
@@ -169,15 +152,6 @@ export function RequirementSidebar({
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 pl-5 text-[10px] text-muted-foreground">
                   <span>v{requirement.revision}</span>
                   <span>{REQUIREMENT_PRIORITY_LABEL[requirement.priority]}</span>
-                  {chips.slice(0, 3).map((label) => (
-                    <span
-                      key={`${requirement.id}-${label}`}
-                      className="rounded-full bg-accent px-1.5 py-0.5 text-accent-foreground"
-                    >
-                      {label}
-                    </span>
-                  ))}
-                  {chips.length > 3 ? <span>+{chips.length - 3}</span> : null}
                 </div>
               </div>
             )

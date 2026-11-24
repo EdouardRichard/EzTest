@@ -231,30 +231,6 @@ func TestRecordDerivesMetricsAndIgnoresClientVerdict(t *testing.T) {
 	}
 }
 
-func TestRecordDerivesSevenMetricsWhenVisualCountersArePresent(t *testing.T) {
-	repo := &fakeRepo{}
-	service := newService(repo, nil, nil, nil)
-
-	sample := passingSample()
-	visualInjected, visualCorrect := 10, 9
-	sample.VisualInjected = &visualInjected
-	sample.VisualCorrect = &visualCorrect
-
-	run, err := service.Record(context.Background(), platform.Actor{ID: 1, Role: "admin"}, inputWith(sample))
-	if err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-	if len(run.Metrics) != 7 {
-		t.Fatalf("metrics = %d, want 7", len(run.Metrics))
-	}
-	if run.Metrics[6].Name != quality.MetricVisualClassificationAccuracy {
-		t.Fatalf("last metric = %q", run.Metrics[6].Name)
-	}
-	if run.Status != quality.StatusPassed {
-		t.Fatalf("status = %q, want passed", run.Status)
-	}
-}
-
 func TestRecordRejectsInvalidSample(t *testing.T) {
 	repo := &fakeRepo{}
 	service := newService(repo, nil, nil, nil)

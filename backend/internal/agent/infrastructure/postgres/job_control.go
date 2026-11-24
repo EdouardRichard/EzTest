@@ -101,15 +101,15 @@ func (r *WorkItemRepository) CancelJob(
 		return agent.WorkItem{}, agent.ErrConflict
 	}
 
-	args := []any{id, leaseEpoch, reason, now}
+	args := []any{id, leaseEpoch, reason, now, cancelableWorkItemStatuses, string(agent.WorkItemFailed)}
 	versionFilter := ""
 	if versionID > 0 {
-		versionFilter = ` AND version_id = $5`
+		versionFilter = ` AND version_id = $7`
 		args = append(args, versionID)
 	}
 	updated, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = 'failed',
+		SET status = $6,
 		    last_error = $3,
 		    claimed_by = NULL,
 		    lease_until = NULL,
@@ -120,7 +120,7 @@ func (r *WorkItemRepository) CancelJob(
 		WHERE id = $1
 		  AND lease_epoch = $2
 		  AND kind <> ''
-		  AND status IN ('open', 'claimed', 'running')`+versionFilter+`
+		  AND status = ANY($5::text[])`+versionFilter+`
 		RETURNING `+workItemColumns,
 		args...))
 	if err != nil {
@@ -137,12 +137,12 @@ func (r *WorkItemRepository) CancelJob(
 	// keeps counting (see ClaimWorkItem). At most one row is open per item.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'failed',
+		SET status = $4,
 		    error = $2,
 		    finished_at = $3
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id, reason, now); err != nil {
+		  AND status = ANY($5::text[])
+	`, id, reason, now, string(agent.AttemptFailed), attemptOpenStatuses); err != nil {
 		return agent.WorkItem{}, wrapDB("cancel job: close attempt", err)
 	}
 
@@ -194,15 +194,15 @@ func (r *WorkItemRepository) RetryJob(
 		return agent.WorkItem{}, agent.ErrConflict
 	}
 
-	args := []any{id, now}
+	args := []any{id, now, string(agent.WorkItemOpen), string(agent.WorkItemFailed)}
 	versionFilter := ""
 	if versionID > 0 {
-		versionFilter = ` AND version_id = $3`
+		versionFilter = ` AND version_id = $5`
 		args = append(args, versionID)
 	}
 	updated, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = 'open',
+		SET status = $3,
 		    attempts = 0,
 		    claimed_by = NULL,
 		    lease_until = NULL,
@@ -210,7 +210,7 @@ func (r *WorkItemRepository) RetryJob(
 		    available_at = $2,
 		    updated_at = $2
 		WHERE id = $1
-		  AND status = 'failed'
+		  AND status = $4
 		  AND kind <> ''
 		  AND attempts < max_attempts`+versionFilter+`
 		RETURNING `+workItemColumns,
@@ -248,6 +248,13 @@ func jobScopeArgs(id, versionID int64) []any {
 		args = append(args, versionID)
 	}
 	return args
+}
+
+// cancelableWorkItemStatuses mirrors jobStatusCancelable as a query parameter
+// (the open/claimed/running set a cancel may act on), bound into SQL -- never
+// inline literals (V-0017/H-B2 single source).
+var cancelableWorkItemStatuses = []string{
+	string(agent.WorkItemOpen), string(agent.WorkItemClaimed), string(agent.WorkItemRunning),
 }
 
 func jobStatusCancelable(status agent.WorkItemStatus) bool {

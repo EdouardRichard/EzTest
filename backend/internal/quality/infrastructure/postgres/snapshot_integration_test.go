@@ -42,7 +42,6 @@ func fixtureSnapshotMetrics(pass float64) []quality.Metric {
 		{Name: quality.MetricDesignCoverage, Value: 0.9, Threshold: 0.8, Passed: true},
 		{Name: quality.MetricExecutionPassRate, Value: pass, Threshold: 0.8, Passed: pass >= 0.8},
 		{Name: quality.MetricCaseCoverage, Value: 1, Threshold: 0.8, Passed: true},
-		{Name: quality.MetricVisualClassificationAccuracy, Value: 0.9, Threshold: 0.8, Passed: true},
 	}
 }
 
@@ -61,11 +60,6 @@ func (p *integrationSnapshotPorts) CountCaseConfirmation(context.Context, *int64
 }
 
 func (p *integrationSnapshotPorts) CountExecutionPass(context.Context, *int64) (int, int, error) {
-	p.calls++
-	return 0, 0, nil
-}
-
-func (p *integrationSnapshotPorts) VisualClassification(context.Context, *int64) (int, int, error) {
 	p.calls++
 	return 0, 0, nil
 }
@@ -93,7 +87,7 @@ func TestSnapshotTriggerAndTrendsUnknownVersion404WithRealVersionRead(t *testing
 	}
 	ports := &integrationSnapshotPorts{}
 	service := qualityapp.NewService(repo, ids, clock.System{}, nil, nil, nil).
-		WithSnapshotPorts(ports, ports, ports, ports).
+		WithSnapshotPorts(ports, ports, ports).
 		WithVersionExistence(versionapp.NewVersionReadService(versionReader))
 
 	const unknown int64 = 999999
@@ -147,8 +141,8 @@ func TestEvalRepositorySnapshotVersionAndTrends(t *testing.T) {
 	if loaded.VersionID == nil || *loaded.VersionID != 7 || loaded.Mode != quality.EvalModeSnapshot {
 		t.Fatalf("loaded = %+v", loaded)
 	}
-	if len(loaded.Metrics) != 4 {
-		t.Fatalf("metrics = %d, want 4", len(loaded.Metrics))
+	if len(loaded.Metrics) != 3 {
+		t.Fatalf("metrics = %d, want 3", len(loaded.Metrics))
 	}
 
 	latest, err := repo.LatestForVersion(ctx, 7)

@@ -1073,6 +1073,8 @@ function Initialize-P5ApiContext {
     if ([string]::IsNullOrWhiteSpace($codeBranch) -or $codeBranch -eq "HEAD") { $codeBranch = "master" }
 
     Assert-PortFree -Port $apiPort
+    # Keep the acceptance export root inside .tmp so artefacts are inspectable
+    # and never leak into the repository tree.
     $exportDir = Join-Path $tmpDir "p5-exports"
     if (Test-Path -LiteralPath $exportDir) { Remove-Item -LiteralPath $exportDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $exportDir | Out-Null
@@ -1082,23 +1084,18 @@ function Initialize-P5ApiContext {
     $env:EZTEST_WEB_ORIGIN = "http://localhost:6868"
     $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
-    $env:EZTEST_EXPORT_DIR = $exportDir
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
     }
     foreach ($key in @($envValues.Keys)) {
-        if ([string]$key -like "EZTEST_MINDMAP_*" -or [string]$key -like "EZTEST_EXPLORE_*" -or [string]$key -eq "EZTEST_EXPORT_DIR") {
+        if ([string]$key -like "EZTEST_MINDMAP_*" -or [string]$key -like "EZTEST_EXPLORE_*") {
             if (-not [string]::IsNullOrWhiteSpace([string]$envValues[$key])) {
                 Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
             }
         }
     }
-    # Always keep the acceptance export root inside .tmp so artefacts are
-    # inspectable and never leak into the repository tree.
-    $env:EZTEST_EXPORT_DIR = $exportDir
-
     $script:p5.ApiProcess = Start-AcceptanceApi -RunNumber 5
     $health = Invoke-RestMethod -Uri "$apiBaseUrl/api/health" -TimeoutSec 20
     if ($health.data.status -ne "ok" -or $health.data.db -ne "ok") {
@@ -1261,7 +1258,7 @@ function Start-P6Executor {
     if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "executor\src\server.mjs"))) { return $null }
     $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:13336"
     $env:EZTEST_EXECUTOR_TOKEN = $Token
-    $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "4"
+    $env:EZTEST_EXECUTOR_MAX_SESSIONS = "4"
     $outLog = Join-Path $tmpDir "acceptance-p6-executor.out.log"
     $errLog = Join-Path $tmpDir "acceptance-p6-executor.err.log"
     Remove-Item -LiteralPath $outLog, $errLog -ErrorAction SilentlyContinue
@@ -1669,13 +1666,12 @@ function Initialize-P6ApiContext {
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
     $env:EZTEST_EXECUTOR_URL = "http://127.0.0.1:13336"
     $env:EZTEST_EXECUTOR_TOKEN = $ExecutorToken
-    $env:EZTEST_EVIDENCE_DIR = $evidenceDir
     $env:EZTEST_EXEC_WORKER_INTERVAL_MS = "200"
     # One case at a time keeps the session lease/checkpoint sequence
     # deterministic with the single imported session used by these checks.
     $env:EZTEST_EXEC_MAX_CONCURRENT_CASES = "1"
     $env:EZTEST_EXEC_CASE_TIMEOUT_MS = "120000"
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
     }
     foreach ($key in @($envValues.Keys)) {
@@ -2003,7 +1999,7 @@ try {
                 $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
                 $env:EZTEST_ADMIN_USERNAME = $adminUsername
                 $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-                foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+                foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
                     if ($envValues.ContainsKey($key)) {
                         Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
                     }
@@ -2963,7 +2959,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                             if ([string]::IsNullOrWhiteSpace($storedPath)) { throw "export $format has no stored file_path" }
                             $absolutePath = Join-Path $current.ExportDir ($storedPath -replace '/', '\')
                             if (-not (Test-Path -LiteralPath $absolutePath)) {
-                                throw "export $format file is missing under EZTEST_EXPORT_DIR"
+                                throw "export $format file is missing under the export root"
                             }
                             $fileBytes = [System.IO.File]::ReadAllBytes($absolutePath)
                             if ((Get-P5Sha256Hex -Bytes $fileBytes) -ne $download.Sha256) {
@@ -3604,7 +3600,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                                 if ([string]::IsNullOrWhiteSpace($storedPath)) { throw "evidence $evidenceId has no stored path" }
                                 if ($storedPath -match '^[A-Za-z]:\\' -or $storedPath -match '^/') { throw "evidence $evidenceId stored path is absolute" }
                                 $absolutePath = Join-Path $script:p6.EvidenceDir ($storedPath -replace '/', '\')
-                                if (-not (Test-Path -LiteralPath $absolutePath)) { throw "evidence $evidenceId file is missing under EZTEST_EVIDENCE_DIR" }
+                                if (-not (Test-Path -LiteralPath $absolutePath)) { throw "evidence $evidenceId file is missing under the evidence root" }
                                 $fileBytes = [System.IO.File]::ReadAllBytes($absolutePath)
                                 if ((Get-P5Sha256Hex -Bytes $fileBytes) -ne [string]$evidence.sha256) {
                                     throw "evidence $evidenceId stored file hash does not match the recorded sha256"

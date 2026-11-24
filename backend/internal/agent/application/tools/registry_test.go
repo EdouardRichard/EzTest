@@ -8,8 +8,8 @@ import (
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 )
 
-func TestP1ToolNamesCoversSpecToolSet(t *testing.T) {
-	names := P1ToolNames()
+func TestBaseToolNamesCoversSpecToolSet(t *testing.T) {
+	names := BaseToolNames()
 	want := []string{
 		ToolContextVersionPack,
 		ToolContextTaskPack,
@@ -36,10 +36,10 @@ func TestP1ToolNamesCoversSpecToolSet(t *testing.T) {
 	}
 }
 
-func TestP1SchemasDoNotAcceptModelSuppliedScope(t *testing.T) {
-	registry := NewP1Registry(Deps{})
-	definitions := registry.Definitions(P1ToolNames())
-	if len(definitions) != len(P1ToolNames()) {
+func TestBaseSchemasDoNotAcceptModelSuppliedScope(t *testing.T) {
+	registry := NewBaseRegistry(Deps{})
+	definitions := registry.Definitions(BaseToolNames())
+	if len(definitions) != len(BaseToolNames()) {
 		t.Fatalf("definitions = %d", len(definitions))
 	}
 	for _, definition := range definitions {
@@ -64,7 +64,7 @@ func TestP1SchemasDoNotAcceptModelSuppliedScope(t *testing.T) {
 }
 
 func TestRegistryDefinitionsPreserveAllowedOrderAndSkipUnknown(t *testing.T) {
-	registry := NewP1Registry(Deps{})
+	registry := NewBaseRegistry(Deps{})
 	definitions := registry.Definitions([]string{
 		ToolRequirementRead,
 		"reserved.p2.tool",
@@ -79,7 +79,7 @@ func TestRegistryDefinitionsPreserveAllowedOrderAndSkipUnknown(t *testing.T) {
 }
 
 func TestRegistryExecuteRejectsUnknownTool(t *testing.T) {
-	registry := NewP1Registry(Deps{})
+	registry := NewBaseRegistry(Deps{})
 	_, err := registry.Execute(t.Context(), Scope{VersionID: 10}, "requirement.close", json.RawMessage(`{}`))
 	toolErr := asToolError(t, err)
 	if toolErr.Code != CodeInvalidArgument {
@@ -88,7 +88,7 @@ func TestRegistryExecuteRejectsUnknownTool(t *testing.T) {
 }
 
 func TestRegistryRejectsUnknownParametersIncludingVersionID(t *testing.T) {
-	registry := NewP1Registry(Deps{})
+	registry := NewBaseRegistry(Deps{})
 	for _, name := range []string{ToolRequirementRead, ToolContextTaskPack, ToolSUTList} {
 		_, err := registry.Execute(t.Context(), Scope{VersionID: 10}, name, json.RawMessage(`{"version_id":"99"}`))
 		toolErr := asToolError(t, err)
@@ -103,7 +103,7 @@ func TestRegistryRejectsUnknownParametersIncludingVersionID(t *testing.T) {
 // same FR/NFR source in one version resolves to the existing draft instead of a
 // second one.
 func TestRequirementDraftCreateDescriptionStatesSourceIdempotency(t *testing.T) {
-	registry := NewP1Registry(Deps{})
+	registry := NewBaseRegistry(Deps{})
 	tool, ok := registry.Get(ToolRequirementDraftCreate)
 	if !ok {
 		t.Fatalf("registry has no %s", ToolRequirementDraftCreate)

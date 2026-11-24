@@ -26,7 +26,7 @@ export const waveCountsFixture: WaveCounts = {
   interrupted: 0,
   superseded: 0,
   evidence: 7,
-  by_version_sut: {
+  by_sut: {
     "1001": { total: 3, passed: 1, failed: 1, blocked: 0, inconclusive: 0 },
     "1002": { total: 2, passed: 1, failed: 1, blocked: 0, inconclusive: 0 },
   },
@@ -102,7 +102,7 @@ export const executionOverviewFixture: ExecutionOverview = {
     last_heartbeat: TIMESTAMP,
     version: "0.2.0-p3",
   },
-  quotas: { global: 3, per_sut: 2, cross_system: 1 },
+  quotas: { max_concurrent_case_runs: 3 },
   human_request_timeout_seconds: 1800,
 }
 
@@ -167,7 +167,7 @@ const baseCaseRun: CaseRun = {
   },
   started_at: TIMESTAMP,
   finished_at: "2026-10-31T12:00:08Z",
-  version_sut_ids: ["1002"],
+  sut_ids: ["1002"],
   evidence_count: 2,
 }
 
@@ -192,7 +192,7 @@ export const failedCaseRunFixture: CaseRun = {
     evidence_count: 3,
   },
   finished_at: "2026-10-31T12:00:41Z",
-  version_sut_ids: ["1001", "1002"],
+  sut_ids: ["1001", "1002"],
   evidence_count: 3,
 }
 
@@ -207,7 +207,7 @@ export const blockedCaseRunFixture: CaseRun = {
   failure_class: "blocked",
   summary: { verdict_reason: "missing_account", evidence_count: 0 },
   finished_at: "2026-10-31T12:00:50Z",
-  version_sut_ids: ["1001"],
+  sut_ids: ["1001"],
   evidence_count: 0,
 }
 
@@ -220,7 +220,7 @@ export const runningCaseRunFixture: CaseRun = {
   title: "订单详情时间窗口",
   status: "running",
   finished_at: null,
-  version_sut_ids: ["1001", "1002"],
+  sut_ids: ["1001", "1002"],
   evidence_count: 1,
 }
 
@@ -234,7 +234,7 @@ export const caseRunsFixture: CaseRun[] = [
 export const evidenceScreenshotFixture: Evidence = {
   id: "9401",
   case_run_id: "9302",
-  version_sut_id: "1002",
+  sut_id: "1002",
   step_seq: 3,
   assertion_seq: 1,
   kind: "screenshot",
@@ -248,7 +248,7 @@ export const evidenceScreenshotFixture: Evidence = {
 export const evidenceTextFixture: Evidence = {
   id: "9402",
   case_run_id: "9302",
-  version_sut_id: "1001",
+  sut_id: "1001",
   step_seq: 1,
   assertion_seq: null,
   kind: "text",
@@ -264,7 +264,7 @@ export const caseRunDetailFixture: CaseRunDetail = {
   steps: [
     {
       seq: 1,
-      target_version_sut_id: "1001",
+      target_sut_id: "1001",
       status: "passed",
       observed: { summary: "打开订单详情页" },
       error: "",
@@ -273,7 +273,7 @@ export const caseRunDetailFixture: CaseRunDetail = {
     },
     {
       seq: 2,
-      target_version_sut_id: "1002",
+      target_sut_id: "1002",
       status: "passed",
       observed: { summary: "提交退款申请" },
       error: "",
@@ -282,7 +282,7 @@ export const caseRunDetailFixture: CaseRunDetail = {
     },
     {
       seq: 3,
-      target_version_sut_id: "1002",
+      target_sut_id: "1002",
       status: "passed",
       observed: { summary: "读取退款金额" },
       error: "",
@@ -299,7 +299,7 @@ export const caseRunDetailFixture: CaseRunDetail = {
       expected: "订单状态已支付",
       actual: "订单状态已支付",
       reason: "",
-      target_version_sut_id: "1001",
+      target_sut_id: "1001",
     },
     {
       step_seq: 3,
@@ -309,7 +309,7 @@ export const caseRunDetailFixture: CaseRunDetail = {
       expected: "¥5,000.00",
       actual: "¥5,200.00",
       reason: "退款金额与实付金额不一致",
-      target_version_sut_id: "1002",
+      target_sut_id: "1002",
     },
   ],
   evidence: [evidenceScreenshotFixture, evidenceTextFixture],
@@ -323,7 +323,7 @@ export const humanRequestFixture: HumanRequest = {
   status: "pending",
   payload: {
     reason: "支付网关需要 2FA 验证码",
-    version_sut_id: "1002",
+    sut_id: "1002",
     account_role: "admin",
     page_url: "https://pay.test/p3/login?mfa=1",
     challenge_kind: "2fa",
@@ -352,7 +352,7 @@ export const clarificationQuestionFixture: HumanRequest = {
   status: "pending",
   payload: {
     reason: "请确认退款口径：T+1 还是 T+3？",
-    version_sut_id: null,
+    sut_id: null,
     account_role: "",
     page_url: "",
     challenge_kind: "",
@@ -395,7 +395,7 @@ export const intentFixture: Intent = {
   case_version_id: "7002",
   case_id: "7001",
   case_title: "退款 T+1 到账",
-  version_sut_ids: ["1002"],
+  sut_ids: ["1002"],
   purpose: "initial",
   status: "done",
   attempt_no: 1,

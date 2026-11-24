@@ -261,11 +261,21 @@ func TestRequirementsConfirmedAdvanceStage(t *testing.T) {
 func sampleRequirementVersionView() versionapp.RequirementVersionView {
 	return versionapp.RequirementVersionView{
 		ID: 9002, RequirementID: 9001, Revision: 2,
-		Title: "Checkout coupons", Description: "desc", AcceptanceCriteria: "ac",
+		Title: "Checkout coupons",
+		UserStory: versionapp.RequirementUserStoryView{
+			AsA: "a shopper", IWant: "to apply a coupon", SoThat: "I pay less",
+		},
+		Rules: "One coupon per order.",
+		AcceptanceCriteria: []versionapp.RequirementAcceptanceCriterionView{
+			{ID: "AC-1", Given: "a valid coupon", When: "it is applied", Then: "the total drops"},
+			{ID: "AC-2", Given: "an expired coupon", When: "it is applied", Then: "it is rejected"},
+		},
 		Priority: "P1", Constraints: json.RawMessage(`{"business_rules":[]}`),
-		TargetVersionSUTs: []string{"5001"}, TargetPages: []string{"6001"}, TargetAPIs: []string{"7001"},
-		ContentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		CreatedAt:   testTime,
+		SutDescription:   "The web storefront checkout.",
+		ScopeOut:         "Gift cards.",
+		AccountRolesHint: []string{"shopper"},
+		ContentHash:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		CreatedAt:        testTime,
 	}
 }
 
@@ -273,7 +283,6 @@ func sampleRequirementView() versionapp.RequirementView {
 	return versionapp.RequirementView{
 		ID: 9001, CurrentVersionID: 9002, Revision: 2, Title: "Checkout coupons",
 		Status: "clarified", Priority: "P1",
-		TargetVersionSUTs: []string{"5001"}, TargetPages: []string{"6001"}, TargetAPIs: []string{"7001"},
 		UpdatedAt: testTime, ConfirmedAt: &testTime,
 	}
 }
@@ -284,7 +293,7 @@ func sampleRequirementDetail() versionapp.RequirementDetail {
 		CurrentVersion:  sampleRequirementVersionView(),
 		History: []versionapp.RequirementVersionView{{
 			ID: 9000, RequirementID: 9001, Revision: 1, Title: "Old title", Priority: "P2",
-			Constraints: json.RawMessage(`{}`), TargetVersionSUTs: []string{}, TargetPages: []string{}, TargetAPIs: []string{},
+			Constraints: json.RawMessage(`{}`),
 			ContentHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CreatedAt: testTime,
 		}},
 		Confirmations: []versionapp.ConfirmationView{{
@@ -303,17 +312,23 @@ func sampleRequirementDetail() versionapp.RequirementDetail {
 	}
 }
 
-func TestCreateRequirementParsesTargetsAndReturnsDetailShape(t *testing.T) {
+func TestCreateRequirementParsesContractAndReturnsDetailShape(t *testing.T) {
 	handler, stub := newRequirementServer(t)
 	stub.detail = sampleRequirementDetail()
 
 	body := `{
 		"title": "Checkout coupons",
-		"description": "desc",
-		"acceptance_criteria": "ac",
+		"user_story": {"as_a": "a shopper", "i_want": "to apply a coupon", "so_that": "I pay less"},
+		"rules": "One coupon per order.",
+		"acceptance_criteria": [
+			{"given": "a valid coupon", "when": "it is applied", "then": "the total drops"},
+			{"given": "an expired coupon", "when": "it is applied", "then": "it is rejected"}
+		],
 		"priority": "P1",
 		"constraints": {"business_rules": ["one per order"]},
-		"targets": {"version_suts": ["5001"], "pages": ["6001"], "apis": ["7001"]}
+		"sut_description": "The web storefront checkout.",
+		"scope_out": "Gift cards.",
+		"account_roles_hint": ["shopper"]
 	}`
 	recorder := call(t, handler, http.MethodPost, "/api/versions/101/requirements", body, actor())
 	if recorder.Code != http.StatusCreated {
@@ -325,9 +340,21 @@ func TestCreateRequirementParsesTargetsAndReturnsDetailShape(t *testing.T) {
 	if stub.lastDraft.Title != "Checkout coupons" || stub.lastDraft.Priority != "P1" {
 		t.Fatalf("draft = %#v", stub.lastDraft)
 	}
-	if len(stub.lastDraft.TargetVersionSUTs) != 1 || stub.lastDraft.TargetVersionSUTs[0] != "5001" ||
-		stub.lastDraft.TargetPages[0] != "6001" || stub.lastDraft.TargetAPIs[0] != "7001" {
-		t.Fatalf("targets = %#v", stub.lastDraft)
+	if stub.lastDraft.UserStory.AsA != "a shopper" || stub.lastDraft.UserStory.IWant != "to apply a coupon" ||
+		stub.lastDraft.UserStory.SoThat != "I pay less" {
+		t.Fatalf("user_story = %#v", stub.lastDraft.UserStory)
+	}
+	if stub.lastDraft.Rules != "One coupon per order." || stub.lastDraft.SutDescription != "The web storefront checkout." ||
+		stub.lastDraft.ScopeOut != "Gift cards." {
+		t.Fatalf("draft = %#v", stub.lastDraft)
+	}
+	if len(stub.lastDraft.AcceptanceCriteria) != 2 ||
+		stub.lastDraft.AcceptanceCriteria[0].Given != "a valid coupon" ||
+		stub.lastDraft.AcceptanceCriteria[1].Then != "it is rejected" {
+		t.Fatalf("acceptance_criteria = %#v", stub.lastDraft.AcceptanceCriteria)
+	}
+	if len(stub.lastDraft.AccountRolesHint) != 1 || stub.lastDraft.AccountRolesHint[0] != "shopper" {
+		t.Fatalf("account_roles_hint = %#v", stub.lastDraft.AccountRolesHint)
 	}
 	if string(stub.lastDraft.Constraints) != `{"business_rules": ["one per order"]}` {
 		t.Fatalf("constraints = %s", stub.lastDraft.Constraints)
@@ -343,17 +370,37 @@ func TestCreateRequirementParsesTargetsAndReturnsDetailShape(t *testing.T) {
 	if _, hasVersionID := data["version_id"]; hasVersionID {
 		t.Fatalf("summary must not expose version_id: %#v", data)
 	}
+	// The summary no longer carries a targets object: the requirement contract
+	// has no resource targets (design v1.3.1 §5.1).
+	if _, hasTargets := data["targets"]; hasTargets {
+		t.Fatalf("summary must not expose targets any more: %#v", data)
+	}
 	if data["confirmed_at"] != "2026-10-31T12:00:00Z" || data["updated_at"] != "2026-10-31T12:00:00Z" {
 		t.Fatalf("times = %#v/%#v", data["confirmed_at"], data["updated_at"])
-	}
-	targets := data["targets"].(map[string]any)
-	if targets["version_suts"].([]any)[0] != "5001" || targets["pages"].([]any)[0] != "6001" || targets["apis"].([]any)[0] != "7001" {
-		t.Fatalf("targets = %#v", targets)
 	}
 
 	current := data["current_version"].(map[string]any)
 	if current["id"] != "9002" || current["requirement_id"] != "9001" || current["content_hash"] == "" {
 		t.Fatalf("current_version = %#v", current)
+	}
+	story := current["user_story"].(map[string]any)
+	if story["as_a"] != "a shopper" || story["i_want"] != "to apply a coupon" || story["so_that"] != "I pay less" {
+		t.Fatalf("current_version.user_story = %#v", story)
+	}
+	if current["sut_description"] != "The web storefront checkout." || current["scope_out"] != "Gift cards." {
+		t.Fatalf("current_version = %#v", current)
+	}
+	criteria := current["acceptance_criteria"].([]any)
+	if len(criteria) != 2 {
+		t.Fatalf("current_version.acceptance_criteria = %#v", criteria)
+	}
+	first := criteria[0].(map[string]any)
+	if first["id"] != "AC-1" || first["given"] != "a valid coupon" || first["then"] != "the total drops" {
+		t.Fatalf("current_version.acceptance_criteria[0] = %#v", first)
+	}
+	roles := current["account_roles_hint"].([]any)
+	if len(roles) != 1 || roles[0] != "shopper" {
+		t.Fatalf("current_version.account_roles_hint = %#v", roles)
 	}
 	if _, ok := current["created_by"]; ok {
 		t.Fatalf("current_version must not expose internal audit ids: %#v", current)
@@ -400,7 +447,7 @@ func TestRequirementListParsesFiltersAndReturnsSummaryPage(t *testing.T) {
 		t.Fatalf("items = %#v", items)
 	}
 	item := items[0].(map[string]any)
-	if item["id"] != "9001" || item["current_version_id"] != "9002" || item["targets"].(map[string]any)["pages"].([]any)[0] != "6001" {
+	if item["id"] != "9001" || item["current_version_id"] != "9002" || item["title"] != "Checkout coupons" {
 		t.Fatalf("item = %#v", item)
 	}
 	payload := decodeBody(t, recorder)
@@ -437,7 +484,9 @@ func TestRequirementGetUpdateRollbackAndRelations(t *testing.T) {
 		t.Fatalf("get args = %d/%d", stub.lastVersionID, stub.lastRequestID)
 	}
 
-	updateBody := `{"title":"New","description":"d","acceptance_criteria":"a","priority":"P0","constraints":{},"targets":{"version_suts":[],"pages":[],"apis":[]},"reason":"clarified scope"}`
+	updateBody := `{"title":"New","user_story":{"as_a":"a shopper","i_want":"to pay","so_that":"I check out"},` +
+		`"acceptance_criteria":[{"given":"g","when":"w","then":"t"}],"priority":"P0","constraints":{},` +
+		`"sut_description":"The checkout.","reason":"clarified scope"}`
 	patched := call(t, handler, http.MethodPatch, "/api/versions/101/requirements/9001", updateBody, actor())
 	if patched.Code != http.StatusOK {
 		t.Fatalf("patch status = %d, body = %s", patched.Code, patched.Body.String())
@@ -475,6 +524,53 @@ func TestRequirementGetUpdateRollbackAndRelations(t *testing.T) {
 	}
 	if payload := decodeBody(t, relations); payload["next_cursor"] != "" || payload["has_more"] != false {
 		t.Fatalf("relations envelope = %#v", payload)
+	}
+}
+
+// TestRequirementUpdateRejectsUnknownFields pins R-H5 (H-B10): the requirement
+// PATCH body is decoded strictly, so an unknown field is a typed 400 field error
+// instead of being silently ignored. UpdateRequirementRequest is the documented
+// full-replacement shape: the acceptance-criterion input is {given,when,then}
+// only (no client-supplied id), and a removed body-level field such as
+// description is not accepted. The service must not be reached when decoding
+// fails.
+func TestRequirementUpdateRejectsUnknownFields(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown body field description",
+			body: `{"title":"New","user_story":{"as_a":"a","i_want":"b","so_that":"c"},` +
+				`"acceptance_criteria":[{"given":"g","when":"w","then":"t"}],` +
+				`"sut_description":"The checkout.","description":"legacy field","reason":"edit"}`,
+		},
+		{
+			name: "unknown acceptance criterion id",
+			body: `{"title":"New","user_story":{"as_a":"a","i_want":"b","so_that":"c"},` +
+				`"acceptance_criteria":[{"id":"AC-1","given":"g","when":"w","then":"t"}],` +
+				`"sut_description":"The checkout.","reason":"edit"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, stub := newRequirementServer(t)
+			stub.detail = sampleRequirementDetail()
+			recorder := call(t, handler, http.MethodPatch, "/api/versions/101/requirements/9001", tc.body, actor())
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", recorder.Code, recorder.Body.String())
+			}
+			body := errorBody(t, recorder)
+			if body["code"] != "invalid_argument" {
+				t.Fatalf("error code = %#v, want invalid_argument (typed field error)", body["code"])
+			}
+			if field := body["details"].(map[string]any)["field"]; field != "body" {
+				t.Fatalf("field = %#v, want body", field)
+			}
+			if stub.lastReason != "" {
+				t.Fatalf("strict decode must fail before the service: reason = %q", stub.lastReason)
+			}
+		})
 	}
 }
 
@@ -786,7 +882,7 @@ func TestRequirementViewsExposeCloseProjection(t *testing.T) {
 	}
 }
 
-func TestVersionDetailIncludesP1Counts(t *testing.T) {
+func TestVersionDetailIncludesRequirementCounts(t *testing.T) {
 	stub := &stubService{}
 	view := sampleView()
 	view.RequirementCounts = version.RequirementCounts{Total: 5, Draft: 2, Clarified: 3}

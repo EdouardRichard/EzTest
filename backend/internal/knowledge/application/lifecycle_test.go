@@ -397,14 +397,7 @@ func TestRouteChangeMarksStale(t *testing.T) {
 	// account bindings exposes the current route/role keys, so a change can be
 	// diffed against a captured snapshot and fed to MarkBindingsStale.
 	t.Run("version exposes the page route and account role keys", func(t *testing.T) {
-		bindings := []version.Binding{{
-			ID:            9001,
-			VersionID:     42,
-			SUTID:         1001,
-			EnvironmentID: 1101,
-			ScopeExclude:  version.NewScopeExclude(nil, nil, nil),
-			Accounts:      []version.AccountBinding{{AccountID: 5001}},
-		}}
+		accounts := []version.AccountBinding{{AccountID: 5001}}
 		catalog := versionKeysCatalog{
 			pages: map[int64]resourceapp.PageView{
 				1301: {ID: "1301", RouteTemplate: " /login "},
@@ -414,13 +407,15 @@ func TestRouteChangeMarksStale(t *testing.T) {
 				5001: {ID: "5001", Username: "admin", Roles: []string{" admin "}, Status: "active"},
 			},
 			environments: map[int64]resourceapp.EnvironmentView{
-				1101: {ID: "1101", SUTID: "1001", Pages: []resourceapp.PageView{
-					{ID: "1301", RouteTemplate: " /login ", Status: "approved"},
-					{ID: "1302", RouteTemplate: "", Status: "approved"},
+				1101: {ID: "1101", Name: "prod", Status: "active", SUTs: []resourceapp.SUTView{
+					{ID: "1001", EnvironmentID: "1101", Name: "Orders", Pages: []resourceapp.PageView{
+						{ID: "1301", SUTID: "1001", RouteTemplate: " /login ", Status: "approved"},
+						{ID: "1302", SUTID: "1001", RouteTemplate: "", Status: "approved"},
+					}},
 				}},
 			},
 		}
-		service := versionapp.New(versionKeysRepo{bindings: bindings}, catalog, nil, nil, nil, nil, nil)
+		service := versionapp.New(versionKeysRepo{accounts: accounts}, catalog, nil, nil, nil, nil, nil)
 		keys, err := service.KnowledgeBindingKeys(context.Background(), 42)
 		if err != nil {
 			t.Fatalf("KnowledgeBindingKeys: %v", err)
@@ -584,11 +579,12 @@ func TestKnowledgeBindingInvalidationReasonValidation(t *testing.T) {
 // embedding the port interfaces keeps the unused methods out of the test.
 type versionKeysRepo struct {
 	version.Repository
-	bindings []version.Binding
+	accounts []version.AccountBinding
 }
 
-func (r versionKeysRepo) Get(_ context.Context, id int64) (version.Version, []version.Binding, error) {
-	return version.Version{ID: id}, r.bindings, nil
+func (r versionKeysRepo) Get(_ context.Context, id int64) (version.Version, []version.AccountBinding, error) {
+	// v0.2.4-B: the version binds environment 1101 directly on its own row.
+	return version.Version{ID: id, EnvironmentID: 1101}, r.accounts, nil
 }
 
 type versionKeysCatalog struct {
@@ -620,6 +616,12 @@ func (c versionKeysCatalog) GetAccount(_ context.Context, id int64) (resourceapp
 		return resourceapp.AccountView{}, platform.NotFound("account")
 	}
 	return account, nil
+}
+
+// ListEnvironmentRepositories answers the environment code pool read the version
+// binding projection makes; this fixture has no repositories.
+func (c versionKeysCatalog) ListEnvironmentRepositories(_ context.Context, _ int64) ([]resourceapp.SUTRepositoryView, error) {
+	return nil, nil
 }
 
 /* ------------------------------- HTTP secrets ----------------------------- */

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -46,17 +47,36 @@ const (
 	ToolSUTPageList                = "sut.page_list"
 	// ToolSUTDatabaseList is the v0.22 E-1 read-only database inventory
 	// (R-E1-2). It is additive: the frozen P1 registration order above does not
-	// include it; resources.go registers it through RegisterP4ToolGroup when the
+	// include it; resources.go registers it through RegisterToolGroup when the
 	// resource port also implements the DatabaseLister surface.
 	ToolSUTDatabaseList = "sut.database_list"
+	// ToolSUTRead is the v0.2.4-F P16 SUT detail reader (SC-F2). It is additive:
+	// the frozen P1 registration order above does not include it; sut_tools.go
+	// registers it through RegisterToolGroup when the resource port also
+	// implements the SUTReader surface.
+	ToolSUTRead = "sut.read"
+	// ToolSUTAssetRegister is the v0.2.4-F P17 explore->prove->register tool
+	// (SC-F3). It is additive: sut_tools.go registers it through RegisterToolGroup
+	// when the asset-registration port is wired (Deps.AssetRegistration.Registrar).
+	ToolSUTAssetRegister = "sut.asset_register"
+	// ToolSUTRegister is the v0.2.4-F R-B4 new-SUT registration tool (SC-F4). It is
+	// additive: sut_tools.go registers it through RegisterToolGroup when the
+	// new-SUT registration port is wired (Deps.SUTRegistration.Registrar).
+	ToolSUTRegister = "sut.register"
+	// ToolFixtureUpload / ToolFixtureDownload are the v0.2.4-F P18 session fixture
+	// tools (SC-F5). They are additive: fixture_tools.go registers them through
+	// RegisterToolGroup when the fixture library port is wired
+	// (Deps.SessionFixtures.Library).
+	ToolFixtureUpload   = "fixture.upload"
+	ToolFixtureDownload = "fixture.download"
 	// ToolToolResultRead is the v0.22 A-6 continuation tool (R-A6-1). It is
-	// registered by NewP7Registry only when the content-store port is wired;
+	// registered by NewKnowledgeRegistry only when the content-store port is wired;
 	// the frozen P1 registration order above is unchanged.
 	ToolToolResultRead = "tool_result.read"
 )
 
-// p1ToolNames is the frozen P1 registration order.
-var p1ToolNames = []string{
+// baseToolNames is the frozen P1 registration order.
+var baseToolNames = []string{
 	ToolContextVersionPack,
 	ToolContextTaskPack,
 	ToolContextTeamRoomRead,
@@ -73,9 +93,9 @@ var p1ToolNames = []string{
 	ToolSUTPageList,
 }
 
-// P1ToolNames returns a copy of the frozen P1 tool names.
-func P1ToolNames() []string {
-	return append([]string(nil), p1ToolNames...)
+// BaseToolNames returns a copy of the frozen P1 tool names.
+func BaseToolNames() []string {
+	return append([]string(nil), baseToolNames...)
 }
 
 // Scope is injected by the runtime for every tool execution. It is never part
@@ -89,7 +109,6 @@ type Scope struct {
 	CaseVersionID        int64
 	RoundID              int64
 	AgentRunID           int64
-	VersionSUTIDs        []int64
 	// P3 execution scope (contracts/agent-profiles-tools.md P3 increment). The
 	// case_run dispatch epoch/token fence every result write.
 	WaveID        int64
@@ -97,15 +116,13 @@ type Scope struct {
 	IntentID      int64
 	DispatchEpoch int64
 	DispatchToken string
-	// P4 delivery/steward scope (contracts/agent-profiles-tools.md §7.2). The
-	// task target IDs are copied from the work-item payload by the runner;
-	// RequirementID/RequirementVersionID above are reused by requirement.close.
-	IssueID              int64
-	ReportID             int64
-	ReportRevision       int32
-	CloseRound           int32
-	ReportRevisionID     int64
-	PredicateFingerprint string
+	// P4 delivery scope (contracts/agent-profiles-tools.md §7.2). The task target
+	// IDs are copied from the work-item payload by the runner. GD-17 removed the
+	// steward close scope (close_round/report_revision_id/predicate_fingerprint)
+	// with the requirement.close/version.close work types.
+	IssueID        int64
+	ReportID       int64
+	ReportRevision int32
 	// Extraction is the v0.22 A-7 deterministic extraction context of one
 	// requirement.extraction_emit call (spec R-A7-2/4/5). The extraction worker
 	// (Task 17/18) injects it out of band; it is never part of a tool schema.
@@ -174,7 +191,8 @@ func InvalidField(field, message string) *Error {
 
 // InvalidWithAllowed builds a retryable field-level invalid_argument error that
 // also names the accepted values and the next action. Used by the self-describing
-// case.graph_propose contract for enums, database ids and unknown fields.
+// case.graph_propose contract for enums, the covered_acs / sut_id argument errors
+// and unknown fields.
 func InvalidWithAllowed(field, message string, allowed []string, hint string) *Error {
 	err := InvalidField(field, message)
 	err.Allowed = append([]string(nil), allowed...)
@@ -262,6 +280,58 @@ func (r *Registry) Names() []string {
 	return names
 }
 
+// ToolDomain derives the capability domain of a tool name: the namespace before
+// the first dot ("exec.run" → "exec"). The domain tag is a pure function of the
+// registered name — the registry is the single authority and there is no second
+// hand-maintained domain table (constitution art.5). A name without a namespace
+// has no domain.
+func ToolDomain(name string) string {
+	namespace, _, found := strings.Cut(name, ".")
+	if !found || namespace == "" {
+		return ""
+	}
+	return namespace
+}
+
+// Domains returns the sorted distinct capability domains of the registered
+// tools (derived, never stored).
+func (r *Registry) Domains() []string {
+	if r == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	domains := make([]string, 0, 8)
+	for name := range r.byName {
+		domain := ToolDomain(name)
+		if domain == "" {
+			continue
+		}
+		if _, duplicate := seen[domain]; duplicate {
+			continue
+		}
+		seen[domain] = struct{}{}
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	return domains
+}
+
+// NamesInDomain returns the registered tool names of one capability domain in
+// sorted order. It is the derived membership a domain wildcard ("exec.*")
+// permits; the registry stays the authority on which members exist.
+func (r *Registry) NamesInDomain(domain string) []string {
+	if r == nil || domain == "" {
+		return nil
+	}
+	names := make([]string, 0, 4)
+	for _, name := range r.Names() {
+		if ToolDomain(name) == domain {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // Definitions renders llm tool definitions for the profile's allowed tools.
 // Unknown names (for example a profile seeded before a tool was removed) are
 // skipped defensively.
@@ -317,17 +387,17 @@ type Deps struct {
 	// Execution is the P3 execution context surface. It is nil for P1/P2-only
 	// wiring; P3 tools then fail as an internal configuration error.
 	Execution ExecutionPort
-	// P5 is the additive P5 codeintel/visual service surface. P1–P4 wiring
+	// P5 is the additive P5 codeintel service surface. P1–P4 wiring
 	// leaves it zero; the P5 tools then fail as an internal configuration
 	// error. It is nested so the frozen P1–P4 Deps fields stay unchanged.
-	P5 P5Deps
+	CodeIntel CodeIntelDeps
 	// P7 is the additive P7 knowledge tool surface. It is nested so the frozen
 	// P1–P6 Deps fields stay unchanged; a zero value disables the P7 tools.
-	P7 P7Deps
+	Knowledge KnowledgeDeps
 	// Completion is the additive v0.22 task.complete surface (spec R-A3). It is
 	// nested so the frozen P1–P7 Deps fields stay unchanged. The composition
 	// root fills it per run (Task 36) and registers TaskCompleteTools through
-	// RegisterP4ToolGroup; a zero value leaves task.complete unregistered.
+	// RegisterToolGroup; a zero value leaves task.complete unregistered.
 	Completion CompletionDeps
 	// ToolResult is the additive v0.22 A-6 tool-result governance surface
 	// (R-A6-1..R-A6-5). The composition root fills it per run (Task 36); a nil
@@ -340,6 +410,23 @@ type Deps struct {
 	// draft/upsert sink. It is nested so the frozen P1-P7 Deps fields stay
 	// unchanged.
 	Extraction ExtractionDeps
+	// Skill is the additive v0.2.4-C T19 skill capability-domain surface
+	// (SC-C12). Both ports must be wired for skill.read to register; a zero
+	// value leaves the tool unregistered. It is nested so the frozen P1-P7
+	// Deps fields stay unchanged.
+	Skill SkillDeps
+	// AssetRegistration is the additive v0.2.4-F T10 P17 explore->prove->register
+	// surface (SC-F3). A nil Registrar leaves sut.asset_register unregistered. It
+	// is nested so the frozen P1-P7 Deps fields stay unchanged.
+	AssetRegistration AssetRegistrationDeps
+	// SUTRegistration is the additive v0.2.4-F T11 R-B4 new-SUT registration surface
+	// (SC-F4). A nil Registrar leaves sut.register unregistered. It is nested so the
+	// frozen P1-P7 Deps fields stay unchanged.
+	SUTRegistration SUTRegistrationDeps
+	// SessionFixtures is the additive v0.2.4-F T13 P18 session fixture surface
+	// (SC-F5). A nil Library leaves fixture.upload/fixture.download unregistered.
+	// It is nested so the frozen P1-P7 Deps fields stay unchanged.
+	SessionFixtures SessionFixtureDeps
 }
 
 // ExtractionDeps is the per-run wiring of the v0.22 A-7 deterministic
@@ -353,10 +440,10 @@ type ExtractionDeps struct {
 
 // registerExtractionToolGroup appends the extraction tool only when its sink is
 // wired. It uses the additive P4 tool-group mechanism from registry.go so the
-// frozen P1-P7 registration sets are not edited by this task; NewP4Registry and
+// frozen P1-P7 registration sets are not edited by this task; NewToolGroupRegistry and
 // every later composition (P5-P7, the runtime registry) evaluate it.
 func init() {
-	RegisterP4ToolGroup(func(deps Deps) []Tool {
+	RegisterToolGroup(func(deps Deps) []Tool {
 		if deps.Extraction.Sink == nil {
 			return nil
 		}
@@ -386,27 +473,58 @@ type RequirementSummary struct {
 	Priority         string
 }
 
+// RequirementUserStory is the three-part user story of the requirement
+// contract (design v1.3.1 §5.1).
+type RequirementUserStory struct {
+	AsA    string
+	IWant  string
+	SoThat string
+}
+
+// RequirementAcceptanceCriterionInput is one Gherkin acceptance criterion a
+// model submits. It carries no id: ids are server-assigned ("AC-<n>") and
+// inherited across revisions by identical content, so a model can neither pick
+// one nor resurrect one a deleted criterion left behind.
+type RequirementAcceptanceCriterionInput struct {
+	Given string
+	When  string
+	Then  string
+}
+
+// RequirementAcceptanceCriterion is one acceptance criterion as read back, with
+// the server-assigned id a design case's covered_acs refers to.
+type RequirementAcceptanceCriterion struct {
+	ID    string
+	Given string
+	When  string
+	Then  string
+}
+
 // RequirementDetail is the full current requirement revision.
 type RequirementDetail struct {
 	RequirementSummary
-	Description        string
-	AcceptanceCriteria string
+	UserStory          RequirementUserStory
+	Rules              string
+	AcceptanceCriteria []RequirementAcceptanceCriterion
 	Constraints        json.RawMessage
-	TargetVersionSUTs  []string
-	TargetPages        []string
-	TargetAPIs         []string
+	SutDescription     string
+	ScopeOut           string
+	AccountRolesHint   []string
 }
 
-// RequirementDraft is the validated draft payload submitted by a model.
+// RequirementDraft is the validated draft payload submitted by a model. There
+// are no resource targets: a version binds an environment and the requirement
+// names its subject in SutDescription.
 type RequirementDraft struct {
 	Title              string
-	Description        string
-	AcceptanceCriteria string
+	UserStory          RequirementUserStory
+	Rules              string
+	AcceptanceCriteria []RequirementAcceptanceCriterionInput
 	Priority           string
 	Constraints        json.RawMessage
-	TargetVersionSUTs  []string
-	TargetPages        []string
-	TargetAPIs         []string
+	SutDescription     string
+	ScopeOut           string
+	AccountRolesHint   []string
 }
 
 // RequirementPort is the version context's requirement application surface.
@@ -492,20 +610,29 @@ type AttachmentPort interface {
 	AttachmentImageRefByImage(ctx context.Context, versionID, conversationID, imageID int64) (AttachmentImage, error)
 }
 
-// SUTSummary is one version-SUT binding shown to the model.
+// SUTSummary is one SUT of the version's bound environment shown to the model.
+// BaseURL/Source/Status are the v0.2.4-F P16 enrichment (SC-F2): sut.list now
+// emits the base_url its Description always promised, plus the SUT's registration
+// source/status, so the execution team can match a case's sut_description against
+// the catalog without a second round-trip. They are identity/label fields read
+// from the catalog row; the effective-scope RANGE still comes from EffectiveSUTs.
 type SUTSummary struct {
-	VersionSUTID int64
-	Name         string
-	Environment  string
-	Scope        string
+	SUTID       int64
+	Name        string
+	Environment string
+	Scope       string
+	BaseURL     string
+	Source      string
+	Status      string
 }
 
-// ResourcePage is one page or API bound to a version SUT.
+// ResourcePage is one page or API of a SUT of the version's bound environment.
 type ResourcePage struct {
-	VersionSUTID int64
-	// ID is the bound page/API catalog ID as a decimal string. requirement
-	// target_pages/target_apis only accept these IDs; paths are rejected by the
-	// version context, so the model must receive them from sut.page_list.
+	SUTID int64
+	// ID is the bound page/API catalog ID as a decimal string. v0.2.4-B: it is
+	// an inventory identifier for the model to read, not something a requirement
+	// or a case binds to -- both contracts describe their subject in natural
+	// language now (design v1.3.1 §5.1/§5.2).
 	ID     string
 	Kind   string
 	Name   string
@@ -516,23 +643,24 @@ type ResourcePage struct {
 // ResourcePort is the resource/version context read surface for SUT data.
 type ResourcePort interface {
 	ListSUTs(ctx context.Context, versionID int64) ([]SUTSummary, error)
-	ListPages(ctx context.Context, versionID, versionSUTID int64) ([]ResourcePage, error)
+	ListPages(ctx context.Context, versionID, sutID int64) ([]ResourcePage, error)
 }
 
-// NewP2Registry registers the frozen P1 tool set plus the P2 design tools.
+// NewDesignRegistry registers the frozen P1 tool set plus the P2 design tools.
 // case.confirm and the granular design.* write tools are deliberately absent:
 // confirmation is user/server-only and graph writes go through
 // case.graph_propose (P2-D-5).
-func NewP2Registry(deps Deps) *Registry {
-	return NewRegistry(append(p1Tools(deps),
+func NewDesignRegistry(deps Deps) *Registry {
+	return NewRegistry(append(baseTools(deps),
 		&designGraphRead{deps: deps},
 		&caseGraphPropose{deps: deps},
 		&designReviewSubmit{deps: deps},
 		&designDataPlanSubmit{deps: deps},
+		&designJudgmentSubmit{deps: deps},
 	)...)
 }
 
-func p1Tools(deps Deps) []Tool {
+func baseTools(deps Deps) []Tool {
 	return []Tool{
 		&contextVersionPack{deps: deps},
 		&contextTaskPack{deps: deps},

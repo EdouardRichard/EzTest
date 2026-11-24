@@ -75,8 +75,8 @@ func ValidPauseMode(mode string) bool {
 	return mode == "" || mode == PauseModeGraceful || mode == PauseModeImmediate
 }
 
-// SUTCounts is the per-version-SUT projection of a wave (spec §5.6). The map
-// key of ByVersionSUT is the decimal version_sut ID.
+// SUTCounts is the per-SUT projection of a wave (spec §5.6). The map
+// key of BySUT is the decimal SUT id.
 type SUTCounts struct {
 	Total        int `json:"total"`
 	Passed       int `json:"passed"`
@@ -86,7 +86,7 @@ type SUTCounts struct {
 }
 
 // WaveCounts is the run_wave.counts snapshot. Total counts case_runs once;
-// ByVersionSUT counts a cross-system case under each SUT it uses.
+// BySUT counts a cross-system case under each SUT it uses.
 type WaveCounts struct {
 	Total        int                  `json:"total"`
 	Pending      int                  `json:"pending"`
@@ -100,13 +100,13 @@ type WaveCounts struct {
 	Interrupted  int                  `json:"interrupted"`
 	Superseded   int                  `json:"superseded"`
 	Evidence     int                  `json:"evidence"`
-	ByVersionSUT map[string]SUTCounts `json:"by_version_sut"`
+	BySUT        map[string]SUTCounts `json:"by_sut"`
 }
 
-// Normalize returns counts with a non-nil ByVersionSUT map.
+// Normalize returns counts with a non-nil BySUT map.
 func (c WaveCounts) Normalize() WaveCounts {
-	if c.ByVersionSUT == nil {
-		c.ByVersionSUT = map[string]SUTCounts{}
+	if c.BySUT == nil {
+		c.BySUT = map[string]SUTCounts{}
 	}
 	return c
 }
@@ -126,12 +126,22 @@ type RunWave struct {
 	PauseMode   string
 	ReportID    *int64
 	// ScopeSnapshot is the frozen effective scope of the wave (R-C5-1): the
-	// version_sut page/API/database/account/repository id sets captured when the
+	// per-SUT page/API/database/account/repository id sets captured when the
 	// wave is planned. It is written once and never updated, so a rerun of the
 	// same wave observes the same scope even if the version binding changed.
 	ScopeSnapshot string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// EnvironmentFingerprint and CodeBaseline are the wave-level fingerprint
+	// carriers (v0.2.4-F SC-F7): the fingerprint values computed from the frozen
+	// scope at plan time, carried on the wave so a wave-level consumer reads the
+	// in-wave-stable value rather than recomputing from the live catalog. They are
+	// derived from ScopeSnapshot (the planner sets them at creation; the repository
+	// rebuilds them on read via ParseWaveScopeSnapshot) and are empty for a legacy
+	// wave whose frozen document predates the carrier. Wave-level consumers verify
+	// them against the frozen inputs through executionapp.WaveFrozenFingerprint.
+	EnvironmentFingerprint string
+	CodeBaseline           string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // PauseModeOrDefault returns the effective pause mode.

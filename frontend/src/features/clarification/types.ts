@@ -1,7 +1,7 @@
 /**
  * Wire types for the P1 clarification workspace.
  *
- * Field names are pinned by `docs/version-V0.2/contracts/openapi.yaml`
+ * Field names are pinned by `docs/openapi/api.yaml`
  * (`x-frozen: P1`, spec §8). IDs are decimal strings, timestamps RFC3339,
  * list endpoints use `{data, next_cursor, has_more}` and detail endpoints use
  * `{data: ...}`.
@@ -10,6 +10,7 @@
 import type {
   CaseCardPart,
   MessagePart as ConversationMessagePart,
+  MessageStreamState,
 } from "@/features/conversation/types"
 
 export type RequirementStatus = "draft" | "clarified" | "closed" | "obsolete"
@@ -28,7 +29,11 @@ export type ExtractionStatus = "pending" | "processing" | "done" | "failed" | "s
 
 export type AttachmentErrorCode = "unsupported_attachment_format" | "extraction_failed"
 
-export type TeamRoomKind = "clarification" | "design" | "execution" | "delivery" | "steward"
+/**
+ * Product team rooms. The Version Steward team was removed (v0.2.4-G T5, GD-17):
+ * closure is now a deterministic reconciler predicate, not an LLM team.
+ */
+export type TeamRoomKind = "clarification" | "design" | "execution" | "delivery"
 
 export type TeamRoomPostKind = "finding" | "decision" | "blocker" | "handoff" | "status"
 
@@ -157,6 +162,12 @@ export type ConversationMessage = {
   refs: MessageRef[]
   /** 0.2.1 assistant model that actually generated the message; null for user messages. */
   actual_model?: string | null
+  /**
+   * v0.2.4-D incremental reply lifecycle: `streaming` on the Begin placeholder,
+   * `complete`/`interrupted` on the terminal full frame. Absent on legacy rows
+   * (the server normalizes batch messages to `complete`).
+   */
+  stream_state?: MessageStreamState
   created_at: string
 }
 
@@ -170,11 +181,12 @@ export type PostMessageRequest = {
   parts: NewMessagePart[]
 }
 
-/** `RequirementTargets` — decimal IDs of version-bound SUTs/pages/APIs. */
-export type RequirementTargets = {
-  version_suts: string[]
-  pages: string[]
-  apis: string[]
+/** P4 latest-closure projection (`requirementClosureDTO`, v0.2.4-B). */
+export type RequirementClosure = {
+  closure_id: string
+  close_round: number
+  closed_at: string
+  reopen_count: number
 }
 
 /** `RequirementSummary` — current revision summary returned by the list endpoint. */
@@ -185,24 +197,43 @@ export type Requirement = {
   title: string
   status: RequirementStatus
   priority: RequirementPriority
-  targets: RequirementTargets
   updated_at: string
   confirmed_at: string | null
+  closed_at: string | null
+  closure: RequirementClosure | null
+  /** v0.2.4-G T6: admin waiver flag (read visibility for all users). */
+  waived?: boolean
 }
 
-/** `RequirementVersionView` — immutable requirement version snapshot. */
+/** §5.1 three-part user story (v0.2.4-B natural-language requirement contract). */
+export type RequirementUserStory = {
+  as_a: string
+  i_want: string
+  so_that: string
+}
+
+/** One structured acceptance criterion; the id is server-assigned ("AC-<n>"). */
+export type AcceptanceCriterion = {
+  id: string
+  given: string
+  when: string
+  then: string
+}
+
+/** `RequirementVersionView` — immutable requirement version snapshot (V1). */
 export type RequirementVersionView = {
   id: string
   requirement_id: string
   revision: number
   title: string
-  description: string
-  acceptance_criteria: string
+  user_story: RequirementUserStory
+  rules: string
+  acceptance_criteria: AcceptanceCriterion[]
   priority: RequirementPriority
   constraints: Record<string, unknown>
-  target_version_suts: string[]
-  target_pages: string[]
-  target_apis: string[]
+  sut_description: string
+  scope_out: string
+  account_roles_hint: string[]
   content_hash: string
   created_at: string
 }
@@ -263,13 +294,23 @@ export type RequirementDetail = Requirement & {
   attachments: AttachmentView[]
 }
 
+/** Request-side acceptance criterion: no id (server-assigned, inherited by content). */
+export type AcceptanceCriterionInput = {
+  given: string
+  when: string
+  then: string
+}
+
 export type RequirementWriteRequest = {
   title: string
-  description: string
-  acceptance_criteria: string
+  user_story: RequirementUserStory
+  rules: string
+  acceptance_criteria: AcceptanceCriterionInput[]
   priority: RequirementPriority
   constraints?: Record<string, unknown>
-  targets?: RequirementTargets
+  sut_description: string
+  scope_out: string
+  account_roles_hint: string[]
 }
 
 export type RequirementCreateRequest = RequirementWriteRequest
@@ -420,17 +461,4 @@ export type RequirementExtractionProgress = {
 /** `POST /api/versions/{id}/requirements/extractions` response (API-6). */
 export type RequirementExtractionStartResult = {
   runs: RequirementExtractionProgress[]
-}
-
-/** A selectable target (SUT, page or API) from the version's bindings. */
-export type TargetOption = {
-  id: string
-  label: string
-  hint?: string
-}
-
-export type TargetOptions = {
-  suts: TargetOption[]
-  pages: TargetOption[]
-  apis: TargetOption[]
 }

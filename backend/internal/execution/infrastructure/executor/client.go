@@ -1,7 +1,10 @@
-// Package executor is the HTTP client for the Playwright executor service
-// (executor protocol A', P3 extension). The API owns the bearer token and never
-// exposes the browser directly to the agent: every browser/db/http action is
-// proxied through this client by the execution tools.
+// Package executor is the HTTP client for the executor service (protocol v2:
+// sessions + exec/shell/files/artifacts/trace). The API owns the bearer token
+// and never exposes the executor directly to the agent: every execution call is
+// proxied through this client by the execution use cases.
+//
+// Protocol v2 is the only published surface (v0.2.4-C R-C2): the whole v1
+// context family was deleted on both sides in one change set.
 package executor
 
 import (
@@ -23,45 +26,84 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
-// MaxActionDuration is the executor's per-action cap. The API-side case_run
-// lease must be longer than the action plus transport overhead: the default
-// case lease is 90s and the client bound below is 75s.
-const MaxActionDuration = 60 * time.Second
+// maxRequestDurationBase is the baseline bound for one control-plane executor
+// request. The general command channel has its own (much longer) operational
+// deadline below. (The former per-browser-action cap retired with the T16
+// bridge removal; the value is retained as the control-plane sizing basis.)
+const maxRequestDurationBase = 60 * time.Second
 
-// DefaultTimeout bounds one executor request. The executor itself caps actions
-// at 60s (goto 30s); a slightly larger client bound lets the executor return its
-// own typed timeout error instead of the client aborting first. The case_run
-// lease (75s+) must stay above this bound so a slow action is never mistaken for
-// a lost executor by lease recovery.
-const DefaultTimeout = MaxActionDuration + 15*time.Second
+// DefaultTimeout bounds one control-plane executor request (health, session
+// create/close, artifacts, network read, cancel). A slightly larger client bound
+// than the executor's own cap lets the executor return its typed timeout error
+// instead of the client aborting first. The case_run lease (75s+) must stay above
+// this bound so a slow request is never mistaken for a lost executor by lease
+// recovery.
+const DefaultTimeout = maxRequestDurationBase + 15*time.Second
+
+// DefaultCommandTimeout mirrors the executor's operational command deadline
+// (EZTEST_EXECUTOR_COMMAND_TIMEOUT_MS, default 15min). ExecRequestTimeout adds
+// transport overhead so the executor's own typed executor_timeout wins instead
+// of the client aborting a command that is still inside its deadline. The
+// case_run lease is renewed by an independent heartbeat while a command runs.
+const (
+	DefaultCommandTimeout = 15 * time.Minute
+	ExecRequestTimeout    = DefaultCommandTimeout + 30*time.Second
+)
 
 const (
 	healthPath   = "/healthz"
-	contextsPath = "/v1/contexts"
-	// A screenshot or download artifact is capped at 10MB by the executor and
-	// travels base64-encoded, so the response can exceed the request cap.
-	maxResponseBytes = 32 << 20
+	sessionsPath = "/v1/sessions"
+	// maxResponseBytes bounds one executor response. An artifact page can carry
+	// base64 content up to the executor's artifact limit, so the bound is well
+	// above the request cap; exceeding it is an EXPLICIT typed error, never a
+	// silent truncation (constitution art.7.6).
+	maxResponseBytes = 256 << 20
 
 	// RequestIDHeader correlates one API-side executor call with the executor's
 	// own request start/finish log lines (v0.2.3 X-01).
 	RequestIDHeader = "X-EzTest-Request-Id"
 
 	// CodeExecutorTimeout is the typed platform code for a transport timeout or
-	// cancellation. Non-timeout transport failures keep executor_unavailable.
+	// cancellation. Non-timeout transport failures keep CodeExecutorUnavailable.
 	CodeExecutorTimeout = "executor_timeout"
+	// CodeExecutorUnavailable is the typed platform code this client produces for
+	// an unreachable executor or a protocol failure (unavailable/protocolError).
+	// It is the WIRE code of the executor protocol, not the persisted
+	// case_run.summary.terminal_cause: execution/application.classifyExecutorError
+	// maps it onto execution.TerminalCauseExecutorUnavailable, onto
+	// TerminalCauseExecutorContextCreateFailed for a session create, or onto the
+	// executor_lost failure class for a dial failure -- a non-identity mapping, so
+	// the two vocabularies are distinct even where they share a spelling.
+	CodeExecutorUnavailable = "executor_unavailable"
+)
+
+// Typed executor conflict codes (protocol v2 lease fencing). The API maps them
+// onto its own lease/session taxonomy instead of forwarding arbitrary codes.
+const (
+	CodeSessionNotFound    = "session_not_found"
+	CodeLeaseEpochRequired = "lease_epoch_required"
+	CodeLeaseLost          = "lease_lost"
+	CodeLeaseExpired       = "lease_expired"
+	CodeSessionReclaiming  = "session_reclaiming"
+	CodeSessionLimit       = "session_limit"
+	CodeDraining           = "draining"
+	// CodeBrowserCliUnavailable is the executor's typed 503 for a missing
+	// official playwright CLI runtime (executor/src/browser_cli.mjs). It is a
+	// concrete executor capability limitation, not a transport outage.
+	CodeBrowserCliUnavailable = "browser_cli_unavailable"
 )
 
 // CallDiagnostics is the dispatch provenance attached to one executor call. The
-// router/adapter layers know the owner and context; every field is optional and
+// router/adapter layers know the owner and session; every field is optional and
 // is copied into the structured error details/log line when known. It never
-// carries credentials. CreateContext is the only call that receives
-// case_run_id/attempt (from the create metadata); Action/Cancel/Close attach
-// only context_id (plus owner/endpoint/registry_hit) for now.
+// carries credentials. CreateSession is the only call that receives
+// case_run_id/attempt (from the create metadata); the other calls attach only
+// session_id (plus owner/endpoint/registry_hit).
 type CallDiagnostics struct {
 	OwnerExecutorID int64
 	CaseRunID       int64
 	Attempt         int
-	ContextID       string
+	SessionID       string
 	// RegistryHit reports whether the owner was resolved from the executor
 	// registry (false means primary-endpoint fallback).
 	RegistryHit *bool
@@ -79,82 +121,255 @@ func callDiagnosticsFrom(ctx context.Context) (CallDiagnostics, bool) {
 	return diagnostics, ok
 }
 
-// Health is the executor /healthz payload. A degraded executor still answers
-// (503) and keeps its bearer-protected routes available for cleanup. Creating
-// and LastContextCreateError expose an in-flight/hung context creation (X-01).
+type requestTimeoutKey struct{}
+
+// WithRequestTimeout overrides the per-request bound of one executor call. The
+// command channel uses it: a 15-minute command must not be aborted by the
+// control-plane bound. A shorter caller deadline still wins.
+func WithRequestTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	return context.WithValue(ctx, requestTimeoutKey{}, timeout)
+}
+
+func requestTimeoutFrom(ctx context.Context) (time.Duration, bool) {
+	timeout, ok := ctx.Value(requestTimeoutKey{}).(time.Duration)
+	return timeout, ok && timeout > 0
+}
+
+// Health is the executor /healthz payload (v2 session surface). A draining
+// executor answers 503 and keeps its bearer-protected routes available for
+// cleanup. The probe never launches a browser: exec/shell/files do not need one.
 type Health struct {
-	Status                 string `json:"status"`
-	Version                string `json:"version"`
-	Contexts               int    `json:"contexts"`
-	MaxContexts            int    `json:"maxContexts"`
-	BrowserVersion         string `json:"browserVersion,omitempty"`
-	Error                  string `json:"error,omitempty"`
-	Creating               int    `json:"creating"`
-	LastContextCreateError string `json:"lastContextCreateError,omitempty"`
+	Status            string `json:"status"`
+	Version           string `json:"version"`
+	Sessions          int    `json:"sessions"`
+	MaxSessions       int    `json:"maxSessions"`
+	Draining          bool   `json:"draining"`
+	ReclaimedSessions int    `json:"reclaimedSessions"`
+	Error             string `json:"error,omitempty"`
 }
 
-// Viewport is the optional browser viewport of a new context.
-type Viewport struct {
-	Width  int `json:"width"`
-	Height int `json:"height"`
+// Lease is the session lease the API stamps at creation. The epoch mirrors the
+// case_run dispatch epoch: every write carries it so a stale owner is fenced.
+type Lease struct {
+	Epoch int64
+	TTL   time.Duration
 }
 
-// CreateContextInput is one POST /v1/contexts request. Metadata is opaque to the
-// executor (P3 extension, ≤2KB) and is echoed by GET /v1/contexts.
-type CreateContextInput struct {
-	Key          string
-	AllowedHosts []string
-	BaseURL      string
-	StorageState json.RawMessage
-	Metadata     map[string]any
-	Viewport     *Viewport
-}
-
-// ContextInfo is one executor context. Key/Metadata/CreatedAt are returned by
-// GET /v1/contexts; CreateContext fills them from the request because the
-// executor's create response only carries the id.
-type ContextInfo struct {
-	ID        string
+// CreateSessionInput is one POST /v1/sessions request. Metadata is opaque to the
+// executor (≤2KB) and is echoed by GET /v1/sessions. BaseURL is an informational
+// hint consumed only by the retained browser bridge.
+type CreateSessionInput struct {
 	Key       string
+	Workspace string
+	BaseURL   string
 	Metadata  map[string]any
-	CreatedAt string
+	Lease     *Lease
 }
 
-// ActionError is the executor's typed action failure (target_not_found,
-// target_ambiguous, host_not_allowed, ...). It is not a transport error: the
-// browser tool maps it to a step failure/observed result.
-type ActionError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+// SessionInfo is one executor session summary.
+type SessionInfo struct {
+	ID               string         `json:"sessionId"`
+	Key              string         `json:"key"`
+	Workspace        string         `json:"workspace"`
+	Metadata         map[string]any `json:"metadata"`
+	CreatedAt        string         `json:"createdAt"`
+	LeaseEpoch       int64          `json:"lease_epoch"`
+	LeaseExpiresAt   string         `json:"lease_expires_at"`
+	LeaseTTLMS       int64          `json:"lease_ttl_ms"`
+	CommandCount     int            `json:"commandCount"`
+	RunningCommands  int            `json:"runningCommands"`
+	ArtifactCount    int            `json:"artifactCount"`
+	ArtifactBase     int64          `json:"artifact_base"`
+	ArtifactsEvicted int64          `json:"artifacts_evicted"`
 }
 
-// Artifact is one binary result of an action, base64-encoded for transport.
-// The API re-computes SHA256 and size before persisting it as evidence.
+// LeaseInfo is the answer of an explicit renewal/takeover.
+type LeaseInfo struct {
+	SessionID      string `json:"sessionId"`
+	LeaseEpoch     int64  `json:"lease_epoch"`
+	LeaseExpiresAt string `json:"lease_expires_at"`
+	LeaseTTLMS     int64  `json:"lease_ttl_ms"`
+}
+
+// ExecInput is one command. Argv is the default form; Shell=true asks the
+// executor to run the single argv entry through the platform shell.
+type ExecInput struct {
+	Argv       []string
+	Shell      bool
+	Stdin      string
+	TimeoutMS  int
+	Background bool
+	Env        map[string]string
+	LeaseEpoch int64
+}
+
+// ExecResult is the settled command result. Stdout/Stderr are the inline head;
+// *Truncated/*Ref expose the full spilled content explicitly.
+type ExecResult struct {
+	CommandID       string     `json:"command_id"`
+	PID             int        `json:"pid"`
+	Exit            *int       `json:"exit"`
+	Signal          string     `json:"signal"`
+	Outcome         string     `json:"outcome"`
+	DurationMS      int64      `json:"duration"`
+	Stdout          string     `json:"stdout"`
+	Stderr          string     `json:"stderr"`
+	StdoutTruncated bool       `json:"stdout_truncated"`
+	StderrTruncated bool       `json:"stderr_truncated"`
+	StdoutRef       string     `json:"stdout_ref"`
+	StderrRef       string     `json:"stderr_ref"`
+	StdoutBytes     int64      `json:"stdout_bytes"`
+	StderrBytes     int64      `json:"stderr_bytes"`
+	StdoutSHA256    string     `json:"stdout_sha256"`
+	StderrSHA256    string     `json:"stderr_sha256"`
+	Background      bool       `json:"background"`
+	TimedOut        bool       `json:"timed_out"`
+	Cancelled       bool       `json:"cancelled"`
+	SpawnError      string     `json:"spawn_error,omitempty"`
+	Artifacts       []Artifact `json:"artifacts"`
+}
+
+// Shell operations (protocol v2 PTY channel).
+const (
+	ShellCreate = "create"
+	ShellWrite  = "write"
+	ShellRead   = "read"
+	ShellClose  = "close"
+	ShellWait   = "wait"
+)
+
+// ShellRequest is one PTY shell operation. Op selects the sub-route; the unused
+// fields of another op are omitted from the wire payload.
+type ShellRequest struct {
+	Op         string
+	ShellID    string
+	Argv       []string
+	Cols       int
+	Rows       int
+	Env        map[string]string
+	Data       string
+	Since      int64
+	TimeoutMS  int
+	LeaseEpoch int64
+}
+
+// ShellResult is the union answer of the shell operations. Which fields are
+// populated depends on the requested Op.
+type ShellResult struct {
+	ShellID    string `json:"shell_id"`
+	PID        int    `json:"pid"`
+	Status     string `json:"status"`
+	Data       string `json:"data"`
+	NextCursor int64  `json:"next_cursor"`
+	TotalBytes int64  `json:"total_bytes"`
+	Truncated  bool   `json:"truncated"`
+	Exit       *int   `json:"exit"`
+	Outcome    string `json:"outcome"`
+	OK         bool   `json:"ok"`
+}
+
+// File operations (protocol v2 workspace files channel).
+const (
+	FileUpload   = "upload"
+	FileDownload = "download"
+	FileList     = "list"
+)
+
+// FileRequest is one workspace files operation.
+type FileRequest struct {
+	Op         string
+	Path       string
+	Base64     string
+	LeaseEpoch int64
+}
+
+// FileEntry is one workspace directory entry.
+type FileEntry struct {
+	Path  string `json:"path"`
+	Bytes int64  `json:"bytes"`
+	MIME  string `json:"mime"`
+	Dir   bool   `json:"dir"`
+}
+
+// FileResult is the union answer of the files operations.
+type FileResult struct {
+	Path      string      `json:"path"`
+	Bytes     int64       `json:"bytes"`
+	SHA256    string      `json:"sha256"`
+	MIME      string      `json:"mime"`
+	Base64    string      `json:"base64"`
+	Files     []FileEntry `json:"files"`
+	Truncated bool        `json:"truncated"`
+}
+
+// Artifact is one recording-layer artifact of the session ledger. Command
+// artifacts carry the full command record as base64 JSON; file/trace artifacts
+// carry the file content, or an explicit content_omitted flag when the content
+// exceeds the transfer limit (never a silent drop).
 type Artifact struct {
-	Kind     string `json:"kind"`
-	MIME     string `json:"mime"`
-	Base64   string `json:"base64"`
-	SHA256   string `json:"sha256"`
-	Filename string `json:"filename,omitempty"`
-	Bytes    int    `json:"bytes"`
+	Kind            string `json:"kind"`
+	SessionID       string `json:"session_id"`
+	CommandID       string `json:"command_id"`
+	Path            string `json:"path"`
+	SHA256          string `json:"sha256"`
+	Size            int64  `json:"size"`
+	MIME            string `json:"mime"`
+	Filename        string `json:"filename"`
+	Base64          string `json:"base64"`
+	ContentOmitted  bool   `json:"content_omitted"`
+	ContentReason   string `json:"content_reason"`
+	RecordingFailed bool   `json:"recording_failed"`
+	Outcome         string `json:"outcome"`
+	Error           string `json:"error"`
 }
 
-// ActionResult is one action envelope.
-type ActionResult struct {
-	OK        bool
-	Result    json.RawMessage
-	Artifacts []Artifact
-	Error     *ActionError
+// ArtifactPage is one incremental pull of the session recording ledger. The
+// cursor is an ABSOLUTE sequence: Gap/Missed report that the client fell behind
+// the executor's bounded buffer, so the caller can degrade honestly instead of
+// silently missing evidence (constitution art.4.5 / art.7.6).
+type ArtifactPage struct {
+	Artifacts      []Artifact `json:"artifacts"`
+	NextCursor     int64      `json:"next_cursor"`
+	Total          int64      `json:"total"`
+	BaseCursor     int64      `json:"base_cursor"`
+	Evicted        int64      `json:"evicted"`
+	Gap            bool       `json:"gap"`
+	Missed         int64      `json:"missed"`
+	EvictionFailed int64      `json:"artifact_eviction_failed"`
 }
 
-// Client is the executor protocol surface used by the execution runtime.
+// TraceRef describes the playwright trace file of a session, when one exists.
+type TraceRef struct {
+	Available bool   `json:"available"`
+	Path      string `json:"path"`
+	Bytes     int64  `json:"bytes"`
+	SHA256    string `json:"sha256"`
+	MIME      string `json:"mime"`
+}
+
+// Client is the executor protocol v2 surface used by the execution runtime.
+//
+// The transitional Playwright-library browser bridge was removed in v0.2.4-C
+// T16: the browser capability domain runs the official playwright-cli over Exec
+// (T15), and browser traffic is PURE-RECORDED by a passive CDP observer read
+// through NetworkLog (design §4.3). There is no v1 dual track.
 type Client interface {
 	Health(ctx context.Context) (Health, error)
-	CreateContext(ctx context.Context, in CreateContextInput) (ContextInfo, error)
-	Action(ctx context.Context, contextID, action string, args json.RawMessage) (ActionResult, error)
-	Cancel(ctx context.Context, contextID string) (bool, error)
-	Close(ctx context.Context, contextID string) error
-	ListContexts(ctx context.Context) ([]ContextInfo, error)
+	CreateSession(ctx context.Context, in CreateSessionInput) (SessionInfo, error)
+	GetSession(ctx context.Context, sessionID string) (SessionInfo, error)
+	ListSessions(ctx context.Context) ([]SessionInfo, error)
+	Exec(ctx context.Context, sessionID string, in ExecInput) (ExecResult, error)
+	Shell(ctx context.Context, sessionID string, in ShellRequest) (ShellResult, error)
+	Files(ctx context.Context, sessionID string, in FileRequest) (FileResult, error)
+	Artifacts(ctx context.Context, sessionID string, since int64) (ArtifactPage, error)
+	Trace(ctx context.Context, sessionID string) (TraceRef, error)
+	// NetworkLog reads the session's recorded browser traffic log (pure CDP
+	// recording, T16). tail bounds the item count (0 = executor default). The
+	// raw payload is {items:[...], recording, degraded[, reason]}.
+	NetworkLog(ctx context.Context, sessionID string, tail int) (json.RawMessage, error)
+	Cancel(ctx context.Context, sessionID string) (bool, error)
+	RenewLease(ctx context.Context, sessionID string, leaseEpoch int64) (LeaseInfo, error)
+	CloseSession(ctx context.Context, sessionID string) error
 }
 
 // HTTPClient is the production Client. It never follows redirects so the bearer
@@ -164,26 +379,30 @@ type HTTPClient struct {
 	endpoint string
 	token    string
 	http     *http.Client
+	timeout  time.Duration
 }
 
 var _ Client = (*HTTPClient)(nil)
 
-// NewClient returns a client for endpoint with a per-request timeout. A
-// non-positive timeout falls back to DefaultTimeout.
+// NewClient returns a client for endpoint with a default per-request timeout. A
+// non-positive timeout falls back to DefaultTimeout. The bound is applied per
+// request (not on http.Client) so the command channel can raise it for one call.
 func NewClient(endpoint, token string, timeout time.Duration) *HTTPClient {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	return NewClientWithHTTPClient(endpoint, token, &http.Client{
-		Timeout: timeout,
+	client := NewClientWithHTTPClient(endpoint, token, &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	})
+	client.timeout = timeout
+	return client
 }
 
 // NewClientWithHTTPClient injects the underlying HTTP client (tests use it to
-// exercise timeouts and redirect handling).
+// exercise timeouts and redirect handling). Its Timeout, when set, remains the
+// transport bound.
 func NewClientWithHTTPClient(endpoint, token string, httpClient *http.Client) *HTTPClient {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: DefaultTimeout}
@@ -192,13 +411,18 @@ func NewClientWithHTTPClient(endpoint, token string, httpClient *http.Client) *H
 		endpoint: strings.TrimRight(endpoint, "/"),
 		token:    token,
 		http:     httpClient,
+		timeout:  httpClient.Timeout,
 	}
 }
 
-// ContextKey is the executor context key of one (case_run, version_sut, role)
-// binding (spec §6.1). It is what orphan reconciliation matches on.
-func ContextKey(caseRunID, versionSUTID int64, role string) string {
-	return fmt.Sprintf("run:%d:vs:%d:role:%s", caseRunID, versionSUTID, role)
+// SessionKey is the executor session key of one (case_run, SUT, role) binding.
+// It is what orphan reconciliation matches on.
+//
+// This literal is duplicated in application/case_run.go
+// executorSessionKeyFormat — the two MUST change in the same commit or
+// reconciliation silently stops matching.
+func SessionKey(caseRunID, sutID int64, role string) string {
+	return fmt.Sprintf("run:%d:sut:%d:role:%s", caseRunID, sutID, role)
 }
 
 // Health probes GET /healthz. It does not send the bearer token; a 503 degraded
@@ -218,47 +442,67 @@ func (c *HTTPClient) Health(ctx context.Context) (Health, error) {
 	return health, nil
 }
 
-// CreateContext calls POST /v1/contexts.
-func (c *HTTPClient) CreateContext(ctx context.Context, in CreateContextInput) (ContextInfo, error) {
+// CreateSession calls POST /v1/sessions.
+func (c *HTTPClient) CreateSession(ctx context.Context, in CreateSessionInput) (SessionInfo, error) {
 	payload := struct {
-		Key          string          `json:"key,omitempty"`
-		AllowedHosts []string        `json:"allowedHosts"`
-		BaseURL      string          `json:"baseUrl,omitempty"`
-		StorageState json.RawMessage `json:"storageState,omitempty"`
-		Metadata     map[string]any  `json:"metadata,omitempty"`
-		Viewport     *Viewport       `json:"viewport,omitempty"`
+		Key       string         `json:"key,omitempty"`
+		Workspace string         `json:"workspace"`
+		BaseURL   string         `json:"base_url,omitempty"`
+		Metadata  map[string]any `json:"metadata,omitempty"`
+		Lease     *struct {
+			Epoch int64 `json:"lease_epoch"`
+			TTLMS int64 `json:"ttl_ms,omitempty"`
+		} `json:"lease,omitempty"`
 	}{
-		Key:          in.Key,
-		AllowedHosts: in.AllowedHosts,
-		BaseURL:      in.BaseURL,
-		StorageState: in.StorageState,
-		Metadata:     in.Metadata,
-		Viewport:     in.Viewport,
+		Key:       in.Key,
+		Workspace: in.Workspace,
+		BaseURL:   in.BaseURL,
+		Metadata:  in.Metadata,
 	}
-	result, err := c.request(ctx, http.MethodPost, contextsPath, payload, true)
+	if in.Lease != nil {
+		payload.Lease = &struct {
+			Epoch int64 `json:"lease_epoch"`
+			TTLMS int64 `json:"ttl_ms,omitempty"`
+		}{Epoch: in.Lease.Epoch}
+		if in.Lease.TTL > 0 {
+			payload.Lease.TTLMS = in.Lease.TTL.Milliseconds()
+		}
+	}
+	result, err := c.request(ctx, http.MethodPost, sessionsPath, payload, true)
 	if err != nil {
-		return ContextInfo{}, err
+		return SessionInfo{}, err
 	}
 	if err := ensureOK(result); err != nil {
-		return ContextInfo{}, err
+		return SessionInfo{}, err
 	}
-	var created struct {
-		ContextID      string `json:"contextId"`
-		BrowserVersion string `json:"browserVersion"`
+	info, err := decodeSession(result)
+	if err != nil {
+		return SessionInfo{}, err
 	}
-	if err := json.Unmarshal(result.body, &created); err != nil || created.ContextID == "" {
-		return ContextInfo{}, result.failure("body", protocolError("invalid executor create-context response"))
+	if info.Key == "" {
+		info.Key = in.Key
 	}
-	return ContextInfo{
-		ID:       created.ContextID,
-		Key:      in.Key,
-		Metadata: in.Metadata,
-	}, nil
+	if info.Metadata == nil {
+		info.Metadata = in.Metadata
+	}
+	return info, nil
 }
 
-// ListContexts calls GET /v1/contexts (P3 extension).
-func (c *HTTPClient) ListContexts(ctx context.Context) ([]ContextInfo, error) {
-	result, err := c.request(ctx, http.MethodGet, contextsPath, nil, true)
+// GetSession calls GET /v1/sessions/{id}.
+func (c *HTTPClient) GetSession(ctx context.Context, sessionID string) (SessionInfo, error) {
+	result, err := c.request(ctx, http.MethodGet, sessionPath(sessionID), nil, true)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return SessionInfo{}, err
+	}
+	return decodeSession(result)
+}
+
+// ListSessions calls GET /v1/sessions (orphan reconciliation / capacity).
+func (c *HTTPClient) ListSessions(ctx context.Context) ([]SessionInfo, error) {
+	result, err := c.request(ctx, http.MethodGet, sessionsPath, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -266,73 +510,208 @@ func (c *HTTPClient) ListContexts(ctx context.Context) ([]ContextInfo, error) {
 		return nil, err
 	}
 	var payload struct {
-		Contexts []struct {
-			ID        string         `json:"id"`
-			Key       string         `json:"key"`
-			Metadata  map[string]any `json:"metadata"`
-			CreatedAt string         `json:"createdAt"`
-		} `json:"contexts"`
+		Sessions []SessionInfo `json:"sessions"`
 	}
 	if err := json.Unmarshal(result.body, &payload); err != nil {
-		return nil, result.failure("body", protocolError("invalid executor list-contexts response"))
+		return nil, result.failure("body", protocolError("invalid executor list-sessions response"))
 	}
-	contexts := make([]ContextInfo, 0, len(payload.Contexts))
-	for _, item := range payload.Contexts {
-		contexts = append(contexts, ContextInfo{
-			ID:        item.ID,
-			Key:       item.Key,
-			Metadata:  item.Metadata,
-			CreatedAt: item.CreatedAt,
-		})
-	}
-	return contexts, nil
+	sessions := make([]SessionInfo, 0, len(payload.Sessions))
+	sessions = append(sessions, payload.Sessions...)
+	return sessions, nil
 }
 
-// Action calls POST /v1/contexts/{id}/actions. An action-level failure (even a
-// 4xx one) is returned inside ActionResult so the tool layer can classify it;
-// transport, 5xx and malformed responses are returned as errors.
-func (c *HTTPClient) Action(ctx context.Context, contextID, action string, args json.RawMessage) (ActionResult, error) {
-	if len(args) == 0 {
-		args = json.RawMessage(`{}`)
+// Exec calls POST /v1/sessions/{id}/exec. The request bound is raised to the
+// command deadline so a long command is not aborted by the control-plane bound.
+func (c *HTTPClient) Exec(ctx context.Context, sessionID string, in ExecInput) (ExecResult, error) {
+	if len(in.Argv) == 0 {
+		return ExecResult{}, platform.Invalid("argv", "argv must not be empty")
 	}
 	payload := struct {
-		Action string          `json:"action"`
-		Args   json.RawMessage `json:"args"`
-	}{Action: action, Args: args}
-	path := contextsPath + "/" + url.PathEscape(contextID) + "/actions"
-	result, err := c.request(ctx, http.MethodPost, path, payload, true)
-	if err != nil {
-		return ActionResult{}, err
+		Argv       []string          `json:"argv"`
+		Shell      bool              `json:"shell,omitempty"`
+		Stdin      string            `json:"stdin,omitempty"`
+		TimeoutMS  int               `json:"timeout_ms,omitempty"`
+		Background bool              `json:"background,omitempty"`
+		Env        map[string]string `json:"env,omitempty"`
+		LeaseEpoch int64             `json:"lease_epoch"`
+	}{
+		Argv:       in.Argv,
+		Shell:      in.Shell,
+		Stdin:      in.Stdin,
+		TimeoutMS:  in.TimeoutMS,
+		Background: in.Background,
+		Env:        in.Env,
+		LeaseEpoch: in.LeaseEpoch,
 	}
-	var envelope struct {
-		OK        bool            `json:"ok"`
-		Result    json.RawMessage `json:"result"`
-		Artifacts []Artifact      `json:"artifacts"`
-		Error     *ActionError    `json:"error"`
-	}
-	decodeErr := json.Unmarshal(result.body, &envelope)
-	if decodeErr != nil || (!envelope.OK && envelope.Error == nil) {
-		if result.status >= http.StatusInternalServerError || (result.status >= 200 && result.status < 300) {
-			return ActionResult{}, result.failure("body", protocolError("invalid executor action response"))
+	if _, ok := requestTimeoutFrom(ctx); !ok {
+		bound := ExecRequestTimeout
+		if in.TimeoutMS > 0 {
+			bound = time.Duration(in.TimeoutMS)*time.Millisecond + 30*time.Second
 		}
-		return ActionResult{}, result.failure("response", executorError(result))
+		ctx = WithRequestTimeout(ctx, bound)
 	}
-	if result.status >= http.StatusInternalServerError {
-		return ActionResult{}, result.failure("response", executorError(result))
+	result, err := c.request(ctx, http.MethodPost, sessionPath(sessionID)+"/exec", payload, true)
+	if err != nil {
+		return ExecResult{}, err
 	}
-	return ActionResult{
-		OK:        envelope.OK,
-		Result:    envelope.Result,
-		Artifacts: envelope.Artifacts,
-		Error:     envelope.Error,
-	}, nil
+	// A timed-out command still carries its recorded result in error.details so
+	// the settlement path can persist the evidence of what actually ran.
+	if result.status == http.StatusGatewayTimeout {
+		var envelope struct {
+			Error struct {
+				Code    string          `json:"code"`
+				Message string          `json:"message"`
+				Details json.RawMessage `json:"details"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(result.body, &envelope) == nil && len(envelope.Error.Details) > 0 {
+			var timedOut ExecResult
+			if json.Unmarshal(envelope.Error.Details, &timedOut) == nil && timedOut.CommandID != "" {
+				return timedOut, result.failure("response", executorError(result))
+			}
+		}
+	}
+	if err := ensureOK(result); err != nil {
+		return ExecResult{}, err
+	}
+	var decoded ExecResult
+	if err := json.Unmarshal(result.body, &decoded); err != nil || decoded.CommandID == "" {
+		return ExecResult{}, result.failure("body", protocolError("invalid executor exec response"))
+	}
+	return decoded, nil
 }
 
-// Cancel calls POST /v1/contexts/{id}/cancel and reports whether an in-flight
-// action was actually canceled.
-func (c *HTTPClient) Cancel(ctx context.Context, contextID string) (bool, error) {
-	path := contextsPath + "/" + url.PathEscape(contextID) + "/cancel"
-	result, err := c.request(ctx, http.MethodPost, path, nil, true)
+// Shell calls the PTY shell sub-route selected by in.Op.
+func (c *HTTPClient) Shell(ctx context.Context, sessionID string, in ShellRequest) (ShellResult, error) {
+	base := sessionPath(sessionID) + "/shell"
+	switch in.Op {
+	case ShellCreate:
+		payload := struct {
+			Argv       []string          `json:"argv,omitempty"`
+			Cols       int               `json:"cols,omitempty"`
+			Rows       int               `json:"rows,omitempty"`
+			Env        map[string]string `json:"env,omitempty"`
+			LeaseEpoch int64             `json:"lease_epoch"`
+		}{Argv: in.Argv, Cols: in.Cols, Rows: in.Rows, Env: in.Env, LeaseEpoch: in.LeaseEpoch}
+		return c.shellCall(ctx, http.MethodPost, base, payload)
+	case ShellWrite, ShellClose, ShellWait:
+		if in.ShellID == "" {
+			return ShellResult{}, platform.Invalid("shell_id", "shell_id is required")
+		}
+		payload := struct {
+			Data       string `json:"data,omitempty"`
+			TimeoutMS  int    `json:"timeout_ms,omitempty"`
+			LeaseEpoch int64  `json:"lease_epoch"`
+		}{Data: in.Data, TimeoutMS: in.TimeoutMS, LeaseEpoch: in.LeaseEpoch}
+		path := base + "/" + url.PathEscape(in.ShellID) + "/" + in.Op
+		return c.shellCall(ctx, http.MethodPost, path, payload)
+	case ShellRead:
+		if in.ShellID == "" {
+			return ShellResult{}, platform.Invalid("shell_id", "shell_id is required")
+		}
+		path := base + "/" + url.PathEscape(in.ShellID) + "/read?since=" + fmt.Sprintf("%d", in.Since)
+		return c.shellCall(ctx, http.MethodGet, path, nil)
+	default:
+		return ShellResult{}, platform.Invalid("op", "unsupported shell operation")
+	}
+}
+
+func (c *HTTPClient) shellCall(ctx context.Context, method, path string, payload any) (ShellResult, error) {
+	result, err := c.request(ctx, method, path, payload, true)
+	if err != nil {
+		return ShellResult{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return ShellResult{}, err
+	}
+	var decoded ShellResult
+	if err := json.Unmarshal(result.body, &decoded); err != nil {
+		return ShellResult{}, result.failure("body", protocolError("invalid executor shell response"))
+	}
+	return decoded, nil
+}
+
+// Files calls the workspace files sub-route selected by in.Op.
+func (c *HTTPClient) Files(ctx context.Context, sessionID string, in FileRequest) (FileResult, error) {
+	base := sessionPath(sessionID) + "/files"
+	var result *httpResult
+	var err error
+	switch in.Op {
+	case FileUpload:
+		payload := struct {
+			Path       string `json:"path"`
+			Base64     string `json:"base64"`
+			LeaseEpoch int64  `json:"lease_epoch"`
+		}{Path: in.Path, Base64: in.Base64, LeaseEpoch: in.LeaseEpoch}
+		result, err = c.request(ctx, http.MethodPost, base, payload, true)
+	case FileDownload:
+		result, err = c.request(ctx, http.MethodGet, base+"?path="+url.QueryEscape(in.Path), nil, true)
+	case FileList:
+		path := base
+		if in.Path != "" {
+			path += "?path=" + url.QueryEscape(in.Path)
+		}
+		result, err = c.request(ctx, http.MethodGet, path, nil, true)
+	default:
+		return FileResult{}, platform.Invalid("op", "unsupported files operation")
+	}
+	if err != nil {
+		return FileResult{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return FileResult{}, err
+	}
+	var decoded FileResult
+	if err := json.Unmarshal(result.body, &decoded); err != nil {
+		return FileResult{}, result.failure("body", protocolError("invalid executor files response"))
+	}
+	return decoded, nil
+}
+
+// Artifacts calls GET /v1/sessions/{id}/artifacts?since=<absolute cursor>.
+func (c *HTTPClient) Artifacts(ctx context.Context, sessionID string, since int64) (ArtifactPage, error) {
+	if since < 0 {
+		return ArtifactPage{}, platform.Invalid("since", "since must be a non-negative cursor")
+	}
+	path := sessionPath(sessionID) + "/artifacts?since=" + fmt.Sprintf("%d", since)
+	result, err := c.request(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return ArtifactPage{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return ArtifactPage{}, err
+	}
+	var page ArtifactPage
+	if err := json.Unmarshal(result.body, &page); err != nil {
+		return ArtifactPage{}, result.failure("body", protocolError("invalid executor artifacts response"))
+	}
+	if page.Artifacts == nil {
+		page.Artifacts = []Artifact{}
+	}
+	return page, nil
+}
+
+// Trace calls GET /v1/sessions/{id}/trace.
+func (c *HTTPClient) Trace(ctx context.Context, sessionID string) (TraceRef, error) {
+	result, err := c.request(ctx, http.MethodGet, sessionPath(sessionID)+"/trace", nil, true)
+	if err != nil {
+		return TraceRef{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return TraceRef{}, err
+	}
+	var ref TraceRef
+	if err := json.Unmarshal(result.body, &ref); err != nil {
+		return TraceRef{}, result.failure("body", protocolError("invalid executor trace response"))
+	}
+	return ref, nil
+}
+
+// Cancel calls POST /v1/sessions/{id}/cancel and reports whether an in-flight
+// command was actually canceled. Cleanup is never fenced. The executor answers
+// with the cancelled command ids; a non-empty list means work was stopped.
+func (c *HTTPClient) Cancel(ctx context.Context, sessionID string) (bool, error) {
+	result, err := c.request(ctx, http.MethodPost, sessionPath(sessionID)+"/cancel", nil, true)
 	if err != nil {
 		return false, err
 	}
@@ -342,24 +721,75 @@ func (c *HTTPClient) Cancel(ctx context.Context, contextID string) (bool, error)
 	var payload struct {
 		OK     bool `json:"ok"`
 		Result struct {
-			Canceled bool `json:"canceled"`
+			Cancelled []string `json:"cancelled"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(result.body, &payload); err != nil {
 		return false, result.failure("body", protocolError("invalid executor cancel response"))
 	}
-	return payload.Result.Canceled, nil
+	return len(payload.Result.Cancelled) > 0, nil
 }
 
-// Close calls DELETE /v1/contexts/{id}. A missing context is not an error for
-// best-effort terminal cleanup.
-func (c *HTTPClient) Close(ctx context.Context, contextID string) error {
-	path := contextsPath + "/" + url.PathEscape(contextID)
-	result, err := c.request(ctx, http.MethodDelete, path, nil, true)
+// NetworkLog calls GET /v1/sessions/{id}/network?tail=N: the session's recorded
+// browser traffic log (pure CDP recording, T16). The raw payload is returned
+// verbatim ({items:[...], recording, degraded[, reason]}) so the discovery
+// capture can parse the items and store the log as network evidence. A read is
+// best effort and never lease-fenced (terminal-state capture).
+func (c *HTTPClient) NetworkLog(ctx context.Context, sessionID string, tail int) (json.RawMessage, error) {
+	path := sessionPath(sessionID) + "/network"
+	if tail > 0 {
+		path += "?tail=" + fmt.Sprintf("%d", tail)
+	}
+	result, err := c.request(ctx, http.MethodGet, path, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureOK(result); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(result.body), nil
+}
+
+// RenewLease calls POST /v1/sessions/{id}/lease. A higher epoch may take over an
+// expired lease before the sweeper reclaims it (re-claim semantics).
+func (c *HTTPClient) RenewLease(ctx context.Context, sessionID string, leaseEpoch int64) (LeaseInfo, error) {
+	payload := struct {
+		LeaseEpoch int64 `json:"lease_epoch"`
+	}{LeaseEpoch: leaseEpoch}
+	result, err := c.request(ctx, http.MethodPost, sessionPath(sessionID)+"/lease", payload, true)
+	if err != nil {
+		return LeaseInfo{}, err
+	}
+	if err := ensureOK(result); err != nil {
+		return LeaseInfo{}, err
+	}
+	var info LeaseInfo
+	if err := json.Unmarshal(result.body, &info); err != nil || info.SessionID == "" {
+		return LeaseInfo{}, result.failure("body", protocolError("invalid executor lease response"))
+	}
+	return info, nil
+}
+
+// CloseSession calls DELETE /v1/sessions/{id}. A missing session is not an error
+// for best-effort terminal cleanup.
+func (c *HTTPClient) CloseSession(ctx context.Context, sessionID string) error {
+	result, err := c.request(ctx, http.MethodDelete, sessionPath(sessionID), nil, true)
 	if err != nil {
 		return err
 	}
 	return ensureOK(result)
+}
+
+func sessionPath(sessionID string) string {
+	return sessionsPath + "/" + url.PathEscape(sessionID)
+}
+
+func decodeSession(result *httpResult) (SessionInfo, error) {
+	var info SessionInfo
+	if err := json.Unmarshal(result.body, &info); err != nil || info.ID == "" {
+		return SessionInfo{}, result.failure("body", protocolError("invalid executor session response"))
+	}
+	return info, nil
 }
 
 // httpResult is one completed executor HTTP exchange. It carries the
@@ -380,7 +810,16 @@ type httpResult struct {
 // failure attaches structured details and logs one sanitized diagnostic line.
 // It returns the same error so callers can `return ..., result.failure(...)`.
 func (r *httpResult) failure(phase string, err *platform.Error) error {
-	err.Details = r.details(phase)
+	// Typed details already carried by the error (for example the executor's
+	// retry_after_seconds hint) are preserved; the request diagnostics are merged
+	// in around them.
+	details := r.details(phase)
+	for key, value := range err.Details {
+		if _, exists := details[key]; !exists {
+			details[key] = value
+		}
+	}
+	err.Details = details
 	attrs := []any{
 		slog.String("executor.endpoint", r.endpoint),
 		slog.String("executor.method", r.method),
@@ -411,8 +850,8 @@ func (r *httpResult) dispatchLogAttrs() []any {
 	if value, ok := details["attempt"]; ok {
 		attrs = append(attrs, slog.Any("executor.attempt", value))
 	}
-	if value, ok := details["context_id"]; ok {
-		attrs = append(attrs, slog.Any("executor.context_id", value))
+	if value, ok := details["session_id"]; ok {
+		attrs = append(attrs, slog.Any("executor.session_id", value))
 	}
 	if value, ok := details["registry_hit"]; ok {
 		attrs = append(attrs, slog.Any("executor.registry_hit", value))
@@ -421,7 +860,7 @@ func (r *httpResult) dispatchLogAttrs() []any {
 }
 
 // details builds the sanitized request-scoped diagnostics. It never includes
-// the bearer token, the request body or the raw (credential-bearing) URL.
+// the bearer token or the request body.
 func (r *httpResult) details(phase string) map[string]any {
 	details := map[string]any{
 		"endpoint":   r.endpoint,
@@ -447,8 +886,8 @@ func (r *httpResult) details(phase string) map[string]any {
 		if diagnostics.Attempt > 0 {
 			details["attempt"] = diagnostics.Attempt
 		}
-		if diagnostics.ContextID != "" {
-			details["context_id"] = diagnostics.ContextID
+		if diagnostics.SessionID != "" {
+			details["session_id"] = diagnostics.SessionID
 		}
 		if diagnostics.RegistryHit != nil {
 			details["registry_hit"] = *diagnostics.RegistryHit
@@ -472,6 +911,26 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, payload a
 		}
 		body = bytes.NewReader(encoded)
 	}
+	bound := c.timeout
+	if override, ok := requestTimeoutFrom(ctx); ok {
+		bound = override
+	}
+	// The reported bound is the CONFIGURED per-request budget (or the caller's
+	// shorter deadline), measured before this call derives its own deadline —
+	// otherwise the diagnostic would drift by the microseconds already spent.
+	reported := bound
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && (reported <= 0 || remaining < reported) {
+			reported = remaining
+		}
+	}
+	if bound > 0 {
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > bound {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, bound)
+			defer cancel()
+		}
+	}
 	request, err := http.NewRequestWithContext(ctx, method, c.endpoint+path, body)
 	if err != nil {
 		return nil, protocolError("executor endpoint is invalid")
@@ -491,7 +950,7 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, payload a
 		path:      path,
 		endpoint:  sanitizedEndpoint(c.endpoint),
 		requestID: requestID,
-		timeout:   c.effectiveTimeout(ctx),
+		timeout:   reported,
 	}
 	started := time.Now()
 	response, err := c.http.Do(request)
@@ -500,34 +959,28 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, payload a
 		return nil, result.failure(transportPhase(err), transportError(ctx, err))
 	}
 	defer func() { _ = response.Body.Close() }()
-	raw, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	result.duration = time.Since(started)
 	result.status, result.body = response.StatusCode, raw
 	if readErr != nil {
-		// io.ReadAll can fail after the headers because http.Client.Timeout also
-		// bounds the body (artifacts travel up to 32 MiB). A timeout or
-		// cancellation there is the same transport failure as one before the
-		// headers, so it keeps the executor_timeout taxonomy instead of being
-		// flattened into executor_unavailable.
+		// io.ReadAll can fail after the headers because a deadline also bounds
+		// the body. A timeout or cancellation there is the same transport
+		// failure as one before the headers, so it keeps the executor_timeout
+		// taxonomy instead of being flattened into executor_unavailable.
 		if transportTimedOutOrCanceled(ctx, readErr) {
 			return nil, result.failure("body", transportError(ctx, readErr))
 		}
 		return nil, result.failure("body", unavailable("executor response could not be read"))
 	}
-	return result, nil
-}
-
-// effectiveTimeout is the smaller of the HTTP client bound and the caller's
-// remaining context budget, used only for diagnostics.
-func (c *HTTPClient) effectiveTimeout(ctx context.Context) time.Duration {
-	timeout := c.http.Timeout
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining > 0 && (timeout <= 0 || remaining < timeout) {
-			return remaining
-		}
+	if len(raw) > maxResponseBytes {
+		// Explicit oversize failure instead of a silently truncated body.
+		return nil, result.failure("body", &platform.Error{
+			Status:  http.StatusBadGateway,
+			Code:    "executor_response_too_large",
+			Message: fmt.Sprintf("executor response exceeds the %d byte client limit", maxResponseBytes),
+		})
 	}
-	return timeout
+	return result, nil
 }
 
 // transportError maps a failed exchange onto the typed transport taxonomy.
@@ -553,7 +1006,7 @@ func transportError(ctx context.Context, err error) *platform.Error {
 
 // transportTimedOutOrCanceled reports whether err (or the caller's context) is a
 // deadline or cancellation, including a response-body read that was interrupted
-// by http.Client.Timeout.
+// by a deadline.
 func transportTimedOutOrCanceled(ctx context.Context, err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(ctx.Err(), context.DeadlineExceeded) ||
@@ -590,9 +1043,15 @@ func transportPhase(err error) string {
 		return "response"
 	case strings.Contains(message, "reading response body"):
 		return "body"
-	default:
-		return "request"
 	}
+	// A deadline that is neither a dial nor a TLS failure was reached while the
+	// exchange was in flight: the request had been written and the response had
+	// not arrived. Report it as the response phase (the same classification the
+	// transport-level timeout produced before the bound moved to the context).
+	if isTimeoutError(err) || errors.Is(err, context.DeadlineExceeded) {
+		return "response"
+	}
+	return "request"
 }
 
 // ensureOK maps a non-2xx response to a typed error.
@@ -605,22 +1064,49 @@ func ensureOK(result *httpResult) error {
 
 // executorError converts an executor error envelope into a *platform.Error.
 // Every 5xx is the retryable executor_unavailable environment failure, except
-// an explicit executor_timeout reply. Forwarding an arbitrary executor code
-// would leak it into the API failure taxonomy (Task 11 classifies these).
+// the explicit executor_timeout reply, the operational draining signal and the
+// typed browser_cli_unavailable capability gap (code + install guidance kept).
+// Forwarding an arbitrary executor code would leak it into the API failure
+// taxonomy.
 func executorError(result *httpResult) *platform.Error {
 	var envelope struct {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
+			Details struct {
+				RetryAfterSeconds int64 `json:"retry_after_seconds"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(result.body, &envelope)
 	code := envelope.Error.Code
 	if result.status >= http.StatusInternalServerError {
-		if code == CodeExecutorTimeout {
+		switch code {
+		case CodeExecutorTimeout:
 			return &platform.Error{
 				Status:    http.StatusGatewayTimeout,
 				Code:      CodeExecutorTimeout,
+				Message:   envelope.Error.Message,
+				Retryable: true,
+			}
+		case CodeDraining:
+			// Drain is operational backpressure, not an environment failure:
+			// the caller retries another endpoint or later.
+			return &platform.Error{
+				Status:    http.StatusServiceUnavailable,
+				Code:      CodeDraining,
+				Message:   envelope.Error.Message,
+				Retryable: true,
+			}
+		case CodeBrowserCliUnavailable:
+			// The official playwright CLI runtime is not installed on this
+			// executor. Keep the typed code and the install guidance: the code
+			// token feeds the X-02 executor-capability attribution (blocked, no
+			// SUT issue) and the message tells the operator how to fix the host.
+			// Retryable: another endpoint (or this one after install) can serve.
+			return &platform.Error{
+				Status:    http.StatusServiceUnavailable,
+				Code:      CodeBrowserCliUnavailable,
 				Message:   envelope.Error.Message,
 				Retryable: true,
 			}
@@ -630,17 +1116,27 @@ func executorError(result *httpResult) *platform.Error {
 	if code == "" {
 		return unavailable(fmt.Sprintf("executor returned HTTP %d", result.status))
 	}
-	return &platform.Error{
+	apiErr := &platform.Error{
 		Status:  result.status,
 		Code:    code,
 		Message: envelope.Error.Message,
 	}
+	if code == CodeSessionLimit {
+		// Capacity backpressure is retryable after the executor's hint.
+		apiErr.Retryable = true
+		if envelope.Error.Details.RetryAfterSeconds > 0 {
+			apiErr.Details = map[string]any{
+				"retry_after_seconds": envelope.Error.Details.RetryAfterSeconds,
+			}
+		}
+	}
+	return apiErr
 }
 
 func unavailable(message string) *platform.Error {
 	return &platform.Error{
 		Status:    http.StatusServiceUnavailable,
-		Code:      "executor_unavailable",
+		Code:      CodeExecutorUnavailable,
 		Message:   message,
 		Retryable: true,
 	}
@@ -649,7 +1145,7 @@ func unavailable(message string) *platform.Error {
 func protocolError(message string) *platform.Error {
 	return &platform.Error{
 		Status:  http.StatusServiceUnavailable,
-		Code:    "executor_unavailable",
+		Code:    CodeExecutorUnavailable,
 		Message: message,
 	}
 }

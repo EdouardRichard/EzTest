@@ -235,7 +235,7 @@ try {
     $execJson = $null
     try { $execJson = $execHealth.Body | ConvertFrom-Json } catch { }
     if ($execHealth.Status -eq 200 -and $null -ne $execJson -and $execJson.status -eq "ok") {
-        Write-Row -Component "executor /healthz" -State "OK" -Detail "browser=$($execJson.browserVersion)" -Color "Green"
+        Write-Row -Component "executor /healthz" -State "OK" -Detail "cli=$($execJson.browserCli.cli_version)" -Color "Green"
     } else {
         $errorText = ""
         if ($null -ne $execJson -and $null -ne $execJson.error) { $errorText = " error=$($execJson.error)" }

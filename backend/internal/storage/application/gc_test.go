@@ -634,6 +634,57 @@ func TestGCRunDryRunClassifiesFourCandidateClassesAndProtects(t *testing.T) {
 	}
 }
 
+// TestGCEvidenceRecordingKindsUseEvidenceOwner pins the v0.2.4-C GC
+// verification: content refs of the recording-layer evidence kinds
+// command/file/trace carry owner_kind "evidence" (the evidence kind is the ref
+// ROLE, not the owner_kind), so the already-registered OwnerKindEvidence lookup
+// covers them and no new owner_kind registration is needed. Live evidence rows
+// are protected through the evidence owner probe; an orphaned recording-kind
+// ref is reclaimable exactly like a legacy evidence kind, never permanently
+// protected as an unknown owner.
+func TestGCEvidenceRecordingKindsUseEvidenceOwner(t *testing.T) {
+	fixture := newGCFixture(t)
+	old := 40 * 24 * time.Hour
+	commandObject := gcObject(gcSHA("c"), 100, old)
+	fileObject := gcObject(gcSHA("f"), 200, old)
+	traceObject := gcObject(gcSHA("t"), 300, old)
+	orphanObject := gcObject(gcSHA("o"), 400, old)
+
+	fixture.repo.refs = []GCRef{
+		gcRef(101, commandObject, OwnerKindEvidence, 501, "command"),
+		gcRef(102, fileObject, OwnerKindEvidence, 502, "file"),
+		gcRef(103, traceObject, OwnerKindEvidence, 503, "trace"),
+		gcRef(104, orphanObject, OwnerKindEvidence, 504, "command"),
+	}
+	fixture.owners.evidence[501] = true
+	fixture.owners.evidence[502] = true
+	fixture.owners.evidence[503] = true
+	fixture.repo.liveCounts = map[string]int{
+		commandObject.SHA256: 1,
+		fileObject.SHA256:    1,
+		traceObject.SHA256:   1,
+		orphanObject.SHA256:  1,
+	}
+
+	run, err := fixture.svc.Run(context.Background(), storage.GCModeDryRun, 77)
+	if err != nil {
+		t.Fatalf("Run dry_run: %v", err)
+	}
+	report := decodeGCReport(t, run)
+	if got := report.Protected[GCProtectedOwnerExists]; got != 3 {
+		t.Fatalf("owner_exists protections = %d, want 3 (live command/file/trace evidence)", got)
+	}
+	if got := report.Protected[GCProtectedUnknownOwnerKind]; got != 0 {
+		t.Fatalf("unknown_owner_kind protections = %d, want 0 (recording kinds share owner_kind evidence)", got)
+	}
+	if len(report.UnknownOwnerKinds) != 0 {
+		t.Fatalf("unknown owner kinds = %#v, want none", report.UnknownOwnerKinds)
+	}
+	if got := report.Candidates[storage.GCCandidateOrphanFile]; got != 1 {
+		t.Fatalf("orphan_file candidates = %d, want 1 (the orphaned command ref)", got)
+	}
+}
+
 func TestGCApplyTombstonesFirstThenRefsObjectsAndFiles(t *testing.T) {
 	fixture := newGCFixture(t)
 	old := 40 * 24 * time.Hour

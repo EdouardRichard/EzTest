@@ -127,15 +127,15 @@ function resourceResolution(kind: string | undefined, hasVersions: boolean): str
     case "environment":
       return "请先在引用版本中改用其他环境，或删除这些版本。"
     case "page":
-      return "请先在引用版本的页面范围中排除该页面，或调整版本的环境绑定。"
+      return "请先调整引用版本的环境绑定（改用不含该 SUT 的环境），或删除这些版本。"
     case "api":
-      return "请先在引用版本的 API 范围中排除该 API，或调整版本的环境绑定。"
+      return "请先调整引用版本的环境绑定（改用不含该 SUT 的环境），或删除这些版本。"
     case "database":
       return "请先在引用版本中解除该目标库的绑定，或停用后再删除。"
     case "account":
       return "请从引用版本的账号绑定中移除该账号。"
     case "repository":
-      return "请先在版本绑定中移除该代码仓关联后再删除。"
+      return "请先解除引用版本所属环境 SUT 的代码仓关联，或调整版本的环境绑定后再删除。"
     default:
       return "请先在版本绑定中解除对该资源的引用后再删除。"
   }
@@ -284,16 +284,12 @@ export function ResourceRequestError({ error, fallback }: { error: unknown; fall
             </div>
           ) : null}
         </>
-      ) : (
-        <>
-          {view.versions.length > 0 ? (
-            <p className="mt-1">
-              引用版本：
-              <ReferencingVersionLinks versions={view.versions} />
-            </p>
-          ) : null}
-        </>
-      )}
+      ) : view.versions.length > 0 ? (
+        <p className="mt-1">
+          引用版本：
+          <ReferencingVersionLinks versions={view.versions} />
+        </p>
+      ) : null}
       {view.versions.length >= REFERENCING_VERSIONS_LIMIT ? (
         <p className="mt-1 text-muted-foreground">
           仅显示前 {REFERENCING_VERSIONS_LIMIT} 个，引用版本可能更多。
@@ -407,8 +403,8 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
       title={editing ? "编辑 SUT" : "新建 SUT"}
       description={
         editing
-          ? "更新 SUT 的名称与简介；默认环境在环境列表中单独维护。"
-          : "创建 SUT 时会同时创建它的默认环境；后续可继续添加环境。"
+          ? "更新 SUT 的名称与简介；环境在环境列表中单独维护。"
+          : "创建 SUT 时会同时创建一个顶层环境并把 SUT 挂在它下面；base_url 属于 SUT。"
       }
       onClose={onClose}
       onSubmit={(event) => void handleSubmit(event)}
@@ -451,7 +447,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
         <>
           <Field
             id="sut-env-name"
-            label="默认环境名称"
+            label="环境名称"
             required
             error={errors.environmentName}
             hint="例如：测试环境"
@@ -465,10 +461,10 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
           </Field>
           <Field
             id="sut-base-url"
-            label="环境地址"
+            label="SUT 地址"
             required
             error={errors.baseUrl}
-            hint="完整的 http(s) 地址，例如 https://order.test"
+            hint="SUT 的 base_url，完整 http(s) 地址，例如 https://order.test"
           >
             <Input
               id="sut-base-url"
@@ -492,8 +488,7 @@ export type EnvironmentDialogProps = {
 export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDialogProps) {
   const editing = initial !== undefined
   const [name, setName] = useState(initial?.name ?? "")
-  const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "")
-  const [isDefault, setIsDefault] = useState(initial?.is_default ?? false)
+  const [description, setDescription] = useState(initial?.description ?? "")
   const [status, setStatus] = useState<ResourceStatus>(initial?.status ?? "active")
   const [errors, setErrors] = useState<FormErrors<EnvironmentFormValues>>({})
   const [formError, setFormError] = useState<unknown>(null)
@@ -505,8 +500,7 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
 
     const values: EnvironmentFormValues = {
       name: name.trim(),
-      baseUrl: baseUrl.trim(),
-      isDefault,
+      description: description.trim(),
       status,
     }
     const nextErrors = validateEnvironmentForm(values)
@@ -527,7 +521,7 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
   return (
     <DialogForm
       title={editing ? "编辑环境" : "新建环境"}
-      description="同一 SUT 下环境名称唯一；设为默认环境会取消其他默认环境。"
+      description="环境是顶层资源，拥有若干 SUT；环境名称全局唯一。"
       onClose={onClose}
       onSubmit={(event) => void handleSubmit(event)}
       submitLabel={editing ? "保存环境" : "创建环境"}
@@ -544,39 +538,28 @@ export function EnvironmentDialog({ initial, onClose, onSubmit }: EnvironmentDia
           onChange={(event) => setName(event.target.value)}
         />
       </Field>
-      <Field id="env-base-url" label="环境地址" required error={errors.baseUrl}>
-        <Input
-          id="env-base-url"
-          autoComplete="off"
-          value={baseUrl}
-          onChange={(event) => setBaseUrl(event.target.value)}
+      <Field id="env-description" label="环境描述" error={errors.description}>
+        <Textarea
+          id="env-description"
+          className="min-h-20"
+          value={description}
+          onChange={(event) => setDescription(event.target.value)}
         />
       </Field>
-      <div className="flex flex-wrap items-center gap-4">
-        <label htmlFor="env-default" className="flex items-center gap-2 text-xs text-foreground">
-          <input
-            id="env-default"
-            type="checkbox"
-            checked={isDefault}
-            onChange={(event) => setIsDefault(event.target.checked)}
-          />
-          设为默认环境
-        </label>
-        <div className="w-32">
-          <Field id="env-status" label="状态">
-            <Select
-              id="env-status"
-              value={status}
-              onChange={(event) => setStatus(event.target.value as ResourceStatus)}
-            >
-              {Object.entries(STATUS_LABELS).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </Select>
-          </Field>
-        </div>
+      <div className="w-32">
+        <Field id="env-status" label="状态">
+          <Select
+            id="env-status"
+            value={status}
+            onChange={(event) => setStatus(event.target.value as ResourceStatus)}
+          >
+            {Object.entries(STATUS_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </Select>
+        </Field>
       </div>
     </DialogForm>
   )
@@ -902,13 +885,12 @@ export type DatabaseDialogValues = DatabaseFormValues & {
 }
 
 export type DatabaseDialogProps = {
-  environmentId: string
   initial?: TargetDatabase
   onClose: () => void
   onSubmit: (values: DatabaseDialogValues) => Promise<void>
 }
 
-export function DatabaseDialog({ environmentId, initial, onClose, onSubmit }: DatabaseDialogProps) {
+export function DatabaseDialog({ initial, onClose, onSubmit }: DatabaseDialogProps) {
   const editing = initial !== undefined
   const [name, setName] = useState(initial?.name ?? "")
   const [dsn, setDsn] = useState(initial?.dsn ?? "")
@@ -925,7 +907,6 @@ export function DatabaseDialog({ environmentId, initial, onClose, onSubmit }: Da
     setFormError(null)
 
     const values: DatabaseDialogValues = {
-      environmentId: initial?.environment_id ?? environmentId,
       name: name.trim(),
       dsn: dsn.trim(),
       username: username.trim(),
@@ -1040,13 +1021,12 @@ export type AccountDialogValues = AccountFormValues & {
 }
 
 export type AccountDialogProps = {
-  environmentId: string
   initial?: TestAccount
   onClose: () => void
   onSubmit: (values: AccountDialogValues) => Promise<void>
 }
 
-export function AccountDialog({ environmentId, initial, onClose, onSubmit }: AccountDialogProps) {
+export function AccountDialog({ initial, onClose, onSubmit }: AccountDialogProps) {
   const editing = initial !== undefined
   const [username, setUsername] = useState(initial?.username ?? "")
   const [password, setPassword] = useState("")
@@ -1062,7 +1042,6 @@ export function AccountDialog({ environmentId, initial, onClose, onSubmit }: Acc
     setFormError(null)
 
     const values: AccountDialogValues = {
-      environmentId: initial?.environment_id ?? environmentId,
       username: username.trim(),
       password,
       roles,
@@ -1087,7 +1066,7 @@ export function AccountDialog({ environmentId, initial, onClose, onSubmit }: Acc
   return (
     <DialogForm
       title={editing ? "编辑测试账号" : "新建测试账号"}
-      description="账号归属于当前环境；密码只返回是否已设置。"
+      description="测试账号属于全局账号池；密码只返回是否已设置。"
       onClose={onClose}
       onSubmit={(event) => void handleSubmit(event)}
       submitLabel={editing ? "保存账号" : "创建账号"}

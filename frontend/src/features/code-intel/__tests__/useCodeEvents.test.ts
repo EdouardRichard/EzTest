@@ -87,7 +87,7 @@ describe("useCodeEvents", () => {
     act(() => {
       connectOptions.onEvent({ event: "message", data: eventFrame("code.index_started") })
       connectOptions.onEvent({ event: "message", data: eventFrame("code.index_finished") })
-      connectOptions.onEvent({ event: "message", data: eventFrame("visual.diff_created") })
+      connectOptions.onEvent({ event: "message", data: eventFrame("eval.completed") })
       connectOptions.onEvent({ event: "message", data: eventFrame("code.analysis_finished") })
     })
 

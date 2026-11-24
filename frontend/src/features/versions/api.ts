@@ -66,9 +66,11 @@ export function getVersionBinding(versionId: string): Promise<VersionBindingOver
 }
 
 /**
- * `PUT /api/versions/{id}/binding`: partial binding update (repository
- * inclusion, account threshold, scope exclusions). The server enforces the
- * stage gate and returns the refreshed overview.
+ * `PUT /api/versions/{id}/binding`: partial binding update (v0.2.4-B). Only the
+ * bound environment (`environment_id`) and the version account subset
+ * (`account_ids`) are writable; the code pool is derived from the environment and
+ * every approved asset of its SUTs is in scope. The server enforces the stage gate
+ * and returns the refreshed overview.
  */
 export function updateVersionBinding(
   versionId: string,

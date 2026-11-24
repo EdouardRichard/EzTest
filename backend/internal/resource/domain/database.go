@@ -7,20 +7,20 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
-// TargetDatabase is one database the tests of a SUT environment may access.
+// TargetDatabase is one database the tests of a SUT may access. Its name is
+// unique per SUT (uk_target_database_name).
 type TargetDatabase struct {
-	ID            int64
-	SUTID         int64
-	EnvironmentID int64
-	Name          string
-	Kind          string
-	DSN           string
-	Username      string
-	Password      string
-	ReadOnly      bool
-	Status        string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID        int64
+	SUTID     int64
+	Name      string
+	Kind      string
+	DSN       string
+	Username  string
+	Password  string
+	ReadOnly  bool
+	Status    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Validate checks target-database fields. Password is optional.

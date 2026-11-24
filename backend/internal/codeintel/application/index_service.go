@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
 // Work types and team (contracts/task-types.md §7).
@@ -49,10 +49,14 @@ const (
 	defaultAnalysisTimeout = 180
 )
 
-var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-
 // ValidCommitSHA reports whether value is a 40-character lowercase hex commit.
-func ValidCommitSHA(value string) bool { return commitSHAPattern.MatchString(value) }
+// The shape rule has one authority — platform/validation.GitCommitSHA, the same
+// validator behind the sut_repository.code_baseline_commit CHECK constraint —
+// so the application and the database cannot disagree. An empty value means
+// "not resolved yet" and is not a commit.
+func ValidCommitSHA(value string) bool {
+	return value != "" && validation.GitCommitSHA("commit", value) == nil
+}
 
 // IndexRepository persists code_index_run rows. ActiveRun returns the single
 // queued/running run of a repository (partial unique index); DoneRunByCommit
@@ -142,7 +146,7 @@ func NewIndexService(deps IndexDeps) *IndexService {
 // index.repo work item. It returns created=false when a done run for the same
 // repo+commit is reused (HTTP 200) and true for a new queued run (HTTP 202).
 func (s *IndexService) Start(ctx context.Context, versionID, repoID int64, commit string) (codeintel.IndexRun, bool, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return codeintel.IndexRun{}, false, err
 	}
@@ -164,10 +168,10 @@ func (s *IndexService) Start(ctx context.Context, versionID, repoID int64, commi
 		}
 		runCommit = resolved
 	case binding.CodeBaselineCommit != "":
-		// version_sut stores one baseline commit for the whole binding. In a
-		// multi-repo binding it belongs to the deterministic baseline repo, so
-		// another repository must resolve its own head instead of inheriting a
-		// foreign commit and failing the index.
+		// v0.2.4-B: the baseline is pinned per (SUT, repository), so it belongs to
+		// this repository. It still has to resolve in the local clone (a pinned
+		// commit can be absent after a re-clone or a history rewrite); otherwise
+		// the repository's own branch head is indexed.
 		if _, resolveErr := s.git.ResolveCommit(ctx, repository.Path, binding.CodeBaselineCommit); resolveErr == nil {
 			runCommit = binding.CodeBaselineCommit
 		} else {
@@ -307,13 +311,14 @@ func (s *IndexService) Execute(ctx context.Context, runID int64) error {
 	return nil
 }
 
-// backfillBaseline writes version_sut.code_baseline_commit when it is still
-// empty (spec §5.5 step 5). Failures are best-effort and never fail the index.
+// backfillBaseline writes sut_repository.code_baseline_commit for every (SUT,
+// repository) pair of this run's repository whose baseline is still empty
+// (spec §5.5 step 5). Failures are best-effort and never fail the index.
 func (s *IndexService) backfillBaseline(ctx context.Context, run codeintel.IndexRun) {
 	if run.VersionID <= 0 {
 		return
 	}
-	bindings, err := s.versions.VersionSUTBindings(ctx, run.VersionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, run.VersionID)
 	if err != nil {
 		return
 	}
@@ -321,13 +326,13 @@ func (s *IndexService) backfillBaseline(ctx context.Context, run codeintel.Index
 		if binding.RepoID != run.RepoID || binding.CodeBaselineCommit != "" {
 			continue
 		}
-		if err := s.versions.SetCodeBaselineCommit(ctx, binding.VersionSUTID, run.CommitSHA); err != nil {
-			s.recordAudit(ctx, "code.index.baseline_failed", "version_sut", platformid.Format(binding.VersionSUTID), map[string]any{
+		if err := s.versions.SetSUTRepositoryBaselineCommit(ctx, binding.SUTID, binding.RepoID, run.CommitSHA); err != nil {
+			s.recordAudit(ctx, "code.index.baseline_failed", "sut_repository", platformid.Format(binding.SUTID), map[string]any{
 				"repo_id": platformid.Format(run.RepoID),
 			})
 			continue
 		}
-		s.recordAudit(ctx, "code.index.baseline", "version_sut", platformid.Format(binding.VersionSUTID), map[string]any{
+		s.recordAudit(ctx, "code.index.baseline", "sut_repository", platformid.Format(binding.SUTID), map[string]any{
 			"repo_id":    platformid.Format(run.RepoID),
 			"commit_sha": run.CommitSHA,
 		})
@@ -352,10 +357,10 @@ func (s *IndexService) Get(ctx context.Context, runID int64) (codeintel.IndexRun
 	return run, nil
 }
 
-// RepoStatus lists the distinct repositories bound to a version with their
-// latest index run and baseline commit.
+// RepoStatus lists the distinct repositories of the version's environment code
+// pool with their latest index run and baseline commit.
 func (s *IndexService) RepoStatus(ctx context.Context, versionID int64) ([]RepoStatus, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
@@ -380,9 +385,9 @@ func (s *IndexService) RepoStatus(ctx context.Context, versionID int64) ([]RepoS
 			return nil, mapDomainError(err, "code repository")
 		}
 		status := RepoStatus{RepoID: repoID, Repository: repository, BaselineCommit: seen[repoID]}
-		// A multi-repo binding carries one shared baseline commit, which only
-		// resolves in the deterministic baseline repository. Other repositories
-		// fall back to their own newest done index commit.
+		// The baseline is pinned per (SUT, repository). A pinned commit that is
+		// absent from the local clone cannot be shown as this repository's
+		// baseline; the newest done index commit of this version stands in.
 		if ValidCommitSHA(status.BaselineCommit) {
 			if _, err := s.git.ResolveCommit(ctx, repository.Path, status.BaselineCommit); err != nil {
 				status.BaselineCommit = ""
@@ -678,19 +683,25 @@ func (s *IndexService) excludeGlobs(ctx context.Context) []string {
 	return globs
 }
 
-func bindingForRepo(bindings []VersionSUTBinding, repoID int64) (VersionSUTBinding, bool) {
+// bindingForRepo returns the first (SUT, repository) pair of one repository in
+// the environment code pool. The pool is de-duplicated per repository by the
+// resource catalog, so this is the repository's own binding.
+func bindingForRepo(bindings []SUTRepoBinding, repoID int64) (SUTRepoBinding, bool) {
 	for _, binding := range bindings {
 		if binding.RepoID == repoID {
 			return binding, true
 		}
 	}
-	return VersionSUTBinding{}, false
+	return SUTRepoBinding{}, false
 }
 
 // baselineForRepo returns the resolved baseline commit of one repository and
-// rejects conflicting commits when the same repo is bound through multiple
-// version_sut rows (spec §5.5: 409 repo_baseline_conflict).
-func baselineForRepo(bindings []VersionSUTBinding, repoID int64) (string, error) {
+// rejects conflicting commits when the same repo reaches the version through
+// more than one SUT with different pinned commits (spec §5.5: 409
+// repo_baseline_conflict). The environment code pool de-duplicates per
+// repository, so this guard is the invariant check behind that rule rather than
+// a routinely reachable branch.
+func baselineForRepo(bindings []SUTRepoBinding, repoID int64) (string, error) {
 	baseline := ""
 	for _, binding := range bindings {
 		if binding.RepoID != repoID {

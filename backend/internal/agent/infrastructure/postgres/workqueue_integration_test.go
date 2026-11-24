@@ -53,7 +53,7 @@ func TestContractClaimForTeamsSelectsStageEntryItems(t *testing.T) {
 
 	productTeams := []agent.Team{
 		agent.TeamClarification, agent.TeamDesign, agent.TeamExecution,
-		agent.TeamDelivery, agent.TeamSteward,
+		agent.TeamDelivery,
 	}
 	claimed, err := repo.ClaimWorkItemForTeams(ctx, "agent-worker", productTeams, now)
 	if err != nil || claimed == nil {
@@ -151,7 +151,6 @@ func TestWorkItemClaimForTeamsOnlyRequestedTeam(t *testing.T) {
 		agent.TeamDesign,
 		agent.TeamExecution,
 		agent.TeamDelivery,
-		agent.TeamSteward,
 	}
 	claimed, ok, err := repo.ClaimForTeams(ctx, "agent-worker", productTeams, 2*time.Second)
 	if err != nil || !ok {

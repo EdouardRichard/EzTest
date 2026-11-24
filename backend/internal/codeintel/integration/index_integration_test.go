@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,23 +27,24 @@ import (
 // --- minimal integration ports ---------------------------------------------------
 
 type integrationVersions struct {
-	bindings []codeintelapp.VersionSUTBinding
+	bindings []codeintelapp.SUTRepoBinding
 	setCalls []int64Commit
 }
 
 type int64Commit struct {
-	versionSUTID int64
-	commit       string
+	sutID  int64
+	repoID int64
+	commit string
 }
 
-func (v *integrationVersions) VersionSUTBindings(_ context.Context, _ int64) ([]codeintelapp.VersionSUTBinding, error) {
+func (v *integrationVersions) SUTRepoBindings(_ context.Context, _ int64) ([]codeintelapp.SUTRepoBinding, error) {
 	return v.bindings, nil
 }
 
-func (v *integrationVersions) SetCodeBaselineCommit(_ context.Context, versionSUTID int64, commit string) error {
-	v.setCalls = append(v.setCalls, int64Commit{versionSUTID: versionSUTID, commit: commit})
+func (v *integrationVersions) SetSUTRepositoryBaselineCommit(_ context.Context, sutID, repoID int64, commit string) error {
+	v.setCalls = append(v.setCalls, int64Commit{sutID: sutID, repoID: repoID, commit: commit})
 	for index := range v.bindings {
-		if v.bindings[index].VersionSUTID == versionSUTID {
+		if v.bindings[index].SUTID == sutID && v.bindings[index].RepoID == repoID {
 			v.bindings[index].CodeBaselineCommit = commit
 		}
 	}
@@ -244,8 +246,8 @@ func newIndexIntegrationFixture(t *testing.T, pool *pgxpool.Pool, repoPath strin
 	git := gitx.New(nil, 10*time.Second)
 	runs := codeintelpg.NewIndexRunRepository(pool)
 	entities := codeintelpg.NewEntityRepository(pool, ids)
-	versions := &integrationVersions{bindings: []codeintelapp.VersionSUTBinding{{
-		VersionSUTID: 11, VersionID: 1, RepoID: 10, Branch: "main",
+	versions := &integrationVersions{bindings: []codeintelapp.SUTRepoBinding{{
+		SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main",
 	}}}
 	resources := &integrationResources{repo: codeintelapp.RepoRef{ID: 10, Name: "fixture", Path: repoPath, Branch: "main"}}
 	queue := &integrationQueue{}
@@ -383,5 +385,66 @@ func TestIndexIntegrationTruncation(t *testing.T) {
 	}
 	if count := countEntities(t, pool, 10); count != 1 {
 		t.Fatalf("truncated entity count = %d", count)
+	}
+}
+
+// Concurrent CreateRun calls for one repository race on the partial unique
+// active-run index. Exactly one must win; the loser must surface as the domain
+// conflict sentinel (HTTP 409), not as an opaque database failure (HTTP 500).
+func TestIndexRunRepositoryConcurrentStartConflict(t *testing.T) {
+	pool := testutil.NewDB(t)
+	runs := codeintelpg.NewIndexRunRepository(pool)
+	ctx := context.Background()
+	now := time.Now()
+	newRun := func(id int64, commit string) codeintel.IndexRun {
+		return codeintel.IndexRun{
+			ID: id, RepoID: 9100, CommitSHA: commit, Branch: "main",
+			Status: string(codeintel.IndexQueued), Stats: json.RawMessage(`{}`),
+			Errors: json.RawMessage(`[]`), CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	candidates := []codeintel.IndexRun{
+		newRun(910001, strings.Repeat("c", 40)),
+		newRun(910002, strings.Repeat("d", 40)),
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(candidates))
+	var wg sync.WaitGroup
+	for _, candidate := range candidates {
+		wg.Add(1)
+		go func(run codeintel.IndexRun) {
+			defer wg.Done()
+			<-start
+			_, err := runs.CreateRun(ctx, run)
+			errs <- err
+		}(candidate)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var succeeded, conflicted int
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, codeintel.ErrConflict):
+			conflicted++
+		default:
+			t.Fatalf("unexpected concurrent CreateRun error: %v", err)
+		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("concurrent CreateRun = %d success, %d conflict; want 1/1", succeeded, conflicted)
+	}
+	var active int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM code_index_run WHERE repo_id = $1 AND status IN ('queued', 'running')
+	`, 9100).Scan(&active); err != nil {
+		t.Fatalf("count active runs: %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("active runs = %d, want 1", active)
 	}
 }

@@ -391,8 +391,14 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 	fixture.gcInsertObject(t, reportSHA, int64(len(reportData)), "text/html; charset=utf-8", reportRel, old)
 	fixture.gcInsertRef(t, 305, reportSHA, storageapp.OwnerKindReportRevision, 4101, storageapp.RoleReportHTML, old)
 
-	// requirement attachment whose version still exists.
-	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO version (id, title, created_by) VALUES (5001, 'GC integration', 1)`); err != nil {
+	// requirement attachment whose version still exists. v0.2.4-B made
+	// version.environment_id NOT NULL (a logical cross-context reference, so no
+	// physical foreign key), which means the fixture must also seed the
+	// environment row the version points at.
+	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO environment (id, name, status) VALUES (990001, 'gc fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("insert environment: %v", err)
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO version (id, title, created_by, environment_id) VALUES (5001, 'GC integration', 1, 990001)`); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
 	attachmentData := []byte("attachment bytes")

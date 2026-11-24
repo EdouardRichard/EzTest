@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Cross-language behaviour gate for the requirement CONFIRMATION precheck (v0.2.4-E SC-E1/SC-E10).",
+    "The server authority is backend/internal/version/domain/requirement.go",
+    "(NormalizePlaceholderTerm / IsPlaceholder and ValidateConfirmed's sut_description rune floor).",
+    "The frontend convenience precheck is frontend/src/features/clarification/requirement-precheck.ts.",
+    "SC-E10 forbids a second hand-maintained matching truth: this fixture is the SHARED case set both",
+    "implementations are evaluated against (Go: confirmation_precheck_gate_test.go; TS:",
+    "requirement-precheck.authority.test.ts). A semantic drift on either side fails its own gate.",
+    "Word list and threshold are never hard-coded in the client at runtime — they come from settings;",
+    "the terms/min_chars below are gate inputs, not defaults."
+  ],
+  "placeholder_cases": [
+    { "name": "exact_term", "value": "TBD", "terms": ["TBD", "TODO"], "is_placeholder": true },
+    { "name": "trim_and_lowercase_value", "value": "  tBd  ", "terms": ["TBD"], "is_placeholder": true },
+    { "name": "term_is_normalized_too", "value": "xxx", "terms": [" XXX "], "is_placeholder": true },
+    { "name": "cjk_exact_term", "value": "待补充", "terms": ["待定", "待补充"], "is_placeholder": true },
+    { "name": "cjk_trimmed", "value": " 暂无\n", "terms": ["暂无"], "is_placeholder": true },
+    { "name": "substring_is_not_a_match", "value": "TODO: 补充登录异常路径", "terms": ["TODO"], "is_placeholder": false },
+    { "name": "term_prefix_is_not_a_match", "value": "占位符说明", "terms": ["占位"], "is_placeholder": false },
+    { "name": "term_suffix_is_not_a_match", "value": "XxxYyy", "terms": ["xxx"], "is_placeholder": false },
+    { "name": "real_content_passes", "value": "手机号与验证码登录", "terms": ["TBD", "TODO", "待定"], "is_placeholder": false },
+    { "name": "empty_value_is_not_a_term", "value": "", "terms": ["TBD", "TODO"], "is_placeholder": false },
+    { "name": "empty_term_list_never_matches", "value": "TBD", "terms": [], "is_placeholder": false },
+    { "name": "case_fold_is_unicode_aware", "value": "ＰＬＡＣＥＨＯＬＤＥＲ", "terms": ["ｐｌａｃｅｈｏｌｄｅｒ"], "is_placeholder": true }
+  ],
+  "min_length_cases": [
+    { "name": "cjk_19_below_floor", "value": "一二三四五六七八九十一二三四五六七八九", "min_chars": 20, "too_short": true },
+    { "name": "cjk_20_at_floor", "value": "一二三四五六七八九十一二三四五六七八九十", "min_chars": 20, "too_short": false },
+    { "name": "cjk_21_above_floor", "value": "一二三四五六七八九十一二三四五六七八九十一", "min_chars": 20, "too_short": false },
+    { "name": "astral_runes_not_utf16_units", "value": "😀😀😀😀😀😀😀😀😀😀abcde", "min_chars": 20, "too_short": true },
+    { "name": "astral_runes_at_floor", "value": "😀😀😀😀😀😀😀😀😀😀abcdefghij", "min_chars": 20, "too_short": false },
+    { "name": "surrounding_whitespace_is_trimmed", "value": "   一二三四五六七八九十一二三四五六七八   ", "min_chars": 20, "too_short": true },
+    { "name": "zero_floor_accepts_empty", "value": "", "min_chars": 0, "too_short": false },
+    { "name": "empty_below_positive_floor", "value": "   ", "min_chars": 20, "too_short": true }
+  ]
+}

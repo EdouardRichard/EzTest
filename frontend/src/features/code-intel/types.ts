@@ -219,7 +219,7 @@ export type CodeImpactCandidateView = {
   id: string
   analysis_id: string
   repo_id?: string | null
-  version_sut_id?: string | null
+  sut_id?: string | null
   subject_kind: CodeImpactSubjectKind
   subject_id: string
   reason: string
@@ -242,22 +242,12 @@ export type CodeAnalysisDetailView = {
   errors?: Array<Record<string, unknown>>
 }
 
-export type CodeImpactAnalysisRef = {
-  repo_id: string
-  analysis_id: string
-  base_commit_sha: string
-  head_commit_sha: string
-  status: CodeAnalysisStatus
-  degraded: boolean
-  candidates_count?: number
-}
-
-/** `CodeImpactView`: merged multi-repository impact projection. */
-export type CodeImpactView = {
-  version_id: string
-  analyses: CodeImpactAnalysisRef[]
-  candidates: CodeImpactCandidateView[]
-}
+/*
+ * `getCodeImpact` returns a bare `CodeImpactCandidateView[]`: the union endpoint writes the
+ * shared list envelope via httpx.List (api.yaml `CodeImpactListEnvelope`), so `data` is an
+ * array of merged candidates, not the retired `CodeImpactView` object (version_id/analyses
+ * never appear in that response). The base client unwraps `data`.
+ */
 
 /* ---------------------------------- anchors -------------------------------- */
 
@@ -320,14 +310,14 @@ export type CodeProposalView = {
   kind: CodeProposalKind
   id: string
   name: string
-  url?: string | null
-  route_template?: string | null
-  method?: string | null
-  path_template?: string | null
+  // Go codeProposalDTO sends url/route_template/method/path_template as plain strings
+  // (empty string when unused, never null) and has no evidence/created_at field.
+  url: string
+  route_template: string
+  method: string
+  path_template: string
   status: "proposed"
   source: "ai" | "code"
-  evidence?: Array<Record<string, unknown>>
-  created_at: string
 }
 
 export type CodeProposalCounts = {

@@ -34,16 +34,16 @@ describe("validateSutForm", () => {
     })
 
     expect(errors.name).toBe("请输入 SUT 名称")
-    expect(errors.environmentName).toBe("请输入默认环境名称")
-    expect(errors.baseUrl).toBe("请输入环境地址")
+    expect(errors.environmentName).toBe("请输入环境名称")
+    expect(errors.baseUrl).toBe("请输入 SUT 地址")
   })
 
   it("rejects a base URL without an http(s) scheme", () => {
     expect(validateSutForm({ ...validSut, baseUrl: "order.test" }).baseUrl).toBe(
-      "环境地址必须是完整的 http(s) 地址",
+      "SUT 地址必须是完整的 http(s) 地址",
     )
     expect(validateSutForm({ ...validSut, baseUrl: "ftp://order.test" }).baseUrl).toBe(
-      "环境地址必须是完整的 http(s) 地址",
+      "SUT 地址必须是完整的 http(s) 地址",
     )
   })
 
@@ -78,8 +78,7 @@ describe("validateSutForm", () => {
 describe("validateEnvironmentForm", () => {
   const validEnvironment = {
     name: "预发环境",
-    baseUrl: "https://pre.order.test",
-    isDefault: false,
+    description: "",
     status: "active" as const,
   }
 
@@ -87,10 +86,9 @@ describe("validateEnvironmentForm", () => {
     expect(validateEnvironmentForm(validEnvironment)).toEqual({})
   })
 
-  it("requires a name and a valid base URL", () => {
-    const errors = validateEnvironmentForm({ ...validEnvironment, name: "", baseUrl: "//bad" })
+  it("requires a name", () => {
+    const errors = validateEnvironmentForm({ ...validEnvironment, name: "" })
     expect(errors.name).toBe("请输入环境名称")
-    expect(errors.baseUrl).toBe("环境地址必须是完整的 http(s) 地址")
   })
 })
 
@@ -153,7 +151,6 @@ describe("validateApiForm", () => {
 
 describe("validateDatabaseForm", () => {
   const validDatabase = {
-    environmentId: "1101",
     name: "order_db",
     dsn: "postgres://order-db:5432/order",
     username: "order",
@@ -171,11 +168,9 @@ describe("validateDatabaseForm", () => {
   it("rejects other DSN schemes and missing fields", () => {
     const errors = validateDatabaseForm({
       ...validDatabase,
-      environmentId: "",
       dsn: "mysql://order-db/order",
       username: "",
     })
-    expect(errors.environmentId).toBe("请选择环境")
     expect(errors.dsn).toBe("DSN 必须以 postgres:// 或 postgresql:// 开头")
     expect(errors.username).toBe("请输入数据库用户名")
   })
@@ -189,7 +184,6 @@ describe("validateDatabaseForm", () => {
 
 describe("validateAccountForm", () => {
   const validAccount = {
-    environmentId: "1101",
     username: "buyer",
     password: "secret",
     roles: "buyer, order_admin",

@@ -258,10 +258,13 @@ describe("clarification api", () => {
     await expect(
       createRequirement("2001", {
         title: "退款到账时效",
-        description: "T+1 到账",
-        acceptance_criteria: "审核通过后 T+1 到账",
+        user_story: { as_a: "买家", i_want: "T+1 到账", so_that: "及时收到退款" },
+        rules: "",
+        acceptance_criteria: [{ given: "审核通过", when: "T+1", then: "到账" }],
         priority: "P1",
-        targets: { version_suts: ["1002"], pages: [], apis: [] },
+        sut_description: "支付网关退款链路",
+        scope_out: "",
+        account_roles_hint: [],
       }),
     ).resolves.toEqual(requirementDetailFixture)
 
@@ -299,10 +302,13 @@ describe("clarification api", () => {
   it("patches a requirement into a new draft revision", async () => {
     const payload: RequirementUpdateRequest = {
       title: "退款到账时效",
-      description: "T+1 到账",
-      acceptance_criteria: "审核通过后 T+1 到账",
+      user_story: { as_a: "买家", i_want: "T+1 到账", so_that: "及时收到退款" },
+      rules: "",
+      acceptance_criteria: [{ given: "审核通过", when: "T+1", then: "到账" }],
       priority: "P1",
-      targets: { version_suts: ["1002"], pages: ["2301"], apis: [] },
+      sut_description: "支付网关退款链路",
+      scope_out: "",
+      account_roles_hint: [],
       reason: "补充节假日规则",
     }
     fetchMock.mockResolvedValue(jsonResponse({ data: requirementDetailFixture }))
@@ -515,11 +521,8 @@ describe("clarification api", () => {
     expect(requirementFixture.current_version_id).toBe(requirementVersionFixture.id)
     expect(requirementDetailFixture.current_version).toEqual(requirementVersionFixture)
     expect(requirementDetailFixture.history).toEqual([])
-    expect(requirementDetailFixture.targets).toEqual({
-      version_suts: ["1002"],
-      pages: ["2301"],
-      apis: [],
-    })
+    expect(requirementDetailFixture.closed_at).toBeNull()
+    expect(requirementDetailFixture.closure).toBeNull()
   })
 
   it("reads the latest extraction run and maps its typed 404 to the empty state", async () => {

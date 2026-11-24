@@ -35,21 +35,21 @@ func TestRepositorySeedUpdateAndRevisions(t *testing.T) {
 		t.Fatalf("settings = %d, want %d", len(list), len(defs))
 	}
 
-	initial, err := repo.Get(ctx, "execution.global_concurrency")
+	initial, err := repo.Get(ctx, "execution.max_concurrent_case_runs")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if string(initial.Value) != "3" || initial.Version != 1 {
-		t.Fatalf("initial = %#v", initial)
+	if string(initial.Value) != "0" || initial.Version != 1 {
+		t.Fatalf("initial = %#v (want the 0 = unlimited default)", initial)
 	}
 
 	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	previous, updated, err := repo.Update(ctx, "execution.global_concurrency", json.RawMessage("5"), 9001, 42, at)
+	previous, updated, err := repo.Update(ctx, "execution.max_concurrent_case_runs", json.RawMessage("5"), 9001, 42, at)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if string(previous) != "3" {
-		t.Fatalf("previous = %s, want the locked old value 3", previous)
+	if string(previous) != "0" {
+		t.Fatalf("previous = %s, want the locked old value 0", previous)
 	}
 	if string(updated.Value) != "5" || updated.Version != 2 {
 		t.Fatalf("updated = %#v", updated)
@@ -58,14 +58,14 @@ func TestRepositorySeedUpdateAndRevisions(t *testing.T) {
 		t.Fatalf("updated_by = %v", updated.UpdatedBy)
 	}
 
-	revisions, err := repo.Revisions(ctx, "execution.global_concurrency", 10, nil)
+	revisions, err := repo.Revisions(ctx, "execution.max_concurrent_case_runs", 10, nil)
 	if err != nil {
 		t.Fatalf("Revisions: %v", err)
 	}
 	if len(revisions) != 1 {
 		t.Fatalf("revisions = %#v", revisions)
 	}
-	if string(revisions[0].OldValue) != "3" || string(revisions[0].NewValue) != "5" {
+	if string(revisions[0].OldValue) != "0" || string(revisions[0].NewValue) != "5" {
 		t.Fatalf("revision = %#v", revisions[0])
 	}
 
@@ -73,7 +73,7 @@ func TestRepositorySeedUpdateAndRevisions(t *testing.T) {
 	if err := repo.Seed(ctx, defs); err != nil {
 		t.Fatalf("third Seed: %v", err)
 	}
-	after, err := repo.Get(ctx, "execution.global_concurrency")
+	after, err := repo.Get(ctx, "execution.max_concurrent_case_runs")
 	if err != nil {
 		t.Fatalf("Get after seed: %v", err)
 	}

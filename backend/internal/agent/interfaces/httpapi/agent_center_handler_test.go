@@ -29,6 +29,30 @@ type stubAgentCenterService struct {
 	runCalls   int
 	catCalls   int
 	qualCalls  int
+
+	// transcript is the admin-only run transcript read (v0.2.4-D T8).
+	transcript          []agentpkg.AgentMessage
+	transcriptErr       error
+	transcriptCalls     int
+	lastTranscriptRunID int64
+
+	// activity is the admin-only agent_activity fact read (v0.2.4-D T10).
+	activity          []agentpkg.Activity
+	activityErr       error
+	activityCalls     int
+	lastActivityRunID int64
+}
+
+func (s *stubAgentCenterService) RunActivity(_ context.Context, runID int64) ([]agentpkg.Activity, error) {
+	s.activityCalls++
+	s.lastActivityRunID = runID
+	return s.activity, s.activityErr
+}
+
+func (s *stubAgentCenterService) RunTranscript(_ context.Context, runID int64) ([]agentpkg.AgentMessage, error) {
+	s.transcriptCalls++
+	s.lastTranscriptRunID = runID
+	return s.transcript, s.transcriptErr
 }
 
 func (s *stubAgentCenterService) Catalog(_ context.Context) (agentapp.Catalog, error) {

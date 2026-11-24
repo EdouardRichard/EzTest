@@ -8,6 +8,7 @@ import (
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
@@ -42,49 +43,73 @@ func NewCredentialAdapter(versions VersionBindingService, accounts AccountSecret
 
 var _ executionapp.CredentialReader = (*CredentialAdapter)(nil)
 
-// Account resolves a test account by exact role match within the version SUT.
-// An empty role selects the first bound account; multiple matches are a
-// configuration conflict.
-func (a *CredentialAdapter) Account(ctx context.Context, versionID, versionSUTID int64, role string) (executionapp.AccountCredential, error) {
+// Account resolves a test account by exact role match for one SUT of the
+// version's bound environment, preferring an account affined to that SUT
+// (AccountView.SUTID == sutID) and falling back to a shared account (SUTID
+// empty) when none is affined. An empty role selects the first bound account.
+// Several accounts sharing a role within the same tier resolve
+// deterministically to the lowest account ID.
+//
+// v0.2.4-F (SC-F6): the per-version binding row is gone, so sutID identifies a
+// SUT of the bound environment and the candidate accounts are the
+// version-level subset, filtered by SUT affinity with a shared-account
+// fallback.
+func (a *CredentialAdapter) Account(ctx context.Context, versionID, sutID int64, role string) (executionapp.AccountCredential, error) {
 	view, err := a.versions.Get(ctx, versionID)
 	if err != nil {
 		return executionapp.AccountCredential{}, err
 	}
-	var binding *versionapp.BindingView
-	for i := range view.Bindings {
-		if view.Bindings[i].ID == versionSUTID {
-			binding = &view.Bindings[i]
-			break
-		}
+	if !boundSUT(view.Binding, sutID) {
+		return executionapp.AccountCredential{}, platform.NotFound("sut")
 	}
-	if binding == nil {
-		return executionapp.AccountCredential{}, platform.NotFound("version_sut")
-	}
-	if len(binding.Accounts) == 0 {
+	accounts := view.Binding.Accounts
+	if len(accounts) == 0 {
 		return executionapp.AccountCredential{}, platform.NotFound("test_account")
 	}
 	role = strings.TrimSpace(role)
 	matches := make([]string, 0, 1)
-	for _, account := range binding.Accounts {
-		if role == "" {
-			matches = append(matches, account.ID)
-			break
-		}
-		for _, accountRole := range account.Roles {
-			if strings.TrimSpace(accountRole) == role {
-				matches = append(matches, account.ID)
-				break
+	if role == "" {
+		matches = append(matches, accounts[0].ID)
+	} else {
+		// v0.2.4-F (SC-F6): among role-matching candidates, prefer an account
+		// affined to this SUT; fall back to shared (no-affinity) accounts only
+		// when none is affined. An account affined to a different SUT is not a
+		// candidate for this one, even as a fallback.
+		wantedSUTID := strconv.FormatInt(sutID, 10)
+		affinity := make([]string, 0, 1)
+		shared := make([]string, 0, 1)
+		for _, account := range accounts {
+			matched := false
+			for _, accountRole := range account.Roles {
+				if strings.TrimSpace(accountRole) == role {
+					matched = true
+					break
+				}
 			}
+			if !matched {
+				continue
+			}
+			switch account.SUTID {
+			case wantedSUTID:
+				affinity = append(affinity, account.ID)
+			case "":
+				shared = append(shared, account.ID)
+			}
+		}
+		if len(affinity) > 0 {
+			matches = affinity
+		} else {
+			matches = shared
 		}
 	}
 	if len(matches) == 0 {
 		return executionapp.AccountCredential{}, platform.NotFound("test_account")
 	}
 	// Deterministic account selection (Task 90): several SUT test accounts may
-	// share a role (e.g. author). Selecting the lowest account ID keeps repeated
-	// case runs on the same account instead of failing mid-execution with a
-	// state_conflict; all candidates are bound to the version SUT, so no auth
-	// boundary is bypassed.
+	// share a role (e.g. author) within the same affinity tier. Selecting the
+	// lowest account ID keeps repeated case runs on the same account instead of
+	// failing mid-execution with a state_conflict; all candidates are bound to
+	// the version, so no auth boundary is bypassed.
 	sort.SliceStable(matches, func(i, j int) bool {
 		left, leftErr := strconv.ParseInt(strings.TrimSpace(matches[i]), 10, 64)
 		right, rightErr := strconv.ParseInt(strings.TrimSpace(matches[j]), 10, 64)
@@ -107,49 +132,43 @@ func (a *CredentialAdapter) Account(ctx context.Context, versionID, versionSUTID
 	return executionapp.AccountCredential{AccountID: accountID, Username: username, Password: password}, nil
 }
 
-// Database resolves the version-SUT target database credential. An explicit
-// database_id must belong to the binding; otherwise the first bound database is
-// used.
-func (a *CredentialAdapter) Database(ctx context.Context, versionID, versionSUTID int64, databaseID *int64) (executionapp.DatabaseCredential, error) {
+// Database resolves the target database credential of one SUT of the version's
+// bound environment. An explicit database_id must belong to that SUT **and be
+// active**: a database an operator disabled is outside the version's effective
+// scope, so it is a 404 and its secret is never read. Without an explicit id the
+// SUT's first active database is used, and a SUT with no active database has no
+// credential at all.
+func (a *CredentialAdapter) Database(ctx context.Context, versionID, sutID int64, databaseID *int64) (executionapp.DatabaseCredential, error) {
 	view, err := a.versions.Get(ctx, versionID)
 	if err != nil {
 		return executionapp.DatabaseCredential{}, err
 	}
-	var binding *versionapp.BindingView
-	for i := range view.Bindings {
-		if view.Bindings[i].ID == versionSUTID {
-			binding = &view.Bindings[i]
-			break
-		}
+	databases := boundSUTDatabases(view.Binding, sutID)
+	if databases == nil {
+		return executionapp.DatabaseCredential{}, platform.NotFound("sut")
 	}
-	if binding == nil {
-		return executionapp.DatabaseCredential{}, platform.NotFound("version_sut")
-	}
-	if len(binding.Databases) == 0 {
+	if len(databases) == 0 {
 		return executionapp.DatabaseCredential{}, platform.NotFound("target_database")
 	}
 	selected := ""
 	if databaseID != nil {
 		wanted := strconv.FormatInt(*databaseID, 10)
-		for _, database := range binding.Databases {
+		for _, database := range databases {
 			if database.ID == wanted {
 				selected = database.ID
 				break
 			}
 		}
 		if selected == "" {
+			// Not inside the effective scope: the id belongs to another SUT, or an
+			// operator disabled that database. Neither may yield a credential.
 			return executionapp.DatabaseCredential{}, platform.NotFound("target_database")
 		}
 	} else {
-		for _, database := range binding.Databases {
-			if database.Status == "" || database.Status == "active" {
-				selected = database.ID
-				break
-			}
-		}
-		if selected == "" {
-			selected = binding.Databases[0].ID
-		}
+		// boundSUTDatabases already returns active rows only, so the first one is
+		// the default. The status predicate that used to live here was a second
+		// copy of the effective-scope rule and is gone with it.
+		selected = databases[0].ID
 	}
 	databaseIDValue, err := strconv.ParseInt(strings.TrimSpace(selected), 10, 64)
 	if err != nil || databaseIDValue <= 0 {
@@ -163,7 +182,7 @@ func (a *CredentialAdapter) Database(ctx context.Context, versionID, versionSUTI
 		return executionapp.DatabaseCredential{}, err
 	}
 	readOnly := true
-	for _, database := range binding.Databases {
+	for _, database := range databases {
 		if database.ID == selected {
 			readOnly = database.ReadOnly
 			break
@@ -176,4 +195,36 @@ func (a *CredentialAdapter) Database(ctx context.Context, versionID, versionSUTI
 		Password:   password,
 		ReadOnly:   readOnly,
 	}, nil
+}
+
+// boundSUT reports whether the SUT belongs to the environment the version binds.
+// Membership is an identity question, not a scope question, so this deliberately
+// reads the raw catalog list: a SUT whose pages are all still proposed is bound
+// all the same, and its version-level accounts still resolve.
+func boundSUT(catalog versionapp.EnvironmentSUTCatalog, sutID int64) bool {
+	wanted := strconv.FormatInt(sutID, 10)
+	for _, sut := range catalog.Environment.SUTs {
+		if sut.ID == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// boundSUTDatabases returns the ACTIVE target databases of one SUT of the bound
+// environment — the effective scope, never the raw catalog list. A nil result
+// means the SUT is not part of the environment; an empty result means the SUT is
+// bound but owns no database the version may use.
+//
+// This is a trust boundary: the rows returned here are the only ones Database()
+// will resolve a credential for, so a database an operator disabled must not
+// appear on either the explicit database_id path or the default fallback.
+func boundSUTDatabases(catalog versionapp.EnvironmentSUTCatalog, sutID int64) []resourceapp.DatabaseView {
+	for _, sut := range catalog.EffectiveSUTs() {
+		if sut.SUTID != sutID {
+			continue
+		}
+		return sut.Databases
+	}
+	return nil
 }

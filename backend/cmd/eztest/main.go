@@ -21,9 +21,9 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	agentdeliveryadapter "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/deliveryadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/designadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/knowledgeadapter"
-	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
 	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
@@ -57,6 +57,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
 	orchestrationapp "github.com/EdouardRichard/EzTest/backend/internal/orchestration/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
@@ -66,18 +67,25 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	storagedomain "github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
 	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
 	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
-	visualapp "github.com/EdouardRichard/EzTest/backend/internal/visual/application"
-	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
 )
 
-var version = "0.2.1"
+// version is the release identity reported by GET /api/health. Release builds
+// stamp it from the repository-root VERSION file via
+//
+//	-X github.com/EdouardRichard/EzTest/backend/cmd/eztest.version=<VERSION>
+//
+// The default stays "dev" so an unstamped local build reports honestly instead
+// of pretending to be a released version.
+var version = "dev"
 
 func hostName() string {
 	name, err := os.Hostname()
@@ -117,6 +125,21 @@ func runReconciler(ctx context.Context, gate orchestrationapp.LeaderGate, reconc
 	shouldRun := func() bool { return gate != nil && gate.IsLeader() }
 	if err := reconciler.Run(ctx, shouldRun); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("eztest: reconciler loop stopped: %v", err)
+	}
+}
+
+// runReportStaleWatcher starts the causal report-stale loop (v0.2.4-G T11). It is
+// leader-gated like the reconciler: causal drains run on conclusion-input event
+// wakes, and the periodic complete sweep runs on its own ticker so a lost event
+// (which produces no wake) is still healed. A gate-closed causal wake is re-armed,
+// never dropped, so it runs once leadership is acquired.
+func runReportStaleWatcher(ctx context.Context, gate orchestrationapp.LeaderGate, watcher *deliveryapp.ReportStaleWatcher) {
+	if watcher == nil {
+		return
+	}
+	shouldRun := func() bool { return gate != nil && gate.IsLeader() }
+	if err := watcher.Run(ctx, shouldRun, deliveryapp.DefaultReportStaleSweepInterval); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("eztest: report stale watcher stopped: %v", err)
 	}
 }
 
@@ -227,6 +250,38 @@ const maxDesignRequirementGenerations = 3
 // task board. Composition-root only.
 type designTaskEnqueuer struct {
 	queue *agentapp.WorkQueue
+	// judgeExhausted records the judge_exhausted escalation facts (one per
+	// unjudged draft case version) when a draft set's judge generation budget is
+	// spent (T8). The composition root wires it over the version FactService in
+	// T13; a nil store fails closed (ErrJudgeExhaustedStoreUnavailable) rather
+	// than silently leaving a pending.
+	judgeExhausted designapp.JudgeExhaustedStore
+	// judgeGenerations is the TARGETED design.judge row source of one
+	// requirement version. The generation sequence/budget must never be derived
+	// from the capped newest-500 ListByVersion page (a busy version strands the
+	// draft set); a nil source fails closed rather than silently falling back to
+	// that window.
+	judgeGenerations judgeGenerationWorkItemSource
+	// coverageRepairs is the TARGETED design.requirement row source of one
+	// requirement version (H-F5). The coverage-repair generation counter must
+	// never be derived from the capped newest-500 ListByVersion page: on a busy
+	// version the older authoring generations fall out of the page, the counter
+	// undercounts and the derived key collides with a terminal generation, so
+	// Ensure reports created=false and the requirement is never repaired again.
+	// A nil source fails closed rather than silently falling back to that window.
+	coverageRepairs authorBatchWorkItemSource
+	// authorExhausted records the author_exhausted escalation fact when a
+	// requirement revision's CASE-AUTHORING generation budget is spent while its
+	// coverage is still incomplete (H-F5b). Without it the requirement strands:
+	// no further design.requirement generation can be created and nothing was
+	// written a human could see. A nil store fails closed
+	// (ErrAuthorExhaustedStoreUnavailable) rather than silently leaving the stall.
+	authorExhausted designapp.AuthorExhaustedStore
+	// events emits the best-effort design.judge_exhausted degradation event.
+	events eventingapp.Publisher
+	// logger attributes the authoring-budget escalation (constitution VII.7). A
+	// nil logger falls back to slog.Default() so a degraded assembly still logs.
+	logger *slog.Logger
 }
 
 func (e designTaskEnqueuer) Ensure(ctx context.Context, in designapp.TaskInput) (bool, error) {
@@ -245,20 +300,70 @@ func (e designTaskEnqueuer) Ensure(ctx context.Context, in designapp.TaskInput) 
 }
 
 // EnsureCoverageRepair applies one fresh authoring generation for a requirement
-// version whose coverage is still missing. It looks at the version's existing
-// design.requirement work items so a terminal "done but empty" generation (S3
-// emitted no usable case and the static dedupe key blocked every retry) is
-// repaired, while an in-flight or retry-backed generation is left alone and the
-// bounded generation budget is respected.
+// version whose coverage is still missing. It looks at the requirement version's
+// existing design.requirement work items so a terminal "done but empty"
+// generation (S3 emitted no usable case and the static dedupe key blocked every
+// retry) is repaired, while an in-flight or retry-backed generation is left alone
+// and the bounded generation budget is respected. The generations are read
+// through the TARGETED coverageRepairs source, never the capped ListByVersion
+// window (H-F5: a busy version strands the requirement exactly like DEV-E2/E3).
 func (e designTaskEnqueuer) EnsureCoverageRepair(ctx context.Context, in designapp.TaskInput, requirementVersionID int64) (bool, error) {
 	if e.queue == nil {
 		return false, nil
 	}
-	items, err := e.queue.ListByVersion(ctx, in.VersionID, agentapp.MaxListLimit)
+	if e.coverageRepairs == nil {
+		return false, errors.New("coverage repair work-item source is not wired")
+	}
+	items, err := e.coverageRepairs.AuthorItemsForRequirementVersion(ctx, in.VersionID, requirementVersionID)
 	if err != nil {
 		return false, err
 	}
-	key := coverageRepairDedupeKey(items, in.DedupeKey, requirementVersionID)
+	key, exhausted, generation := coverageRepairDedupeKey(items, in.DedupeKey, requirementVersionID)
+	if exhausted {
+		// H-F5b (spec SC-E4 "无永久 pending", the authoring-side mirror of DEV-E3 /
+		// EnsureJudgeGeneration): the budget is spent and EVERY generation is
+		// terminal, so no further authoring generation can ever be created for this
+		// requirement revision. Returning (false, nil) here used to strand the
+		// requirement with incomplete coverage and no record anywhere. Escalate
+		// durably instead; an unwired store fails closed rather than going silent.
+		if e.authorExhausted == nil {
+			return false, designapp.ErrAuthorExhaustedStoreUnavailable
+		}
+		requirementID := judgeTaskPayloadID(in.Payload, "requirement_id")
+		// T11c M3 (parse-boundary fail-closed, same rule as #34): the escalation
+		// fact is keyed requirement:<id>:requirement_version:<id>. A zero/absent
+		// requirement_id would write a requirement:0:… record that misattributes
+		// the stall (and collides with any other id-less escalation sharing the
+		// revision key), deduping the second one into silence. Both production
+		// callers always carry the id, so this is unreachable today — but this is
+		// the one newly-written durable record path, so it fails closed instead of
+		// persisting an invalid attribution.
+		if requirementID <= 0 {
+			return false, platform.Invalid("requirement_id", "the author-exhaustion escalation requires a positive requirement_id in the task payload")
+		}
+		// T11c M4: record the ACTUAL terminal generation count, not the budget
+		// constant. The two are equal today, but this is an attribution record —
+		// it must state how many generations actually ran, so a future change to
+		// the bound (or an extra terminal row) cannot silently misreport history.
+		created, err := e.authorExhausted.InsertAuthorExhausted(ctx, in.VersionID, requirementID, requirementVersionID, generation)
+		if err != nil {
+			return false, err
+		}
+		// Attribute ONCE, on the pass that actually wrote the fact. The exhausted
+		// condition persists across every later reconcile pass; warning per pass
+		// would bury the signal in its own repetition (T10 review M3). The fact is
+		// the durable truth and is readable through the version facts read model;
+		// the human paths out are a new requirement revision (fresh budget), manual
+		// case authoring/confirmation, or a requirement waiver.
+		if created {
+			e.log().Warn("design: case-authoring generation budget exhausted with incomplete coverage; requirement escalated to a human",
+				"version_id", in.VersionID,
+				"requirement_id", requirementID,
+				"requirement_version_id", requirementVersionID,
+				"generations", generation)
+		}
+		return false, nil
+	}
 	if key == "" {
 		return false, nil
 	}
@@ -275,14 +380,35 @@ func (e designTaskEnqueuer) EnsureCoverageRepair(ctx context.Context, in designa
 }
 
 // coverageRepairDedupeKey derives the dedupe key of the next design.requirement
-// generation for one requirement version, or "" when a generation must not be
-// requested: a previous generation is still in flight, a retryable failure is
-// queued for a retry, or the bounded generation budget is exhausted. The first
-// generation keeps the base key; later generations append ":repair:<n>", so the
-// static key of a terminal item can never block the repair.
-func coverageRepairDedupeKey(items []agent.WorkItem, baseKey string, requirementVersionID int64) string {
+// generation for one requirement version, plus whether the bounded authoring
+// budget is EXHAUSTED and the ACTUAL terminal generation count. It returns
+// ("", false, n) when a generation must not be requested because a previous
+// generation is still in flight or a retryable failure is queued for a retry
+// (work is still owed — a normal wait, never an escalation), ("", true, n) when
+// every generation is terminal and the budget is spent (the caller writes the
+// escalation fact, attributing the actual count n), the base key for the very
+// first generation, and baseKey+":repair:<n>" afterwards, so the static key of a
+// terminal item can never block the repair.
+//
+// H-F5b: the two "" answers used to be indistinguishable, and the exhausted one
+// stranded the requirement silently. The ORDER matters and is unchanged: an
+// in-flight generation short-circuits before the budget check, so a merely queued
+// or running author is never escalated (the T10 review I1 lesson).
+//
+// T11c M4: the third return is the counted terminal generations, so the
+// escalation fact records how many generations actually ran rather than the
+// budget constant (the two are equal today; the record must stay honest if they
+// diverge).
+//
+// T11d minor (T11c deferred): n is a FULL terminal count ONLY on the exhausted
+// answer. On the non-exhausted answers — in particular the in-flight
+// short-circuit below — n is just the number of terminal generations traversed
+// BEFORE the first non-terminal item, so it is order-dependent and partial. It
+// must not be used for attribution there (only the exhausted branch writes a
+// fact, and it is the only branch whose n is complete).
+func coverageRepairDedupeKey(items []agent.WorkItem, baseKey string, requirementVersionID int64) (string, bool, int) {
 	if requirementVersionID <= 0 {
-		return ""
+		return "", false, 0
 	}
 	generation := 0
 	for _, item := range items {
@@ -293,25 +419,196 @@ func coverageRepairDedupeKey(items []agent.WorkItem, baseKey string, requirement
 		if err != nil || payload.RequirementVersionID != requirementVersionID {
 			continue
 		}
-		switch item.Status {
-		case agent.WorkItemOpen, agent.WorkItemClaimed, agent.WorkItemRunning, agent.WorkItemWaitingHuman:
-			return ""
-		case agent.WorkItemFailed:
-			// A failed item below its attempt cap is retried by the queue; a new
-			// generation would duplicate that retry.
-			if item.Attempts < item.MaxAttempts {
-				return ""
-			}
+		// One lifecycle authority (designWorkItemTerminal): an in-flight or
+		// retry-backed generation still owes work, so a fresh generation would
+		// duplicate it.
+		if !designWorkItemTerminal(item) {
+			return "", false, generation
 		}
 		generation++
 	}
 	if generation >= maxDesignRequirementGenerations {
-		return ""
+		return "", true, generation
 	}
 	if generation == 0 {
-		return baseKey
+		return baseKey, false, generation
 	}
-	return fmt.Sprintf("%s:repair:%d", baseKey, generation)
+	return fmt.Sprintf("%s:repair:%d", baseKey, generation), false, generation
+}
+
+// log returns the enqueuer's logger, never nil (a degraded assembly still
+// attributes its escalations, constitution VII.7).
+func (e designTaskEnqueuer) log() *slog.Logger {
+	if e.logger != nil {
+		return e.logger
+	}
+	return slog.Default()
+}
+
+// maxJudgeGenerations bounds the judge-run generations of one current-draft
+// case-version set (T8). A judge run that keeps failing (LLM unavailable, a
+// crashed run) must not loop forever; once the budget is spent every unjudged
+// draft of the set is escalated to a human via a judge_exhausted fact instead
+// of staying permanently pending. A changed draft set (a revised case version,
+// an added or removed draft) starts a fresh budget.
+const maxJudgeGenerations = 3
+
+// EnsureJudgeGeneration applies one fresh design.judge generation for a
+// requirement version whose coverage union is complete (spec SC-E4). It mirrors
+// EnsureCoverageRepair but filters design.judge items, bounds the budget per
+// current-draft case-version SET (drafts), and on exhaustion records a
+// judge_exhausted escalation fact for EVERY pending case version (via the T6
+// store) and emits design.judge_exhausted per NEWLY created fact, rather than
+// leaving a permanent pending. Drafts already judged for their current content
+// are not pending: they keep their verdict instead of a false "judge
+// unavailable" fact (T6 DeriveReviewState ranks judge_exhausted above pass). An
+// in-flight or retry-backed generation is never duplicated; the generation
+// dedupe is the serialization point that keeps one judge run per
+// requirement-version generation (controller ruling T8-6). The generations are
+// read through the TARGETED judgeGenerations source, never the capped
+// ListByVersion window.
+func (e designTaskEnqueuer) EnsureJudgeGeneration(ctx context.Context, in designapp.TaskInput, drafts, pending []designapp.JudgeCaseRef) (bool, error) {
+	if e.queue == nil {
+		return false, nil
+	}
+	requirementVersionID := judgeTaskPayloadID(in.Payload, "requirement_version_id")
+	if e.judgeGenerations == nil {
+		return false, errors.New("judge generation work-item source is not wired")
+	}
+	items, err := e.judgeGenerations.JudgeItemsForRequirementVersion(ctx, in.VersionID, requirementVersionID)
+	if err != nil {
+		return false, err
+	}
+	key, exhausted := judgeGenerationDedupeKey(items, in.DedupeKey, requirementVersionID, drafts)
+	if exhausted {
+		if e.judgeExhausted == nil {
+			return false, designapp.ErrJudgeExhaustedStoreUnavailable
+		}
+		requirementID := judgeTaskPayloadID(in.Payload, "requirement_id")
+		for _, ref := range pending {
+			created, err := e.judgeExhausted.InsertJudgeExhausted(ctx, in.VersionID, requirementID, ref.CaseID, ref.CaseVersionID)
+			if err != nil {
+				return false, err
+			}
+			// Emit ONLY on the creation transition. Judge exhaustion is a designed
+			// expected outcome that persists across reconcile passes, and every
+			// persisted event wakes a full reconcile pass (eventSvc.Observe ->
+			// reconciler.Notify). Re-publishing per pass would be a self-sustaining
+			// event/SSE loop; the fact stays the durable truth either way.
+			if created {
+				e.publishJudgeExhausted(ctx, in.VersionID, requirementID, ref.CaseID, ref.CaseVersionID)
+			}
+		}
+		return false, nil
+	}
+	if key == "" {
+		return false, nil
+	}
+	in.DedupeKey = key
+	_, created, err := e.queue.Ensure(ctx, agent.NewWorkItem{
+		VersionID: in.VersionID,
+		Team:      in.Team,
+		Type:      in.Type,
+		Priority:  in.Priority,
+		DedupeKey: in.DedupeKey,
+		Payload:   in.Payload,
+	})
+	return created, err
+}
+
+// judgeGenerationDedupeKey derives the dedupe key of the next design.judge
+// generation for one requirement version, plus whether the current draft set's
+// bounded budget is exhausted. It returns ("", false) when a generation must not
+// be requested because a judge run of the requirement version is still in
+// flight or queued for retry (the serialization point: one judge run per
+// requirement-version generation), ("", true) when the draft set's budget is
+// spent (the caller writes the escalation facts), the base key for the very
+// first generation, and baseKey+":judge:<n>" afterwards.
+//
+// Two counters, deliberately distinct: the dedupe SEQUENCE counts every terminal
+// design.judge generation of the requirement version (any draft set), so a reset
+// budget can never reuse an occupied dedupe key and strand the new set; the
+// BUDGET counts only terminal generations whose stored draft-set anchor equals
+// the current set, so any change to the draft set resets the budget. The anchor
+// format's single authority is designapp.JudgeDraftSetKey (the planner writes
+// the stored value with the same function).
+func judgeGenerationDedupeKey(items []agent.WorkItem, baseKey string, requirementVersionID int64, drafts []designapp.JudgeCaseRef) (string, bool) {
+	setKey := designapp.JudgeDraftSetKey(drafts)
+	if setKey == "" || requirementVersionID <= 0 {
+		return "", false
+	}
+	sequence, budget := 0, 0
+	for _, item := range items {
+		if agentapp.WorkTypeForItem(item) != designapp.TaskTypeDesignJudge {
+			continue
+		}
+		payload, err := agentapp.ParseWorkItemPayload(item.Payload)
+		if err != nil || payload.RequirementVersionID != requirementVersionID {
+			continue
+		}
+		// Same lifecycle authority as the coverage-repair counter and the rework
+		// budget: an in-flight or retry-backed judge run is the serialization
+		// point, never a generation to duplicate.
+		if !designWorkItemTerminal(item) {
+			return "", false
+		}
+		sequence++
+		if judgePayloadDraftSet(item.Payload) == setKey {
+			budget++
+		}
+	}
+	if budget >= maxJudgeGenerations {
+		return "", true
+	}
+	if sequence == 0 {
+		return baseKey, false
+	}
+	return fmt.Sprintf("%s:judge:%d", baseKey, sequence), false
+}
+
+// judgePayloadDraftSet reads the stored generation anchor
+// (draft_case_version_ids) of a design.judge work item. An unparsable or absent
+// anchor never matches a current set (the item is skipped, mirroring
+// coverageRepairDedupeKey's treatment of unparsable payloads).
+func judgePayloadDraftSet(raw json.RawMessage) string {
+	var payload struct {
+		DraftCaseVersionIDs string `json:"draft_case_version_ids"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	return payload.DraftCaseVersionIDs
+}
+
+// publishJudgeExhausted emits the best-effort design.judge_exhausted degradation
+// event on the version channel (constitution VII.6: no silent degradation). The
+// event shape has ONE authority shared with the planner's stalled-authoring-batch
+// escalation: designapp.JudgeExhaustedEvent.
+func (e designTaskEnqueuer) publishJudgeExhausted(ctx context.Context, versionID, requirementID, caseID, caseVersionID int64) {
+	if e.events == nil {
+		return
+	}
+	_ = e.events.Publish(ctx, designapp.JudgeExhaustedEvent(ctx, versionID, requirementID, caseID, caseVersionID))
+}
+
+// judgeTaskPayloadID reads a decimal ID from a design TaskInput payload (IDs are
+// canonical decimal strings, with JSON-number compatibility).
+func judgeTaskPayloadID(payload map[string]any, key string) int64 {
+	value, ok := payload[key]
+	if !ok {
+		return 0
+	}
+	switch typed := value.(type) {
+	case string:
+		parsed, _ := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		return parsed
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
 }
 
 // designConversationCreator creates the auto-design conversation through the
@@ -324,7 +621,7 @@ func (c designConversationCreator) CreateDesign(ctx context.Context, versionID i
 	if c.svc == nil {
 		return 0, errors.New("design conversation creator has no conversation service")
 	}
-	view, err := c.svc.Create(ctx, versionID, "design", title, 0)
+	view, err := c.svc.Create(ctx, versionID, versiondomain.ConversationDesign, title, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -540,7 +837,7 @@ func (a deliveryReportArtifactStore) CreateReportArtifact(ctx context.Context, i
 		ID:        in.ID,
 		VersionID: in.VersionID,
 		OwnerID:   in.OwnerID,
-		OwnerKind: "report",
+		OwnerKind: storagedomain.OwnerKindReport,
 		Format:    in.Format,
 		MIME:      in.MIME,
 		Filename:  in.Filename,
@@ -679,37 +976,6 @@ func (a designCaseRunStatuses) LatestCaseRunStatuses(ctx context.Context, versio
 	return statuses, nil
 }
 
-// designVisualAssertions adapts the visual context's assertion configuration
-// service onto the design graph's confirmation resolver port (Task 115). The
-// composition root is the only place that knows both contexts: design reads the
-// visual_assertion rows through this port, never through the visual tables
-// (spec §2.1).
-type designVisualAssertions struct {
-	configs *visualapp.ConfigService
-}
-
-func (a designVisualAssertions) ListActiveVisualAssertions(ctx context.Context, versionID, caseVersionID int64) ([]designapp.VisualAssertionRef, error) {
-	if a.configs == nil {
-		return nil, errors.New("design visual assertion resolver is not configured")
-	}
-	list, err := a.configs.List(ctx, versionID, &caseVersionID, nil)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]designapp.VisualAssertionRef, 0, len(list))
-	for _, config := range list {
-		if config.Status != visual.AssertionActive || config.ID <= 0 ||
-			config.CaseAssertionID <= 0 || config.CaseVersionID != caseVersionID {
-			continue
-		}
-		refs = append(refs, designapp.VisualAssertionRef{
-			ID:              config.ID,
-			CaseAssertionID: config.CaseAssertionID,
-		})
-	}
-	return refs, nil
-}
-
 // caseRunCanceller breaks the construction cycle between the execution
 // CaseRunner (which needs the human service to open takeovers) and the human /
 // pause services (which cancel in-flight case executor runs). The runner pointer
@@ -750,7 +1016,7 @@ func (a executionCoverageAdapter) ListRequirements(ctx context.Context, versionI
 		return nil, nil
 	}
 	refs := make([]executionapp.RequirementRef, 0)
-	for _, status := range []string{"clarified", "closed"} {
+	for _, status := range []string{string(versiondomain.RequirementClarified), string(versiondomain.RequirementClosed)} {
 		var beforeID *int64
 		for {
 			items, hasMore, err := a.requirements.List(ctx, versionID, status, 100, beforeID)
@@ -777,12 +1043,14 @@ func (a executionCoverageAdapter) ListRequirements(ctx context.Context, versionI
 
 var _ executionapp.CoverageReader = executionCoverageAdapter{}
 
-// executionQuotaReader projects the running case_runs into the frozen quota
-// accounting shape (P3-D-11): each running run counts once globally plus once
-// per version_sut it uses, and a multi-SUT run counts as cross-system.
+// executionQuotaReader projects the running case_runs into the quota accounting
+// shape: under the single global limit (design P5, v0.2.4-F) each running run
+// counts once, and nothing else. The retired per-SUT/cross-system dimensions
+// needed a per-run SUT set here; with them gone the reader no longer resolves
+// intents at all (intent.sut_ids remains a recorded fact for resolution/
+// fingerprint/knowledge, not a quota input).
 type executionQuotaReader struct {
 	caseRuns executionapp.CaseRunRepository
-	intents  executionapp.IntentRepository
 }
 
 func (q executionQuotaReader) RunningCases(ctx context.Context) ([]execution.RunningCase, error) {
@@ -792,17 +1060,7 @@ func (q executionQuotaReader) RunningCases(ctx context.Context) ([]execution.Run
 	}
 	usage := make([]execution.RunningCase, 0, len(runs))
 	for _, run := range runs {
-		versionSUTIDs := []int64{}
-		if q.intents != nil {
-			if intent, err := q.intents.Get(ctx, run.IntentID); err == nil {
-				versionSUTIDs = intent.VersionSUTIDs
-			}
-		}
-		usage = append(usage, execution.RunningCase{
-			CaseRunID:     run.ID,
-			VersionSUTIDs: versionSUTIDs,
-			CrossSystem:   len(versionSUTIDs) > 1,
-		})
+		usage = append(usage, execution.RunningCase{CaseRunID: run.ID})
 	}
 	return usage, nil
 }
@@ -844,17 +1102,17 @@ type versionCaseBindingSource interface {
 	Get(ctx context.Context, id int64) (versionapp.VersionView, error)
 }
 
-// p7VersionCaseBindings resolves the page/API/account binding keys of one
+// orchestrationVersionCaseBindings resolves the page/API/account binding keys of one
 // version for the knowledge success hook (Task 51). The version read model
 // already exposes the SUT family, environment IDs, route templates, API
 // method/path templates and account roles; this adapter only projects them, so
 // the agent knowledge adapter never imports the version context.
-type p7VersionCaseBindings struct {
+type orchestrationVersionCaseBindings struct {
 	versions versionCaseBindingSource
 }
 
 // VersionBindings implements knowledgeadapter.VersionBindingReader.
-func (b p7VersionCaseBindings) VersionBindings(ctx context.Context, versionID int64) ([]knowledgeadapter.VersionBinding, error) {
+func (b orchestrationVersionCaseBindings) VersionBindings(ctx context.Context, versionID int64) ([]knowledgeadapter.VersionBinding, error) {
 	if b.versions == nil {
 		return nil, errors.New("knowledge case bindings: version read model is not configured")
 	}
@@ -865,14 +1123,37 @@ func (b p7VersionCaseBindings) VersionBindings(ctx context.Context, versionID in
 	if err != nil {
 		return nil, err
 	}
-	bindings := make([]knowledgeadapter.VersionBinding, 0, len(view.Bindings))
-	for _, item := range view.Bindings {
-		binding := knowledgeadapter.VersionBinding{
-			SystemID:      parseCaseBindingID(item.SUT.ID),
-			EnvironmentID: parseCaseBindingID(item.Environment.ID),
+	// v0.2.4-B: the version binds an environment, so one knowledge binding is
+	// produced per SUT of that environment and the account roles come from the
+	// version-level account subset.
+	catalog := view.Binding
+	environmentID := parseCaseBindingID(catalog.Environment.ID)
+	accountRoles := make([]string, 0)
+	seenAccountRoles := make(map[string]struct{})
+	for _, account := range catalog.Accounts {
+		for _, role := range account.Roles {
+			role = strings.TrimSpace(role)
+			if role == "" {
+				continue
+			}
+			if _, duplicate := seenAccountRoles[role]; duplicate {
+				continue
+			}
+			seenAccountRoles[role] = struct{}{}
+			accountRoles = append(accountRoles, role)
 		}
-		if item.SUT.Family != nil {
-			binding.SystemKey = strings.TrimSpace(*item.SUT.Family)
+	}
+	// EffectiveSUTs, not Environment.SUTs: a knowledge binding key must name a
+	// page/API that is inside the version's effective scope. Keying a merely
+	// proposed page would sediment a page_key that MarkBindingsStale can never
+	// match against an approved catalog row (v0.2.4-B review round 1).
+	bindings := make([]knowledgeadapter.VersionBinding, 0, len(catalog.Environment.SUTs))
+	for _, item := range catalog.EffectiveSUTs() {
+		binding := knowledgeadapter.VersionBinding{
+			SystemID:      item.SUTID,
+			SystemKey:     item.Family,
+			EnvironmentID: environmentID,
+			AccountRoles:  append([]string(nil), accountRoles...),
 		}
 		for _, page := range item.Pages {
 			// The page binding key is the route template only (spec §10.2,
@@ -893,20 +1174,6 @@ func (b p7VersionCaseBindings) VersionBindings(ctx context.Context, versionID in
 				continue
 			}
 			binding.APIs = append(binding.APIs, knowledgeadapter.APIBinding{ID: id, Key: key})
-		}
-		seenRoles := make(map[string]struct{}, len(item.Accounts))
-		for _, account := range item.Accounts {
-			for _, role := range account.Roles {
-				role = strings.TrimSpace(role)
-				if role == "" {
-					continue
-				}
-				if _, duplicate := seenRoles[role]; duplicate {
-					continue
-				}
-				seenRoles[role] = struct{}{}
-				binding.AccountRoles = append(binding.AccountRoles, role)
-			}
 		}
 		bindings = append(bindings, binding)
 	}
@@ -1008,14 +1275,14 @@ func runExecutionScheduler(
 		if wake == nil {
 			return
 		}
-		p7RunGated(gate, func() {
+		orchestrationRunGated(gate, func() {
 			if wake.takeScanAll() {
 				scanIntents()
 			}
 		})
 	}
 	tick := func() {
-		p7RunGated(gate, func() {
+		orchestrationRunGated(gate, func() {
 			if scheduler != nil {
 				if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf("eztest: execution scheduler: %v", err)
@@ -1049,7 +1316,7 @@ func runExecutionScheduler(
 			tick()
 			flushIntents()
 		case <-scan:
-			p7RunGated(gate, scanIntents)
+			orchestrationRunGated(gate, scanIntents)
 		case <-wake.events():
 			flushIntents()
 		}
@@ -1065,7 +1332,7 @@ func runExecutorPoller(ctx context.Context, gate orchestrationapp.LeaderGate, re
 		return
 	}
 	poll := func() {
-		p7RunGated(gate, func() {
+		orchestrationRunGated(gate, func() {
 			if err := registry.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("eztest: executor poll: %v", err)
 			}
@@ -1115,7 +1382,7 @@ func runHumanQuestionExpiryWorker(
 		interval = humanExpiryInterval
 	}
 	sweep := func() {
-		p7RunGated(gate, func() {
+		orchestrationRunGated(gate, func() {
 			now := time.Now().UTC()
 			if questions != nil {
 				count, err := questions.ExpireQuestions(ctx, now)
@@ -1181,7 +1448,7 @@ func main() {
 	// bootstrap generator is used solely for the api_instance row; reusing a
 	// shared settings node for business IDs would collide across replicas.
 	nodeID := int64(1)
-	nodeSetting, err := settingsRepo.Get(ctx, "runtime.snowflake_node_id")
+	nodeSetting, err := settingsRepo.Get(ctx, orchestrationapp.SettingNodeID)
 	if err != nil {
 		log.Fatalf("eztest: read snowflake node: %v", err)
 	}
@@ -1199,8 +1466,8 @@ func main() {
 	eventHub := eventingapp.NewHub(eventingapp.DefaultHubBuffer)
 	eventSvc := eventingapp.New(eventingpg.New(pool), eventHub, eventingpg.NewNotifier(pool))
 
-	instanceKey := p7InstanceKey()
-	p7OrchestrationRuntime, err := startP7Orchestration(ctx, p7OrchestrationDeps{
+	instanceKey := orchestrationInstanceKey()
+	orchComponents, err := startOrchestration(ctx, orchestrationComponentsDeps{
 		Pool:         pool,
 		SettingsRepo: settingsRepo,
 		BootstrapIDs: bootstrapIDs,
@@ -1216,14 +1483,14 @@ func main() {
 		log.Fatalf("eztest: register api instance: %v", err)
 	}
 	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), p7StopTimeout)
+		stopCtx, cancel := context.WithTimeout(context.Background(), orchestrationStopTimeout)
 		defer cancel()
-		if err := p7OrchestrationRuntime.Service.Stop(stopCtx); err != nil {
+		if err := orchComponents.Service.Stop(stopCtx); err != nil {
 			log.Printf("eztest: stop api instance: %v", err)
 		}
 	}()
 
-	ids, err := id.NewSnowflake(p7OrchestrationRuntime.Service.NodeID())
+	ids, err := id.NewSnowflake(orchComponents.Service.NodeID())
 	if err != nil {
 		log.Fatalf("eztest: configure snowflake: %v", err)
 	}
@@ -1231,7 +1498,7 @@ func main() {
 	auditSvc := auditapp.New(auditpg.New(pool), ids, clk)
 	// The registry is constructed before auditSvc exists; attach the real
 	// recorder now that the allocated node seeded the generator.
-	p7OrchestrationRuntime.LateAudit.Set(auditSvc)
+	orchComponents.LateAudit.Set(auditSvc)
 	settingsSvc := settingsapp.New(settingsRepo, definitions, ids, clk, auditSvc, eventSvc)
 	if err := settingsSvc.Reload(ctx); err != nil {
 		log.Fatalf("eztest: load settings: %v", err)
@@ -1249,11 +1516,15 @@ func main() {
 	// P5 code baseline resolution: the version context resolves a bound
 	// repository's HEAD through the read-only codeintel git layer. The adapter
 	// is constructed before the service and completed right after it.
-	p5Git := newP5GitClient()
-	p5Bindings := newP5CodeBindings(p5Git, resourceSvc)
+	codeIntelGit := newGitClient()
+	codeIntelBindingGraph := newCodeIntelBindings(codeIntelGit, resourceSvc)
 	versionRepo := versionpg.New(pool, ids)
-	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
-	p5Bindings.SetVersionService(versionSvc, versionRepo)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, codeIntelBindingGraph)
+	// v0.2.4-B: the resolved code baseline lives on sut_repository, so the
+	// resource service is both the baseline writer the version service resolves
+	// through and the write path the codeintel index backfill uses.
+	versionSvc.SetBaselineWriter(resourceSvc)
+	codeIntelBindingGraph.SetVersionService(versionSvc, resourceSvc)
 	resourceSvc.SetUsageChecker(versionSvc)
 	// v0.22 W0: the plan/fact/handoff services back plan.update, task.complete,
 	// the design handoff artifact and the attachment image-caption facts
@@ -1262,7 +1533,7 @@ func main() {
 	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc,
 		versionapp.WithFactAudit(auditSvc))
 	handoffSvc := versionapp.NewHandoffService(
-		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), ids, eventSvc)
+		versionpostgres.NewHandoffStore(pool), versionpostgres.NewHandoffReader(pool), resourceSvc, ids, eventSvc)
 	// v0.22 API-5/6/7 (Task 18/37 fix round 1): the extraction service backs the
 	// progress reads, the pause/resume/retry transitions and the production
 	// worker. The attachment-side source/processor are wired right after the
@@ -1279,14 +1550,27 @@ func main() {
 	// P1 control plane and clarification services.
 	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc, err := newRequirementService(
-		requirementRepo, versionSvc, resourceSvc,
+		requirementRepo, versionSvc,
 		designStale, auditSvc, eventSvc, ids, clk)
 	if err != nil {
 		log.Fatalf("eztest: wire requirement service: %v", err)
 	}
+	// v0.2.4-E T11: the requirement confirmation gate reads its placeholder
+	// terms and min-description-chars from the settings center at confirm time
+	// (codeIntelSettings adapts settingsapp.Service to the Int+Raw read surface).
+	requirementSvc.SetConfirmationSettings(&codeIntelSettings{settings: settingsSvc})
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
-	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
+	workQueue := agentapp.NewWorkQueue(workItems, clk, agentapp.DefaultLease, agentapp.DefaultMaxAttempts)
 	workQueue.SetEvents(eventSvc)
+	// GD-17 (v0.2.4-G, SC-G10): terminalize in-flight requirement.close/
+	// version.close rows an upgrade left behind. They have no consumer after the
+	// Steward removal; without disposal they would block closure forever. Run once
+	// after migrations and before the workers start; idempotent on later boots.
+	if disposed, err := agentapp.DisposeRetiredCloseWorkItems(ctx, workItems); err != nil {
+		log.Fatalf("eztest: dispose retired close work items: %v", err)
+	} else if disposed > 0 {
+		log.Printf("eztest: disposed %d retired steward close work item(s) (GD-17 deterministic closure)", disposed)
+	}
 	teamRoom := agentapp.NewTeamRoom(agentpg.NewTeamRoomRepository(pool, ids), clk, ids, settingsSvc, eventSvc)
 	enqueuer := versionTaskEnqueuer{queue: workQueue}
 	attachmentSvc := versionapp.NewAttachmentService(
@@ -1353,15 +1637,59 @@ func main() {
 
 	// P2 design services and cross-context adapters.
 	designTeamRoom := designTeamRoomAdapter{room: teamRoom}
+	// v0.2.4-E T13: the independent judge wiring (T6 service/repository, T7
+	// confirmation gate, T9 shared review gate, judge-exhausted fact adapter over
+	// the version FactService). ONE ReviewGateService instance feeds both advance
+	// edges below (planner converge + version manual advance): one predicate, one
+	// truth. The judge-exhausted store is injected into the task enqueuer so a
+	// spent judge generation budget escalates instead of stranding a pending.
+	designJudge := buildDesignJudge(pool, ids, clk, eventSvc, settingsSvc, designRepo, factSvc)
+	// H-F5/H-F6: ONE targeted design.requirement row source feeds both the
+	// coverage-repair generation counter and the authoring-batch settle read the
+	// judge predicate gates on. Neither may fall back to the capped newest-500
+	// ListByVersion page (a busy version strands the requirement / releases the
+	// judge onto a partial draft set).
+	designAuthorItems := &authorBatchSQLSource{pool: pool}
 	designPlanner := designapp.NewPlanner(
 		designRepo, ids, clk, eventSvc,
-		designTaskEnqueuer{queue: workQueue},
+		designTaskEnqueuer{
+			queue: workQueue, judgeExhausted: designJudge.Exhausted,
+			judgeGenerations: &judgeGenerationSQLSource{pool: pool},
+			coverageRepairs:  designAuthorItems,
+			authorExhausted:  &authorExhaustedFactStore{facts: factSvc},
+			events:           eventSvc,
+			logger:           slog.Default(),
+		},
 		designTeamRoom,
 		designConversationCreator{svc: conversationSvc},
 		designVersionStarter{svc: versionSvc},
 		designStale,
 	)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
+	// T7 confirmation gate + T8 judge scheduler + T9 converge review gate. Without
+	// these the confirmation/judge/review paths fail closed; wiring them is what
+	// makes the quality gate live in production.
+	designGraph.SetJudgmentGate(designJudge.Gate)
+	designPlanner.SetJudgeScheduler(designJudge.Store, settingsSvc)
+	// SC-E4 escalation budget: a design.rework that retried to exhaustion is
+	// terminal but produces no new judgment round, so the round-derived rework
+	// count alone would keep the case in reworking forever. Both the scheduler
+	// and the judgment service read the terminal rework count from the same
+	// work_item source the round-provenance reader uses.
+	designPlanner.SetReworkBudgetReader(&judgeReworkBudgetReader{source: &judgeReworkSQLSource{pool: pool}})
+	// H-F6: the judge is enqueued only once the requirement version's authoring
+	// batch has settled (or never existed). A batch that stalls past the settle
+	// window escalates the pending drafts instead of deferring forever.
+	designPlanner.SetAuthorBatchReader(&authorBatchReader{source: designAuthorItems})
+	designPlanner.SetReviewGate(designJudge.ReviewGate)
+	// VII.6/VII.7: the automatic converge path must attribute an unreadable review
+	// gate (a persistent judgment-store outage otherwise pins versions in
+	// designing with no signal).
+	designPlanner.SetLogger(slog.Default())
+	// T16: the judgment read report enumerates the version's current cases
+	// through the SAME design graph reader the review gate uses.
+	designJudge.Service.SetGraphReader(designRepo)
+	designJudge.Service.SetReworkBudgetReader(&judgeReworkBudgetReader{source: &judgeReworkSQLSource{pool: pool}})
 	// W2-11 (WP-6): the additive discovery case revision service reads the
 	// observation provenance chain through a design-side read projection; the
 	// resource-confirmed observer below turns an approved discovered page/API
@@ -1405,28 +1733,72 @@ func main() {
 	executionQueue := executionadapters.NewWorkQueueAdapter(workQueue)
 	executionGaps := executionadapters.NewGapEnsurer(workQueue, requirementSvc)
 	executionTeamRoom := executionadapters.NewTeamRoomAdapter(teamRoom)
+	// v0.2.4-F T9 (P16, SC-F2): the SUT resolution service reads the effective
+	// environment catalog, matches the case's sut_description, and appends the
+	// sut_resolution fact (with the touched/verified page/API asset ids — the
+	// knowledge-dimension truth source). It is wired into the execution task
+	// provider below so every execute.case dispatch records its resolution before
+	// the agent run; a missing match or asset gap records method=exploration.
+	executionSUTResolution := executionapp.NewSUTResolutionService(executionapp.SUTResolutionDeps{
+		Catalog:     executionadapters.NewSUTCatalogAdapter(versionSvc),
+		Resolutions: executionRepo.SUTResolutions,
+		Events:      eventSvc,
+		Clock:       clk,
+	})
+	// v0.2.4-F T10 (P17, SC-F3): the asset registration evidence gate. A discovered
+	// asset (page/api/db) is registered into the catalog as source=ai/status=approved
+	// ONLY after server-side proof (evidence exists + sha256 integrity + linked
+	// assertion passed); an unproven discovery is never registered (fail-closed). It
+	// appends the asset_registration fact and publishes sut.asset_registered. The
+	// sut.asset_register tool reaches it through ToolDeps.AssetRegistration below.
+	executionAssetRegistration := executionapp.NewAssetRegistrationService(executionapp.AssetRegistrationDeps{
+		Evidence:      executionRepo.Evidence,
+		Results:       executionRepo.Results,
+		Content:       executionContent,
+		Assets:        executionadapters.NewProvenAssetAdapter(resourceSvc),
+		Registrations: executionRepo.AssetRegistrations,
+		Events:        eventSvc,
+		Clock:         clk,
+	})
+	// v0.2.4-F T11 (R-B4, SC-F4): the new-SUT registration evidence gate. When a
+	// discovered resource matches no existing SUT, the agent proposes a new SUT;
+	// effective proof (evidence exists + sha256 + linked assertion passed) auto-
+	// approves it (source=ai/status=approved, R-F1), otherwise it stays proposed
+	// (fail-closed, admin audits/rejects post-hoc). It writes the same append-only
+	// sut_registration fact and publishes sut.registered. The sut.register tool
+	// reaches it through ToolDeps.SUTRegistration below.
+	executionSUTRegistration := executionapp.NewSUTRegistrationService(executionapp.SUTRegistrationDeps{
+		Evidence: executionRepo.Evidence,
+		Results:  executionRepo.Results,
+		Content:  executionContent,
+		SUTs:     executionadapters.NewNewSUTAdapter(resourceSvc, versionSvc),
+		Events:   eventSvc,
+	})
+	// v0.2.4-F T14 (SC-F10, R-E7): the case_author discovery-fact producer. The
+	// design read face (CaseAuthorFacts) is no longer nil in production: page/api
+	// facts come from the P17 proven asset registrations, login_session from the
+	// P18 session fixture library, both gated to the version's effective SUT
+	// scope. gap stays reserved (due 0.3) with no producer this version.
+	designGraph.SetDiscoveryFacts(designapp.NewDiscoveryFactsProducer(designapp.DiscoveryFactsSources{
+		Assets:   newDesignDiscoveryAssetFacts(versionSvc, executionRepo.AssetRegistrations),
+		Sessions: newDesignDiscoverySessionFacts(versionSvc, executionRepo.SessionFixtures),
+	}))
 	executionCoverage := executionCoverageAdapter{requirements: requirementSvc}
 	// The delivery issue repository is created before the P5 contexts because
 	// code anchors validate issue subjects through a read-only adapter.
 	issueRepo := deliverypg.NewIssueRepository(pool, ids)
 
-	// P5 codeintel + visual contexts. Both are constructed here (after the P3
-	// repositories they read, before the P3 case runner that consumes the
-	// visual assert port) and started later with the process.
-	p5 := newP5Runtime(ctx, p5RuntimeDeps{
+	// P5 codeintel context. It is constructed here (after the P3 repositories
+	// it reads) and started later with the process.
+	codeIntel := newCodeIntelRuntime(ctx, codeIntelRuntimeDeps{
 		Pool: pool, LLM: llmSvc, IDs: ids, Clock: clk, Audit: auditSvc, Events: eventSvc,
 		Settings: settingsSvc, Resource: resourceSvc, Versions: versionSvc,
 		VersionRepo: versionRepo, Requirements: requirementSvc, Design: designRepo,
 		Issues: issueRepo, Execution: executionRepo, Content: executionContent,
-		Queue: workQueue, Bindings: p5Bindings, InstanceID: instanceID,
+		Queue: workQueue, Bindings: codeIntelBindingGraph, InstanceID: instanceID,
 		// P7 §4.5: the codeintel worker stops claiming while this replica drains.
-		DrainGate: p7OrchestrationRuntime.Service.IsDraining,
+		DrainGate: orchComponents.Service.IsDraining,
 	})
-	// Task 115: confirmation must resolve every kind=visual assertion to an
-	// active visual_assertion configuration before freezing the case version,
-	// so execution can map it to execution.visual_assert instead of running
-	// into inconclusive(visual_assertion_not_run).
-	designGraph.SetVisualAssertionResolver(designVisualAssertions{configs: p5.VisualConfigs})
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
@@ -1447,34 +1819,6 @@ func main() {
 		}
 		log.Printf("eztest: executor self-check ok endpoint=%s", executorURL)
 	}()
-	// P9 explore runtime: the real HTTP explore-action executor, the bounded
-	// version-scoped session cache and the version fact recorder are constructed
-	// once and shared by every exploration caller (Task 36/37). Reuse
-	// verification closes its throwaway page through DELETE /v1/explore, so the
-	// 8-page cap cannot be exhausted by repeated logins.
-	p9rt, err := newP9Runtime(p9RuntimeDeps{
-		Pool:          pool,
-		IDs:           ids,
-		Events:        eventSvc,
-		Accounts:      resourceSvc,
-		Versions:      versionSvc,
-		Requirements:  requirementSvc,
-		Design:        designGraph,
-		ExecutorURL:   executorURL,
-		ExecutorToken: executorToken,
-		Now:           clk.Now,
-		// Discovery proposes the pages/APIs it finds into this SUT environment's
-		// catalog, so a version can bind them (task 76).
-		Resources: resourceSvc,
-	})
-	if err != nil {
-		log.Fatalf("eztest: wire P9 explore runtime: %v", err)
-	}
-	p9ExploreRuntime = p9rt
-	// The case author reads the exploration facts (page/API/gap/login) through
-	// its design graph read: the design graph holds the same process-wide fact
-	// store the explore runtime writes (Task 37).
-	designGraph.SetDiscoveryFacts(p9FactRecords{facts: p9rt.Facts})
 	executorRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
 		Repo:     executionRepo.Executors,
 		Probe:    executionadapters.NewExecutorProbe(executorClient),
@@ -1488,14 +1832,15 @@ func main() {
 				executioninfra.NewClient(endpoint, executorToken, executioninfra.DefaultTimeout))
 		},
 	})
-	// P8 per-executor routing: browser contexts and control calls are sent to
-	// the endpoint that owns them; executorID 0 keeps the P3 single-endpoint
-	// fallback for historical rows.
+	// Per-executor routing: execution sessions and control calls are sent to the
+	// endpoint that owns them; executorID 0 keeps the single-endpoint fallback
+	// for historical rows.
 	executorRouter := executionadapters.NewExecutorRouter(executorResolver, executorRegistry, executorURL)
 	executionCanceller := &caseRunCanceller{}
 	executionHumans := executionapp.NewHumanService(executionapp.HumanServiceDeps{
 		Humans:    executionRepo.Humans,
 		CaseRuns:  executionRepo.CaseRuns,
+		Evidence:  executionRepo.Evidence,
 		Waves:     executionRepo.Waves,
 		Canceller: executionCanceller,
 		WorkQueue: executionQueue,
@@ -1504,7 +1849,10 @@ func main() {
 		Clock:     clk,
 		Events:    eventSvc,
 		Audit:     auditSvc,
-		Timeout:   1800 * time.Second,
+		// v0.2.4-F T13 (SC-F5, defect 020): the takeover expiry reads the
+		// execution.human_request_timeout_seconds setting (default 1800s). The
+		// former hardcoded 1800s override masked the setting — a configured
+		// value never took effect; the service's own fallback keeps the default.
 	})
 	// v0.22 structured questions (R-B3-3): the Host question.ask tool and the
 	// questions API share one service; the message writer persists the question
@@ -1540,6 +1888,7 @@ func main() {
 		Waves:        executionRepo.Waves,
 		CaseRuns:     executionRepo.CaseRuns,
 		Results:      executionRepo.Results,
+		Evidence:     executionRepo.Evidence,
 		Cases:        executionCases,
 		Requirements: executionCoverage,
 		Gaps:         executionGaps,
@@ -1588,16 +1937,25 @@ func main() {
 		// returns a secondary/push-registered endpoint. Multi-endpoint rows are
 		// still polled, heartbeated, registered and admin-listed; per-executor
 		// browser routing stays a P8 item.
-		Executors:   executorRegistry,
-		WorkQueue:   executionQueue,
-		Quota:       execution.QuotaFromSettings(3, 2, 1),
-		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns, intents: executionRepo.Intents},
+		Executors: executorRegistry,
+		WorkQueue: executionQueue,
+		// Design P5 (v0.2.4-F, V-0015): the single global concurrent-case-run
+		// limit comes from execution.max_concurrent_case_runs (default 0 =
+		// unlimited), read live on every dispatch pass -- replacing the retired
+		// hardcoded QuotaFromSettings(3, 2, 1) that ignored the settings center.
+		Settings:    settingsSvc,
+		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns},
 		Analyzer:    executionAnalysis,
 		Replanner:   executionIntents,
 		IDs:         ids,
 		Clock:       clk,
 		Events:      eventSvc,
 		Instance:    instanceID,
+		// v0.2.4-B review round 4: the scheduler can terminate a run itself (a
+		// context requirement no dispatchable executor can serve), and such a run
+		// never reaches CaseRunner.postTerminalHandoff, so the scheduler needs its
+		// own team-room sink or the "needs a human" verdict would reach no human.
+		TeamRoom: executionTeamRoom,
 		// Same lease the CaseRunner stamps in Prepare (the scheduler also
 		// enforces this as a minimum): a queued work item can wait longer than
 		// 30s before a worker claims it.
@@ -1616,6 +1974,7 @@ func main() {
 		Intents:     executionRepo.Intents,
 		Waves:       executionRepo.Waves,
 		CaseRuns:    executionRepo.CaseRuns,
+		Evidence:    executionRepo.Evidence,
 		Humans:      executionHumans,
 		Executors:   executionRepo.Executors,
 		Contexts:    executionSUTContextRepo,
@@ -1629,22 +1988,26 @@ func main() {
 		MaxAttempts: execution.DefaultMaxDispatchAttempts,
 		ContextTTL:  300 * time.Second,
 		Replanner:   executionIntents,
+		// Share the registry's settings-backed offline window with recovery so
+		// an enlarged execution.executor_offline_seconds is honored everywhere.
+		OfflineWindow: executorRegistry.OfflineWindow,
 	})
 	executionHandler := executionhttp.New(executionhttp.Deps{
-		Intents:       executionRepo.Intents,
-		Waves:         executionRepo.Waves,
-		CaseRuns:      executionRepo.CaseRuns,
-		Results:       executionRepo.Results,
-		Evidence:      executionRepo.Evidence,
-		Humans:        executionRepo.Humans,
-		Executors:     executionRepo.Executors,
-		Cases:         executionCases,
-		Versions:      executionVersionAdapter,
-		Content:       executionContent,
-		Settings:      settingsSvc,
+		Intents:   executionRepo.Intents,
+		Waves:     executionRepo.Waves,
+		CaseRuns:  executionRepo.CaseRuns,
+		Results:   executionRepo.Results,
+		Evidence:  executionRepo.Evidence,
+		Humans:    executionRepo.Humans,
+		Executors: executionRepo.Executors,
+		Cases:     executionCases,
+		Versions:  executionVersionAdapter,
+		Content:   executionContent,
+		Settings:  settingsSvc,
 		// W1-14A: read-only DB-29 query surface of the discovery APIs.
-		Discovery:     executionRepo.Observations,
-		AuthChecker:   executorAuthChecker,
+		Discovery:       executionRepo.Observations,
+		SessionFixtures: executionRepo.SessionFixtures,
+		AuthChecker:     executorAuthChecker,
 		IntentService:   executionIntents,
 		Planner:         executionScheduler,
 		PauseService:    executionPause,
@@ -1653,7 +2016,7 @@ func main() {
 		Registry:        executorRegistry,
 	})
 
-	// P4 delivery/chain/steward composition. The composition root is the only
+	// P4 delivery/chain/closure composition. The composition root is the only
 	// place that knows every context; the cross-context reads go through the
 	// application adapters, never through another context's tables.
 	analysisRepo := deliverypg.NewAnalysisRepository(pool, ids)
@@ -1662,13 +2025,17 @@ func main() {
 	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
 	templateVersion, err := settingsSvc.String(ctx, "report.template_version")
 	if err != nil || templateVersion == "" {
-		templateVersion = "1"
+		// v0.2.4-G R-G10b: the human-useful fixed v3 report is the production
+		// default (matches the settings catalog default). The renderer is built
+		// once at boot; changing report.template_version at runtime requires a
+		// restart (existing limitation, disclosed).
+		templateVersion = "3"
 	}
 	reportRenderer, err := deliveryrender.NewHTMLRenderer(templateVersion)
 	if err != nil {
 		log.Fatalf("eztest: configure report renderer: %v", err)
 	}
-	p4Tasks := p4.NewTaskEnsurer(workQueue, reportRepo, requirementVersionLookup{repo: requirementRepo})
+	deliveryTasks := agentdeliveryadapter.NewTaskEnsurer(workQueue, reportRepo)
 
 	readDeps := deliveryadapters.Deps{
 		Versions:     versionSvc,
@@ -1684,11 +2051,23 @@ func main() {
 		Humans:       executionRepo.Humans,
 		Issues:       issueRepo,
 		Triage:       analysisRepo,
+		// v0.2.4-G T8: report evidence display caps (settings center) and the
+		// evidence_ref reverse-lookup read side (T4) for the defect card.
+		Settings:     settingsSvc,
+		EvidenceRefs: executionRepo.Evidence,
+		// v0.2.4-G T9: design judge fact consumption (SC-G4 I3) and the wave
+		// frozen fingerprint consumer (SC-G6 P15, SC-F7 report leg).
+		Judgments:        designJudge.Service,
+		WaveFingerprints: deliveryadapters.NewExecutionWaveFingerprintReader(),
+		// v0.2.4-G T10: the waived report projects the admin waive-close reason /
+		// operator from the version waiver fact (SC-G11). FactService.Current
+		// satisfies the narrow read port; the report gates on closure_kind.
+		WaiverFacts: factSvc,
 	}
 	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
 	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
 	issueSvc := deliveryapp.NewIssueService(
-		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
+		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, deliveryTasks)
 	issueSvc.WithTriageReader(analysisRepo)
 	issueSvc.WithRetestExecutor(deliveryRetestAdapter{
 		intents:   executionIntents,
@@ -1701,10 +2080,10 @@ func main() {
 	retestCallbacks.set(deliveryRetestNotifier{issues: issueSvc})
 	analysisSvc := deliveryapp.NewAnalysisService(analysisRepo, issueSvc, clk)
 	analysisSvc.WithTriagePoster(deliveryTriagePoster{room: teamRoom})
-	pdfEnabled, pdfAttempts := p7RenderSettings(ctx, settingsSvc)
+	pdfEnabled, pdfAttempts := orchestrationRenderSettings(ctx, settingsSvc)
 	reportSvc := deliveryapp.NewReportService(
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
-		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc),
+		deliveryEvents, deliveryAudit, clk, deliveryTasks, deliverySectionOptions(ctx, settingsSvc),
 	).WithRenderJobs(reportRepo, pdfEnabled, pdfAttempts)
 	// v0.22 report.published callback: only the version report completion read
 	// by the stage gate can advance reporting -> completed.
@@ -1712,6 +2091,16 @@ func main() {
 	// v0.22 W2-7 report artifact export: reuse the storage content ledger via
 	// the narrow delivery port; the preallocated artifact ID names export.started.
 	reportSvc.WithArtifactStore(deliveryReportArtifactStore{exports: storageExportSvc}, ids)
+
+	// v0.2.4-G T11 (SC-G8, R-G7/R-G10/R-G10a): causal report stale. The watcher
+	// re-fingerprints a version's published reports on every conclusion-input
+	// change event — for EVERY version, not just running ones (the old narrow P4
+	// polling is removed from EnsureReports). The complete sweep is the periodic
+	// fallback over ALL published reports, healing lost events and the no-event
+	// terminal reclassification path (G does not touch the execution terminal write
+	// path). Judge state events additionally refresh the report display (R-G10a).
+	reportStaleSweeper := deliveryapp.NewReportStaleSweeper(reportRepo, reportSvc, slog.Default()).WithDisplayHealer(reportSvc)
+	reportStaleWatcher := deliveryapp.NewReportStaleWatcher(reportSvc, reportSvc, reportStaleSweeper, slog.Default())
 
 	// Four-way work-item dispatcher (0.2.1 D21): the only writer of 0.2.1
 	// work_item rows. It enforces the creator-kind matrix, the version-stage
@@ -1765,10 +2154,25 @@ func main() {
 		Requirements:  requirementRepo,
 		Reports:       versionadapters.NewReportStatusReader(reportSvc),
 		ReportStaler:  reportSvc,
-		Tasks:         p4Tasks,
 		Audit:         auditSvc,
 		Events:        eventSvc,
 		Clock:         clk,
+	})
+	// v0.2.4-G T6: two-level admin waiver (SC-G11, GD-06/P23, Q7=A). WaiveClose
+	// routes through the single Close terminal entry (versionCloseSvc.CloseWaived)
+	// and synchronously regenerates the unverified report via the delivery adapter;
+	// WaiveRequirement marks the requirement so the deterministic closure
+	// reconciler closes it with the completeness checks overridden.
+	waiverSvc := versionapp.NewWaiverService(versionapp.WaiverServiceDeps{
+		Versions:     versionRepo,
+		Closer:       versionCloseSvc,
+		Requirements: requirementRepo,
+		Waivers:      requirementRepo,
+		Reports:      versionadapters.NewWaivedReportRegenerator(reportSvc),
+		Facts:        factSvc,
+		Audit:        auditSvc,
+		Events:       eventSvc,
+		Clock:        clk,
 	})
 	// v0.22 W0 stage service (Task 36): the single orchestrated stage writer for
 	// the production callers. Every gate is adapted from an existing use case;
@@ -1799,6 +2203,10 @@ func main() {
 		Handoff:     handoffSvc,
 	})
 	stageCallbacks.set(stageService)
+	// v0.2.4-E T13: the SAME shared review gate instance the planner converge path
+	// uses (designJudge.ReviewGate) gates the manual designing -> case_review
+	// advance. One predicate, one truth (T9); nil would fail the edge closed.
+	stageService.SetDesignReviewGate(designJudge.ReviewGate)
 	// W2-2 R-W2-1: approving a blocked_recovery human request asks the version
 	// stage to leave the blocked stage. The port is wired here because the stage
 	// service is constructed after the human service. The wrapper treats an
@@ -1818,7 +2226,6 @@ func main() {
 		Issues:       closureReaders,
 		WorkItems:    closureReaders,
 		Versions:     versionCloseSvc,
-		Tasks:        p4Tasks,
 		Audit:        auditSvc,
 		Events:       eventSvc,
 		IDs:          ids,
@@ -1843,11 +2250,11 @@ func main() {
 	chainSvc := chainapp.NewChainService(
 		chainVersionProvider, chainDesignProvider, chainExecutionProvider,
 		chainDeliveryProvider, chainResourceProvider, chainCursorProvider, chainCursorProvider,
-		clk, p4ChainBudget(ctx, settingsSvc)).WithSettings(settingsSvc)
+		clk, deliveryChainBudget(ctx, settingsSvc)).WithSettings(settingsSvc)
 	deliveryHandler := deliveryapi.New(issueSvc, deliveryapi.WithReports(reportSvc))
 	chainHandler := chainapi.New(chainSvc)
 
-	p6Read, err := newP6ReadRuntime(p6ReadDeps{
+	readModel, err := newReadModelRuntime(readModelDeps{
 		Pool:     pool,
 		IDs:      ids,
 		Clock:    clk,
@@ -1859,10 +2266,10 @@ func main() {
 		Reports: reportSvc,
 	})
 	if err != nil {
-		log.Fatalf("eztest: wire P6 read models: %v", err)
+		log.Fatalf("eztest: wire read models: %v", err)
 	}
 
-	registerP4Plugins(issueSvc, analysisSvc, reportSvc, closureSvc, versionCloseSvc)
+	registerDeliveryPlugins(issueSvc, analysisSvc, reportSvc)
 
 	runtimeRepo := agentpg.NewRuntimeRepository(pool, ids)
 	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
@@ -1874,37 +2281,52 @@ func main() {
 	if err := agentapp.BackfillProfiles(ctx, runtimeRepo, auditSvc); err != nil {
 		log.Fatalf("eztest: backfill agent profiles: %v", err)
 	}
-	p6Agent, err := newP6AgentRuntime(pool, runtimeRepo, p6Read.VersionQuery, llmSvc, auditSvc)
-	if err != nil {
-		log.Fatalf("eztest: wire P6 agent centre: %v", err)
+	// v0.2.4-E T13: reconcile the design_judge profile model to the
+	// design.judge_model setting (empty inherits the platform default). A
+	// non-empty value must name a configured LLM model; an invalid one fails
+	// assembly closed rather than silently running the judge on a wrong model.
+	if err := wireJudgeModel(ctx, settingsSvc, llmSvc, runtimeRepo); err != nil {
+		log.Fatalf("eztest: wire design_judge model: %v", err)
 	}
-	p6Read.Handlers.AgentCenter = p6Agent.AgentCenter
-	p6Read.Handlers.Profiles = p6Agent.Profiles
+	agentQuery, err := newAgentQueryRuntime(pool, runtimeRepo, readModel.VersionQuery, llmSvc, auditSvc)
+	if err != nil {
+		log.Fatalf("eztest: wire agent center: %v", err)
+	}
+	readModel.Handlers.AgentCenter = agentQuery.AgentCenter
+	readModel.Handlers.Profiles = agentQuery.Profiles
+
+	// Skill library (v0.2.4-C T18): DB-authoritative runtime store with
+	// idempotent file seeding and the admin CRUD surface. Re-seeding never
+	// overwrites administrator edits or resurrects deletions.
+	skillRT := newSkillRuntime(pool, ids, auditSvc)
+	seedSkills(ctx, skillRT.Service)
+	readModel.Handlers.Skills = skillRT.Handler
 
 	// P7 services: knowledge (context + agent/tool bridge), storage GC and the
 	// report PDF worker/ensurer. Constructed before the agent runner so the
 	// runner and tool registry receive the knowledge adapter.
-	p7rt, err := newP7Runtime(ctx, p7RuntimeDeps{
-		Pool:           pool,
-		Settings:       settingsSvc,
-		IDs:            ids,
-		Clock:          clk,
-		Audit:          auditSvc,
-		Events:         eventSvc,
-		Hub:            eventHub,
-		Queue:          workQueue,
-		ReportRepo:     reportRepo,
-		ReportContent:  deliveryContent,
-		DeliveryEvents: deliveryEvents,
-		DeliveryAudit:  deliveryAudit,
-		Orchestrator:   p7OrchestrationRuntime.Service,
-		Leader:         p7OrchestrationRuntime.Leader,
-		InstanceKey:    instanceKey,
-		InstanceID:     instanceID,
-		Logger:         slog.Default(),
+	orchRuntime, err := newOrchestrationRuntime(ctx, orchestrationRuntimeDeps{
+		Pool:            pool,
+		VersionBindings: versionSvc,
+		Settings:        settingsSvc,
+		IDs:             ids,
+		Clock:           clk,
+		Audit:           auditSvc,
+		Events:          eventSvc,
+		Hub:             eventHub,
+		Queue:           workQueue,
+		ReportRepo:      reportRepo,
+		ReportContent:   deliveryContent,
+		DeliveryEvents:  deliveryEvents,
+		DeliveryAudit:   deliveryAudit,
+		Orchestrator:    orchComponents.Service,
+		Leader:          orchComponents.Leader,
+		InstanceKey:     instanceKey,
+		InstanceID:      instanceID,
+		Logger:          slog.Default(),
 	})
 	if err != nil {
-		log.Fatalf("eztest: wire P7 runtime: %v", err)
+		log.Fatalf("eztest: wire orchestration runtime: %v", err)
 	}
 
 	// P8 knowledge success hook: the adapter maps a passed case run's page/API
@@ -1912,11 +2334,11 @@ func main() {
 	// sediments page_locator/api_auth/login_recipe drafts (auto-approved with
 	// audit) through the real knowledge service. The binding resolver is a
 	// composition-root adapter so the knowledge bridge never imports version.
-	p7rt.KnowledgeAdapter.SetVersionBindings(p7VersionCaseBindings{versions: versionSvc})
+	orchRuntime.KnowledgeAdapter.SetVersionBindings(orchestrationVersionCaseBindings{versions: versionSvc})
 	// P8 knowledge lifecycle: a resource page-route / account-role change marks
 	// the approved knowledge bound to the old value stale. The resource context
 	// only emits the neutral change; the knowledge service owns the scan/write.
-	resourceSvc.SetKnowledgeInvalidator(p7rt.KnowledgeInvalidator)
+	resourceSvc.SetKnowledgeInvalidator(orchRuntime.KnowledgeInvalidator)
 
 	// The case runner is constructed after the P7 runtime so the knowledge
 	// success hook is non-nil (the hook is best effort at the Finish boundary:
@@ -1930,8 +2352,9 @@ func main() {
 		Humans:      executionRepo.Humans,
 		Cases:       executionCases,
 		Bindings:    executionVersionAdapter,
+		Versions:    executionVersionAdapter,
 		APIs:        executionVersionAdapter,
-		Browser:     executionadapters.NewBrowserAdapterWithRouter(executorRouter),
+		Execution:   executionadapters.NewExecutionAdapterWithRouter(executorRouter),
 		Credentials: executionCredentials,
 		Content:     executionContent,
 		HTTPClient:  executionHTTPClient,
@@ -1940,7 +2363,6 @@ func main() {
 		Gaps:        executionGaps,
 		TeamRoom:    executionTeamRoom,
 		Human:       executionHumans,
-		Visual:      p5.VisualPort,
 		// WP-2: terminal discovery observations flow through the ingest service
 		// (normalize/filter/dedupe) into the DB-29 repository. The SUT host
 		// resolver filters third-party CDN/analytics traffic; a nil writer would
@@ -1955,24 +2377,47 @@ func main() {
 		Events:        eventSvc,
 		Audit:         auditSvc,
 		InstanceID:    instanceID,
-		KnowledgeHook: p7rt.KnowledgeAdapter,
+		KnowledgeHook: orchRuntime.KnowledgeAdapter,
 		// The failure hook moves the knowledge reused by a failed case_run to
 		// suspect; the success hook stamps last_verified_at on a passed run.
-		KnowledgeFailureHook: p7rt.KnowledgeAdapter,
+		KnowledgeFailureHook: orchRuntime.KnowledgeAdapter,
+		// v0.2.4-F T14 (SC-F10): the knowledge page/API dimension true source —
+		// the run's sut_resolution validated assets (directory-hit included)
+		// plus the resolved SUTs' proven asset registrations. Never fabricated.
+		Resolutions:   executionRepo.SUTResolutions,
+		Registrations: executionRepo.AssetRegistrations,
 	})
 	executionCanceller.runner = executionRunner
+	// EV-006: bind the command-log replay trigger now that the case runner exists
+	// (the handler is constructed earlier). Replay reuses the runner's settlement
+	// aggregation and executor session chain; nil would answer 503.
+	executionHandler.SetReplay(executionRunner)
+	// v0.2.4-F T13 (P18, SC-F5): the session fixture library. The agent saves a
+	// login state via CLI state-save and uploads it here (append-only fact under
+	// the (version,sut,environment,role) reuse key, content-addressed bytes); a
+	// later case_run downloads the current fixture and injects it via CLI
+	// state-load. The session port is the case runner itself, so save/load run on
+	// the same fenced executor session as every other execution tool and are
+	// recorded as evidence. The fixture.upload/fixture.download tools reach it
+	// through ToolDeps.SessionFixtures below; the admin listing reads the same
+	// facts through executionHandler (SessionFixtures dep).
+	executionSessionFixtures := executionapp.NewSessionFixtureService(executionapp.SessionFixtureDeps{
+		Fixtures: executionRepo.SessionFixtures,
+		Catalog:  executionadapters.NewSUTCatalogAdapter(versionSvc),
+		Content:  executionContent,
+		Session:  executionRunner,
+		Events:   eventSvc,
+		Clock:    clk,
+	})
 
 	// P8 in-flight counters: HTTP requests and agent runs. The orchestration
 	// heartbeat copies them into api_instance for drain/rolling-upgrade
 	// observation; they never participate in scheduling.
 	requestLoad := &load.Counter{}
 	workLoad := &load.Counter{}
-	p7OrchestrationRuntime.Service.SetLoadTracker(p8LoadTracker{requests: requestLoad, work: workLoad})
+	orchComponents.Service.SetLoadTracker(retentionLoadTracker{requests: requestLoad, work: workLoad})
 
-	// The P5 tool deps bind the constructed services to this process; the
-	// execution.visual_assert group resolves its port from the case runner.
-	p5Tools := p5.Tools
-	p5Tools.VisualAssert = executionRunner
+	codeIntelTools := codeIntel.Tools
 	// v0.22 W0 completion and settlement share one target resolver: the
 	// success-only task.complete write and the A-14 turn/time settlement
 	// writeback must agree on this version/run's one plan item.
@@ -2019,36 +2464,62 @@ func main() {
 		CompactionSummary: compactionSummary,
 		CompactionManager: compactionManager,
 		// P7 knowledge injection + usage accounting (S6 report §5).
-		Knowledge:      p7rt.KnowledgeAdapter,
-		KnowledgeUsage: p7rt.KnowledgeAdapter,
+		Knowledge:      orchRuntime.KnowledgeAdapter,
+		KnowledgeUsage: orchRuntime.KnowledgeAdapter,
+		// T19 skill progressive disclosure: the resident metadata layer is
+		// injected per run; bodies are read on demand through skill.read.
+		Skills: skillRT.Service,
 		ToolDeps: tools.Deps{
 			Requirement: ports,
 			Attachment:  ports,
 			Resource:    ports,
-			Design:      designadapter.New(designGraph),
-			Execution:   executionRunner,
-			P5:          p5Tools,
-			P7: tools.P7Deps{
-				Knowledge: p7rt.KnowledgeAdapter,
-				Retrieval: p7rt.KnowledgeAdapter,
+			Design: designadapter.New(designGraph).
+				SetJudgment(designJudge.Service, designJudge.Store, settingsSvc).
+				SetReworkProvenance(&judgeReworkWorkItemReader{source: &judgeReworkSQLSource{pool: pool}}),
+			Execution: executionRunner,
+			CodeIntel: codeIntelTools,
+			Knowledge: tools.KnowledgeDeps{
+				Knowledge: orchRuntime.KnowledgeAdapter,
+				Retrieval: orchRuntime.KnowledgeAdapter,
 			},
 			// v0.22 A-6: spill/read/prune through the content ledger.
 			ToolResult: tools.ToolResultDeps{
 				Content:  toolContentStore{adapter: ports, storage: storageSvc},
 				Settings: settingsSvc,
 			},
+			// T19 skill capability domain: on-demand body read + usage ledger.
+			Skill: tools.SkillDeps{
+				Reader: skillRT.ToolReader,
+				Usage:  skillRT.Service,
+			},
+			// T10 P17 explore->prove->register: the server-side evidence gate.
+			AssetRegistration: tools.AssetRegistrationDeps{
+				Registrar: executionAssetRegistration,
+			},
+			// T11 R-B4 new-SUT registration: the server-side evidence gate (R-F1).
+			SUTRegistration: tools.SUTRegistrationDeps{
+				Registrar: executionSUTRegistration,
+			},
+			// T13 P18 session fixture library: cross-case login-state reuse.
+			SessionFixtures: tools.SessionFixtureDeps{
+				Library: executionSessionFixtures,
+			},
 		},
-		TaskProvider:         executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
-		RunCanceller:         executionRunner,
-		ReportFinalizer:      p4ReportFinalizer{service: reportSvc},
-		RequirementFinalizer: versionapp.NewClosureFinalizer(closureSvc),
-		InstanceID:           instanceID,
-		Load:                 workLoad,
+		TaskProvider:    executionadapters.NewResolutionTaskProvider(executionRunner, executionSUTResolution),
+		RunCanceller:    executionRunner,
+		ReportFinalizer: deliveryReportFinalizer{service: reportSvc},
+		InstanceID:      instanceID,
+		Load:            workLoad,
 	})
 	workerOptions := []agentapp.WorkerOption{
 		agentapp.WithWorkerEvents(eventSvc),
-		agentapp.WithWorkerDrainGate(p7OrchestrationRuntime.Service.IsDraining),
+		agentapp.WithWorkerDrainGate(orchComponents.Service.IsDraining),
 		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)),
+		// v0.2.4-H T12 (H-E2): the work-item lease recovery pass settles the ITEM;
+		// this settles the RUN it abandoned and seals its transcript/Host heads.
+		// It rides the same startup + periodic recovery ticks, so a crashed run is
+		// recovered as soon as its lease is recovered.
+		agentapp.WithWorkerCrashSweeper(agentapp.NewRunCrashSweeper(runtimeRepo, ports, eventSvc, slog.Default(), clock.System{})),
 	}
 	// EZTEST_AGENT_CONCURRENCY lets a deployment bound how many agent runs
 	// share the LLM/executor at once (the acceptance stack uses 1 to avoid
@@ -2066,7 +2537,7 @@ func main() {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runStageReconciler(ctx, p7OrchestrationRuntime.Leader, versionSvc, versionRepo, stageService, 30*time.Second)
+		runStageReconciler(ctx, orchComponents.Leader, versionSvc, versionRepo, stageService, 30*time.Second)
 	}()
 	// v0.22 deterministic attachment pipeline (Task 19/20) plus the requirement
 	// extraction worker (Task 37 fix round 1): pending attachments are parsed by
@@ -2075,17 +2546,17 @@ func main() {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runAttachmentExtractionWorker(ctx, p7OrchestrationRuntime.Leader, attachmentSvc, extractionSvc, 5*time.Second)
+		runAttachmentExtractionWorker(ctx, orchComponents.Leader, attachmentSvc, extractionSvc, 5*time.Second)
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExtractionWorker(ctx, p7OrchestrationRuntime.Leader, extractionSvc, 2*time.Second)
+		runExtractionWorker(ctx, orchComponents.Leader, extractionSvc, 2*time.Second)
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		if err := p5.Worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := codeIntel.Worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("eztest: codeintel worker stopped: %v", err)
 		}
 	}()
@@ -2105,7 +2576,7 @@ func main() {
 		Clock:           clk,
 		Logger:          slog.Default(),
 		Design:          designPlanner,
-		P4:              p4.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
+		Delivery:        agentdeliveryadapter.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
 		RunningVersions: versionSvc,
 		// R49 stage-entry-job recovery: read the stage and re-enqueue through
 		// the same idempotent dispatcher the stage machine uses. The presence
@@ -2119,12 +2590,15 @@ func main() {
 		StageJobs:         dispatcher,
 		StageJobPresence:  workItems,
 		StageJobSelection: workItems,
-		StageTransitions:  eventingpg.NewStageTransitionReader(pool),
+		// V-0020: read the transition reason from the durable stage_transition
+		// fact, not the version.stage_changed event, so R49 still works after
+		// event retention deletes the event log.
+		StageTransitions: versionpg.NewStageReasonReader(pool),
 		// The event-driven loop is the default; the env switch restores the old
 		// periodic scan until P10 acceptance.
 		PollInterval: reconcilerPollInterval(),
 		// P7 report PDF backfill runs after the P4 rules (S1 report §5.5).
-		P7: p7rt.RenderEnsurer,
+		ReportRender: orchRuntime.RenderEnsurer,
 	})
 	// Event-driven wake (spec §5.7): every persisted event is a hint that the
 	// control plane may need a repair pass. Notify only signals a coalescing
@@ -2143,22 +2617,12 @@ func main() {
 		// stage before the create response is returned. Routed through the
 		// v0.22 StageService (R-B4-1).
 		advanceCreatedVersionToClarifying(ctx, stageStarter, event)
-		// P9 explore analysis (Task 37): every version-scoped event schedules a
-		// coalesced, leader-gated gap/coverage refresh. The analysis performs
-		// its page probes through the shared explore runtime (Login first,
-		// serialized, page-scoped close). Requirement events carry the changed
-		// input: they bypass the 10-minute per-version interval so the analysis
-		// actually sees the requirements created/confirmed after version.created
-		// (Task 69). The channel#seq identity suppresses the duplicate delivery
-		// of the same event from the local observer and the cross-instance
-		// listener.
-		if versionID > 0 && p9rt != nil && p9rt.Analysis != nil {
-			eventKey := event.Channel + "#" + strconv.FormatInt(event.Seq, 10)
-			p9rt.Analysis.NotifyEvent(versionID, event.Type, eventKey)
-		}
 		return nil
 	}
 	eventSvc.Observe(wake)
+	// v0.2.4-G T11: conclusion-input change events drive the causal report stale
+	// check (non-blocking enqueue; the background watcher drains off this path).
+	eventSvc.Observe(reportStaleWatcher.Observe)
 	eventSvc.Observe(eventingapp.NewSystemEventConsumer(slog.Default()))
 	// W1-14B: settle proposed discovery observations when an admin confirms or
 	// rejects a discovered page/API (system-channel resource events). Like the
@@ -2173,49 +2637,44 @@ func main() {
 	// W1-14B decision observer: it never blocks or fails the resource publish.
 	revisionObserver := designGraph.ResourceConfirmedObserver(slog.Default())
 	eventSvc.Observe(revisionObserver)
-	if p7rt.Listener != nil {
-		p7rt.Listener.Observe(wake)
-		p7rt.Listener.Observe(decisionObserver)
-		p7rt.Listener.Observe(revisionObserver)
+	if orchRuntime.Listener != nil {
+		orchRuntime.Listener.Observe(wake)
+		orchRuntime.Listener.Observe(reportStaleWatcher.Observe)
+		orchRuntime.Listener.Observe(decisionObserver)
+		orchRuntime.Listener.Observe(revisionObserver)
 	}
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runReconciler(ctx, p7OrchestrationRuntime.Leader, reconciler)
+		runReconciler(ctx, orchComponents.Leader, reconciler)
+	}()
+	// v0.2.4-G T11: leader-gated causal stale watcher + periodic complete sweep.
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runReportStaleWatcher(ctx, orchComponents.Leader, reportStaleWatcher)
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutionScheduler(ctx, p7OrchestrationRuntime.Leader, executionIntents, versionSvc,
+		runExecutionScheduler(ctx, orchComponents.Leader, executionIntents, versionSvc,
 			executionScheduler, executionRecovery, intentWake, intentScanIntervalFromEnv())
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutorPoller(ctx, p7OrchestrationRuntime.Leader, executorRegistry, settingsSvc)
+		runExecutorPoller(ctx, orchComponents.Leader, executorRegistry, settingsSvc)
 	}()
 	// W2-2 R-W2-1: one leader-gated sweep expires overdue question/decision
 	// human requests (question.timeout_seconds). It never blocks the stage.
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runHumanQuestionExpiryWorker(ctx, p7OrchestrationRuntime.Leader, executionQuestions, executionHumans, humanExpiryInterval)
+		runHumanQuestionExpiryWorker(ctx, orchComponents.Leader, executionQuestions, executionHumans, humanExpiryInterval)
 	}()
-	// P9 explore analysis consumer (Task 37, R93): the leader-gated refresh loop
-	// that drives GapAnalysis/Coverage/CaseAugment over the shared explore
-	// runtime. Only the leader probes/writes, and a per-version debounce keeps
-	// an event storm to one refresh per interval.
-	background.Add(1)
-	go func() {
-		defer background.Done()
-		p9rt.Analysis.Run(ctx, func() bool {
-			return p7OrchestrationRuntime.Leader != nil && p7OrchestrationRuntime.Leader.IsLeader()
-		})
-	}()
-
 	// P7 background loops: leader election, SSE listener, instance maintenance,
 	// per-replica report PDF worker and the leader-gated GC worker.
-	p7rt.StartWorkers(ctx, &background, settingsSvc)
+	orchRuntime.StartWorkers(ctx, &background, settingsSvc)
 
 	// P8 leader-gated event/audit retention. The cutoffs are read on every tick
 	// from the settings center; the batch size reuses retention.gc_batch_size.
@@ -2223,58 +2682,59 @@ func main() {
 		auditpg.New(pool),
 		eventingpg.New(pool),
 		auditSvc,
-		p8RetentionBatch(ctx, settingsSvc),
+		retentionBatch(ctx, settingsSvc),
 	)
 	auditDays := func(ctx context.Context) int {
-		return p8IntSetting(ctx, settingsSvc, "security.audit_retention_days", 90)
+		return retentionIntSetting(ctx, settingsSvc, "security.audit_retention_days", 90)
 	}
 	eventDays := func(ctx context.Context) int {
-		return p8IntSetting(ctx, settingsSvc, "retention.event_days", 90)
+		return retentionIntSetting(ctx, settingsSvc, "retention.event_days", 90)
 	}
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runP8RetentionWorker(ctx, p7rt.leader, retentionService,
-			func(ctx context.Context) time.Duration { return p8RetentionInterval(ctx, settingsSvc) },
-			auditDays, eventDays, p8Logf)
+		runRetentionWorker(ctx, orchRuntime.leader, retentionService,
+			func(ctx context.Context) time.Duration { return retentionInterval(ctx, settingsSvc) },
+			auditDays, eventDays, retentionLogf)
 	}()
 
 	handler := server.New(server.Deps{
-		Config:         cfg,
-		Pool:           pool,
-		Version:        version,
-		Settings:       settingsSvc,
-		Identity:       identitySvc,
-		Audit:          auditSvc,
-		Events:         eventSvc,
-		Storage:        storageSvc,
-		LLM:            llmSvc,
-		Resource:       resourceSvc,
-		Versions:       versionSvc,
-		Requirements:   requirementSvc,
-		Conversations:  conversationSvc,
-		Stage:          stageService,
-		Plans:          planSvc,
-		Facts:          factSvc,
-		Handoffs:       handoffSvc,
-		Attachments:    attachmentSvc,
-		Extraction:     extractionSvc,
-		TeamRoom:       teamRoom,
-		DesignGraph:    designGraph,
-		DesignExports:  designExports,
-		DesignStarter:  designStarterAdapter{planner: designPlanner},
-		Execution:      executionHandler,
-		Delivery:       deliveryHandler,
-		Chain:          chainHandler,
-		Closure:        closureSvc,
-		VersionClose:   versionCloseSvc,
-		CodeIntel:      p5.CodeIntel,
-		Visual:         p5.Visual,
-		P6:             &p6Read.Handlers,
-		P7:             p7rt.p7ServerHandlers(),
-		Jobs:           jobControlHandler,
-		Load:           requestLoad,
-		ContextPackets: versionadapter.NewContextPacketReader(runtimeRepo),
+		Config:          cfg,
+		Pool:            pool,
+		Version:         version,
+		Settings:        settingsSvc,
+		Identity:        identitySvc,
+		Audit:           auditSvc,
+		Events:          eventSvc,
+		Storage:         storageSvc,
+		LLM:             llmSvc,
+		Resource:        resourceSvc,
+		Versions:        versionSvc,
+		Requirements:    requirementSvc,
+		Conversations:   conversationSvc,
+		Stage:           stageService,
+		Plans:           planSvc,
+		Facts:           factSvc,
+		Handoffs:        handoffSvc,
+		Attachments:     attachmentSvc,
+		Extraction:      extractionSvc,
+		TeamRoom:        teamRoom,
+		DesignGraph:     designGraph,
+		DesignExports:   designExports,
+		DesignStarter:   designStarterAdapter{planner: designPlanner},
+		DesignJudgments: designJudge.Service,
+		Execution:       executionHandler,
+		Delivery:        deliveryHandler,
+		Chain:           chainHandler,
+		Closure:         closureSvc,
+		VersionClose:    versionCloseSvc,
+		Waivers:         waiverSvc,
+		CodeIntel:       codeIntel.CodeIntel,
+		ReadModel:       &readModel.Handlers,
+		ControlPlane:    orchRuntime.orchestrationServerHandlers(),
+		Jobs:            jobControlHandler,
+		Load:            requestLoad,
+		ContextPackets:  versionadapter.NewContextPacketReader(runtimeRepo),
 	})
 
 	srv := &http.Server{
@@ -2306,7 +2766,7 @@ func main() {
 	background.Wait()
 	// Graceful registry shutdown marks this api_instance stopped and releases
 	// its node ID for the next replica (the deferred Stop is idempotent).
-	if err := p7OrchestrationRuntime.Service.Stop(shutdownCtx); err != nil {
+	if err := orchComponents.Service.Stop(shutdownCtx); err != nil {
 		log.Printf("eztest: stop api instance: %v", err)
 	}
 	log.Printf("eztest: stopped")

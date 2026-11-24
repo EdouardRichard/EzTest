@@ -38,7 +38,7 @@ func TestKnowledgeCuratorReadToolset(t *testing.T) {
 	}
 
 	denied := []string{
-		"browser.goto",
+		"exec.run",
 		"execution.case_finish",
 		"execution.step_record",
 		"case.confirm",

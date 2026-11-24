@@ -11,10 +11,12 @@ import (
 	"strings"
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 const maxRequestBody = 1 << 20
@@ -38,9 +40,10 @@ type ExportService interface {
 
 // Handler serves the P2 design endpoints.
 type Handler struct {
-	graph   GraphService
-	exports ExportService
-	stages  StageReader
+	graph     GraphService
+	exports   ExportService
+	stages    StageReader
+	judgments JudgmentService
 }
 
 // StageReader is the deterministic version-stage projection used to keep the
@@ -61,15 +64,48 @@ func (h *Handler) SetStageReader(reader StageReader) {
 	h.stages = reader
 }
 
+// JudgmentService is the design judgment application surface the override and
+// judgment-read handlers need (T16). *designapp.JudgmentService satisfies it.
+type JudgmentService interface {
+	Override(ctx context.Context, versionID, caseID, actorID int64, reason string) (design.Override, error)
+	ListJudgments(ctx context.Context, versionID int64, requirementID *int64) (designapp.JudgmentReportView, error)
+}
+
+// SetJudgmentService wires the judgment application service (T16). Without it
+// the override/judgment-read routes fail closed (503) instead of silently
+// pretending success; production always sets it.
+func (h *Handler) SetJudgmentService(svc JudgmentService) {
+	h.judgments = svc
+}
+
 var (
-	_ GraphService  = (*designapp.GraphService)(nil)
-	_ ExportService = (*designapp.ExportService)(nil)
+	_ GraphService    = (*designapp.GraphService)(nil)
+	_ ExportService   = (*designapp.ExportService)(nil)
+	_ JudgmentService = (*designapp.JudgmentService)(nil)
 )
 
 func requireActor(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	actor, ok := platform.ActorFrom(r.Context())
 	if !ok || actor.ID <= 0 {
 		httpx.Error(w, r, platform.Unauthenticated())
+		return 0, false
+	}
+	return actor.ID, true
+}
+
+// requireAdmin is the defense-in-depth admin guard for the judgment override
+// route (T16): the server also mounts it behind the admin middleware
+// (registerDesignRoutes), but a direct handler call must never let a non-admin
+// override a judge verdict. Mirrors requireActor's shape, adding the role
+// check (constitution Constraints A: admin/user functional distinction).
+func requireAdmin(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	actor, ok := platform.ActorFrom(r.Context())
+	if !ok || actor.ID <= 0 {
+		httpx.Error(w, r, platform.Unauthenticated())
+		return 0, false
+	}
+	if !actor.IsAdmin() {
+		httpx.Error(w, r, platform.Forbidden())
 		return 0, false
 	}
 	return actor.ID, true
@@ -111,17 +147,17 @@ func (h *Handler) requireCaseReview(ctx context.Context, versionID int64, scope 
 	if err != nil {
 		return err
 	}
-	if string(stage.Stage) == "case_review" {
+	if stage.Stage == version.StageCaseReview {
 		return nil
 	}
 	return &platform.Error{
 		Status:  http.StatusConflict,
 		Code:    "invalid_stage_for_action",
-		Message: scope + " confirmation requires stage case_review, but the version is at " + string(stage.Stage),
+		Message: scope + " confirmation requires stage " + string(version.StageCaseReview) + ", but the version is at " + string(stage.Stage),
 		Details: map[string]any{
 			"action":         "confirm_cases",
 			"scope":          scope,
-			"required_stage": "case_review",
+			"required_stage": string(version.StageCaseReview),
 			"current_stage":  string(stage.Stage),
 			"next_action":    confirmationScopeNextAction(scope),
 		},

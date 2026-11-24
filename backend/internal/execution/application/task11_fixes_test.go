@@ -7,7 +7,6 @@ package executionapp_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -55,7 +54,7 @@ func TestFailureSubmitRejectsExecutorCapabilityEscalation(t *testing.T) {
 		}
 		seedRunState(fixture, execution.CaseRunBlocked, execution.FailureClassBlocked)
 
-		if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+		if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 			CaseRunID: 3001, FailureClass: "application", Summary: "product defect",
 		}); err == nil {
 			t.Fatal("marked blocked run was escalated to application through runner.FailureSubmit")
@@ -81,7 +80,7 @@ func TestFailureSubmitRejectsExecutorCapabilityEscalation(t *testing.T) {
 		fixture.results.steps[1] = executorLimitationStep(1, "hover_unavailable")
 		seedRunState(fixture, execution.CaseRunFailed, execution.FailureClassApplication)
 
-		if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+		if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 			CaseRunID: 3001, FailureClass: "application", Summary: "product defect",
 		}); err == nil {
 			t.Fatal("marked failed(application) run bypassed the executor capability guard")
@@ -92,76 +91,6 @@ func TestFailureSubmitRejectsExecutorCapabilityEscalation(t *testing.T) {
 			}
 		}
 	})
-}
-
-// TestBrowserCapabilityErrorMarksRecordedStep is the real producer path: the
-// structured executor error code returned by the browser tool is remembered and
-// attached to the next failed/blocked step record, so the marker does not depend
-// on the model copying a code into free text.
-func TestBrowserCapabilityErrorMarksRecordedStep(t *testing.T) {
-	fixture := newCaseRunnerFixture(t)
-	prepareCaseRun(t, fixture)
-	fixture.browser.result = executionapp.BrowserActionResult{
-		OK: false,
-		Error: &executionapp.BrowserActionError{
-			Code: "file_chooser_unavailable", Message: "the executor cannot drive the native file chooser",
-		},
-	}
-	args := json.RawMessage(`{"target":"#upload","files":["/tmp/a.pdf"]}`)
-	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "upload_file", args); err == nil {
-		t.Fatal("Browser(capability error) returned no error")
-	}
-	// The model only records prose; the structured origin must supply the code.
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
-		Seq: 1, Status: "blocked",
-		Observed: "无法选择本地文件，上传动作未能发起",
-		Error:    "the browser action could not be performed",
-	}); err != nil {
-		t.Fatalf("StepRecord: %v", err)
-	}
-	steps, err := fixture.results.ListSteps(context.Background(), 3001)
-	if err != nil || len(steps) != 1 {
-		t.Fatalf("steps = %+v, err = %v", steps, err)
-	}
-	code, ok := execution.StepExecutorLimitation(steps[0])
-	if !ok || code != "file_chooser_unavailable" {
-		t.Fatalf("step observed = %+v, want the structured file_chooser_unavailable marker", steps[0].Observed)
-	}
-}
-
-// TestServiceUnavailableErrorIsNotExecutorLimitation is the negative SUT-error
-// case: a closed capability allowlist never turns a real service/endpoint
-// failure (or the product observation next to it) into an executor block.
-func TestServiceUnavailableErrorIsNotExecutorLimitation(t *testing.T) {
-	fixture := newCaseRunnerFixture(t)
-	prepareCaseRun(t, fixture)
-	fixture.browser.result = executionapp.BrowserActionResult{
-		OK: false,
-		Error: &executionapp.BrowserActionError{
-			Code: "service_unavailable", Message: "the SUT service is unavailable",
-		},
-	}
-	args := json.RawMessage(`{"target":"#upload","files":["/tmp/a.pdf"]}`)
-	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "upload_file", args); err == nil {
-		t.Fatal("Browser(service error) returned no error")
-	}
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
-		Seq: 1, Status: "failed",
-		Observed: "页面上没有「上传」按钮",
-		Error:    "service_unavailable: the SUT returned 503",
-	}); err != nil {
-		t.Fatalf("StepRecord: %v", err)
-	}
-	steps, err := fixture.results.ListSteps(context.Background(), 3001)
-	if err != nil || len(steps) != 1 {
-		t.Fatalf("steps = %+v, err = %v", steps, err)
-	}
-	if code, ok := execution.StepExecutorLimitation(steps[0]); ok {
-		t.Fatalf("service_unavailable was persisted as an executor limitation (%q)", code)
-	}
-	if !execution.StepShowsApplicationDeviation(steps[0]) {
-		t.Fatal("a real SUT error/observation was suppressed as an executor limitation")
-	}
 }
 
 // TestFinalizeRetryCASDoesNotClobberPausedRun reproduces the human-pause race:
@@ -183,7 +112,7 @@ func TestFinalizeRetryCASDoesNotClobberPausedRun(t *testing.T) {
 	runErr := &agentapp.RunError{
 		Reason:    "tool_failure",
 		Retryable: true,
-		Cause:     executionError("executor_timeout", map[string]any{"phase": "request", "method": "POST", "path": "/v1/contexts"}),
+		Cause:     executionError("executor_timeout", map[string]any{"phase": "request", "method": "POST", "path": "/v1/sessions"}),
 	}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 1, 3); err != nil {
 		t.Fatalf("Finalize retry over a paused row returned %v, want a benign no-op", err)
@@ -236,14 +165,14 @@ func TestDispatchClearsStaleRetryReason(t *testing.T) {
 	}
 }
 
-// TestContextCreateCauseRequiresPost: /v1/contexts is only the lazy browser
+// TestContextCreateCauseRequiresPost: /v1/sessions is only the lazy session
 // context creation on POST; a GET (context read) timeout is not a context-create
 // failure.
 func TestContextCreateCauseRequiresPost(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	cause := executionError("executor_timeout", map[string]any{
-		"phase": "request", "method": "GET", "path": "/v1/contexts",
+		"phase": "request", "method": "GET", "path": "/v1/sessions",
 	})
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: cause}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 3, 3); err != nil {
@@ -257,7 +186,8 @@ func TestContextCreateCauseRequiresPost(t *testing.T) {
 
 // TestRunErrorClassificationPrefersTypedCause: a typed run error (budget, model,
 // tool) wins over an already-expired caller context, so a run-level budget
-// deadline is not stamped as an executor timeout.
+// deadline is not stamped as an executor timeout. P6 (design §4.5): a budget
+// exhaustion settles inconclusive (exhausted≠failed), never an executor timeout.
 func TestRunErrorClassificationPrefersTypedCause(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
@@ -268,8 +198,17 @@ func TestRunErrorClassificationPrefersTypedCause(t *testing.T) {
 		t.Fatalf("Finalize: %v", err)
 	}
 	stored := fixture.caseRuns.get(t, 3001)
-	if stored.FailureClass != execution.FailureClassModel {
-		t.Fatalf("failure class = %q, want model (typed run error before ctx deadline)", stored.FailureClass)
+	// The typed budget cause wins over the expired ctx: it must NOT be relabeled
+	// as an executor timeout (the precedence this test pins).
+	if stored.Summary.TerminalCause == execution.TerminalCauseExecutorTimeout {
+		t.Fatalf("terminal cause = %q, the expired caller ctx must not stamp a typed budget run as an executor timeout", stored.Summary.TerminalCause)
+	}
+	if stored.FailureClass == execution.FailureClassTimeout {
+		t.Fatalf("failure class = %q, want not timeout (typed budget cause wins)", stored.FailureClass)
+	}
+	// P6: budget exhaustion is inconclusive, never failed.
+	if stored.Status != execution.CaseRunInconclusive {
+		t.Fatalf("status = %q, want inconclusive (P6 exhausted≠failed)", stored.Status)
 	}
 }
 
@@ -289,7 +228,7 @@ func TestRunningRowHasNoVerdictReason(t *testing.T) {
 	runErr := &agentapp.RunError{
 		Reason:    "tool_failure",
 		Retryable: true,
-		Cause:     executionError("executor_timeout", map[string]any{"phase": "request", "method": "POST", "path": "/v1/contexts"}),
+		Cause:     executionError("executor_timeout", map[string]any{"phase": "request", "method": "POST", "path": "/v1/sessions"}),
 	}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 1, 3); err != nil {
 		t.Fatalf("Finalize retry: %v", err)

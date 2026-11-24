@@ -91,7 +91,7 @@ func TestDesignBudgetAllowsAllCaseAuthors(t *testing.T) {
 }
 
 // TestDesignBudgetExpandsCritic makes the design floor's profile scope explicit
-// (Task 79 fix round). P2Profiles seeds design_critic at the lighter 4/120/300
+// (Task 79 fix round). DesignProfiles seeds design_critic at the lighter 4/120/300
 // floor in older databases, but every design profile can face a full
 // design.graph_read + submit turn. The runner deliberately raises the runtime
 // envelope to 16/600/900; the seeded row remains the admin-visible default.

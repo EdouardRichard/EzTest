@@ -92,7 +92,7 @@ func TestExecutionIntentValidate(t *testing.T) {
 		ID:                     1,
 		VersionID:              2,
 		CaseVersionID:          3,
-		VersionSUTIDs:          []int64{10, 11},
+		SUTIDs:                 []int64{10, 11},
 		EnvironmentFingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		Purpose:                PurposeInitial,
 		Status:                 IntentOpen,

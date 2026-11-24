@@ -22,9 +22,9 @@ package tools
 // Wiring (Task 36): the composition root fills tools.Deps.Completion per run and
 // registers this group through the existing registration list:
 //
-//	tools.RegisterP4ToolGroup(tools.TaskCompleteTools)
+//	tools.RegisterToolGroup(tools.TaskCompleteTools)
 //
-// NewP7Registry composes registered P4 groups, so runner.go needs no new
+// NewKnowledgeRegistry composes registered P4 groups, so runner.go needs no new
 // registration hook. The runner must still translate *TaskCompleteResult into
 // Usage.Completed (the result implements CompletionSignal) before Budget.Decide;
 // that Lead-only wiring belongs to Task 36.
@@ -38,6 +38,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Completion tool name, status and bounds.
@@ -200,11 +201,11 @@ func NewExtractionMismatchError(state ExtractionReconciliation) *CompletionError
 	)
 }
 
-// NewPlanItemNotDoneError reports a target plan item that is not done yet.
+// NewPlanItemNotDoneError reports a target plan item that is not terminal yet.
 func NewPlanItemNotDoneError(itemID int64, status string) *CompletionError {
 	return NewNotCompleteError(
 		fmt.Sprintf("plan item %d is %q, not done", itemID, status),
-		"finish the plan item (plan.update status=done plus decision) and retry",
+		"finish the plan item (plan.update to a terminal status — done/completed/cancelled/skipped/closed/failed — plus decision) and retry",
 		map[string]any{
 			"field":   "plan_item",
 			"item_id": idString(itemID),
@@ -671,14 +672,14 @@ func (v *PlanItemCompletionValidator) Validate(ctx context.Context, req Completi
 	return verification, nil
 }
 
-// planItemDone reports the terminal done statuses of version_plan_item.
+// planItemDone reports whether a version_plan_item status is terminal. It
+// DERIVES from the version domain authority (version.PlanItemTerminal, the
+// seven-value set behind PlanItemTerminalStatuses) — the old two-value switch
+// (done/completed) was a LIVE divergence: a cancelled/skipped/closed/failed
+// plan item could never complete task.complete (invariant 15④, closed by
+// v0.2.4-C T22; regression pin TestPlanItemCompletionAcceptsAllTerminalStatuses).
 func planItemDone(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "done", "completed":
-		return true
-	default:
-		return false
-	}
+	return version.PlanItemTerminal(status)
 }
 
 // --- design validator -------------------------------------------------------
@@ -792,7 +793,7 @@ func (v *HostCompletionValidator) Validate(ctx context.Context, req CompletionRe
 // TaskCompleteTools returns the W0 task.complete tool group. The composition
 // root registers it through the existing tool-group registration list:
 //
-//	tools.RegisterP4ToolGroup(tools.TaskCompleteTools)
+//	tools.RegisterToolGroup(tools.TaskCompleteTools)
 //
 // A zero CompletionDeps returns no tool, so assemblies that do not wire the
 // validator/writer never expose a half-wired completion tool.

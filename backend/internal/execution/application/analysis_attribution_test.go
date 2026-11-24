@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
@@ -60,7 +60,7 @@ func TestFailureAttributionInResultRead(t *testing.T) {
 		ID: 9001, CaseRunID: 3001, Kind: execution.EvidenceScreenshot, MIME: "image/png",
 	})
 
-	value, err := fixture.runner.ResultRead(context.Background(), p3Scope(), tools.ResultReadInput{})
+	value, err := fixture.runner.ResultRead(context.Background(), executionScope(), tools.ResultReadInput{})
 	if err != nil {
 		t.Fatalf("ResultRead: %v", err)
 	}
@@ -76,8 +76,8 @@ func TestFailureAttributionInResultRead(t *testing.T) {
 	if !ok {
 		t.Fatalf("result_read has no deterministic attribution: %+v", application)
 	}
-	if attribution["classification"] != exploreapp.FailureClassificationApplication ||
-		attribution["action"] != exploreapp.FailureActionHuman || attribution["retryable"] != false {
+	if attribution["classification"] != executionapp.FailureClassificationApplication ||
+		attribution["action"] != executionapp.FailureActionHuman || attribution["retryable"] != false {
 		t.Fatalf("application attribution = %+v", attribution)
 	}
 	problem, ok := attribution["problem_draft"].(map[string]any)
@@ -100,8 +100,8 @@ func TestFailureAttributionInResultRead(t *testing.T) {
 	if !ok {
 		t.Fatalf("environment result_read has no attribution: %+v", environment)
 	}
-	if environmentAttribution["classification"] != exploreapp.FailureClassificationEnvironment ||
-		environmentAttribution["action"] != exploreapp.FailureActionRetry ||
+	if environmentAttribution["classification"] != executionapp.FailureClassificationEnvironment ||
+		environmentAttribution["action"] != executionapp.FailureActionRetry ||
 		environmentAttribution["retryable"] != true {
 		t.Fatalf("environment attribution = %+v", environmentAttribution)
 	}
@@ -131,7 +131,7 @@ func TestFailureAttributionUsesFailedStepObservation(t *testing.T) {
 		ID: 9002, CaseRunID: caseRunID, Kind: execution.EvidenceScreenshot, MIME: "image/png",
 	})
 
-	value, err := fixture.runner.ResultRead(context.Background(), p3Scope(), tools.ResultReadInput{})
+	value, err := fixture.runner.ResultRead(context.Background(), executionScope(), tools.ResultReadInput{})
 	if err != nil {
 		t.Fatalf("ResultRead: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestFailureAttributionUsesFailedStepObservation(t *testing.T) {
 	if !ok {
 		t.Fatalf("result_read has no attribution: %+v", run)
 	}
-	if attribution["classification"] != exploreapp.FailureClassificationApplication {
+	if attribution["classification"] != executionapp.FailureClassificationApplication {
 		t.Fatalf("classification = %v, want application", attribution["classification"])
 	}
 	reason, _ := attribution["reason"].(string)

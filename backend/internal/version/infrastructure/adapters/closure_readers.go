@@ -15,6 +15,7 @@ import (
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -30,6 +31,9 @@ const WorkItemLimit = 500
 // RequirementReader loads one version requirement by ID.
 type RequirementReader interface {
 	GetRequirement(ctx context.Context, requirementID int64) (version.Requirement, error)
+	// Get loads the requirement aggregate (current revision acceptance criteria)
+	// the AC-level CoverageRecorded predicate consumes (v0.2.4-G SC-G4 P29).
+	Get(ctx context.Context, versionID, requirementID int64) (version.RequirementAggregate, error)
 }
 
 // DesignReader is the design application current+confirmed case read surface.
@@ -232,10 +236,17 @@ func (r *ClosureReaders) CountInflightCaseRuns(ctx context.Context, requirementI
 	return count, nil
 }
 
-// CoverageRecorded implements versionapp.ClosureCoverageReader: every current+
-// confirmed case version must appear in the execution coverage projection
-// (i.e. its latest case_run is readable). A requirement without confirmed cases
-// reports false; the has_confirmed_case check carries the reason.
+// CoverageRecorded implements versionapp.ClosureCoverageReader as AC-level LINK
+// coverage (v0.2.4-G P29/SC-G4): the requirement's current acceptance-criterion
+// set must be a subset of the union of covered_acs across its current+confirmed
+// case versions (AC全集 ⊆ ∪covered_acs). This replaces the former requirement-
+// level "every case has a readable latest run" check — execution is gated by the
+// separate cases_terminal/cases_verified checks, so closure determinism is
+// preserved. An AC with no covering confirmed case is a deterministic gap (the
+// E coverage-union precheck). The union/normalization reuse the design domain
+// CoverageUnion/CoverageComplete (single source of truth, no second AC union).
+// A requirement without confirmed cases reports false; has_confirmed_case carries
+// the reason.
 func (r *ClosureReaders) CoverageRecorded(ctx context.Context, requirementID int64) (bool, error) {
 	if requirementID <= 0 {
 		return false, platform.Invalid("requirement_id", "must be a positive decimal ID")
@@ -247,11 +258,43 @@ func (r *ClosureReaders) CoverageRecorded(ctx context.Context, requirementID int
 	if len(cases) == 0 {
 		return false, nil
 	}
-	latest, err := r.deps.CaseRuns.LatestByCaseVersions(ctx, requirement.VersionID, caseVersionIDs(cases))
+	acIDs, err := r.currentRequirementACIDs(ctx, requirement)
 	if err != nil {
 		return false, err
 	}
-	return len(latest) == len(cases), nil
+	confirmed := make([][]string, 0, len(cases))
+	for _, item := range cases {
+		confirmed = append(confirmed, item.CoveredACs)
+	}
+	union := design.CoverageUnion(confirmed, nil)
+	return design.CoverageComplete(union, acIDs), nil
+}
+
+// currentRequirementACIDs reads the acceptance-criterion ids of the requirement's
+// current revision (the AC full set). The aggregate read reuses the version
+// repository's existing Get path (no second AC source). A broken data invariant
+// (no current revision, or the current revision absent from the aggregate) fails
+// CLOSED with a typed error rather than vacuously passing the predicate on an
+// empty AC set (art.7.6 — no silent pass).
+func (r *ClosureReaders) currentRequirementACIDs(ctx context.Context, requirement version.Requirement) ([]string, error) {
+	if requirement.CurrentVersionID == nil {
+		return nil, platform.StateConflict("the requirement has no current revision; the AC coverage predicate cannot be evaluated")
+	}
+	aggregate, err := r.deps.Requirements.Get(ctx, requirement.VersionID, requirement.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, revision := range aggregate.Versions {
+		if revision.ID != *requirement.CurrentVersionID {
+			continue
+		}
+		ids := make([]string, 0, len(revision.AcceptanceCriteria))
+		for _, criterion := range revision.AcceptanceCriteria {
+			ids = append(ids, criterion.ID)
+		}
+		return ids, nil
+	}
+	return nil, platform.StateConflict("the requirement's current revision was not found in the aggregate; the AC coverage predicate cannot be evaluated")
 }
 
 // CaseRunIssueRefs implements versionapp.ClosureIssueRefReader: every issue
@@ -287,8 +330,8 @@ func (r *ClosureReaders) CaseRunIssueRefs(ctx context.Context, requirementID int
 
 // OpenWorkItems implements versionapp.ClosureWorkItemReader for one
 // requirement. Total counts open/claimed/running work items of the version
-// whose payload references the requirement; RequirementClose counts the
-// requirement.close task itself so the service can subtract it.
+// whose payload references the requirement. GD-17 removed the requirement.close
+// work type, so there is no self-task split.
 func (r *ClosureReaders) OpenWorkItems(ctx context.Context, requirementID int64) (versionapp.OpenWorkItemCounts, error) {
 	if requirementID <= 0 {
 		return versionapp.OpenWorkItemCounts{}, platform.Invalid("requirement_id", "must be a positive decimal ID")
@@ -311,16 +354,13 @@ func (r *ClosureReaders) OpenWorkItems(ctx context.Context, requirementID int64)
 			continue
 		}
 		counts.Total++
-		if item.Type == "requirement.close" {
-			counts.RequirementClose++
-		}
 	}
 	return counts, nil
 }
 
 // BlockingWorkItems implements versionapp.VersionWorkItemReader: open/claimed/
-// running work items of the version, including the version.close task itself
-// (the service subtracts it).
+// running work items of the version. GD-17 removed the version.close work type,
+// so there is no self-task split.
 func (r *ClosureReaders) BlockingWorkItems(ctx context.Context, versionID int64) (versionapp.BlockingWorkItemCounts, error) {
 	if versionID <= 0 {
 		return versionapp.BlockingWorkItemCounts{}, platform.Invalid("version_id", "must be a positive decimal ID")
@@ -335,9 +375,6 @@ func (r *ClosureReaders) BlockingWorkItems(ctx context.Context, versionID int64)
 			continue
 		}
 		counts.Total++
-		if item.Type == "version.close" {
-			counts.VersionClose++
-		}
 	}
 	return counts, nil
 }

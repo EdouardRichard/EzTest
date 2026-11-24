@@ -13,9 +13,15 @@ const (
 	VerdictReasonNoAssertions    = "no_assertions"
 	VerdictReasonBlocked         = "blocked"
 	VerdictReasonAgentFailure    = "agent_failure"
-	// VerdictReasonVisualAssertionNotRun is the P5 finalizer: a case_version
-	// with visual assertions but no executed visual result must not pass.
-	VerdictReasonVisualAssertionNotRun = "visual_assertion_not_run"
+	// VerdictReasonEvidenceDropped marks a run whose conclusion was degraded
+	// because evidence was lost (constitution art.4.5). It is not a SUT defect:
+	// the run simply cannot be trusted, so it never carries a failure class.
+	VerdictReasonEvidenceDropped = "evidence_dropped"
+	// VerdictReasonNoEvidence marks a failed conclusion degraded because the run
+	// produced no evidence at all (constitution art.1.2 "no-evidence failed
+	// degrades inconclusive"). A failure nobody can inspect is not a trustworthy
+	// defect, so it never carries a failure class.
+	VerdictReasonNoEvidence = "no_evidence"
 )
 
 // FinishCandidate is the model-submitted execution.case_finish candidate. The
@@ -37,13 +43,120 @@ type VerdictInput struct {
 	Assertions   []AssertionResult
 	Finish       *FinishCandidate
 	AgentFailure FailureClass
+	// EvidenceDropped is the persisted count of evidence items this run lost.
+	// Above zero the deterministic verdict degrades to inconclusive: a
+	// conclusion drawn from incomplete evidence is not trustworthy
+	// (constitution art.4.5, art.1.1 "no-evidence failed degrades").
+	EvidenceDropped int64
+	// EvidenceCount is the persisted count of evidence items this run holds.
+	// A failed verdict with zero evidence degrades to inconclusive: a failure
+	// with no immutable evidence to inspect is not a trustworthy defect
+	// (constitution art.1.2). Callers supply it from the evidence repository;
+	// Aggregate stays pure and never reads the database itself.
+	EvidenceCount int
+	// Prior, when non-nil, selects the RECLASSIFICATION question (V-0022): the
+	// run is already terminal (failed/blocked/inconclusive) and the analysis
+	// fallback re-judges its persisted verdict against the recorded facts. The
+	// verdict is derived from the recorded steps/assertions and the prior
+	// verdict — never from the case definition, which may no longer be
+	// executable (a superseded case version still has terminal runs to analyze).
+	// The evidence gates apply exactly as in settlement. Mutually exclusive
+	// with AgentSettlement.
+	Prior *PriorVerdict
+	// AgentSettlement, when non-nil, selects the AGENT-LEVEL settlement question
+	// (V-0022): the run ended outside the agent loop (human timeout/cancel,
+	// recovery dispatch-budget exhaustion) and is settled failed(Class) with the
+	// stable Reason code, independent of the case definition and the recorded
+	// results (the analysis fallback re-judges those afterwards). The evidence
+	// gates apply: a zero-evidence failed still degrades inconclusive. Mutually
+	// exclusive with Prior.
+	AgentSettlement *AgentSettlement
 }
 
-// Aggregate applies the §4.3 four-state aggregation. The model candidate is
-// only a hint: assertion failures are authoritative for application defects,
-// step failures keep their mapped class, missing required results are
-// inconclusive, and blocked prerequisites win over incomplete.
+// Aggregate is the single deterministic verdict authority (constitution
+// art.3.3/3.6). It answers exactly one of three questions, selected by the
+// input, and applies the shared evidence gates and the structured executor
+// capability limitation to every answer:
+//
+//   - settlement (default): did the confirmed case pass? The model candidate is
+//     only a hint; assertion failures are authoritative for application defects,
+//     step failures keep their mapped class, missing required results are
+//     inconclusive, and blocked prerequisites win over incomplete.
+//   - reclassification (Prior): is the persisted terminal failure verdict
+//     correctly classified given the recorded facts?
+//   - agent-level settlement (AgentSettlement): the run was abandoned for a
+//     session/infrastructure reason; the verdict is the deterministic failure
+//     mapping, not a re-judgment of results.
 func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, error) {
+	var status CaseRunStatus
+	var class FailureClass
+	var summary CaseRunSummary
+	var err error
+	switch {
+	case in.AgentSettlement != nil:
+		status, class, summary, err = agentSettlementVerdict(in)
+	case in.Prior != nil:
+		status, class, summary, err = reclassifyResults(in)
+	default:
+		status, class, summary, err = aggregateResults(in)
+	}
+	if err != nil {
+		return "", "", CaseRunSummary{}, err
+	}
+	// Lost evidence degrades first so a run that already cannot be trusted keeps
+	// the more specific evidence_dropped reason; the no-evidence gate then only
+	// sees a verdict that is still failed (constitution art.4.5 before art.1.2).
+	status, class, summary, err = degradeForEvidenceDrop(in.EvidenceDropped, status, class, summary)
+	if err != nil {
+		return "", "", CaseRunSummary{}, err
+	}
+	status, class, summary, err = degradeForNoEvidence(in.EvidenceCount, status, class, summary)
+	if err != nil {
+		return "", "", CaseRunSummary{}, err
+	}
+	// A structured executor capability limitation wins over the text heuristics
+	// and assertion evidence in every mode: the executor could not perform the
+	// action, so the run is blocked, never a SUT application defect (v0.2.3 X-02).
+	status, class, summary = ApplyExecutorCapabilityLimitation(status, class, summary, in.Steps)
+	return status, class, summary, nil
+}
+
+// degradeForEvidenceDrop applies constitution art.4.5 to an aggregated verdict.
+// Only the two CONCLUSIVE states degrade: passed and failed become inconclusive
+// with no failure class (an untrustworthy conclusion must never create an issue).
+// blocked already reports "cannot determine" and keeps its blocker signal;
+// process states (interrupted/skipped/superseded) are not verdicts at all.
+func degradeForEvidenceDrop(dropped int64, status CaseRunStatus, class FailureClass, summary CaseRunSummary) (CaseRunStatus, FailureClass, CaseRunSummary, error) {
+	summary.EvidenceDropped = dropped
+	if dropped <= 0 {
+		return status, class, summary, nil
+	}
+	switch status {
+	case CaseRunPassed, CaseRunFailed:
+		summary.VerdictReason = VerdictReasonEvidenceDropped
+		return CaseRunInconclusive, "", summary, nil
+	default:
+		return status, class, summary, nil
+	}
+}
+
+// degradeForNoEvidence applies constitution art.1.2 to an aggregated verdict: a
+// failed conclusion backed by zero evidence is not a trustworthy defect and
+// degrades to inconclusive with no failure class (it must never create an issue).
+// Only failed degrades — passed is a clean result that needs no defect evidence,
+// blocked already reports "cannot determine", and process states are not verdicts.
+// It runs after degradeForEvidenceDrop, so a run already degraded for lost
+// evidence keeps evidence_dropped rather than being relabelled no_evidence.
+func degradeForNoEvidence(count int, status CaseRunStatus, class FailureClass, summary CaseRunSummary) (CaseRunStatus, FailureClass, CaseRunSummary, error) {
+	summary.EvidenceCount = count
+	if status == CaseRunFailed && count == 0 {
+		summary.VerdictReason = VerdictReasonNoEvidence
+		return CaseRunInconclusive, "", summary, nil
+	}
+	return status, class, summary, nil
+}
+
+func aggregateResults(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, error) {
 	if in.Finish != nil && !in.Finish.Valid() {
 		return "", "", CaseRunSummary{}, fmt.Errorf("%w: %q", ErrInvalidVerdict, in.Finish.Verdict)
 	}
@@ -89,12 +202,11 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		}
 	}
 
-	summary.countVisualResults(in.Case.Assertions, assertionResults)
 	if failedStep != nil && failedStep.Error != "" {
 		summary.LastError = failedStep.Error
 	}
 
-	// Executor loss is infrastructure state, not a visual verdict.
+	// Executor loss is infrastructure state, not a case verdict.
 	if in.AgentFailure == FailureClassExecutorLost {
 		summary.VerdictReason = VerdictReasonAgentFailure
 		return CaseRunInterrupted, FailureClassExecutorLost, summary, nil
@@ -110,18 +222,6 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		}
 		summary.VerdictReason = VerdictReasonAssertionFailed
 		return CaseRunFailed, class, summary, nil
-	}
-
-	// P5 removes the P3 "visual skipped but case passed" shortcut: a visual
-	// assertion that never ran (or is inconclusive) makes the case inconclusive
-	// instead of silently green (spec §7.3). The visual result is authoritative
-	// over an agent/model "blocked" or step failure for the same visual reason.
-	if reason, environment, inconclusive := visualBlock(in.Case.Assertions, assertionResults); inconclusive {
-		summary.VerdictReason = reason
-		if environment {
-			return CaseRunInconclusive, FailureClassEnvironment, summary, nil
-		}
-		return CaseRunInconclusive, "", summary, nil
 	}
 
 	// Agent-level failures that are not a deterministic result.
@@ -193,9 +293,8 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 	return CaseRunPassed, "", summary, nil
 }
 
-// completeResults checks that every required step and non-visual assertion has a
-// final passing result. Visual assertions are evaluated by visualBlock before
-// this point (P5 four-state mapping), so they are not re-checked here.
+// completeResults checks that every required step and assertion has a final
+// passing result.
 func completeResults(
 	in VerdictInput,
 	stepResults map[int]StepResult,
@@ -215,9 +314,6 @@ func completeResults(
 	}
 	if len(in.Case.Assertions) > 0 {
 		for _, assertion := range in.Case.Assertions {
-			if assertion.Kind == AssertionKindVisual {
-				continue
-			}
 			result, ok := assertionResults[[2]int{assertion.StepSeq, assertion.AssertionSeq}]
 			if !ok || result.Verdict != AssertionPassed {
 				summary.VerdictReason = VerdictReasonIncomplete
@@ -226,9 +322,6 @@ func completeResults(
 		}
 	} else {
 		for _, result := range in.Assertions {
-			if result.Kind == AssertionKindVisual {
-				continue
-			}
 			if result.Verdict != AssertionPassed {
 				summary.VerdictReason = VerdictReasonIncomplete
 				return CaseRunInconclusive, "", false
@@ -236,145 +329,6 @@ func completeResults(
 		}
 	}
 	return "", "", true
-}
-
-// countVisualResults fills the P5 four-state visual counters. A missing or
-// legacy-skipped visual result counts as inconclusive, never as skipped: the
-// false-pass shortcut is removed (spec §7.3). VisualSkipped stays 0.
-func (s *CaseRunSummary) countVisualResults(assertions []CaseAssertion, results map[[2]int]AssertionResult) {
-	s.VisualSkipped = 0
-	seen := make(map[[2]int]struct{}, len(assertions))
-	for _, assertion := range assertions {
-		if assertion.Kind != AssertionKindVisual {
-			continue
-		}
-		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
-		seen[key] = struct{}{}
-		result, ok := results[key]
-		s.countVisualResult(result, ok)
-	}
-	for key, result := range results {
-		if result.Kind != AssertionKindVisual {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		s.countVisualResult(result, true)
-	}
-}
-
-func (s *CaseRunSummary) countVisualResult(result AssertionResult, ok bool) {
-	if !ok || result.Verdict == AssertionSkipped || result.Verdict == AssertionInconclusive {
-		s.VisualInconclusive++
-		return
-	}
-	switch result.Verdict {
-	case AssertionPassed:
-		s.VisualPassed++
-	case AssertionFailed:
-		s.VisualFailed++
-	default:
-		s.VisualInconclusive++
-	}
-}
-
-// visualBlock returns the inconclusive verdict reason of the first visual
-// assertion that did not pass. environment=true maps the environment-mismatch
-// reason to the environment failure class; "case" reasons keep the empty class.
-// NormalizeVisualSteps removes a free-form blocked/failed step status that the
-// Case Executor attached to a visual assertion whose concrete visual result is
-// inconclusive. The visual tool result is authoritative (spec §7.3); without
-// this, a model-authored blocked status hides the visual verdict from Aggregate.
-func NormalizeVisualSteps(steps []StepResult, assertions []AssertionResult) []StepResult {
-	visual := map[int]bool{}
-	for _, result := range assertions {
-		if result.Kind == AssertionKindVisual && result.Verdict == AssertionInconclusive {
-			visual[result.StepSeq] = true
-		}
-	}
-	if len(visual) == 0 {
-		return steps
-	}
-	normalized := append([]StepResult(nil), steps...)
-	for i := range normalized {
-		if normalized[i].Status != StepBlocked && normalized[i].Status != StepFailed {
-			continue
-		}
-		if visual[normalized[i].Seq] {
-			normalized[i].Status = StepPassed
-			normalized[i].Error = ""
-		}
-	}
-	return normalized
-}
-
-// ApplyVisualOutcome is the final defense-in-depth guard for the P5 visual
-// four-state contract: a concrete inconclusive visual assertion result must not
-// be reported as blocked or failed(environment) because the Case Executor used a
-// free-form step status or finish candidate. It only overrides those two
-// aggregate outcomes; application failures with real assertion evidence stay.
-func ApplyVisualOutcome(status CaseRunStatus, class FailureClass, summary CaseRunSummary, assertions []AssertionResult) (CaseRunStatus, FailureClass, CaseRunSummary) {
-	if status != CaseRunBlocked && !(status == CaseRunFailed && class == FailureClassEnvironment) {
-		return status, class, summary
-	}
-	for _, result := range assertions {
-		if result.Kind != AssertionKindVisual || result.Verdict != AssertionInconclusive {
-			continue
-		}
-		reason := result.Reason
-		if reason == "" {
-			reason = VerdictReasonVisualAssertionNotRun
-		}
-		summary.VerdictReason = reason
-		if reason == "visual_environment_mismatch" {
-			return CaseRunInconclusive, FailureClassEnvironment, summary
-		}
-		return CaseRunInconclusive, "", summary
-	}
-	return status, class, summary
-}
-
-// visualBlock reports whether a visual assertion has no usable verdict.
-func visualBlock(assertions []CaseAssertion, results map[[2]int]AssertionResult) (reason string, environment bool, inconclusive bool) {
-	seen := make(map[[2]int]struct{}, len(assertions))
-	for _, assertion := range assertions {
-		if assertion.Kind != AssertionKindVisual {
-			continue
-		}
-		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
-		seen[key] = struct{}{}
-		result, ok := results[key]
-		if block, env, blocked := visualResultBlock(result, ok); blocked {
-			return block, env, true
-		}
-	}
-	for key, result := range results {
-		if result.Kind != AssertionKindVisual {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		if block, env, ok := visualResultBlock(result, true); ok {
-			return block, env, true
-		}
-	}
-	return "", false, false
-}
-
-func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
-	if !ok || result.Verdict == AssertionSkipped {
-		return VerdictReasonVisualAssertionNotRun, false, true
-	}
-	if result.Verdict != AssertionInconclusive {
-		return "", false, false
-	}
-	reason := result.Reason
-	if reason == "" {
-		reason = VerdictReasonVisualAssertionNotRun
-	}
-	return reason, reason == "visual_environment_mismatch", true
 }
 
 func hasObservedStep(steps []StepResult) bool {

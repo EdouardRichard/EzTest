@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -35,13 +37,14 @@ func (r *QueryReader) CountCaseConfirmation(ctx context.Context, versionID *int6
 	var num, denom int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
-			count(*) FILTER (WHERE cv.status = 'confirmed'),
-			count(*) FILTER (WHERE cv.status IN ('draft', 'confirmed', 'stale'))
+			count(*) FILTER (WHERE cv.status = $2),
+			count(*) FILTER (WHERE cv.status = ANY($3))
 		FROM case_entity ce
 		JOIN case_version cv ON cv.id = ce.current_version_id
 		JOIN case_scenario s ON s.id = ce.scenario_id
 		WHERE $1::bigint IS NULL OR s.version_id = $1
-	`, versionID).Scan(&num, &denom); err != nil {
+	`, versionID, design.CaseStatusConfirmed,
+		[]string{design.CaseStatusDraft, design.CaseStatusConfirmed, design.CaseStatusStale}).Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("count case confirmation: %w", err)
 	}
 	return num, denom, nil
@@ -87,10 +90,10 @@ func (r *QueryReader) ListDraftCases(ctx context.Context, limit int) ([]designap
 		FROM case_entity ce
 		JOIN case_version cv ON cv.id = ce.current_version_id
 		JOIN case_scenario s ON s.id = ce.scenario_id
-		WHERE ce.status = 'draft'
+		WHERE ce.status = $2
 		ORDER BY ce.created_at DESC, ce.id DESC
 		LIMIT $1
-	`, limit)
+	`, limit, design.CaseStatusDraft)
 	if err != nil {
 		return nil, fmt.Errorf("list draft cases: %w", err)
 	}
@@ -125,15 +128,15 @@ func (r *QueryReader) PendingDesignCounts(ctx context.Context, versionIDs []int6
 		SELECT r.version_id, count(*)
 		FROM requirement r
 		WHERE r.version_id = ANY($1)
-		  AND r.status = 'clarified'
+		  AND r.status = $2
 		  AND NOT EXISTS (
 		      SELECT 1 FROM design_scope ds
 		      WHERE ds.version_id = r.version_id
 		        AND ds.requirement_id = r.id
-		        AND ds.status = 'active'
+		        AND ds.status = $3
 		  )
 		GROUP BY r.version_id
-	`, versionIDs)
+	`, versionIDs, string(version.RequirementClarified), design.ScopeStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("count pending design: %w", err)
 	}

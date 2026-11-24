@@ -10,6 +10,7 @@ import type {
   ProfileView,
   PromptMutation,
   PromptRevision,
+  TranscriptMessage,
 } from "./types"
 
 const RUN_PAGE_LIMIT = 20
@@ -58,6 +59,17 @@ export async function listAgentRuns(filters: AgentRunFilters = {}) {
 /** GET /api/agent-center/quality — latest eval summary + global run stats. */
 export function getAgentCenterQuality(): Promise<AgentCenterQuality> {
   return apiGet<AgentCenterQuality>("/api/agent-center/quality")
+}
+
+/**
+ * GET /api/agent-center/runs/{id}/transcript — admin-only transcript snapshot
+ * (id ascending, no pagination). Non-admin callers get 403 from the server;
+ * live increments arrive on the run:{id} event channel.
+ */
+export function getRunTranscript(runId: string): Promise<TranscriptMessage[]> {
+  return apiGet<TranscriptMessage[]>(
+    `/api/agent-center/runs/${encodeURIComponent(runId)}/transcript`,
+  )
 }
 
 /* ---------------------------------- admin --------------------------------- */

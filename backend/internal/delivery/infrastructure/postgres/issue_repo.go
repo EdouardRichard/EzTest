@@ -23,40 +23,39 @@ import (
 
 // delivery_issue columns in scan order. The list is shared by every SELECT,
 // INSERT ... RETURNING and UPDATE ... RETURNING of the adapter.
-const issueColumns = `id, version_id, title, summary, status, category, severity,
+const issueColumns = `id, version_id, title, summary,
+	failed_expected, failed_actual, failed_reason,
+	status, category, severity,
 	dedupe_key, fingerprint, source, expected_revision, merged_into_id, merged_at,
 	merged_by, reopen_count, recurrence_count, last_recurred_at,
 	created_by_run_id, created_at, updated_at,
 	retest_status, last_retest_wave_id, last_retest_case_run_id`
 
-const issueRefColumns = `id, issue_id, kind, ref_id, version_sut_id, role, created_at, updated_at`
+const issueRefColumns = `id, issue_id, kind, ref_id, sut_id, role, created_at, updated_at`
 
 const issueHistoryColumns = `id, issue_id, from_status, to_status, reason, actor_id,
 	actor_kind, created_at, updated_at`
 
-// issueReasonRecurrence is the status-history reason of a recurrence redirect
-// (spec §4.6): the target status is unchanged (from=to), the row records the
-// redirect.
-const issueReasonRecurrence = "recurrence"
-
 const (
 	insertIssueSQL = `
 		INSERT INTO delivery_issue (
-			id, version_id, title, summary, status, category, severity, dedupe_key,
+			id, version_id, title, summary, failed_expected, failed_actual, failed_reason,
+			status, category, severity, dedupe_key,
 			fingerprint, source, expected_revision, created_by_run_id, created_at,
 			updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (version_id, dedupe_key) DO NOTHING
 		RETURNING ` + issueColumns
 
 	insertManualIssueSQL = `
 		INSERT INTO delivery_issue (
-			id, version_id, title, summary, status, category, severity, dedupe_key,
+			id, version_id, title, summary, failed_expected, failed_actual, failed_reason,
+			status, category, severity, dedupe_key,
 			fingerprint, source, expected_revision, created_by_run_id, created_at,
 			updated_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING ` + issueColumns
 
 	selectIssueByDedupeSQL = `
@@ -66,7 +65,7 @@ const (
 
 	insertIssueRefSQL = `
 		INSERT INTO delivery_issue_ref (
-			id, issue_id, kind, ref_id, version_sut_id, role, created_at, updated_at
+			id, issue_id, kind, ref_id, sut_id, role, created_at, updated_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (issue_id, kind, ref_id, role) DO NOTHING`
@@ -141,6 +140,7 @@ func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Is
 
 	created, err := scanIssue(tx.QueryRow(ctx, insertIssueSQL,
 		r.insertID(issue.ID), issue.VersionID, issue.Title, issue.Summary,
+		issue.FailedExpected, issue.FailedActual, issue.FailedReason,
 		string(status), issue.Category, issue.Severity, issue.DedupeKey,
 		issue.Fingerprint, source, expectedRevision, issue.CreatedByRunID,
 		createdAt, updatedAt,
@@ -171,7 +171,7 @@ func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Is
 		ID:        r.ids.Next(),
 		IssueID:   created.ID,
 		To:        created.Status,
-		ActorKind: "system",
+		ActorKind: deliveryapp.IssueActorKindSystem,
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
 	}); err != nil {
@@ -220,6 +220,7 @@ func (r *IssueRepository) CreateManual(ctx context.Context, c deliveryapp.IssueM
 	}
 	created, err := scanIssue(tx.QueryRow(ctx, insertManualIssueSQL,
 		r.insertID(c.Issue.ID), c.Issue.VersionID, c.Issue.Title, c.Issue.Summary,
+		c.Issue.FailedExpected, c.Issue.FailedActual, c.Issue.FailedReason,
 		string(status), c.Issue.Category, c.Issue.Severity, c.Issue.DedupeKey,
 		c.Issue.Fingerprint, source, expectedRevision, c.Issue.CreatedByRunID,
 		createdAt, updatedAt,
@@ -363,7 +364,7 @@ func (r *IssueRepository) GetByID(ctx context.Context, issueID int64) (delivery.
 }
 
 // List returns one descending-ID page of a version's issues. Status, category,
-// severity and the refs' version SUT filter when set; Before is the exclusive
+// severity and the refs' SUT filter when set; Before is the exclusive
 // ID cursor of the previous page.
 func (r *IssueRepository) List(ctx context.Context, versionID int64, f deliveryapp.IssueFilter) ([]delivery.Issue, error) {
 	ctx = contextOrBackground(ctx)
@@ -381,11 +382,11 @@ func (r *IssueRepository) List(ctx context.Context, versionID int64, f deliverya
 		args = append(args, f.Severity)
 		conditions = append(conditions, fmt.Sprintf("severity = $%d", len(args)))
 	}
-	if f.VersionSUTID != nil {
-		args = append(args, *f.VersionSUTID)
+	if f.SUTID != nil {
+		args = append(args, *f.SUTID)
 		conditions = append(conditions, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM delivery_issue_ref r
-			WHERE r.issue_id = delivery_issue.id AND r.version_sut_id = $%d
+			WHERE r.issue_id = delivery_issue.id AND r.sut_id = $%d
 		)`, len(args)))
 	}
 	if f.Before > 0 {
@@ -463,13 +464,15 @@ func (r *IssueRepository) UpdateStatus(ctx context.Context, u deliveryapp.IssueS
 		SET status = $3,
 			expected_revision = expected_revision + 1,
 			reopen_count = reopen_count + CASE
-				WHEN $3 = 'open' AND status IN ('confirmed', 'dismissed') THEN 1
+				WHEN $3 = $5 AND status = ANY($6) THEN 1
 				ELSE 0
 			END,
 			updated_at = $4
 		WHERE id = $1 AND version_id = $2
 		RETURNING `+issueColumns,
 		u.IssueID, u.VersionID, string(u.To), now,
+		string(delivery.IssueStatusOpen),
+		[]string{string(delivery.IssueStatusConfirmed), string(delivery.IssueStatusDismissed)},
 	))
 	if err != nil {
 		return delivery.Issue{}, wrapDB("update issue status", err)
@@ -481,7 +484,7 @@ func (r *IssueRepository) UpdateStatus(ctx context.Context, u deliveryapp.IssueS
 		To:        u.To,
 		Reason:    u.Reason,
 		ActorID:   actorIDPtr(u.ActorID),
-		ActorKind: actorKind(u.ActorKind, "user"),
+		ActorKind: actorKind(u.ActorKind, deliveryapp.IssueActorKindUser),
 		CreatedAt: now,
 		UpdatedAt: now,
 	}); err != nil {
@@ -552,15 +555,16 @@ func (r *IssueRepository) Merge(ctx context.Context, m deliveryapp.IssueMerge) (
 	now := nowUTC()
 	merged, err := scanIssue(tx.QueryRow(ctx, `
 		UPDATE delivery_issue
-		SET status = 'merged',
+		SET status = $6,
 			merged_into_id = $3,
 			merged_at = $4,
 			merged_by = $5,
 			expected_revision = expected_revision + 1,
 			updated_at = $4
-		WHERE id = $1 AND version_id = $2 AND status <> 'merged'
+		WHERE id = $1 AND version_id = $2 AND status <> $6
 		RETURNING `+issueColumns,
 		m.SourceID, m.VersionID, m.TargetID, now, actorIDPtr(m.ActorID),
+		string(delivery.IssueStatusMerged),
 	))
 	if err != nil {
 		return delivery.Issue{}, wrapDB("merge issue", err)
@@ -573,7 +577,7 @@ func (r *IssueRepository) Merge(ctx context.Context, m deliveryapp.IssueMerge) (
 		To:        delivery.IssueStatusMerged,
 		Reason:    m.Reason,
 		ActorID:   actorIDPtr(m.ActorID),
-		ActorKind: "user",
+		ActorKind: deliveryapp.IssueActorKindUser,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}); err != nil {
@@ -628,9 +632,9 @@ func (r *IssueRepository) ApplyRecurrence(ctx context.Context, rec deliveryapp.I
 		SET recurrence_count = recurrence_count + 1,
 			last_recurred_at = GREATEST(COALESCE(last_recurred_at, $2), $2),
 			updated_at = $2
-		WHERE id = $1 AND version_id = $3 AND status <> 'merged'
+		WHERE id = $1 AND version_id = $3 AND status <> $4
 		RETURNING `+issueColumns,
-		rec.TargetID, now, rec.VersionID,
+		rec.TargetID, now, rec.VersionID, string(delivery.IssueStatusMerged),
 	))
 	if isNoRows(err) {
 		return delivery.Issue{}, delivery.ErrStateConflict
@@ -647,8 +651,8 @@ func (r *IssueRepository) ApplyRecurrence(ctx context.Context, rec deliveryapp.I
 		IssueID:   rec.TargetID,
 		From:      &from,
 		To:        targetStatus,
-		Reason:    issueReasonRecurrence,
-		ActorKind: "system",
+		Reason:    delivery.IssueHistoryReasonRecurrence,
+		ActorKind: deliveryapp.IssueActorKindSystem,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}); err != nil {
@@ -703,7 +707,7 @@ func (r *IssueRepository) AppendHistory(ctx context.Context, h delivery.IssueSta
 	}
 	_, err := r.pool.Exec(ctx, insertIssueHistorySQL,
 		r.insertID(h.ID), h.IssueID, statusValue(h.From), string(h.To), h.Reason,
-		h.ActorID, actorKind(h.ActorKind, "system"), createdAt, updatedAt,
+		h.ActorID, actorKind(h.ActorKind, deliveryapp.IssueActorKindSystem), createdAt, updatedAt,
 	)
 	return wrapDB("append issue history", err)
 }
@@ -945,7 +949,7 @@ func (r *IssueRepository) ApplyRetestResult(ctx context.Context, in deliveryapp.
 			From:      &from,
 			To:        from,
 			Reason:    in.Reason,
-			ActorKind: "system",
+			ActorKind: deliveryapp.IssueActorKindSystem,
 			CreatedAt: now,
 			UpdatedAt: now,
 		}); err != nil {
@@ -1016,7 +1020,7 @@ func (r *IssueRepository) insertRefsWithRole(ctx context.Context, exec execer, i
 			updatedAt = createdAt
 		}
 		if _, err := exec.Exec(ctx, insertIssueRefSQL,
-			r.insertID(ref.ID), issueID, ref.Kind, ref.RefID, ref.VersionSUTID,
+			r.insertID(ref.ID), issueID, ref.Kind, ref.RefID, ref.SUTID,
 			role, createdAt, updatedAt,
 		); err != nil {
 			return wrapDB("insert issue ref", err)
@@ -1030,7 +1034,7 @@ func (r *IssueRepository) insertHistory(ctx context.Context, exec execer, change
 	if _, err := exec.Exec(ctx, insertIssueHistorySQL,
 		r.insertID(change.ID), change.IssueID, statusValue(change.From),
 		string(change.To), change.Reason, change.ActorID,
-		actorKind(change.ActorKind, "system"), change.CreatedAt, change.UpdatedAt,
+		actorKind(change.ActorKind, deliveryapp.IssueActorKindSystem), change.CreatedAt, change.UpdatedAt,
 	); err != nil {
 		return wrapDB("insert issue history", err)
 	}
@@ -1044,7 +1048,9 @@ func scanIssue(row rowScanner) (delivery.Issue, error) {
 		status string
 	)
 	if err := row.Scan(
-		&issue.ID, &issue.VersionID, &issue.Title, &issue.Summary, &status,
+		&issue.ID, &issue.VersionID, &issue.Title, &issue.Summary,
+		&issue.FailedExpected, &issue.FailedActual, &issue.FailedReason,
+		&status,
 		&issue.Category, &issue.Severity, &issue.DedupeKey, &issue.Fingerprint,
 		&issue.Source, &issue.ExpectedRevision, &issue.MergedIntoID,
 		&issue.MergedAt, &issue.MergedBy, &issue.ReopenCount,
@@ -1062,7 +1068,7 @@ func scanIssue(row rowScanner) (delivery.Issue, error) {
 func scanIssueRef(row rowScanner) (delivery.IssueRef, error) {
 	var ref delivery.IssueRef
 	if err := row.Scan(&ref.ID, &ref.IssueID, &ref.Kind, &ref.RefID,
-		&ref.VersionSUTID, &ref.Role, &ref.CreatedAt, &ref.UpdatedAt); err != nil {
+		&ref.SUTID, &ref.Role, &ref.CreatedAt, &ref.UpdatedAt); err != nil {
 		return delivery.IssueRef{}, err
 	}
 	return ref, nil

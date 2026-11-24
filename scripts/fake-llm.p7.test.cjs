@@ -7,11 +7,14 @@
 //   - the three P7 role markers (`EzTest 的补全 Agent`, `EzTest 的失败分析 Agent`,
 //     `EzTest 的问题整理 Agent`) select their deterministic tool sequences;
 //   - POST/GET /__p7-mode switches normal | noop | degraded | invalid at runtime;
-//   - every emitted tool name is the P1 gateway's dot->underscore wire form of a
-//     frozen profile tool and every P7 id is a decimal string (D29);
-//   - the execution agent calls execution.db_assert for kind=db assertions and
-//     never sends SQL/target/credentials;
-//   - P1/P3/P4/P5/P6 dispatch is untouched.
+//   - every emitted P7 tool name is the legacy gateway's dot->underscore wire
+//     form of a frozen profile tool and every P7 id is a decimal string (D29);
+//   - the execution scenario (v0.2.4-C T13 contract) uses the CURRENT dotted
+//     capability-domain names: kind=db assertions are recorded through
+//     execution.assertion_record like every other kind (the retired
+//     execution.db_assert/browser.* surface is gone), and recording arguments
+//     never carry SQL/target/credentials;
+//   - P1/P3/P4/P5 legacy dispatch is untouched.
 //
 // Run:
 //   node scripts/fake-llm.p7.test.cjs
@@ -22,6 +25,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { after, before, test } = require("node:test");
+const { parseSse } = require("./fake-llm-sse-test-helper.cjs");
 
 const repoRoot = path.resolve(__dirname, "..");
 const fakeLlmScript = path.join(__dirname, "fake-llm.cjs");
@@ -31,10 +35,12 @@ const MODEL = "deepseek-flash";
 const P7_MARKER_SUPPLEMENT = "EzTest 的补全 Agent";
 const P7_MARKER_FAILURE = "EzTest 的失败分析 Agent";
 const P7_MARKER_TRIAGE = "EzTest 的问题整理 Agent";
-const P6_MARKER = "EzTest 的执行 Agent";
+const P6_MARKER = "[profile:case_executor]";
 const FIXTURE_BASE = "http://127.0.0.1:13335";
 
-// The wire names of the spec §9.2/§9.3/§9.4 tool allowlists (dot->underscore).
+// The wire names of the spec §9.2/§9.3/§9.4 P7 tool allowlists (legacy
+// dot->underscore form). The execution entry is the CURRENT dotted registry
+// surface (v0.2.4-C T13), not the retired underscore/browser.* form.
 const PROFILE_TOOLS = {
   supplement: [
     "supplement_context_read",
@@ -59,16 +65,14 @@ const PROFILE_TOOLS = {
     "triage_finish",
   ],
   execution: [
-    "execution_case_context",
-    "browser_goto",
-    "browser_snapshot",
-    "browser_fill",
-    "browser_click",
-    "browser_screenshot",
-    "execution_step_record",
-    "execution_assertion_record",
-    "execution_db_assert",
-    "execution_case_finish",
+    "context.task_pack",
+    "sut.read",
+    "exec.run",
+    "http.request",
+    "execution.step_record",
+    "execution.assertion_record",
+    "execution.case_finish",
+    "human.request",
   ],
 };
 
@@ -76,7 +80,7 @@ const PROFILE_SYSTEM = {
   supplement: P7_MARKER_SUPPLEMENT + "\n\n你是补全 Agent，只提议不写库。",
   failure: P7_MARKER_FAILURE + "\n\n只分析 failed(application) 用例。",
   triage: P7_MARKER_TRIAGE + "\n\n把候选整理成可复现的问题单。",
-  execution: P6_MARKER + "\n\n你是执行 Agent，只执行给定用例快照。",
+  execution: P6_MARKER + "\n\n你是 EzTest 的用例执行器，只执行给定用例任务包。",
 };
 
 function supplementInstruction(mode) {
@@ -280,50 +284,56 @@ const TRIAGE_CONTEXT_RESULT = {
   ],
 };
 
-const EXECUTION_CASE_CONTEXT = {
-  case_run_id: "9101",
-  batch_id: "9102",
+// The context.task_pack result of an execute.case run (runner.go
+// taskPackResult/executionTaskResult, v0.2.4-F NL contract): the scenario reads
+// result.execution and resolves the SUT from suts[].sut_id. Steps carry the
+// natural-language target_description (the design-target id columns are gone).
+const EXECUTION_TASK_PACK = {
   version_id: "9103",
-  case_node_id: "9104",
-  title: "P7 DB 断言用例",
-  status: "running",
-  attempt: 1,
-  steps: [{ seq: 1, action: "打开订单页并提交", expected: "订单创建成功" }],
-  remaining_steps: [{ seq: 1, action: "打开订单页并提交", expected: "订单创建成功" }],
-  assertions: [
-    {
-      assertion_id: "7101",
-      step_seq: 1,
-      kind: "ui",
-      target: "#result",
-      expression: "text contains 订单创建成功",
-      expected: "订单创建成功",
-    },
-    {
-      assertion_id: "7102",
-      step_seq: 1,
-      kind: "db",
-      target: "orders",
-      expression: "SELECT count(*) FROM orders",
-      expected: "1",
-    },
-  ],
-  completed_seqs: [],
-  cleanup_required: false,
-  base_url: FIXTURE_BASE,
-  allowed_hosts: ["127.0.0.1:13335"],
+  conversation_id: "0",
+  agent_run_id: "9105",
+  type: "execute.case",
+  goal: "严格按任务上下文中的用例步骤顺序执行。",
+  constraints: ["不得虚构 passed"],
+  acceptance_criteria: ["每个执行过的 step 都有 execution.step_record"],
+  scope: { version_id: "9103" },
+  execution: {
+    case_run_id: "9101",
+    wave_id: "9102",
+    intent_id: "9106",
+    case_version_id: "9104",
+    environment_id: "3",
+    case_title: "P7 DB 断言用例",
+    description: "打开订单页并提交，校验 UI 与数据库",
+    sut_description: "订单管理系统（orders），提供订单创建与查询的 Web UI 与数据库。",
+    preconditions: "已创建测试账号",
+    covered_acs: ["AC-1"],
+    priority: "P2",
+    suts: [
+      {
+        sut_id: "7",
+        sut_name: "orders",
+        intro: "订单管理系统",
+        environment_id: "3",
+        environment_name: "test",
+        base_url: FIXTURE_BASE,
+        page_urls: [FIXTURE_BASE + "/p6/orders/new"],
+        api_endpoints: [],
+        account_roles: ["admin"],
+      },
+    ],
+    steps: [{ seq: 1, action: "打开订单页并提交", expected: "订单创建成功", account_role: "admin", target_description: "订单创建页并提交订单" }],
+    assertions: [
+      { step_seq: 1, assertion_seq: 1, kind: "ui", expected: "订单创建成功", target_sut_id: "7" },
+      { step_seq: 1, assertion_seq: 2, kind: "db", expected: "1", target_sut_id: "7" },
+    ],
+    prior_steps: [],
+    prior_assertions: [],
+  },
 };
 
-const EXECUTION_EVIDENCE = { evidence_id: "8101", sha256: "a".repeat(64), size: 1234 };
-const EXECUTION_GOTO = { url: FIXTURE_BASE + "/p6/orders/new", status: 200 };
-const EXECUTION_SNAPSHOT = { url: FIXTURE_BASE + "/p6/orders/new", title: "New order", aria: "- heading" };
-const DB_ASSERT_RESULT = {
-  verdict: "passed",
-  rowCount: 1,
-  truncated: false,
-  elapsedMs: 5,
-  actualPreview: "1",
-};
+const EXEC_RUN_RESULT = { ok: true, exit_code: 0, stdout: "p6-step-prep\n", stderr: "", evidence_ids: ["8101"] };
+const EXEC_HTTP_RESULT = { status: 200, truncated: false, evidence_ids: ["8102"] };
 
 let serverCounter = 0;
 let sharedLlm = null;
@@ -453,44 +463,18 @@ async function streamChat(base, messages, profile) {
   return parseSse(text);
 }
 
-function parseSse(text) {
-  const result = { content: "", toolCalls: [], finishReason: null };
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice("data: ".length).trim();
-    if (data === "" || data === "[DONE]") continue;
-    let chunk;
-    try {
-      chunk = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    const choice = chunk && Array.isArray(chunk.choices) ? chunk.choices[0] : null;
-    if (!choice) continue;
-    const delta = choice.delta || {};
-    if (typeof delta.content === "string") result.content += delta.content;
-    if (Array.isArray(delta.tool_calls)) {
-      for (const fragment of delta.tool_calls) {
-        const index = typeof fragment.index === "number" ? fragment.index : 0;
-        const slot = result.toolCalls[index] || (result.toolCalls[index] = { id: "", name: "", arguments: "" });
-        if (fragment.id) slot.id = fragment.id;
-        if (fragment.function) {
-          if (fragment.function.name) slot.name = fragment.function.name;
-          if (typeof fragment.function.arguments === "string") {
-            slot.arguments += fragment.function.arguments;
-          }
-        }
-      }
-    }
-    if (choice.finish_reason) result.finishReason = choice.finish_reason;
-  }
-  return result;
-}
-
 function assertUnderscoreToolName(name) {
   assert.equal(typeof name, "string");
   assert.ok(!name.includes("."), "tool name " + JSON.stringify(name) + " must not contain a dot");
   assert.match(name, /^[a-z][a-z0-9_]*$/, "tool name " + JSON.stringify(name) + " must be snake_case");
+}
+
+// The current execution surface (v0.2.4-C T13) uses the dotted registry names;
+// the legacy dot->underscore gateway conversion no longer exists.
+function assertDottedToolName(name) {
+  assert.equal(typeof name, "string");
+  assert.match(name, /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/, "tool name " + JSON.stringify(name) + " must be a dotted registry name");
+  assert.ok(!name.startsWith("browser."), "retired browser.* action emitted: " + name);
 }
 
 /**
@@ -969,47 +953,45 @@ test("noop triage finishes without drafts", async () => {
   }
 });
 
-// --- P7 execution addition: execution.db_assert ---------------------------
+// --- execution scenario (v0.2.4-C T13 contract) ---------------------------
 
-test("the execution agent calls execution.db_assert for kind=db assertions only", async () => {
+test("the execution scenario records kind=db assertions via assertion_record on the current tool surface", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
   const messages = newMessages("execution");
   const calls = [];
-  for (let index = 0; index < 10; index += 1) {
+  for (let index = 0; index < 8; index += 1) {
     const choice = await chat(sharedLlm.base, messages, "execution");
     const call = expectToolCall(choice);
-    assertUnderscoreToolName(call.function.name);
+    assertDottedToolName(call.function.name);
     assert.ok(PROFILE_TOOLS.execution.includes(call.function.name));
     const args = JSON.parse(call.function.arguments);
     calls.push({ name: call.function.name, args });
     let result;
     switch (call.function.name) {
-      case "execution_case_context":
-        result = EXECUTION_CASE_CONTEXT;
+      case "context.task_pack":
+        result = EXECUTION_TASK_PACK;
         break;
-      case "browser_goto":
-        result = EXECUTION_GOTO;
+      case "sut.read":
+        result = {
+          version_id: "9103", sut_id: "7", name: "orders", intro: "订单管理系统",
+          base_url: FIXTURE_BASE, source: "admin", status: "approved",
+          environment: "test", environment_id: "3",
+          pages: [], apis: [], databases: [], asset_counts: { pages: 0, apis: 0, databases: 0 },
+        };
         break;
-      case "browser_snapshot":
-        result = EXECUTION_SNAPSHOT;
+      case "exec.run":
+        result = EXEC_RUN_RESULT;
         break;
-      case "browser_fill":
-      case "browser_click":
+      case "http.request":
+        result = EXEC_HTTP_RESULT;
+        break;
+      case "execution.step_record":
         result = { ok: true };
         break;
-      case "browser_screenshot":
-        result = EXECUTION_EVIDENCE;
+      case "execution.assertion_record":
+        result = { ok: true };
         break;
-      case "execution_step_record":
-        result = { step_result_id: "8201", seq: 1, status: "passed", evidence_count: 1 };
-        break;
-      case "execution_assertion_record":
-        result = { assertion_result_id: "8301", assertion_id: "7101", verdict: "passed" };
-        break;
-      case "execution_db_assert":
-        result = DB_ASSERT_RESULT;
-        break;
-      case "execution_case_finish":
+      case "execution.case_finish":
         result = { case_run_id: "9101", status: "passed" };
         break;
       default:
@@ -1023,27 +1005,43 @@ test("the execution agent calls execution.db_assert for kind=db assertions only"
   assert.deepEqual(
     calls.map((call) => call.name),
     [
-      "execution_case_context",
-      "browser_goto",
-      "browser_snapshot",
-      "browser_fill",
-      "browser_click",
-      "browser_screenshot",
-      "execution_step_record",
-      "execution_assertion_record",
-      "execution_db_assert",
-      "execution_case_finish",
+      "context.task_pack",
+      "sut.read",
+      "exec.run",
+      "http.request",
+      "execution.step_record",
+      "execution.assertion_record",
+      "execution.assertion_record",
+      "execution.case_finish",
     ],
   );
-  // The UI assertion still goes through execution_assertion_record; the db
-  // assertion goes through the P7 tool exactly once.
-  assert.equal(calls.filter((call) => call.name === "execution_db_assert").length, 1);
-  const dbCall = calls.find((call) => call.name === "execution_db_assert");
-  assert.deepEqual(dbCall.args, { assertionId: "7102" });
-  // §9.5: the agent supplies only the assertion id, never SQL/target/credentials.
-  for (const forbidden of ["sql", "expected", "target", "connection", "password", "credentials"]) {
-    assert.equal(Object.prototype.hasOwnProperty.call(dbCall.args, forbidden), false, "db_assert must not send " + forbidden);
+  // Resolution confirms the catalog SUT; recordings carry factual sut_id.
+  assert.equal(calls[1].args.sut_id, "7");
+  // Both the ui and the db assertion go through execution.assertion_record:
+  // the retired execution.db_assert server-side tool no longer exists.
+  const records = calls.filter((call) => call.name === "execution.assertion_record");
+  assert.equal(records.length, 2);
+  assert.deepEqual(
+    records.map((call) => [call.args.step_seq, call.args.assertion_seq]),
+    [[1, 1], [1, 2]],
+  );
+  for (const record of records) {
+    assert.equal(record.args.verdict, "passed");
+    assert.ok(String(record.args.actual).length > 0, "an assertion record needs actual");
+    assert.equal(record.args.sut_id, "7", "assertion record carries factual sut_id attribution");
+    // The model records observations; SQL/target/credentials never travel on
+    // the recording arguments (db checks run through db.query separately), and
+    // evidence is settled automatically by the execution tools.
+    for (const forbidden of ["sql", "target", "connection", "password", "credentials", "evidence_ids"]) {
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(record.args, forbidden),
+        false,
+        "assertion_record must not send " + forbidden,
+      );
+    }
   }
+  assert.equal(calls.filter((call) => call.name === "execution.step_record").length, 1);
+  assert.equal(calls[7].args.verdict, "passed");
 });
 
 // --- runtime mode control --------------------------------------------------
@@ -1075,9 +1073,9 @@ test("POST/GET /__p7-mode switches, rejects unknown modes and resets", async () 
   }
 });
 
-// --- regression guard: P1/P3/P4/P5/P6 dispatch is untouched ---------------
+// --- regression guard: P1/P3/P4/P5 legacy dispatch is untouched -----------
 
-test("P1, P3, P4, P5 and P6 requests keep their pre-P7 behavior", async () => {
+test("P1, P3, P4, P5 keep their legacy behavior and P6 reads the task pack", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
 
   const p1 = await postChat(sharedLlm.base, {
@@ -1087,7 +1085,7 @@ test("P1, P3, P4, P5 and P6 requests keep their pre-P7 behavior", async () => {
     tools: agentTools("execution"),
   });
   assert.equal(p1.status, 200, p1.text);
-  assert.equal(p1.json.choices[0].message.tool_calls[0].function.name, "file_read");
+  assert.equal(p1.json.choices[0].message.tool_calls[0].function.name, "file.read");
 
   const p3 = await postChat(sharedLlm.base, {
     model: MODEL,
@@ -1120,7 +1118,7 @@ test("P1, P3, P4, P5 and P6 requests keep their pre-P7 behavior", async () => {
     tools: agentTools("supplement"),
   });
   assert.equal(p5.status, 200, p5.text);
-  assert.equal(p5.json.choices[0].message.tool_calls[0].function.name, "case_graph_read");
+  assert.equal(p5.json.choices[0].message.tool_calls[0].function.name, "design_graph_read");
 
   const p6 = await postChat(sharedLlm.base, {
     model: MODEL,
@@ -1129,7 +1127,7 @@ test("P1, P3, P4, P5 and P6 requests keep their pre-P7 behavior", async () => {
     tools: agentTools("execution"),
   });
   assert.equal(p6.status, 200, p6.text);
-  assert.equal(p6.json.choices[0].message.tool_calls[0].function.name, "execution_case_context");
+  assert.equal(p6.json.choices[0].message.tool_calls[0].function.name, "context.task_pack");
 });
 
 before(async () => {

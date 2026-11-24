@@ -14,14 +14,23 @@ import (
 
 const (
 	dbQueryTimeout    = 10 * time.Second
-	dbStatementLimit  = "5s"
 	dbMaxSchemaTables = 200
 	dbMaxColumns      = 200
+	// dbDefaultStatementTimeout is the PG statement_timeout when the caller does
+	// not pass statement_timeout_ms (5s).
+	dbDefaultStatementTimeout = 5 * time.Second
+	// dbCommitMargin is added to the configured statement timeout to derive the
+	// outer context budget, so the context covers the statement AND the commit
+	// without pre-empting the configured statement_timeout (T12 fix round 1: the
+	// advertised 1..900000ms range must genuinely govern, not a fixed 10s ctx).
+	dbCommitMargin = 5 * time.Second
 )
 
-// DatabaseAdapter runs read-only queries and schema summaries on the target
-// PostgreSQL database. Every query runs inside a READ ONLY transaction with a
-// 5s statement timeout; credentials never leave this adapter.
+// DatabaseAdapter runs general read-write SQL and schema summaries on the target
+// PostgreSQL database. v0.2.4-C T12 (P8): the old READ ONLY transaction and the
+// hard 200-row cap are lifted — queries run read-write and commit, rows are
+// unbounded unless the caller passes MaxRows, and the statement timeout is
+// configurable (default 5s). Credentials never leave this adapter.
 type DatabaseAdapter struct{}
 
 // NewDatabaseAdapter wires the target database adapter.
@@ -29,27 +38,42 @@ func NewDatabaseAdapter() *DatabaseAdapter { return &DatabaseAdapter{} }
 
 var _ executionapp.DatabaseQuerier = (*DatabaseAdapter)(nil)
 
-// Query executes one read-only SELECT/WITH and returns stringified rows.
-func (a *DatabaseAdapter) Query(ctx context.Context, dsn, username, password, sqlText string, maxRows int) (executionapp.DBQueryResult, error) {
+// Query executes one general SQL statement (read or write) and returns
+// stringified rows plus the command tag / affected-row count for writes.
+func (a *DatabaseAdapter) Query(ctx context.Context, dsn, username, password, sqlText string, opts executionapp.DBQueryOptions) (executionapp.DBQueryResult, error) {
 	connection, err := connectTarget(ctx, dsn, username, password)
 	if err != nil {
 		return executionapp.DBQueryResult{}, err
 	}
 	defer func() { _ = connection.Close(context.Background()) }()
 
-	queryCtx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	statementTimeout := dbDefaultStatementTimeout
+	if opts.StatementTimeoutMS > 0 {
+		statementTimeout = time.Duration(opts.StatementTimeoutMS) * time.Millisecond
+	}
+	// T12 fix round 1: the outer context must NOT pre-empt the configured
+	// statement_timeout (advertised 1..900000ms). Derive its budget from
+	// max(floor, statementTimeout + commit margin) so a configured timeout above
+	// the 10s floor genuinely governs and the commit is covered by the same
+	// deadline. With no configured timeout the 10s floor holds (default 5s + 5s).
+	budget := dbQueryTimeout
+	if derived := statementTimeout + dbCommitMargin; derived > budget {
+		budget = derived
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	tx, err := connection.BeginTx(queryCtx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	// P8: read-write transaction (the old pgx.ReadOnly rejected INSERT/UPDATE).
+	tx, err := connection.BeginTx(queryCtx, pgx.TxOptions{AccessMode: pgx.ReadWrite})
 	if err != nil {
-		return executionapp.DBQueryResult{}, targetDBError("could not start a read-only transaction", err)
+		return executionapp.DBQueryResult{}, targetDBError("could not start a transaction", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(queryCtx, "SET LOCAL statement_timeout = '"+dbStatementLimit+"'"); err != nil {
+	statementLimit := fmt.Sprintf("%dms", statementTimeout.Milliseconds())
+	if _, err := tx.Exec(queryCtx, "SET LOCAL statement_timeout = '"+statementLimit+"'"); err != nil {
 		return executionapp.DBQueryResult{}, targetDBError("could not set the statement timeout", err)
 	}
-	if maxRows <= 0 || maxRows > 200 {
-		maxRows = 200
-	}
+	// P8: MaxRows <= 0 means unlimited (the old hard 200-row cap is lifted).
+	maxRows := opts.MaxRows
 	rows, err := tx.Query(queryCtx, sqlText)
 	if err != nil {
 		return executionapp.DBQueryResult{}, targetDBError("the SQL statement failed", err)
@@ -61,7 +85,7 @@ func (a *DatabaseAdapter) Query(ctx context.Context, dsn, username, password, sq
 		result.Columns = append(result.Columns, field.Name)
 	}
 	for rows.Next() {
-		if len(result.Rows) >= maxRows {
+		if maxRows > 0 && len(result.Rows) >= maxRows {
 			result.Truncated = true
 			break
 		}
@@ -83,6 +107,18 @@ func (a *DatabaseAdapter) Query(ctx context.Context, dsn, username, password, sq
 		return executionapp.DBQueryResult{}, targetDBError("the query result could not be read", rows.Err())
 	}
 	result.RowCount = len(result.Rows)
+	// Close the rows before committing: pgx keeps the connection busy while a
+	// result set is open (an early max_rows break leaves it open), and CommandTag
+	// is final once the rows are closed. The deferred Close is then a no-op.
+	rows.Close()
+	commandTag := rows.CommandTag()
+	result.CommandTag = commandTag.String()
+	result.RowsAffected = commandTag.RowsAffected()
+	// P8: commit so write statements (INSERT/UPDATE/DELETE/DDL) persist. The
+	// deferred Rollback is a no-op after a successful Commit.
+	if err := tx.Commit(queryCtx); err != nil {
+		return executionapp.DBQueryResult{}, targetDBError("could not commit the transaction", err)
+	}
 	return result, nil
 }
 

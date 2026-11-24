@@ -10,14 +10,14 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
 
-func TestP1ProfilesMatchContract(t *testing.T) {
-	profiles := agentapp.P1Profiles()
+func TestBaseProfilesMatchContract(t *testing.T) {
+	profiles := agentapp.BaseProfiles()
 	if len(profiles) != 1 {
 		t.Fatalf("profiles = %d, want 1 (the clarification Host; Curator/Scout were removed)", len(profiles))
 	}
 	// W1-1 moved the unused test-only P1 constructor out of production; the
 	// superset registry still registers every P1 tool name.
-	registry := tools.NewP2Registry(tools.Deps{})
+	registry := tools.NewDesignRegistry(tools.Deps{})
 
 	host := profiles[0]
 	if host.Key != agentapp.ProfileKeyClarificationHost || host.Name != "澄清 Host" {
@@ -64,12 +64,12 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func TestP2ProfileSeeds(t *testing.T) {
-	profiles := agentapp.P2Profiles()
+func TestDesignProfileSeeds(t *testing.T) {
+	profiles := agentapp.DesignProfiles()
 	if len(profiles) != 3 {
 		t.Fatalf("P2 profiles = %d, want 3 (design_host, design_author, design_critic)", len(profiles))
 	}
-	registry := tools.NewP2Registry(tools.Deps{})
+	registry := tools.NewDesignRegistry(tools.Deps{})
 
 	type expectation struct {
 		tools   []string
@@ -87,7 +87,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_host]",
-			mustSay: []string{"不确认", "draft", "同一轮内立即", "expected", "视觉基线", "不要用 visual"},
+			mustSay: []string{"不确认", "draft", "同一轮内立即", "expected"},
 		},
 		agentapp.ProfileKeyDesignAuthor: {
 			tools: []string{
@@ -96,7 +96,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_author]",
-			mustSay: []string{"后台作业", "draft", "不能确认", "视觉基线", "不要用 visual", "验收标准未要求", "移动端", "文件选择框", "实时", "硬编码"},
+			mustSay: []string{"后台作业", "draft", "不能确认", "验收标准未要求", "移动端", "文件选择框", "实时", "硬编码"},
 		},
 		agentapp.ProfileKeyDesignCritic: {
 			tools: []string{
@@ -104,7 +104,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 			},
 			budgets: agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 600, HardSeconds: 900},
 			marker:  "[profile:design_critic]",
-			mustSay: []string{"后台作业", "内部", "不构成人工关卡", "视觉基线", "visual", "断言范围", "视口"},
+			mustSay: []string{"后台作业", "内部", "不构成人工关卡", "断言范围", "视口"},
 		},
 	}
 
@@ -150,7 +150,7 @@ func TestP2ProfileSeeds(t *testing.T) {
 // clarification/design domain has exactly two Hosts (clarification_host,
 // design_host) plus the two background jobs (design_author, design_critic), the
 // removed Scout/Curator/Planner seeds are absent, and the execution/analysis
-// seeds (case_executor, analysts, version_steward, report_writer,
+// seeds (case_executor, analysts, report_writer,
 // knowledge_curator) are untouched.
 func TestProfileSeedsAfterTeamConvergence(t *testing.T) {
 	for _, key := range []string{
@@ -165,7 +165,7 @@ func TestProfileSeedsAfterTeamConvergence(t *testing.T) {
 	}
 
 	hostCount := 0
-	for _, profile := range append(agentapp.P1Profiles(), agentapp.P2Profiles()...) {
+	for _, profile := range append(agentapp.BaseProfiles(), agentapp.DesignProfiles()...) {
 		switch profile.Key {
 		case agentapp.ProfileKeyClarificationHost, agentapp.ProfileKeyDesignHost:
 			hostCount++
@@ -197,13 +197,67 @@ func TestProfileSeedsAfterTeamConvergence(t *testing.T) {
 	for _, key := range []string{
 		agentapp.ProfileKeyCaseExecutor,
 		agentapp.ProfileKeyCoverageAnalyst,
-		agentapp.ProfileKeyVersionSteward,
 		agentapp.ProfileKeyFailureAnalyst,
 		agentapp.ProfileKeyReportWriter,
 		agentapp.ProfileKeyKnowledgeCurator,
 	} {
 		if _, ok := agentapp.Profile(key); !ok {
 			t.Fatalf("execution/analysis profile %q must be retained", key)
+		}
+	}
+}
+
+// TestCaseExecutorSeedUsesCapabilityDomains pins the v0.2.4-C T13 seed contract
+// plus the T15 browser domain: the case executor whitelist is domain-level
+// (exec/shell/file/pty wildcards plus the browser.cli passthrough, the HTTP/data
+// convenience tools and the recording/context surface), carries no retired
+// browser.* atomic action, and seeds MaxTurns=0 (unlimited; the turn budget is
+// governed by the execution.max_case_turns setting, not a frozen 150-turn cap).
+func TestCaseExecutorSeedUsesCapabilityDomains(t *testing.T) {
+	profile, ok := agentapp.Profile(agentapp.ProfileKeyCaseExecutor)
+	if !ok {
+		t.Fatal("case_executor profile is missing")
+	}
+	if profile.Budgets != (agent.ProfileBudgets{MaxTurns: 0, SoftSeconds: 1200, HardSeconds: 2400}) {
+		t.Fatalf("case_executor budgets = %+v, want MaxTurns 0 / 1200 / 2400", profile.Budgets)
+	}
+	for _, name := range profile.AllowedTools {
+		if tools.ToolDomain(name) == "browser" && name != tools.ToolBrowserCLI {
+			t.Fatalf("case_executor seed still lists a retired browser-domain tool: %q", name)
+		}
+	}
+	for _, want := range []string{
+		"exec.*", "shell.*", "file.*", "pty.*", tools.ToolBrowserCLI,
+		tools.ToolHTTPRequest, tools.ToolDBQuery, tools.ToolDatabaseSchemaRead, tools.ToolAccountCredentials,
+		tools.ToolExecutionStepRecord, tools.ToolExecutionAssertionRecord, tools.ToolExecutionEvidence,
+		tools.ToolExecutionWait, tools.ToolExecutionCaseFinish, tools.ToolHumanRequest,
+		tools.ToolContextVersionPack, tools.ToolContextTaskPack, tools.ToolContextTeamRoomRead,
+		tools.ToolRequirementRead, tools.ToolSUTList, tools.ToolSUTPageList, tools.ToolDesignGraphRead,
+	} {
+		if !containsString(profile.AllowedTools, want) {
+			t.Fatalf("case_executor seed is missing %q: %v", want, profile.AllowedTools)
+		}
+	}
+	// Every entry is either a registered tool or a wildcard whose domain has
+	// registered members in the admin catalog (the editor's registry surface).
+	catalog := tools.AdminCatalogRegistry()
+	for _, name := range profile.AllowedTools {
+		if domain, wildcard := strings.CutSuffix(name, ".*"); wildcard {
+			if len(catalog.NamesInDomain(domain)) == 0 {
+				t.Fatalf("case_executor wildcard %q has no registered domain members", name)
+			}
+			continue
+		}
+		if _, registered := catalog.Get(name); !registered {
+			t.Fatalf("case_executor seed lists unregistered tool %q", name)
+		}
+	}
+	// The backfill increment carries the same domain-level surface so legacy
+	// rows converge on the seed (single authority: the seed whitelist).
+	increment := agentapp.V022ProfileTools()[agentapp.ProfileKeyCaseExecutor]
+	for _, want := range []string{"exec.*", "shell.*", "file.*", "pty.*", tools.ToolToolResultRead, tools.ToolTaskComplete} {
+		if !containsString(increment, want) {
+			t.Fatalf("case_executor backfill increment is missing %q: %v", want, increment)
 		}
 	}
 }
@@ -224,7 +278,7 @@ func TestProfileKeyForConversationKind(t *testing.T) {
 	}
 }
 
-func TestProfileKeyForWorkTypeP2(t *testing.T) {
+func TestProfileKeyForWorkTypeDesign(t *testing.T) {
 	cases := map[string]string{
 		agentapp.WorkTypeDesignRequirement: agentapp.ProfileKeyDesignAuthor,
 		agentapp.WorkTypeDesignGap:         agentapp.ProfileKeyDesignAuthor,
@@ -240,7 +294,7 @@ func TestProfileKeyForWorkTypeP2(t *testing.T) {
 	}
 	// The Planner/Curator/Scout work types were removed with their profiles.
 	for _, removed := range []string{
-		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
+		"design.round", "design.data_plan",
 		agentapp.WorkTypeRequirementCurate, "attachment.ingest",
 	} {
 		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
@@ -262,8 +316,8 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles()) +
-		len(agentapp.P4Profiles()) + len(agentapp.P7Profiles())
+	wantTotal := len(agentapp.BaseProfiles()) + len(agentapp.DesignProfiles()) + len(agentapp.ExecutionProfiles()) +
+		len(agentapp.DeliveryProfiles()) + len(agentapp.KnowledgeProfiles()) + len(agentapp.JudgeProfiles())
 	if len(first) != wantTotal {
 		t.Fatalf("seeded = %d, want %d", len(first), wantTotal)
 	}

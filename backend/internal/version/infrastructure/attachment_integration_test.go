@@ -204,7 +204,10 @@ func TestAttachmentRepositoryConversationIncludesPreRegistered(t *testing.T) {
 	ctx := context.Background()
 
 	versionID := ids.Next()
-	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by) VALUES ($1, 'attachment race', 42)`, versionID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by, environment_id) VALUES ($1, 'attachment race', 42, 990001)`, versionID); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
 	conversationID := ids.Next()
@@ -274,7 +277,10 @@ func TestAttachmentRepositoryConversationScopesPreRegisteredDrafts(t *testing.T)
 	ctx := context.Background()
 
 	versionID := ids.Next()
-	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by) VALUES ($1, 'attachment scope', 42)`, versionID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO version (id, title, created_by, environment_id) VALUES ($1, 'attachment scope', 42, 990001)`, versionID); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
 	conversationA := ids.Next()

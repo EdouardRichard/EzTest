@@ -20,10 +20,10 @@ func fourStepCaseSnapshot() execution.CaseSnapshot {
 	for seq := 1; seq <= 4; seq++ {
 		snapshot.Steps = append(snapshot.Steps, execution.CaseStep{
 			Seq: seq, Action: "执行步骤", Expected: "符合预期",
-			TargetVersionSUTID: 7, AccountRole: "admin",
+			TargetDescription: "订单页", AccountRole: "admin",
 		})
 		snapshot.Assertions = append(snapshot.Assertions, execution.CaseAssertion{
-			StepSeq: seq, AssertionSeq: 1, Kind: "ui", Expected: "断言满足", TargetVersionSUTID: 7,
+			StepSeq: seq, AssertionSeq: 1, Kind: "ui", Expected: "断言满足", SUTID: 7,
 		})
 	}
 	return snapshot
@@ -34,15 +34,15 @@ func fourStepCaseSnapshot() execution.CaseSnapshot {
 func prepareOneOfFourSteps(t *testing.T, fixture *caseRunnerFixture) {
 	t.Helper()
 	fixture.cases.snapshot = fourStepCaseSnapshot()
-	if _, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItem()); err != nil {
+	if _, err := fixture.runner.Prepare(fixture.runCtx, executionWorkItem()); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "登录弹窗可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "弹窗可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)

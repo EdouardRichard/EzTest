@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 
+	knowledgeapp "github.com/EdouardRichard/EzTest/backend/internal/knowledge/application"
 	knowledge "github.com/EdouardRichard/EzTest/backend/internal/knowledge/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -263,10 +264,27 @@ func (r *Repository) ListRevisions(ctx context.Context, knowledgeID int64) ([]kn
 	return revisions, nil
 }
 
+// injectionStatusScopeArgs appends the injection queries' shared status/scope tail
+// parameters (approved / global / system, all bound from the domain constants) and
+// returns the matching predicate clauses. first is the placeholder index the status
+// argument lands on, so the two callers keep their own leading parameters.
+//
+// Both injection queries used to restate the three constants and the predicate text
+// (repo.go ListForInjection vs SearchTopK): editing one half would have left the
+// other silently reading a different vocabulary (H-A21⑨, T11e-5 Part E).
+func injectionStatusScopeArgs(args []any, first int) ([]any, []string) {
+	args = append(args, string(knowledge.StatusApproved),
+		string(knowledge.ScopeGlobal), string(knowledge.ScopeSystem))
+	return args, []string{
+		fmt.Sprintf("status = $%d", first),
+		fmt.Sprintf("(scope = $%d OR (scope = $%d AND system_key = ANY($1::text[])))", first+1, first+2),
+	}
+}
+
 // ListForInjection returns approved candidates visible to the requested system
 // keys, ordered by ts_rank desc then id desc. Only status=approved rows are
-// returned, so revoked/suspect/stale/draft items never inject. Source
-// staleness is filtered by the application service.
+// returned, so revoked/suspect/stale/draft items never inject. Source staleness is
+// filtered by the application service.
 func (r *Repository) ListForInjection(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error) {
 	if err := r.ready(); err != nil {
 		return nil, err
@@ -279,11 +297,10 @@ func (r *Repository) ListForInjection(ctx context.Context, query knowledge.Injec
 	if keys == nil {
 		keys = []string{}
 	}
-	args := []any{keys, query.Query}
-	where := []string{
-		"status = 'approved'",
-		"(scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))",
-	}
+	// Status/scope predicates bind the domain constants through the SHARED tail
+	// (constitution 五.1; R-H10/T11e-3, DRY per T11e-5 Part E): $3=approved,
+	// $4=global, $5=system.
+	args, where := injectionStatusScopeArgs([]any{keys, query.Query}, 3)
 	if !query.Bindings.IsZero() {
 		bindings, err := encodeBindings(query.Bindings)
 		if err != nil {
@@ -397,12 +414,11 @@ func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQu
 	// The % operator is the trigram-indexable operator; writing it as
 	// OPERATOR(public.%) keeps it resolvable when the session search_path does
 	// not include public (the integration harness narrows it to a test schema).
-	args := []any{keys, text, likeContainsPattern(text)}
-	where := []string{
-		"status = 'approved'",
-		"(scope = 'global' OR (scope = 'system' AND system_key = ANY($1::text[])))",
-		topKCandidatePredicate,
-	}
+	// Status/scope predicates bind the domain constants through the SHARED tail
+	// (constitution 五.1; R-H10/T11e-3, DRY per T11e-5 Part E): $4=approved,
+	// $5=global, $6=system.
+	args, statusScope := injectionStatusScopeArgs([]any{keys, text, likeContainsPattern(text)}, 4)
+	where := append(statusScope, topKCandidatePredicate)
 	if !query.Bindings.IsZero() {
 		bindings, err := encodeBindings(query.Bindings)
 		if err != nil {
@@ -453,9 +469,10 @@ func (r *Repository) SearchTopK(ctx context.Context, query knowledge.InjectionQu
 	return items, nil
 }
 
-// UsageRepository appends knowledge_usage rows. It is a separate type because
-// the item repository already exposes Insert for item+revision transactions;
-// both are wired into the application service as distinct ports.
+// UsageRepository appends knowledge_usage rows and reads their per-item
+// aggregates. It is a separate type because the item repository already
+// exposes Insert for item+revision transactions; both are wired into the
+// application service as distinct ports.
 type UsageRepository struct {
 	pool *pgxpool.Pool
 }
@@ -492,6 +509,24 @@ func (r *UsageRepository) Insert(ctx context.Context, usages []knowledge.Usage) 
 		return fmt.Errorf("commit knowledge usage insert: %w", err)
 	}
 	return nil
+}
+
+// StatsByItem aggregates one item's usage rows: COUNT(*) and MAX(created_at).
+// The write side (Service.RecordUsage) stamps created_at and injected_at with
+// the same clock value, so MAX(created_at) is the last injection time. An item
+// without usage rows scans as {0, nil} (COUNT = 0, MAX = NULL); the read is a
+// derived projection of the append-only facts, never a stored counter.
+func (r *UsageRepository) StatsByItem(ctx context.Context, itemID int64) (knowledgeapp.UsageStats, error) {
+	if r == nil || r.pool == nil {
+		return knowledgeapp.UsageStats{}, errors.New("knowledge usage repository is not configured")
+	}
+	var stats knowledgeapp.UsageStats
+	if err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*), MAX(created_at) FROM knowledge_usage WHERE knowledge_id = $1`, itemID).
+		Scan(&stats.InjectionCount, &stats.LastUsedAt); err != nil {
+		return knowledgeapp.UsageStats{}, fmt.Errorf("read knowledge usage stats: %w", err)
+	}
+	return stats, nil
 }
 
 func (r *Repository) ready() error {

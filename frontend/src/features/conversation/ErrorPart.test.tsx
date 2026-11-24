@@ -39,14 +39,14 @@ describe("error part retry card", () => {
       retryable: true,
       details: {
         field: "cases[0].assertions[0].kind",
-        allowed: ["ui", "api", "db", "text", "visual"],
+        allowed: ["ui", "api", "db", "text"],
         hint: "choose one of the listed assertion kinds",
       },
     }
     render(<ErrorPart part={part} onAction={onAction} />)
 
     expect(screen.getByText("cases[0].assertions[0].kind")).toBeInTheDocument()
-    expect(screen.getByText(/ui, api, db, text, visual/)).toBeInTheDocument()
+    expect(screen.getByText(/ui, api, db, text/)).toBeInTheDocument()
     expect(screen.getByText("choose one of the listed assertion kinds")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "重试" }))
     expect(onAction).toHaveBeenCalledWith(part)

@@ -16,32 +16,35 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// p6PendingDesignFake is the design application port stub used by the version
+// readModelPendingDesignFake is the design application port stub used by the version
 // reader tests: it records the batch it received and returns canned counts.
-type p6PendingDesignFake struct {
+type readModelPendingDesignFake struct {
 	ids    []int64
 	counts map[int64]int
 	err    error
 }
 
-func (f *p6PendingDesignFake) PendingDesignCounts(_ context.Context, versionIDs []int64) (map[int64]int, error) {
+func (f *readModelPendingDesignFake) PendingDesignCounts(_ context.Context, versionIDs []int64) (map[int64]int, error) {
 	f.ids = append([]int64(nil), versionIDs...)
 	return f.counts, f.err
 }
 
-func p6VersionID(value int64) *int64 { return &value }
+func readModelVersionID(value int64) *int64 { return &value }
 
-func p6SeedVersion(t *testing.T, pool *pgxpool.Pool, id int64, title, status string, updatedAt time.Time) {
+func readModelSeedVersion(t *testing.T, pool *pgxpool.Pool, id int64, title, status string, updatedAt time.Time) {
 	t.Helper()
+	if _, err := pool.Exec(context.Background(), `INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
 	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO version (id, title, status, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, 1, $4, $4)
+		INSERT INTO version (id, title, status, created_by, created_at, updated_at, environment_id)
+		VALUES ($1, $2, $3, 1, $4, $4, 990001)
 	`, id, title, status, updatedAt); err != nil {
 		t.Fatalf("seed version: %v", err)
 	}
 }
 
-func p6SeedRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status, title string, createdAt, updatedAt time.Time) {
+func readModelSeedRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status, title string, createdAt, updatedAt time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
@@ -58,24 +61,24 @@ func p6SeedRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementI
 	}
 }
 
-func TestP6VersionQueryReaderCountRequirementClosure(t *testing.T) {
+func TestVersionQueryReaderCountRequirementClosure(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
-	p6SeedVersion(t, pool, 1002, "Checkout SUT", "running", base.Add(time.Hour))
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1002, "Checkout SUT", "running", base.Add(time.Hour))
 
-	p6SeedRequirement(t, pool, 1001, 2001, 3001, "draft", "draft req", base, base)
-	p6SeedRequirement(t, pool, 1001, 2002, 3002, "clarified", "clarified req", base, base)
-	p6SeedRequirement(t, pool, 1001, 2003, 3003, "closed", "closed req", base, base)
-	p6SeedRequirement(t, pool, 1001, 2004, 3004, "obsolete", "obsolete req", base, base)
-	p6SeedRequirement(t, pool, 1002, 2011, 3011, "closed", "other version closed", base, base)
-	p6SeedRequirement(t, pool, 1002, 2012, 3012, "draft", "other version draft", base, base)
+	readModelSeedRequirement(t, pool, 1001, 2001, 3001, "draft", "draft req", base, base)
+	readModelSeedRequirement(t, pool, 1001, 2002, 3002, "clarified", "clarified req", base, base)
+	readModelSeedRequirement(t, pool, 1001, 2003, 3003, "closed", "closed req", base, base)
+	readModelSeedRequirement(t, pool, 1001, 2004, 3004, "obsolete", "obsolete req", base, base)
+	readModelSeedRequirement(t, pool, 1002, 2011, 3011, "closed", "other version closed", base, base)
+	readModelSeedRequirement(t, pool, 1002, 2012, 3012, "draft", "other version draft", base, base)
 
 	num, denom, err := reader.CountRequirementClosure(ctx, nil)
 	if err != nil {
@@ -85,7 +88,7 @@ func TestP6VersionQueryReaderCountRequirementClosure(t *testing.T) {
 		t.Fatalf("global counts = %d/%d, want 2/5 (obsolete excluded)", num, denom)
 	}
 
-	num, denom, err = reader.CountRequirementClosure(ctx, p6VersionID(1001))
+	num, denom, err = reader.CountRequirementClosure(ctx, readModelVersionID(1001))
 	if err != nil {
 		t.Fatalf("CountRequirementClosure version: %v", err)
 	}
@@ -93,7 +96,7 @@ func TestP6VersionQueryReaderCountRequirementClosure(t *testing.T) {
 		t.Fatalf("version counts = %d/%d, want 1/3", num, denom)
 	}
 
-	num, denom, err = reader.CountRequirementClosure(ctx, p6VersionID(1003))
+	num, denom, err = reader.CountRequirementClosure(ctx, readModelVersionID(1003))
 	if err != nil {
 		t.Fatalf("CountRequirementClosure empty version: %v", err)
 	}
@@ -102,18 +105,18 @@ func TestP6VersionQueryReaderCountRequirementClosure(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderSearchVersions(t *testing.T) {
+func TestVersionQueryReaderSearchVersions(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base.Add(time.Hour))
-	p6SeedVersion(t, pool, 1002, "Login API", "running", base.Add(2*time.Hour))
-	p6SeedVersion(t, pool, 1003, "Checkout SUT", "completed", base.Add(3*time.Hour))
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base.Add(time.Hour))
+	readModelSeedVersion(t, pool, 1002, "Login API", "running", base.Add(2*time.Hour))
+	readModelSeedVersion(t, pool, 1003, "Checkout SUT", "completed", base.Add(3*time.Hour))
 
 	rows, err := reader.SearchVersions(ctx, "login", 2)
 	if err != nil {
@@ -138,18 +141,18 @@ func TestP6VersionQueryReaderSearchVersions(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderSearchRequirements(t *testing.T) {
+func TestVersionQueryReaderSearchRequirements(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
-	p6SeedVersion(t, pool, 1002, "Login API", "running", base)
-	p6SeedRequirement(t, pool, 1001, 2001, 3001, "clarified", "Email login", base, base.Add(time.Hour))
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1002, "Login API", "running", base)
+	readModelSeedRequirement(t, pool, 1001, 2001, 3001, "clarified", "Email login", base, base.Add(time.Hour))
 
 	// Requirement 2002 has a historical revision that matches q and a current
 	// revision that also matches. Only the current revision is searched.
@@ -201,16 +204,16 @@ func TestP6VersionQueryReaderSearchRequirements(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderVersionTitles(t *testing.T) {
+func TestVersionQueryReaderVersionTitles(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
-	p6SeedVersion(t, pool, 1002, "Checkout SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1002, "Checkout SUT", "initial", base)
 
 	titles, err := reader.VersionTitles(ctx, []int64{1001, 1002, 9999})
 	if err != nil {
@@ -229,13 +232,13 @@ func TestP6VersionQueryReaderVersionTitles(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderListPendingDesignVersions(t *testing.T) {
+func TestVersionQueryReaderListPendingDesignVersions(t *testing.T) {
 	pool := testutil.NewDB(t)
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base.Add(time.Hour))
-	p6SeedVersion(t, pool, 1002, "Checkout SUT", "initial", base.Add(2*time.Hour))
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base.Add(time.Hour))
+	readModelSeedVersion(t, pool, 1002, "Checkout SUT", "initial", base.Add(2*time.Hour))
 
-	pending := &p6PendingDesignFake{counts: map[int64]int{1001: 2, 1002: 0}}
+	pending := &readModelPendingDesignFake{counts: map[int64]int{1001: 2, 1002: 0}}
 	reader, err := NewQueryReader(pool, pending)
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
@@ -256,7 +259,7 @@ func TestP6VersionQueryReaderListPendingDesignVersions(t *testing.T) {
 		t.Fatalf("port ids = %v, want [1002 1001] (version order)", pending.ids)
 	}
 
-	failing, err := NewQueryReader(pool, &p6PendingDesignFake{err: errors.New("boom")})
+	failing, err := NewQueryReader(pool, &readModelPendingDesignFake{err: errors.New("boom")})
 	if err != nil {
 		t.Fatalf("NewQueryReader failing: %v", err)
 	}
@@ -265,19 +268,19 @@ func TestP6VersionQueryReaderListPendingDesignVersions(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderListDraftRequirements(t *testing.T) {
+func TestVersionQueryReaderListDraftRequirements(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
 
-	p6SeedRequirement(t, pool, 1001, 2001, 3001, "draft", "Older draft", base, base)
-	p6SeedRequirement(t, pool, 1001, 2002, 3002, "draft", "Newer draft", base.Add(time.Hour), base.Add(time.Hour))
-	p6SeedRequirement(t, pool, 1001, 2003, 3003, "clarified", "Clarified", base.Add(2*time.Hour), base.Add(2*time.Hour))
+	readModelSeedRequirement(t, pool, 1001, 2001, 3001, "draft", "Older draft", base, base)
+	readModelSeedRequirement(t, pool, 1001, 2002, 3002, "draft", "Newer draft", base.Add(time.Hour), base.Add(time.Hour))
+	readModelSeedRequirement(t, pool, 1001, 2003, 3003, "clarified", "Clarified", base.Add(2*time.Hour), base.Add(2*time.Hour))
 
 	rows, err := reader.ListDraftRequirements(ctx, 10)
 	if err != nil {
@@ -302,9 +305,9 @@ func TestP6VersionQueryReaderListDraftRequirements(t *testing.T) {
 	}
 }
 
-func TestP6VersionQueryReaderRequiresPoolAndDesignPort(t *testing.T) {
+func TestVersionQueryReaderRequiresPoolAndDesignPort(t *testing.T) {
 	pool := testutil.NewDB(t)
-	if _, err := NewQueryReader(nil, &p6PendingDesignFake{}); err == nil {
+	if _, err := NewQueryReader(nil, &readModelPendingDesignFake{}); err == nil {
 		t.Fatal("expected an error for a nil pool")
 	}
 	if _, err := NewQueryReader(pool, nil); err == nil {
@@ -314,10 +317,10 @@ func TestP6VersionQueryReaderRequiresPoolAndDesignPort(t *testing.T) {
 
 /* ------------------- Task 62 fix round 1: read SQL coverage ------------------ */
 
-// p62FactSeed is one version_fact fixture row. The content hash is derived from
+// readModelFactSeed is one version_fact fixture row. The content hash is derived from
 // the row id so the (version, kind, key, content_hash) unique index never
 // collides across fixture rows.
-type p62FactSeed struct {
+type readModelFactSeed struct {
 	ID           int64
 	VersionID    int64
 	Kind         string
@@ -329,7 +332,7 @@ type p62FactSeed struct {
 	CreatedAt    time.Time
 }
 
-func p62SeedFact(t *testing.T, pool *pgxpool.Pool, seed p62FactSeed) {
+func readModelSeedFact(t *testing.T, pool *pgxpool.Pool, seed readModelFactSeed) {
 	t.Helper()
 	payload := seed.Payload
 	if payload == "" {
@@ -349,8 +352,8 @@ func p62SeedFact(t *testing.T, pool *pgxpool.Pool, seed p62FactSeed) {
 	}
 }
 
-// p62PlanItemSeed is one version_plan_item fixture row.
-type p62PlanItemSeed struct {
+// readModelPlanItemSeed is one version_plan_item fixture row.
+type readModelPlanItemSeed struct {
 	ID         int64
 	VersionID  int64
 	Phase      string
@@ -364,7 +367,7 @@ type p62PlanItemSeed struct {
 	UpdatedAt  time.Time
 }
 
-func p62SeedPlanItem(t *testing.T, pool *pgxpool.Pool, seed p62PlanItemSeed) {
+func readModelSeedPlanItem(t *testing.T, pool *pgxpool.Pool, seed readModelPlanItemSeed) {
 	t.Helper()
 	dependsOn := seed.DependsOn
 	if dependsOn == nil {
@@ -380,7 +383,7 @@ func p62SeedPlanItem(t *testing.T, pool *pgxpool.Pool, seed p62PlanItemSeed) {
 	}
 }
 
-func p62FactIDs(rows []versionapp.FactReadRow) []int64 {
+func readModelFactIDs(rows []versionapp.FactReadRow) []int64 {
 	ids := make([]int64, 0, len(rows))
 	for _, row := range rows {
 		ids = append(ids, row.ID)
@@ -388,7 +391,7 @@ func p62FactIDs(rows []versionapp.FactReadRow) []int64 {
 	return ids
 }
 
-func p62PlanItemIDs(rows []versionapp.PlanItemReadRow) []int64 {
+func readModelPlanItemIDs(rows []versionapp.PlanItemReadRow) []int64 {
 	ids := make([]int64, 0, len(rows))
 	for _, row := range rows {
 		ids = append(ids, row.ID)
@@ -396,7 +399,7 @@ func p62PlanItemIDs(rows []versionapp.PlanItemReadRow) []int64 {
 	return ids
 }
 
-func p62ReadFacts(t *testing.T, reader *QueryReader, query versionapp.FactReadQuery) ([]versionapp.FactReadRow, bool) {
+func readModelReadFacts(t *testing.T, reader *QueryReader, query versionapp.FactReadQuery) ([]versionapp.FactReadRow, bool) {
 	t.Helper()
 	rows, hasMore, err := reader.ListFacts(context.Background(), query)
 	if err != nil {
@@ -405,7 +408,7 @@ func p62ReadFacts(t *testing.T, reader *QueryReader, query versionapp.FactReadQu
 	return rows, hasMore
 }
 
-func p62ReadPlanItems(t *testing.T, reader *QueryReader, query versionapp.PlanItemReadQuery) ([]versionapp.PlanItemReadRow, bool) {
+func readModelReadPlanItems(t *testing.T, reader *QueryReader, query versionapp.PlanItemReadQuery) ([]versionapp.PlanItemReadRow, bool) {
 	t.Helper()
 	rows, hasMore, err := reader.ListPlanItems(context.Background(), query)
 	if err != nil {
@@ -420,43 +423,43 @@ func p62ReadPlanItems(t *testing.T, reader *QueryReader, query versionapp.PlanIt
 // not from the application projection.
 func TestVersionReadFactsSQL(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
-	p6SeedVersion(t, pool, 1002, "Checkout SUT", "running", base)
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1002, "Checkout SUT", "running", base)
 
 	confidence := 0.9
 	supersededBy := int64(5002)
-	p62SeedFact(t, pool, p62FactSeed{
+	readModelSeedFact(t, pool, readModelFactSeed{
 		ID: 5001, VersionID: 1001, Kind: "requirement", Key: "login",
 		Payload: `{"summary":"email login"}`, SupersededBy: &supersededBy,
 		CreatedAt: base,
 	})
-	p62SeedFact(t, pool, p62FactSeed{
+	readModelSeedFact(t, pool, readModelFactSeed{
 		ID: 5002, VersionID: 1001, Kind: "requirement", Key: "login",
 		Payload: `{"summary":"email login v2"}`, Confidence: &confidence,
 		EvidenceIDs: []int64{9001, 9002}, CreatedAt: base.Add(time.Hour),
 	})
-	p62SeedFact(t, pool, p62FactSeed{
+	readModelSeedFact(t, pool, readModelFactSeed{
 		ID: 5003, VersionID: 1001, Kind: "design", Key: "cases",
 		Payload: `{"count":3}`, CreatedAt: base.Add(2 * time.Hour),
 	})
-	p62SeedFact(t, pool, p62FactSeed{
+	readModelSeedFact(t, pool, readModelFactSeed{
 		ID: 5004, VersionID: 1001, Kind: "requirement", Key: "other",
 		CreatedAt: base.Add(3 * time.Hour),
 	})
-	p62SeedFact(t, pool, p62FactSeed{
+	readModelSeedFact(t, pool, readModelFactSeed{
 		ID: 5011, VersionID: 1002, Kind: "requirement", Key: "login",
 		CreatedAt: base.Add(4 * time.Hour),
 	})
 
 	// Default page: current rows only, id DESC, version scoped.
-	rows, hasMore := p62ReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, Limit: 10})
-	if ids := p62FactIDs(rows); !slices.Equal(ids, []int64{5004, 5003, 5002}) {
+	rows, hasMore := readModelReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, Limit: 10})
+	if ids := readModelFactIDs(rows); !slices.Equal(ids, []int64{5004, 5003, 5002}) {
 		t.Fatalf("default fact ids = %v, want [5004 5003 5002] (current, id DESC)", ids)
 	}
 	if hasMore {
@@ -492,8 +495,8 @@ func TestVersionReadFactsSQL(t *testing.T) {
 	}
 
 	// include_superseded returns the append-only history including the closed row.
-	history, _ := p62ReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, IncludeSuperseded: true, Limit: 10})
-	if ids := p62FactIDs(history); !slices.Equal(ids, []int64{5004, 5003, 5002, 5001}) {
+	history, _ := readModelReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, IncludeSuperseded: true, Limit: 10})
+	if ids := readModelFactIDs(history); !slices.Equal(ids, []int64{5004, 5003, 5002, 5001}) {
 		t.Fatalf("history ids = %v, want [5004 5003 5002 5001]", ids)
 	}
 	superseded := history[3]
@@ -505,33 +508,33 @@ func TestVersionReadFactsSQL(t *testing.T) {
 	}
 
 	// kind filter, both with and without the history.
-	design, _ := p62ReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, Kind: "design", Limit: 10})
-	if ids := p62FactIDs(design); !slices.Equal(ids, []int64{5003}) {
+	design, _ := readModelReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1001, Kind: "design", Limit: 10})
+	if ids := readModelFactIDs(design); !slices.Equal(ids, []int64{5003}) {
 		t.Fatalf("design ids = %v, want [5003]", ids)
 	}
-	reqHistory, _ := p62ReadFacts(t, reader, versionapp.FactReadQuery{
+	reqHistory, _ := readModelReadFacts(t, reader, versionapp.FactReadQuery{
 		VersionID: 1001, Kind: "requirement", IncludeSuperseded: true, Limit: 10,
 	})
-	if ids := p62FactIDs(reqHistory); !slices.Equal(ids, []int64{5004, 5002, 5001}) {
+	if ids := readModelFactIDs(reqHistory); !slices.Equal(ids, []int64{5004, 5002, 5001}) {
 		t.Fatalf("requirement history ids = %v, want [5004 5002 5001]", ids)
 	}
 
 	// Cursor pagination: limit+1 read reports has_more and the cursor resumes.
-	page, more := p62ReadFacts(t, reader, versionapp.FactReadQuery{
+	page, more := readModelReadFacts(t, reader, versionapp.FactReadQuery{
 		VersionID: 1001, IncludeSuperseded: true, Limit: 2,
 	})
-	if ids := p62FactIDs(page); !slices.Equal(ids, []int64{5004, 5003}) || !more {
+	if ids := readModelFactIDs(page); !slices.Equal(ids, []int64{5004, 5003}) || !more {
 		t.Fatalf("first page = %v has_more=%v, want [5004 5003] true", ids, more)
 	}
 	cursor := page[len(page)-1].ID
-	page, more = p62ReadFacts(t, reader, versionapp.FactReadQuery{
+	page, more = readModelReadFacts(t, reader, versionapp.FactReadQuery{
 		VersionID: 1001, IncludeSuperseded: true, BeforeID: &cursor, Limit: 2,
 	})
-	if ids := p62FactIDs(page); !slices.Equal(ids, []int64{5002, 5001}) || more {
+	if ids := readModelFactIDs(page); !slices.Equal(ids, []int64{5002, 5001}) || more {
 		t.Fatalf("second page = %v has_more=%v, want [5002 5001] false", ids, more)
 	}
 	// A page that fills the limit exactly must not report has_more.
-	exact, more := p62ReadFacts(t, reader, versionapp.FactReadQuery{
+	exact, more := readModelReadFacts(t, reader, versionapp.FactReadQuery{
 		VersionID: 1001, IncludeSuperseded: true, Limit: 4,
 	})
 	if len(exact) != 4 || more {
@@ -539,7 +542,7 @@ func TestVersionReadFactsSQL(t *testing.T) {
 	}
 
 	// Empty version: empty non-nil page, no has_more.
-	empty, more := p62ReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1003, Limit: 10})
+	empty, more := readModelReadFacts(t, reader, versionapp.FactReadQuery{VersionID: 1003, Limit: 10})
 	if empty == nil || len(empty) != 0 || more {
 		t.Fatalf("empty page = %#v has_more=%v, want empty false", empty, more)
 	}
@@ -550,39 +553,39 @@ func TestVersionReadFactsSQL(t *testing.T) {
 // ordering, cursor pagination and the empty page.
 func TestVersionReadPlanItemsSQL(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
-	p6SeedVersion(t, pool, 1002, "Checkout SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1002, "Checkout SUT", "initial", base)
 
 	workItemID := int64(7001)
-	p62SeedPlanItem(t, pool, p62PlanItemSeed{
+	readModelSeedPlanItem(t, pool, readModelPlanItemSeed{
 		ID: 6001, VersionID: 1001, Phase: "design", Title: "Plan cases",
 		Status: "pending", Order: 1, CreatedAt: base, UpdatedAt: base.Add(30 * time.Minute),
 	})
-	p62SeedPlanItem(t, pool, p62PlanItemSeed{
+	readModelSeedPlanItem(t, pool, readModelPlanItemSeed{
 		ID: 6002, VersionID: 1001, Phase: "execute", Title: "Run batch",
 		Status: "done", DependsOn: []int64{6001}, WorkItemID: &workItemID,
 		Decision: "approved", Order: 2, CreatedAt: base.Add(time.Hour),
 		UpdatedAt: base.Add(time.Hour),
 	})
-	p62SeedPlanItem(t, pool, p62PlanItemSeed{
+	readModelSeedPlanItem(t, pool, readModelPlanItemSeed{
 		ID: 6003, VersionID: 1001, Phase: "execute", Title: "Analyze",
 		Status: "done", DependsOn: []int64{6001, 6002}, Order: 3,
 		CreatedAt: base.Add(2 * time.Hour), UpdatedAt: base.Add(2 * time.Hour),
 	})
-	p62SeedPlanItem(t, pool, p62PlanItemSeed{
+	readModelSeedPlanItem(t, pool, readModelPlanItemSeed{
 		ID: 6011, VersionID: 1002, Phase: "design", Title: "Other version",
 		Status: "pending", Order: 1, CreatedAt: base.Add(3 * time.Hour),
 		UpdatedAt: base.Add(3 * time.Hour),
 	})
 
-	rows, hasMore := p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Limit: 10})
-	if ids := p62PlanItemIDs(rows); !slices.Equal(ids, []int64{6003, 6002, 6001}) {
+	rows, hasMore := readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Limit: 10})
+	if ids := readModelPlanItemIDs(rows); !slices.Equal(ids, []int64{6003, 6002, 6001}) {
 		t.Fatalf("plan item ids = %v, want [6003 6002 6001] (id DESC)", ids)
 	}
 	if hasMore {
@@ -610,28 +613,28 @@ func TestVersionReadPlanItemsSQL(t *testing.T) {
 		t.Fatalf("analyze depends_on = %v", rows[0].DependsOn)
 	}
 
-	done, _ := p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Status: "done", Limit: 10})
-	if ids := p62PlanItemIDs(done); !slices.Equal(ids, []int64{6003, 6002}) {
+	done, _ := readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Status: "done", Limit: 10})
+	if ids := readModelPlanItemIDs(done); !slices.Equal(ids, []int64{6003, 6002}) {
 		t.Fatalf("done ids = %v, want [6003 6002]", ids)
 	}
-	pending, _ := p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Status: "pending", Limit: 10})
-	if ids := p62PlanItemIDs(pending); !slices.Equal(ids, []int64{6001}) {
+	pending, _ := readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Status: "pending", Limit: 10})
+	if ids := readModelPlanItemIDs(pending); !slices.Equal(ids, []int64{6001}) {
 		t.Fatalf("pending ids = %v, want [6001]", ids)
 	}
 
-	page, more := p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Limit: 2})
-	if ids := p62PlanItemIDs(page); !slices.Equal(ids, []int64{6003, 6002}) || !more {
+	page, more := readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1001, Limit: 2})
+	if ids := readModelPlanItemIDs(page); !slices.Equal(ids, []int64{6003, 6002}) || !more {
 		t.Fatalf("first page = %v has_more=%v, want [6003 6002] true", ids, more)
 	}
 	cursor := page[len(page)-1].ID
-	page, more = p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{
+	page, more = readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{
 		VersionID: 1001, BeforeID: &cursor, Limit: 2,
 	})
-	if ids := p62PlanItemIDs(page); !slices.Equal(ids, []int64{6001}) || more {
+	if ids := readModelPlanItemIDs(page); !slices.Equal(ids, []int64{6001}) || more {
 		t.Fatalf("second page = %v has_more=%v, want [6001] false", ids, more)
 	}
 
-	empty, more := p62ReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1003, Limit: 10})
+	empty, more := readModelReadPlanItems(t, reader, versionapp.PlanItemReadQuery{VersionID: 1003, Limit: 10})
 	if empty == nil || len(empty) != 0 || more {
 		t.Fatalf("empty page = %#v has_more=%v, want empty false", empty, more)
 	}
@@ -641,13 +644,13 @@ func TestVersionReadPlanItemsSQL(t *testing.T) {
 // turn a missing/foreign version into a 404 before any fact/plan read.
 func TestVersionReadVersionExistsSQL(t *testing.T) {
 	pool := testutil.NewDB(t)
-	reader, err := NewQueryReader(pool, &p6PendingDesignFake{})
+	reader, err := NewQueryReader(pool, &readModelPendingDesignFake{})
 	if err != nil {
 		t.Fatalf("NewQueryReader: %v", err)
 	}
 	ctx := context.Background()
 	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
-	p6SeedVersion(t, pool, 1001, "Login SUT", "initial", base)
+	readModelSeedVersion(t, pool, 1001, "Login SUT", "initial", base)
 
 	exists, err := reader.VersionExists(ctx, 1001)
 	if err != nil || !exists {

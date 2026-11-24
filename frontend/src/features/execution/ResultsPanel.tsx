@@ -203,7 +203,7 @@ export function ResultsPanel({
                       </span>
                     </span>
                     <span className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
-                      {caseRun.version_sut_ids.map((versionSutId) => (
+                      {caseRun.sut_ids.map((versionSutId) => (
                         <span key={versionSutId}>SUT {versionSutId}</span>
                       ))}
                       {progress !== null ? <span>{progress}</span> : null}

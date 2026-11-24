@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
@@ -45,6 +46,14 @@ type fakeDesignPort struct {
 	dataPlanCalls         int
 	dataPlanResult        any
 	dataPlanErr           error
+
+	judgmentVersionID     int64
+	judgmentRequirementID int64
+	judgmentRunID         int64
+	judgmentInputs        []JudgmentInput
+	judgmentCalls         int
+	judgmentResult        any
+	judgmentErr           error
 }
 
 func (f *fakeDesignPort) ReadGraph(_ context.Context, versionID, requirementID, caseID int64) (any, error) {
@@ -93,12 +102,24 @@ func (f *fakeDesignPort) SubmitDataPlan(_ context.Context, versionID, caseVersio
 	return f.dataPlanResult, f.dataPlanErr
 }
 
+func (f *fakeDesignPort) SubmitJudgment(_ context.Context, versionID, requirementID, runID int64, in JudgmentInput) (any, error) {
+	f.judgmentCalls++
+	f.judgmentVersionID = versionID
+	f.judgmentRequirementID = requirementID
+	f.judgmentRunID = runID
+	f.judgmentInputs = append(f.judgmentInputs, in)
+	return f.judgmentResult, f.judgmentErr
+}
+
+// validGraphProposalJSON is the v0.2.4-B natural-language case contract: the
+// case states sut_description / preconditions / covered_acs, steps carry a prose
+// target_description, and no resource ids appear anywhere.
 func validGraphProposalJSON() string {
 	return `{
   "requirement_id": "501",
   "requirement_version_id": "700",
   "scenarios": [
-    {"ref": "s1", "name": "正常登录", "description": "手机号密码登录", "version_sut_ids": ["9001"], "page_ids": ["9101"], "api_ids": ["9201"], "sort_order": 0}
+    {"ref": "s1", "name": "正常登录", "description": "手机号密码登录", "sort_order": 0}
   ],
   "cases": [
     {
@@ -106,16 +127,14 @@ func validGraphProposalJSON() string {
       "scenario_ref": "s1",
       "title": "账号密码登录成功",
       "description": "使用有效账号登录",
+      "sut_description": "商城前台登录页与登录接口。",
       "preconditions": "已注册账号",
+      "covered_acs": ["AC-1", "AC-2"],
       "test_data": {"phone": "13800000000"},
       "priority": "P1",
-      "default_version_sut_id": "9001",
-      "version_sut_ids": ["9001"],
-      "page_ids": ["9101"],
-      "api_ids": ["9201"],
       "steps": [
-        {"seq": 1, "action": "打开登录页", "expected": "显示表单", "target_version_sut_id": "9001", "target_page_id": "9101", "account_role": "admin", "data": {}},
-        {"seq": 2, "action": "提交账号密码", "expected": "登录成功", "target_api_id": "9201", "data": {}}
+        {"seq": 1, "action": "打开登录页", "expected": "显示表单", "target_description": "登录页的手机号输入框", "account_role": "admin", "data": {}},
+        {"seq": 2, "action": "提交账号密码", "expected": "登录成功", "target_description": "POST /api/login 接口", "data": {}}
       ],
       "assertions": [
         {"step_seq": 1, "kind": "ui", "target": "登录表单", "expected": "表单可见"},
@@ -141,7 +160,7 @@ func executeDesignTool(t *testing.T, registry *Registry, scope Scope, name, payl
 // another requirement is never rewritten (the design context rejects it).
 func TestGraphProposeNormalizesRequirementSourceRef(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"case_version_ids": []string{"7001"}}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
 
 	sameRequirement := strings.Replace(validGraphProposalJSON(), `"ref_id": "700"`, `"ref_id": "501"`, 1)
@@ -167,7 +186,7 @@ func TestGraphProposeNormalizesRequirementSourceRef(t *testing.T) {
 // accepted by the executor. A top-level list is the default source set of every
 // case that does not declare its own.
 func TestDesignToolSchemaSources(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}})
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}})
 	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
 	if len(definitions) != 1 {
 		t.Fatalf("definitions = %d", len(definitions))
@@ -188,7 +207,7 @@ func TestDesignToolSchemaSources(t *testing.T) {
 	}
 
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry = NewP2Registry(Deps{Design: port})
+	registry = NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
 	withoutCaseSources := strings.Replace(validGraphProposalJSON(), `,
       "sources": [
@@ -223,7 +242,7 @@ func TestDesignToolConvergesAfterGraphConflict(t *testing.T) {
 		proposeResult: map[string]any{"graph_hash": "after", "case_version_ids": []string{"7001"}},
 		readResults:   []any{map[string]any{"graph_hash": freshHash}},
 	}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
 	staleHash := strings.Repeat("0", 64)
 	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
@@ -248,7 +267,7 @@ func TestDesignToolConvergesAfterGraphConflict(t *testing.T) {
 }
 
 func TestDesignToolsRegisteredAndCaseConfirmAbsent(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}})
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}})
 	for _, name := range []string{ToolDesignGraphRead, ToolCaseGraphPropose, ToolDesignReviewSubmit, ToolDesignDataPlanSubmit} {
 		if _, ok := registry.Get(name); !ok {
 			t.Fatalf("design tool %q is not registered", name)
@@ -267,14 +286,14 @@ func TestDesignToolsRegisteredAndCaseConfirmAbsent(t *testing.T) {
 	}
 
 	// Registering the P2 set must not change the frozen P1 registration order.
-	p1 := NewP1Registry(Deps{})
-	if names := p1.Names(); len(names) != len(P1ToolNames()) {
+	base := NewBaseRegistry(Deps{})
+	if names := base.Names(); len(names) != len(BaseToolNames()) {
 		t.Fatalf("P1 registry names = %v", names)
 	}
 }
 
 func TestDesignSchemasDoNotExposeScope(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}})
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}})
 	definitions := registry.Definitions([]string{
 		ToolDesignGraphRead, ToolCaseGraphPropose, ToolDesignReviewSubmit, ToolDesignDataPlanSubmit,
 	})
@@ -303,7 +322,7 @@ func TestDesignSchemasDoNotExposeScope(t *testing.T) {
 
 func TestGraphReadToolUsesInjectedScope(t *testing.T) {
 	port := &fakeDesignPort{readResult: map[string]any{"graph_hash": "hash"}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 
 	result, err := executeDesignTool(t, registry, Scope{VersionID: 10, RequirementID: 501}, ToolDesignGraphRead, `{}`)
 	if err != nil {
@@ -338,7 +357,7 @@ func TestGraphReadToolUsesInjectedScope(t *testing.T) {
 
 func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
 
 	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, validGraphProposalJSON()); err != nil {
@@ -354,9 +373,6 @@ func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 	if len(proposal.Scenarios) != 1 || proposal.Scenarios[0].Ref != "s1" || proposal.Scenarios[0].Name != "正常登录" {
 		t.Fatalf("scenarios = %#v", proposal.Scenarios)
 	}
-	if len(proposal.Scenarios[0].VersionSUTIDs) != 1 || proposal.Scenarios[0].VersionSUTIDs[0] != 9001 {
-		t.Fatalf("scenario suts = %#v", proposal.Scenarios[0].VersionSUTIDs)
-	}
 	if len(proposal.Cases) != 1 {
 		t.Fatalf("cases = %#v", proposal.Cases)
 	}
@@ -364,10 +380,18 @@ func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 	if proposedCase.ScenarioRef != "s1" || proposedCase.Title != "账号密码登录成功" || proposedCase.Priority != "P1" {
 		t.Fatalf("case = %#v", proposedCase)
 	}
-	if proposedCase.DefaultVersionSUTID != 9001 || len(proposedCase.VersionSUTIDs) != 1 {
-		t.Fatalf("case targets = %#v", proposedCase)
+	// v0.2.4-B contract elements must reach the port verbatim (covered_acs
+	// normalized sorted-unique by the tool).
+	if proposedCase.SutDescription != "商城前台登录页与登录接口。" {
+		t.Fatalf("sut_description = %q", proposedCase.SutDescription)
 	}
-	if len(proposedCase.Steps) != 2 || proposedCase.Steps[1].TargetAPIID != 9201 {
+	if proposedCase.Preconditions != "已注册账号" {
+		t.Fatalf("preconditions = %q", proposedCase.Preconditions)
+	}
+	if strings.Join(proposedCase.CoveredACs, ",") != "AC-1,AC-2" {
+		t.Fatalf("covered_acs = %v, want [AC-1 AC-2]", proposedCase.CoveredACs)
+	}
+	if len(proposedCase.Steps) != 2 || proposedCase.Steps[1].TargetDescription != "POST /api/login 接口" {
 		t.Fatalf("steps = %#v", proposedCase.Steps)
 	}
 	if len(proposedCase.Assertions) != 2 || proposedCase.Assertions[1].Kind != "api" {
@@ -391,13 +415,34 @@ func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 		{"unknown scenario ref", scope, strings.Replace(validGraphProposalJSON(), `"scenario_ref": "s1"`, `"scenario_ref": "s9"`, 1), "cases[0].scenario_ref"},
 		{"non contiguous steps", scope, strings.Replace(validGraphProposalJSON(), `"seq": 2`, `"seq": 3`, 1), "cases[0].steps[1].seq"},
 		{"bad assertion step", scope, strings.Replace(validGraphProposalJSON(), `"step_seq": 2`, `"step_seq": 9`, 1), "cases[0].assertions[1].step_seq"},
-		{"default sut outside case suts", scope, strings.Replace(validGraphProposalJSON(), `"default_version_sut_id": "9001"`, `"default_version_sut_id": "9999"`, 1), "cases[0].default_version_sut_id"},
+		{"missing sut_description", scope, strings.Replace(validGraphProposalJSON(), `"sut_description": "商城前台登录页与登录接口。",`, ``, 1), "cases[0].sut_description"},
+		{"blank sut_description", scope, strings.Replace(validGraphProposalJSON(), `"sut_description": "商城前台登录页与登录接口。"`, `"sut_description": "   "`, 1), "cases[0].sut_description"},
+		{"missing preconditions", scope, strings.Replace(validGraphProposalJSON(), `"preconditions": "已注册账号",`, ``, 1), "cases[0].preconditions"},
+		{"blank preconditions", scope, strings.Replace(validGraphProposalJSON(), `"preconditions": "已注册账号"`, `"preconditions": "  "`, 1), "cases[0].preconditions"},
+		{"missing covered_acs", scope, strings.Replace(validGraphProposalJSON(), `"covered_acs": ["AC-1", "AC-2"],`, ``, 1), "cases[0].covered_acs"},
+		{"empty covered_acs", scope, strings.Replace(validGraphProposalJSON(), `"covered_acs": ["AC-1", "AC-2"]`, `"covered_acs": []`, 1), "cases[0].covered_acs"},
+		{"malformed covered_acs", scope, strings.Replace(validGraphProposalJSON(), `"covered_acs": ["AC-1", "AC-2"]`, `"covered_acs": ["1"]`, 1), "cases[0].covered_acs"},
 		{"invalid priority", scope, strings.Replace(validGraphProposalJSON(), `"priority": "P1"`, `"priority": "P9"`, 1), "cases[0].priority"},
-		{"db assertion without database", scope, strings.Replace(validGraphProposalJSON(), `"kind": "api"`, `"kind": "db"`, 1), "cases[0].assertions[1].database_id"},
+		{"db assertion without sut_id", scope, strings.Replace(validGraphProposalJSON(), `"kind": "api"`, `"kind": "db"`, 1), "cases[0].assertions[1].sut_id"},
 		{"empty step expected", scope, strings.Replace(validGraphProposalJSON(), `"expected": "显示表单"`, `"expected": ""`, 1), "cases[0].steps[0].expected"},
 		{"empty assertion expected", scope, strings.Replace(validGraphProposalJSON(), `"expected": "表单可见"`, `"expected": ""`, 1), "cases[0].assertions[0].expected"},
 		{"invalid assertion kind", scope, strings.Replace(validGraphProposalJSON(), `"kind": "ui"`, `"kind": "bogus"`, 1), "cases[0].assertions[0].kind"},
+		// The account_role bound must match the design gate's AccountRoleMax, or a
+		// role the tool accepts dies one hop later as a design 400 and the model
+		// loses the precise tool-level field error this early gate exists to give.
+		// 65 chars is one past design.AccountRoleMax (64); the schema used to
+		// publish 200 here and the parser used to allow it.
+		{"over-long account_role", scope, strings.Replace(validGraphProposalJSON(),
+			`"account_role": "admin"`, `"account_role": "`+strings.Repeat("r", design.AccountRoleMax+1)+`"`, 1),
+			"cases[0].steps[0].account_role"},
 		{"missing requirement id", Scope{VersionID: 10}, `{"requirement_version_id":"700","scenarios":[{"ref":"s1","name":"n"}],"cases":[]}`, "requirement_id"},
+		// The retired resource-id fields are unknown fields now and must be
+		// rejected, not silently ignored: a model still sending the pre-B shape
+		// has to be told, not quietly half-applied.
+		{"retired default_version_sut_id", scope, strings.Replace(validGraphProposalJSON(), `"priority": "P1",`, `"priority": "P1", "default_version_sut_id": "9001",`, 1), "cases[0].default_version_sut_id"},
+		{"retired version_sut_ids", scope, strings.Replace(validGraphProposalJSON(), `"priority": "P1",`, `"priority": "P1", "version_sut_ids": ["9001"],`, 1), "cases[0].version_sut_ids"},
+		{"retired step target_page_id", scope, strings.Replace(validGraphProposalJSON(), `"account_role": "admin",`, `"target_page_id": "9101", "account_role": "admin",`, 1), "cases[0].steps[0].target_page_id"},
+		{"retired assertion database_id", scope, strings.Replace(validGraphProposalJSON(), `"kind": "api"`, `"kind": "api", "database_id": "1501"`, 1), "cases[0].assertions[1].database_id"},
 	}
 	for _, testCase := range invalid {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -421,7 +466,7 @@ func TestGraphProposeToolValidatesScopeAndPayload(t *testing.T) {
 
 func TestReviewSubmitToolValidatesAndScopes(t *testing.T) {
 	port := &fakeDesignPort{reviewResult: map[string]any{"posted": true, "count": 1}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 10, RequirementID: 501, AgentRunID: 77}
 
 	payload := `{"summary":"整体可用","findings":[{"severity":"minor","message":"补充异常步骤断言"}]}`
@@ -463,7 +508,7 @@ func TestReviewSubmitToolValidatesAndScopes(t *testing.T) {
 
 func TestDataPlanSubmitToolUsesCaseVersionScope(t *testing.T) {
 	port := &fakeDesignPort{dataPlanResult: map[string]any{"case_id": "7001", "revision": 2}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 
 	payload := `{"case_version_id":"8001","preconditions":"已登录","test_data":{"account":"admin"}}`
 	if _, err := executeDesignTool(t, registry, Scope{VersionID: 10, AgentRunID: 77}, ToolDesignDataPlanSubmit, payload); err != nil {
@@ -490,7 +535,7 @@ func TestDataPlanSubmitToolUsesCaseVersionScope(t *testing.T) {
 	}
 
 	// A nil port is an internal configuration failure, not a model-visible error.
-	unwired := NewP2Registry(Deps{})
+	unwired := NewDesignRegistry(Deps{})
 	_, err = executeDesignTool(t, unwired, Scope{VersionID: 10}, ToolDesignDataPlanSubmit, payload)
 	if err == nil {
 		t.Fatal("unwired design port executed")
@@ -503,8 +548,8 @@ func TestDataPlanSubmitToolUsesCaseVersionScope(t *testing.T) {
 // --- v0.22 E-1 graph_propose contract (Task 33) ----------------------------
 
 // graphProposalWithDBAssertion turns the first (ui) assertion of the shared
-// fixture into a db assertion, optionally carrying a database_id.
-func graphProposalWithDBAssertion(t *testing.T, databaseID string) string {
+// fixture into a db assertion, optionally carrying a sut_id.
+func graphProposalWithDBAssertion(t *testing.T, sutID string) string {
 	t.Helper()
 	const uiAssertion = `{"step_seq": 1, "kind": "ui", "target": "登录表单", "expected": "表单可见"}`
 	dbAssertion := `{"step_seq": 1, "kind": "db", "target": "订单表", "expected": "1 行"}`
@@ -512,16 +557,19 @@ func graphProposalWithDBAssertion(t *testing.T, databaseID string) string {
 	if payload == validGraphProposalJSON() {
 		t.Fatal("test fixture did not rewrite the first assertion to db")
 	}
-	if databaseID != "" {
+	if sutID != "" {
 		withID := strings.Replace(dbAssertion, `"expected": "1 行"`,
-			`"expected": "1 行", "database_id": "`+databaseID+`"`, 1)
+			`"expected": "1 行", "sut_id": "`+sutID+`"`, 1)
 		payload = strings.Replace(payload, dbAssertion, withID, 1)
 	}
 	return payload
 }
 
-// fakeDatabaseResource implements ResourcePort plus the additive
-// DatabaseLister surface the sut.database_list tool and graph_propose consume.
+// fakeDatabaseResource implements ResourcePort plus the additive DatabaseLister
+// surface behind the sut.database_list tool. graph_propose no longer reads it:
+// under the v0.2.4-B contract a db assertion names a SUT and the rule is
+// presence-only (Lead ruling 6), so there is no bound-inventory ownership check
+// left to feed. The fake stays because the resource tools still use the port.
 type fakeDatabaseResource struct {
 	databases []DatabaseSummary
 	err       error
@@ -548,13 +596,12 @@ func boundDatabaseResource() *fakeDatabaseResource {
 	}}
 }
 
-// TestGraphProposeMissingDatabaseIDRetryable pins R-E1-3: a db assertion that
-// omits database_id is a retryable field error whose path and allowed values
-// tell the model exactly how to self-correct, and nothing is written.
-func TestGraphProposeMissingDatabaseIDRetryable(t *testing.T) {
+// TestGraphProposeMissingSUTIDRetryable pins R-E1-3 on the renamed field: a db
+// assertion that omits sut_id is a retryable field error whose path and hint tell
+// the model exactly how to self-correct, and nothing is written.
+func TestGraphProposeMissingSUTIDRetryable(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	resource := boundDatabaseResource()
-	registry := NewP2Registry(Deps{Design: port, Resource: resource})
+	registry := NewDesignRegistry(Deps{Design: port, Resource: boundDatabaseResource()})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
 
 	_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, ""))
@@ -563,20 +610,20 @@ func TestGraphProposeMissingDatabaseIDRetryable(t *testing.T) {
 		t.Fatalf("code = %q, want %q (%v)", toolErr.Code, CodeInvalidArgument, err)
 	}
 	if !toolErr.Retryable {
-		t.Fatalf("missing database_id must be retryable: %+v", toolErr)
+		t.Fatalf("missing sut_id must be retryable: %+v", toolErr)
 	}
-	wantField := "cases[0].assertions[0].database_id"
+	wantField := "cases[0].assertions[0].sut_id"
 	if toolErr.Field != wantField {
 		t.Fatalf("field = %q, want %q", toolErr.Field, wantField)
 	}
 	if field, _ := toolErr.Details["field"].(string); field != wantField {
 		t.Fatalf("details.field = %#v, want %q", toolErr.Details["field"], wantField)
 	}
-	if strings.Join(toolErr.Allowed, ",") != "1501,1502" {
-		t.Fatalf("allowed = %#v, want the bound database ids", toolErr.Allowed)
+	if !strings.Contains(toolErr.Hint, "sut.list") {
+		t.Fatalf("hint = %q, want it to point at sut.list", toolErr.Hint)
 	}
-	if !strings.Contains(toolErr.Hint, "sut.database_list") {
-		t.Fatalf("hint = %q, want it to point at sut.database_list", toolErr.Hint)
+	if strings.Contains(toolErr.Message, "database_id") {
+		t.Fatalf("message still teaches the retired database_id: %q", toolErr.Message)
 	}
 	if port.proposeCalls != 0 {
 		t.Fatalf("rejected proposal reached the design port: %#v", port.proposeInput)
@@ -588,58 +635,57 @@ func TestGraphProposeMissingDatabaseIDRetryable(t *testing.T) {
 		body["field"] != wantField {
 		t.Fatalf("error payload = %#v", body)
 	}
-	if got, _ := body["allowed"].([]string); len(got) != 2 || got[0] != "1501" {
-		t.Fatalf("payload allowed = %#v", body["allowed"])
-	}
-	if hint, _ := body["hint"].(string); !strings.Contains(hint, "sut.database_list") {
+	if hint, _ := body["hint"].(string); !strings.Contains(hint, "sut.list") {
 		t.Fatalf("payload hint = %#v", body["hint"])
 	}
-	t.Logf("missing database_id error payload: %s", testJSON(t, toolErr.Payload()))
+	t.Logf("missing sut_id error payload: %s", testJSON(t, toolErr.Payload()))
 }
 
-// TestGraphProposeRejectsUnboundDatabaseID pins R-E1-2: only databases of the
-// bound environment are legal; the model cannot invent an id.
-func TestGraphProposeRejectsUnboundDatabaseID(t *testing.T) {
+// TestGraphProposeAcceptsAnySUTID pins Lead ruling 6 at the tool boundary: the db
+// rule is PRESENCE only. The retired R-E1-2 inventory check rejected a
+// database_id that was not bound to the version's environment; there is no
+// resource scope left to check against, so any positive sut_id is accepted and
+// the design domain stays the only authority. A regression here means the
+// ownership group was re-introduced through the tool layer.
+func TestGraphProposeAcceptsAnySUTID(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry := NewP2Registry(Deps{Design: port, Resource: boundDatabaseResource()})
+	resource := boundDatabaseResource()
+	registry := NewDesignRegistry(Deps{Design: port, Resource: resource})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 
-	_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "9999"))
-	toolErr := asToolError(t, err)
-	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
-		t.Fatalf("unbound database error = %+v", toolErr)
-	}
-	if toolErr.Field != "cases[0].assertions[0].database_id" {
-		t.Fatalf("field = %q", toolErr.Field)
-	}
-	if strings.Join(toolErr.Allowed, ",") != "1501,1502" {
-		t.Fatalf("allowed = %#v", toolErr.Allowed)
-	}
-	if port.proposeCalls != 0 {
-		t.Fatalf("unbound database reached the design port")
-	}
-}
-
-// TestGraphProposeAcceptsBoundDatabaseID is the positive half of R-E1-2: a
-// database_id from the environment's database list passes validation.
-func TestGraphProposeAcceptsBoundDatabaseID(t *testing.T) {
-	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry := NewP2Registry(Deps{Design: port, Resource: boundDatabaseResource()})
-	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
-
-	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "1501")); err != nil {
-		t.Fatalf("bound database proposal: %v", err)
+	// 424242 is in no inventory the tool could read.
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "424242")); err != nil {
+		t.Fatalf("an arbitrary sut_id must be accepted (presence-only rule): %v", err)
 	}
 	if port.proposeCalls != 1 {
 		t.Fatalf("propose calls = %d, want 1", port.proposeCalls)
 	}
-	if got := port.proposeInput.Cases[0].Assertions[0].DatabaseID; got != 1501 {
-		t.Fatalf("database id = %d, want 1501", got)
+	if got := port.proposeInput.Cases[0].Assertions[0].SUTID; got != 424242 {
+		t.Fatalf("sut_id = %d, want 424242", got)
 	}
 	if got := port.proposeInput.Cases[0].Assertions[0].Kind; got != "db" {
 		t.Fatalf("assertion kind = %q, want db", got)
 	}
-	t.Logf("db assertion accepted: case_version proposal assertions[0].database_id=%d", port.proposeInput.Cases[0].Assertions[0].DatabaseID)
+	if resource.versionID != 0 {
+		t.Fatalf("the tool read the database inventory (%d); the ownership check must stay retired", resource.versionID)
+	}
+}
+
+// TestGraphProposeIgnoresSUTIDForNonDBKinds pins that sut_id is only required by
+// kind=db: a ui/api/text assertion may carry one or not.
+func TestGraphProposeIgnoresSUTIDForNonDBKinds(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+	registry := NewDesignRegistry(Deps{Design: port})
+	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
+
+	if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, validGraphProposalJSON()); err != nil {
+		t.Fatalf("ui/api assertions without sut_id must be accepted: %v", err)
+	}
+	for _, assertion := range port.proposeInput.Cases[0].Assertions {
+		if assertion.SUTID != 0 {
+			t.Fatalf("non-db assertion carried sut_id %d: %+v", assertion.SUTID, assertion)
+		}
+	}
 }
 
 // TestGraphProposeRejectsUnknownFieldWithSuggestion pins R-E1-1/R-E1-4: typos
@@ -647,10 +693,10 @@ func TestGraphProposeAcceptsBoundDatabaseID(t *testing.T) {
 // field so the model can self-correct.
 func TestGraphProposeRejectsUnknownFieldWithSuggestion(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry := NewP2Registry(Deps{Design: port, Resource: boundDatabaseResource()})
+	registry := NewDesignRegistry(Deps{Design: port, Resource: boundDatabaseResource()})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 
-	payload := strings.Replace(validGraphProposalJSON(), `"target_page_id": "9101"`, `"tartget_page_id": "9101"`, 1)
+	payload := strings.Replace(validGraphProposalJSON(), `"target_description": "登录页的手机号输入框"`, `"tartget_description": "登录页的手机号输入框"`, 1)
 	if payload == validGraphProposalJSON() {
 		t.Fatal("fixture did not inject the typo")
 	}
@@ -659,17 +705,17 @@ func TestGraphProposeRejectsUnknownFieldWithSuggestion(t *testing.T) {
 	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
 		t.Fatalf("unknown field error = %+v", toolErr)
 	}
-	wantField := "cases[0].steps[0].tartget_page_id"
+	wantField := "cases[0].steps[0].tartget_description"
 	if toolErr.Field != wantField {
 		t.Fatalf("field = %q, want %q", toolErr.Field, wantField)
 	}
-	if !strings.Contains(toolErr.Message, "target_page_id") {
+	if !strings.Contains(toolErr.Message, "target_description") {
 		t.Fatalf("message = %q, want the nearest legal field", toolErr.Message)
 	}
-	if suggestion, _ := toolErr.Details["suggestion"].(string); suggestion != "target_page_id" {
-		t.Fatalf("suggestion = %#v, want target_page_id", toolErr.Details["suggestion"])
+	if suggestion, _ := toolErr.Details["suggestion"].(string); suggestion != "target_description" {
+		t.Fatalf("suggestion = %#v, want target_description", toolErr.Details["suggestion"])
 	}
-	if !containsString(toolErr.Allowed, "target_page_id") {
+	if !containsString(toolErr.Allowed, "target_description") {
 		t.Fatalf("allowed = %#v, want the legal step fields", toolErr.Allowed)
 	}
 	if port.proposeCalls != 0 {
@@ -681,7 +727,7 @@ func TestGraphProposeRejectsUnknownFieldWithSuggestion(t *testing.T) {
 // descriptions, enums, assertion branches, examples (including db) and the
 // explicit reject-unknown-fields contract.
 func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
 	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
 	if len(definitions) != 1 {
 		t.Fatalf("definitions = %d", len(definitions))
@@ -706,10 +752,29 @@ func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
 	casesSchema, _ := properties["cases"].(map[string]any)
 	caseItems, _ := casesSchema["items"].(map[string]any)
 	caseProperties, _ := caseItems["properties"].(map[string]any)
-	for _, field := range []string{"ref", "scenario_ref", "title", "priority", "steps", "assertions", "sources"} {
+	for _, field := range []string{
+		"ref", "scenario_ref", "title", "sut_description", "preconditions",
+		"covered_acs", "priority", "steps", "assertions", "sources",
+	} {
 		raw, ok := caseProperties[field].(map[string]any)
 		if !ok || strings.TrimSpace(stringValueOf(raw["description"])) == "" {
 			t.Fatalf("case field %q is missing a description", field)
+		}
+	}
+	// The three v0.2.4-B contract elements must be machine-required, not merely
+	// documented, or a model can omit them and only find out from a 400.
+	caseRequired := stringListOf(t, caseItems["required"])
+	for _, field := range []string{"sut_description", "preconditions", "covered_acs"} {
+		if !containsString(caseRequired, field) {
+			t.Fatalf("case schema required = %#v, want it to include %q", caseItems["required"], field)
+		}
+	}
+	for _, gone := range []string{"default_version_sut_id", "version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := caseProperties[gone]; ok {
+			t.Fatalf("case schema still advertises the retired field %q", gone)
+		}
+		if containsString(caseRequired, gone) {
+			t.Fatalf("case schema still requires the retired field %q", gone)
 		}
 	}
 	if priorityEnum := enumOf(t, caseProperties["priority"]); strings.Join(priorityEnum, ",") != "P0,P1,P2,P3" {
@@ -723,11 +788,28 @@ func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
 	if strings.TrimSpace(stringValueOf(stepProperties["action"].(map[string]any)["description"])) == "" {
 		t.Fatalf("step action has no description")
 	}
+	if strings.TrimSpace(stringValueOf(stepProperties["target_description"].(map[string]any)["description"])) == "" {
+		t.Fatalf("step target_description has no description")
+	}
+	// The published bound must equal the design gate's bound. It drifted once
+	// (schema said 200, design enforced AccountRoleMax=64), which let a 70-char
+	// role clear the tool and die one hop later as a design 400 -- losing exactly
+	// the precise field error this early gate exists to give.
+	accountRole, _ := stepProperties["account_role"].(map[string]any)
+	if maxLength, _ := accountRole["maxLength"].(float64); int(maxLength) != design.AccountRoleMax {
+		t.Fatalf("published account_role maxLength = %v, want design.AccountRoleMax (%d)",
+			accountRole["maxLength"], design.AccountRoleMax)
+	}
+	for _, gone := range []string{"target_version_sut_id", "target_page_id", "target_api_id"} {
+		if _, ok := stepProperties[gone]; ok {
+			t.Fatalf("step schema still advertises the retired field %q", gone)
+		}
+	}
 
 	assertionsSchema, _ := caseProperties["assertions"].(map[string]any)
 	assertionItems, _ := assertionsSchema["items"].(map[string]any)
 	assertionProperties, _ := assertionItems["properties"].(map[string]any)
-	if enum := enumOf(t, assertionProperties["kind"]); strings.Join(enum, ",") != "ui,api,db,text,visual" {
+	if enum := enumOf(t, assertionProperties["kind"]); strings.Join(enum, ",") != "ui,api,db,text" {
 		t.Fatalf("assertion kind enum = %#v", assertionProperties["kind"])
 	}
 	if _, ok := assertionItems["anyOf"]; !ok {
@@ -735,8 +817,23 @@ func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
 			t.Fatalf("assertion branches are not expressed with anyOf/oneOf: %#v", assertionItems)
 		}
 	}
-	if strings.TrimSpace(stringValueOf(assertionProperties["database_id"].(map[string]any)["description"])) == "" {
-		t.Fatalf("assertion database_id has no description")
+	if strings.TrimSpace(stringValueOf(assertionProperties["sut_id"].(map[string]any)["description"])) == "" {
+		t.Fatalf("assertion sut_id has no description")
+	}
+	for _, gone := range []string{"target_version_sut_id", "target_api_id", "database_id"} {
+		if _, ok := assertionProperties[gone]; ok {
+			t.Fatalf("assertion schema still advertises the retired field %q", gone)
+		}
+	}
+
+	// The scenario schema lost its resource arrays too.
+	scenariosSchema, _ := properties["scenarios"].(map[string]any)
+	scenarioItems, _ := scenariosSchema["items"].(map[string]any)
+	scenarioProperties, _ := scenarioItems["properties"].(map[string]any)
+	for _, gone := range []string{"version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := scenarioProperties[gone]; ok {
+			t.Fatalf("scenario schema still advertises the retired field %q", gone)
+		}
 	}
 
 	examples, _ := schema["examples"].([]any)
@@ -744,25 +841,146 @@ func TestGraphProposeSchemaIsSelfDescribing(t *testing.T) {
 		t.Fatalf("examples = %d, want at least 2 complete examples", len(examples))
 	}
 	encoded, _ := json.Marshal(examples)
-	if !strings.Contains(string(encoded), `"database_id"`) {
+	if !strings.Contains(string(encoded), `"sut_id"`) {
 		t.Fatalf("examples never show a db assertion: %s", encoded)
+	}
+	for _, want := range []string{`"sut_description"`, `"covered_acs"`, `"preconditions"`, `"target_description"`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Fatalf("examples never show %s: %s", want, encoded)
+		}
+	}
+	for _, gone := range []string{`"version_sut_ids"`, `"default_version_sut_id"`, `"target_page_id"`, `"target_api_id"`, `"database_id"`, `"target_version_sut_id"`} {
+		if strings.Contains(string(encoded), gone) {
+			t.Fatalf("examples still model the retired field %s: %s", gone, encoded)
+		}
 	}
 
 	description := definitions[0].Description
-	for _, want := range []string{"unknown", "database_id", "sut.database_list", "proposal_id", "base_revision"} {
+	for _, want := range []string{"unknown", "sut_id", "sut_description", "covered_acs", "preconditions", "target_description", "proposal_id", "base_revision"} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("%s description lacks %q:\n%s", ToolCaseGraphPropose, want, description)
 		}
 	}
+	for _, gone := range []string{"database_id", "sut.database_list", "target_page_id", "version_sut"} {
+		if strings.Contains(description, gone) && !strings.Contains(description, "已全部移除") {
+			t.Fatalf("%s description still teaches the retired %q:\n%s", ToolCaseGraphPropose, gone, description)
+		}
+	}
 }
 
-// TestGraphProposeAssertionDescriptionUsesStepTargetPageID pins the fix for the
-// ui assertion description: target_page_id belongs to the step (steps[]), not
-// to the assertion object. The assertion schema sets additionalProperties:false,
-// so advertising an assertion-level target_page_id told the model to send a
-// field the contract rejects.
-func TestGraphProposeAssertionDescriptionUsesStepTargetPageID(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+// stringListOf normalizes a JSON-schema "required" array to []string.
+func stringListOf(t *testing.T, raw any) []string {
+	t.Helper()
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	values := make([]string, 0, len(list))
+	for _, item := range list {
+		values = append(values, stringValueOf(item))
+	}
+	return values
+}
+
+// TestGraphProposeSchemaTeachesNoRetiredResourceIDs is the negative guard the
+// ui-assertion/target_page_id fix generalized: the tool schema, its descriptions
+// and its embedded examples must not advertise ANY field the parser rejects. A
+// schema that contradicts its own parser instructs the model to send a payload
+// that is guaranteed to fail, and additionalProperties:false means it fails hard.
+// TestGraphProposeHintsPointAtSourcesThatCarryTheValue pins the round-5 finding:
+// a retry hint is only useful if the source it names actually carries the value.
+// The covered_acs hint used to name design.graph_read, whose payload has no
+// requirement AC ids at all (RequirementGraphView has no AC field, and the adapter
+// emits none) -- the only AC-shaped data there is each existing case card's own
+// covered_acs, which is empty for a requirement with no cases yet, i.e. exactly
+// when the author needs the set. requirement.read is the detail path that carries
+// ac_ids, and it is granted to RoleCaseAuthor.
+func TestGraphProposeHintsPointAtSourcesThatCarryTheValue(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+	registry := NewDesignRegistry(Deps{Design: port, Resource: boundDatabaseResource()})
+	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
+
+	t.Run("covered_acs hint", func(t *testing.T) {
+		payload := strings.Replace(validGraphProposalJSON(),
+			`"covered_acs": ["AC-1", "AC-2"]`, `"covered_acs": ["1"]`, 1)
+		if payload == validGraphProposalJSON() {
+			t.Fatal("fixture did not inject the malformed covered_acs")
+		}
+		_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, payload)
+		toolErr := asToolError(t, err)
+		if toolErr.Field != "cases[0].covered_acs" {
+			t.Fatalf("field = %q, want cases[0].covered_acs", toolErr.Field)
+		}
+		if !strings.Contains(toolErr.Hint, "requirement.read") {
+			t.Fatalf("hint must name requirement.read, the source that carries ac_ids: %q", toolErr.Hint)
+		}
+		if !strings.Contains(toolErr.Hint, "ac_ids") {
+			t.Fatalf("hint must name the ac_ids field the model should read: %q", toolErr.Hint)
+		}
+		if !strings.Contains(toolErr.Hint, "requirement_id") {
+			t.Fatalf("requirement.read is the detail path; the hint must say to pass requirement_id: %q", toolErr.Hint)
+		}
+		// design.graph_read must not be offered as an AC-id source.
+		//
+		// The check is on the POSITIVE SOURCE CLAUSE IN ISOLATION -- the text up to
+		// the first sentence break -- not on the whole hint. An earlier revision
+		// tested `Contains(hint, "graph_read") && !Contains(hint, "Do not use
+		// design.graph_read")`, which is self-defeating: that warning sentence is
+		// part of the hint it guards, so the second condition was always false and
+		// the assertion could never fire. A partial revert that re-added
+		// "design.graph_read or" as a source while keeping the warning produced a
+		// self-contradictory hint and stayed green. Isolating the clause makes the
+		// guard independent of whether the warning survives.
+		positiveClause := toolErr.Hint
+		if idx := strings.Index(positiveClause, ". "); idx >= 0 {
+			positiveClause = positiveClause[:idx]
+		}
+		if !strings.Contains(positiveClause, "requirement.read") {
+			t.Fatalf("the hint's source clause does not name requirement.read: %q", positiveClause)
+		}
+		if strings.Contains(positiveClause, "graph_read") {
+			t.Fatalf("the hint offers design.graph_read as an AC-id source, and it carries none: %q", positiveClause)
+		}
+		// Belt and braces: no phrasing anywhere in the hint may present graph_read
+		// as the thing to copy ids FROM.
+		if strings.Contains(toolErr.Hint, "from design.graph_read") {
+			t.Fatalf("hint tells the model to copy ids from design.graph_read: %q", toolErr.Hint)
+		}
+		if port.proposeCalls != 0 {
+			t.Fatal("a rejected proposal reached the design port")
+		}
+	})
+
+	t.Run("sut_id hint", func(t *testing.T) {
+		_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, ""))
+		toolErr := asToolError(t, err)
+		if toolErr.Field != "cases[0].assertions[0].sut_id" {
+			t.Fatalf("field = %q", toolErr.Field)
+		}
+		// sut.list is the primary source and really returns a decimal sut_id; the
+		// pack's per-row sut_id is the secondary one (round 4). Both are named.
+		if !strings.Contains(toolErr.Hint, "sut.list") {
+			t.Fatalf("hint must name sut.list: %q", toolErr.Hint)
+		}
+		if !strings.Contains(toolErr.Hint, "context.version_pack") {
+			t.Fatalf("hint should also name the pack's per-row sut_id: %q", toolErr.Hint)
+		}
+		if strings.Contains(toolErr.Hint, "database_id") {
+			t.Fatalf("hint still teaches the retired database_id: %q", toolErr.Hint)
+		}
+	})
+}
+
+// TestGraphProposeSchemaExamplesActuallyParse is the guard against the schema
+// contradicting its own parser -- the exact failure mode where the schema and
+// examples advertise one contract while parseGraphProposal enforces another, so
+// the model is instructed to send a payload that is guaranteed to be rejected.
+//
+// Every embedded example is fed through the real tool. This test fails whenever
+// the two halves drift, in either direction.
+func TestGraphProposeSchemaExamplesActuallyParse(t *testing.T) {
+	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
+	registry := NewDesignRegistry(Deps{Design: port, Resource: boundDatabaseResource()})
 	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
 	if len(definitions) != 1 {
 		t.Fatalf("definitions = %d", len(definitions))
@@ -771,47 +989,67 @@ func TestGraphProposeAssertionDescriptionUsesStepTargetPageID(t *testing.T) {
 	if err := json.Unmarshal(definitions[0].Parameters, &schema); err != nil {
 		t.Fatalf("schema is not JSON: %v", err)
 	}
-	properties, _ := schema["properties"].(map[string]any)
-	casesSchema, _ := properties["cases"].(map[string]any)
-	caseItems, _ := casesSchema["items"].(map[string]any)
-	caseProperties, _ := caseItems["properties"].(map[string]any)
-	assertionsSchema, _ := caseProperties["assertions"].(map[string]any)
-	assertionItems, _ := assertionsSchema["items"].(map[string]any)
-	assertionProperties, _ := assertionItems["properties"].(map[string]any)
-	if _, ok := assertionProperties["target_page_id"]; ok {
-		t.Fatalf("assertion schema advertises target_page_id, which is a step field: %#v", assertionProperties)
-	}
-	description := stringValueOf(assertionItems["description"])
-	if strings.Contains(description, "ui=target_page_id") {
-		t.Fatalf("assertion description advertises an assertion-level target_page_id: %q", description)
-	}
-	if !strings.Contains(description, "steps[].target_page_id") {
-		t.Fatalf("assertion description must point ui assertions at steps[].target_page_id: %q", description)
-	}
-	// No embedded example may model an assertion-level target_page_id either.
 	examples, _ := schema["examples"].([]any)
-	for exampleIndex, rawExample := range examples {
-		example, _ := rawExample.(map[string]any)
-		cases, _ := example["cases"].([]any)
-		for caseIndex, rawCase := range cases {
-			caseObject, _ := rawCase.(map[string]any)
-			assertions, _ := caseObject["assertions"].([]any)
-			for assertionIndex, rawAssertion := range assertions {
-				assertion, _ := rawAssertion.(map[string]any)
-				if _, ok := assertion["target_page_id"]; ok {
-					t.Fatalf("examples[%d].cases[%d].assertions[%d] carries an assertion-level target_page_id the schema rejects",
-						exampleIndex, caseIndex, assertionIndex)
-				}
-			}
+	if len(examples) == 0 {
+		t.Fatal("schema carries no examples")
+	}
+	scope := Scope{VersionID: 10, RequirementID: 501, RequirementVersionID: 700, AgentRunID: 77}
+	for index, rawExample := range examples {
+		payload, err := json.Marshal(rawExample)
+		if err != nil {
+			t.Fatalf("examples[%d] is not serializable: %v", index, err)
+		}
+		port.proposeCalls = 0
+		if _, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, string(payload)); err != nil {
+			t.Fatalf("examples[%d] is rejected by the tool's own parser -- the schema contradicts the parser: %v\npayload: %s",
+				index, err, payload)
+		}
+		if port.proposeCalls != 1 {
+			t.Fatalf("examples[%d] did not reach the design port", index)
+		}
+		// Each example must carry the required v0.2.4-B contract elements, so a
+		// passing parse proves the example is a usable template rather than a
+		// minimal stub that happens to slip through.
+		mapped := port.proposeInput
+		if len(mapped.Cases) == 0 {
+			t.Fatalf("examples[%d] produced no cases", index)
+		}
+		item := mapped.Cases[0]
+		if strings.TrimSpace(item.SutDescription) == "" || strings.TrimSpace(item.Preconditions) == "" || len(item.CoveredACs) == 0 {
+			t.Fatalf("examples[%d] omits a required contract element: %+v", index, item)
 		}
 	}
 }
 
-// TestGraphProposeSchemaDBBranchRequiresDatabaseID pins the machine-checkable
-// half of the db branch contract: the anyOf branch for kind=db requires the
-// database_id property instead of only describing it.
-func TestGraphProposeSchemaDBBranchRequiresDatabaseID(t *testing.T) {
-	registry := NewP2Registry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+func TestGraphProposeSchemaTeachesNoRetiredResourceIDs(t *testing.T) {
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
+	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
+	if len(definitions) != 1 {
+		t.Fatalf("definitions = %d", len(definitions))
+	}
+	encoded := string(definitions[0].Parameters)
+	for _, gone := range []string{
+		"target_page_id", "target_api_id", "target_version_sut_id",
+		"default_version_sut_id", "version_sut_ids", "database_id",
+	} {
+		if strings.Contains(encoded, `"`+gone+`"`) {
+			t.Fatalf("schema advertises the retired field %q, which the parser rejects: %s", gone, encoded)
+		}
+	}
+	// page_ids/api_ids remain legal nowhere in this payload; the only surviving
+	// "ids" list is covered_acs.
+	for _, gone := range []string{`"page_ids"`, `"api_ids"`} {
+		if strings.Contains(encoded, gone) {
+			t.Fatalf("schema advertises the retired field %s: %s", gone, encoded)
+		}
+	}
+}
+
+// TestGraphProposeSchemaDBBranchRequiresSUTID pins the machine-checkable half of
+// the db branch contract: the anyOf branch for kind=db requires the sut_id
+// property instead of only describing it.
+func TestGraphProposeSchemaDBBranchRequiresSUTID(t *testing.T) {
+	registry := NewDesignRegistry(Deps{Design: &fakeDesignPort{}, Resource: boundDatabaseResource()})
 	definitions := registry.Definitions([]string{ToolCaseGraphPropose})
 	if len(definitions) != 1 {
 		t.Fatalf("definitions = %d", len(definitions))
@@ -840,79 +1078,64 @@ func TestGraphProposeSchemaDBBranchRequiresDatabaseID(t *testing.T) {
 	if dbBranch == nil {
 		t.Fatalf("assertion schema has no kind=db anyOf branch: %#v", assertionItems["anyOf"])
 	}
-	if _, ok := dbBranch["properties"].(map[string]any)["database_id"]; !ok {
-		t.Fatalf("db branch does not describe database_id: %#v", dbBranch)
+	if _, ok := dbBranch["properties"].(map[string]any)["sut_id"]; !ok {
+		t.Fatalf("db branch does not describe sut_id: %#v", dbBranch)
 	}
 	required, _ := dbBranch["required"].([]any)
 	for _, rawRequired := range required {
-		if stringValueOf(rawRequired) == "database_id" {
+		if stringValueOf(rawRequired) == "sut_id" {
 			return
 		}
 	}
-	t.Fatalf("db branch required = %#v, want database_id", dbBranch["required"])
+	t.Fatalf("db branch required = %#v, want sut_id", dbBranch["required"])
 }
 
-// TestGraphProposeRejectsDatabaseIDWhenInventoryEmpty pins the fix for the
-// "empty list means unknown" hole: a successful sut.database_list that returns
-// zero databases still knows the bound set (empty), so any supplied
-// database_id must be rejected as a retryable argument error instead of
-// reaching the design context's non-retryable validation.
-func TestGraphProposeRejectsDatabaseIDWhenInventoryEmpty(t *testing.T) {
-	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	resource := &fakeDatabaseResource{} // successful list, no bound databases
-	registry := NewP2Registry(Deps{Design: port, Resource: resource})
-	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
-
-	_, err := executeDesignTool(t, registry, scope, ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "1501"))
-	toolErr := asToolError(t, err)
-	if toolErr.Code != CodeInvalidArgument || !toolErr.Retryable {
-		t.Fatalf("empty-inventory database error = %+v, want retryable invalid_argument", toolErr)
-	}
-	if toolErr.Field != "cases[0].assertions[0].database_id" {
-		t.Fatalf("field = %q, want cases[0].assertions[0].database_id", toolErr.Field)
-	}
-	if len(toolErr.Allowed) != 0 {
-		t.Fatalf("allowed = %#v, want the empty bound inventory", toolErr.Allowed)
-	}
-	if !strings.Contains(toolErr.Hint, "sut.database_list") {
-		t.Fatalf("hint = %q, want it to point at sut.database_list", toolErr.Hint)
-	}
-	if port.proposeCalls != 0 {
-		t.Fatalf("unbound database reached the design port: %#v", port.proposeInput)
-	}
-}
-
-// TestGraphProposeDatabaseInventoryUnavailableDefersToDesign documents the
-// best-effort half of R-E1-2: when no database lister is wired (or the lookup
-// fails) the tool cannot know the bound inventory, so it passes the id through
-// and lets the design context's binding validation be the authority instead of
-// rejecting a possibly-valid id. Only a successful inventory read turns an
-// unbound database_id into a local retryable error.
-func TestGraphProposeDatabaseInventoryUnavailableDefersToDesign(t *testing.T) {
+// TestGraphProposeDatabaseInventoryIsNotConsulted pins the retirement of the
+// R-E1-2 inventory check (Lead ruling 6: a db assertion's sut_id is checked for
+// PRESENCE only, ownership is gone). Two behaviours that used to exist must stay
+// gone: rejecting an id absent from a successfully-read (even empty) inventory,
+// and deferring to the design context when no lister is wired. Both are replaced
+// by one rule -- any positive sut_id is passed through untouched.
+func TestGraphProposeDatabaseInventoryIsNotConsulted(t *testing.T) {
 	tests := []struct {
-		name string
-		deps Deps
+		name     string
+		deps     Deps
+		wantRead bool
 	}{
-		{"no lister", Deps{Design: &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}}},
+		{"no lister wired", Deps{Design: &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}}, false},
+		{"empty inventory", Deps{
+			Design:   &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}},
+			Resource: &fakeDatabaseResource{},
+		}, false},
+		{"populated inventory", Deps{
+			Design:   &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}},
+			Resource: boundDatabaseResource(),
+		}, false},
 		{"lister failure", Deps{
 			Design:   &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}},
 			Resource: &fakeDatabaseResource{err: errors.New("resource unavailable")},
-		}},
+		}, false},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			port, _ := testCase.deps.Design.(*fakeDesignPort)
-			registry := NewP2Registry(testCase.deps)
+			registry := NewDesignRegistry(testCase.deps)
+			// 424242 is in none of the inventories above.
 			if _, err := executeDesignTool(t, registry,
 				Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700},
-				ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "1501")); err != nil {
-				t.Fatalf("database inventory unavailable must defer to the design context: %v", err)
+				ToolCaseGraphPropose, graphProposalWithDBAssertion(t, "424242")); err != nil {
+				t.Fatalf("an arbitrary sut_id must be accepted (presence-only rule): %v", err)
 			}
 			if port.proposeCalls != 1 {
-				t.Fatalf("propose calls = %d, want the id passed through to the design context", port.proposeCalls)
+				t.Fatalf("propose calls = %d, want the id passed through", port.proposeCalls)
 			}
-			if got := port.proposeInput.Cases[0].Assertions[0].DatabaseID; got != 1501 {
-				t.Fatalf("database id = %d, want 1501 passed through", got)
+			if got := port.proposeInput.Cases[0].Assertions[0].SUTID; got != 424242 {
+				t.Fatalf("sut_id = %d, want 424242 passed through", got)
+			}
+			if resource, ok := testCase.deps.Resource.(*fakeDatabaseResource); ok && testCase.wantRead == false {
+				if resource.versionID != 0 {
+					t.Fatalf("the tool consulted the database inventory (version %d); the ownership check must stay retired", resource.versionID)
+				}
 			}
 		})
 	}
@@ -950,7 +1173,7 @@ func TestGraphProposeWrongTypedValuesCarryJSONFieldPath(t *testing.T) {
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
 			port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-			registry := NewP2Registry(Deps{Design: port})
+			registry := NewDesignRegistry(Deps{Design: port})
 			_, err := executeDesignTool(t, registry,
 				Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700},
 				ToolCaseGraphPropose, testCase.payload)
@@ -979,7 +1202,7 @@ func TestGraphProposeRejectsBlankProposalID(t *testing.T) {
 	for _, value := range []string{`""`, `"   "`} {
 		t.Run("value="+value, func(t *testing.T) {
 			port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-			registry := NewP2Registry(Deps{Design: port})
+			registry := NewDesignRegistry(Deps{Design: port})
 			payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
 				`"requirement_version_id": "700", "proposal_id": `+value+`,`, 1)
 			_, err := executeDesignTool(t, registry,
@@ -1005,7 +1228,7 @@ func TestGraphProposeProposalIDIsIdempotent(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{
 		"graph_hash": "after", "case_version_ids": []string{"7001"},
 	}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
 		`"requirement_version_id": "700", "proposal_id": "prop-1",`, 1)
@@ -1034,7 +1257,7 @@ func TestGraphProposeProposalIDIsIdempotent(t *testing.T) {
 // different proposal is a non-retryable conflict, never a silent overwrite.
 func TestGraphProposeRejectsReusedProposalIDForDifferentPayload(t *testing.T) {
 	port := &fakeDesignPort{proposeResult: map[string]any{"graph_hash": "after"}}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
 		`"requirement_version_id": "700", "proposal_id": "prop-1",`, 1)
@@ -1068,7 +1291,7 @@ func TestGraphProposeStaleBaseRevisionConflict(t *testing.T) {
 			},
 		},
 	}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
 		`"requirement_version_id": "700", "base_revision": 2,`, 1)
@@ -1107,7 +1330,7 @@ func TestGraphProposeMatchingBaseRevisionProceeds(t *testing.T) {
 			},
 		},
 	}
-	registry := NewP2Registry(Deps{Design: port})
+	registry := NewDesignRegistry(Deps{Design: port})
 	scope := Scope{VersionID: 7, RequirementID: 501, RequirementVersionID: 700}
 	payload := strings.Replace(validGraphProposalJSON(), `"requirement_version_id": "700",`,
 		`"requirement_version_id": "700", "base_revision": 3,`, 1)

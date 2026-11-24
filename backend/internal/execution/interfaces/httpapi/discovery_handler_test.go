@@ -62,7 +62,7 @@ func discoveryObservationRows() []executionapp.DiscoveryObservationRow {
 	return []executionapp.DiscoveryObservationRow{
 		{
 			ID:               375994775003729921,
-			VersionSUTID:     5001,
+			SUTID:            5001,
 			EnvironmentID:    discoveryInt64Ptr(6001),
 			WaveID:           discoveryInt64Ptr(7001),
 			CaseRunID:        discoveryInt64Ptr(3001),
@@ -84,7 +84,7 @@ func discoveryObservationRows() []executionapp.DiscoveryObservationRow {
 		},
 		{
 			ID:               1002,
-			VersionSUTID:     5001,
+			SUTID:            5001,
 			EnvironmentID:    discoveryInt64Ptr(6001),
 			WaveID:           discoveryInt64Ptr(7001),
 			CaseRunID:        discoveryInt64Ptr(3002),
@@ -200,7 +200,7 @@ func TestDiscoveryObservationsReadAPI(t *testing.T) {
 	}
 	item := items[0]
 	assertDiscoveryString(t, item, "observation_id", discoverySnowflakeObservationID)
-	assertDiscoveryString(t, item, "version_sut_id", "5001")
+	assertDiscoveryString(t, item, "sut_id", "5001")
 	assertDiscoveryString(t, item, "environment_id", "6001")
 	assertDiscoveryString(t, item, "wave_id", "7001")
 	assertDiscoveryString(t, item, "case_run_id", "3001")
@@ -320,12 +320,12 @@ func TestDiscoveryObservationsReadAPINotFound(t *testing.T) {
 // projection of one wave (or the whole version when wave_id is omitted).
 func TestDiscoveryDeltasReadAPI(t *testing.T) {
 	rows := []executionapp.DiscoveryObservationRow{
-		{ID: 1, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/a", Decision: "new"},
-		{ID: 2, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/b", Decision: "proposed"},
-		{ID: 3, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "api", Method: "GET", Host: "h", ResourceTemplate: "/api/a", Decision: "proposed"},
-		{ID: 4, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/c", Decision: "approved"},
-		{ID: 5, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/d", Decision: "rejected"},
-		{ID: 6, VersionSUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/e", Decision: "out_of_scope"},
+		{ID: 1, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/a", Decision: "new"},
+		{ID: 2, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/b", Decision: "proposed"},
+		{ID: 3, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "api", Method: "GET", Host: "h", ResourceTemplate: "/api/a", Decision: "proposed"},
+		{ID: 4, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/c", Decision: "approved"},
+		{ID: 5, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/d", Decision: "rejected"},
+		{ID: 6, SUTID: 5001, WaveID: discoveryInt64Ptr(7001), Kind: "page", Host: "h", ResourceTemplate: "/e", Decision: "out_of_scope"},
 	}
 	handler := newDiscoveryHandlerFixture(rows)
 
@@ -387,14 +387,14 @@ func TestDiscoveryDeltasReadAPIRejectsBadWave(t *testing.T) {
 // (T14) is deliberately W2.
 func TestDiscoveryCoverageReadAPI(t *testing.T) {
 	rows := []executionapp.DiscoveryObservationRow{
-		{ID: 1, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/orders/{id}", Decision: "proposed"},
-		{ID: 2, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/orders/{id}", Decision: "proposed"},
-		{ID: 3, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/login", Decision: "approved"},
-		{ID: 4, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/cart", Decision: "new"},
-		{ID: 5, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/legacy", Decision: "rejected"},
-		{ID: 6, VersionSUTID: 5001, Kind: "page", ResourceTemplate: "/admin", Decision: "out_of_scope"},
-		{ID: 7, VersionSUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders/{id}", Decision: "proposed"},
-		{ID: 8, VersionSUTID: 5001, Kind: "api", Method: "POST", ResourceTemplate: "/api/orders", Decision: "new"},
+		{ID: 1, SUTID: 5001, Kind: "page", ResourceTemplate: "/orders/{id}", Decision: "proposed"},
+		{ID: 2, SUTID: 5001, Kind: "page", ResourceTemplate: "/orders/{id}", Decision: "proposed"},
+		{ID: 3, SUTID: 5001, Kind: "page", ResourceTemplate: "/login", Decision: "approved"},
+		{ID: 4, SUTID: 5001, Kind: "page", ResourceTemplate: "/cart", Decision: "new"},
+		{ID: 5, SUTID: 5001, Kind: "page", ResourceTemplate: "/legacy", Decision: "rejected"},
+		{ID: 6, SUTID: 5001, Kind: "page", ResourceTemplate: "/admin", Decision: "out_of_scope"},
+		{ID: 7, SUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders/{id}", Decision: "proposed"},
+		{ID: 8, SUTID: 5001, Kind: "api", Method: "POST", ResourceTemplate: "/api/orders", Decision: "new"},
 	}
 	handler := newDiscoveryHandlerFixture(rows)
 
@@ -446,13 +446,13 @@ func TestDiscoveryCoverageReadAPI(t *testing.T) {
 // kind is skipped instead of panicking.
 func TestDiscoveryCoverageDedupesObservedAndKeepsMethod(t *testing.T) {
 	rows := []executionapp.DiscoveryObservationRow{
-		{ID: 1, VersionSUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "proposed"},
-		{ID: 2, VersionSUTID: 5001, Kind: "api", Method: "POST", ResourceTemplate: "/api/orders", Decision: "proposed"},
-		{ID: 3, VersionSUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "approved"},
-		{ID: 4, VersionSUTID: 5001, Kind: "page", Method: "GET", ResourceTemplate: "/orders", Decision: "proposed"},
-		{ID: 5, VersionSUTID: 5001, Kind: "page", Method: "", ResourceTemplate: "/orders", Decision: "proposed"},
+		{ID: 1, SUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "proposed"},
+		{ID: 2, SUTID: 5001, Kind: "api", Method: "POST", ResourceTemplate: "/api/orders", Decision: "proposed"},
+		{ID: 3, SUTID: 5001, Kind: "api", Method: "GET", ResourceTemplate: "/api/orders", Decision: "approved"},
+		{ID: 4, SUTID: 5001, Kind: "page", Method: "GET", ResourceTemplate: "/orders", Decision: "proposed"},
+		{ID: 5, SUTID: 5001, Kind: "page", Method: "", ResourceTemplate: "/orders", Decision: "proposed"},
 		// Defensive guard: an unknown kind can never panic the aggregation.
-		{ID: 6, VersionSUTID: 5001, Kind: "document", Method: "", ResourceTemplate: "/doc", Decision: "proposed"},
+		{ID: 6, SUTID: 5001, Kind: "document", Method: "", ResourceTemplate: "/doc", Decision: "proposed"},
 	}
 	handler := newDiscoveryHandlerFixture(rows)
 
@@ -489,7 +489,7 @@ func TestDiscoveryCoverageUncoveredIsSortedDedupedAndCapped(t *testing.T) {
 	rows := make([]executionapp.DiscoveryObservationRow, 0, 205)
 	for index := 0; index < 205; index++ {
 		rows = append(rows, executionapp.DiscoveryObservationRow{
-			ID: int64(index + 1), VersionSUTID: 5001, Kind: "page",
+			ID: int64(index + 1), SUTID: 5001, Kind: "page",
 			ResourceTemplate: "/templates/" + strconv.Itoa(index), Decision: "proposed",
 		})
 	}

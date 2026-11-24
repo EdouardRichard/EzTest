@@ -12,9 +12,9 @@ import (
 // its result from the TaskRef alone — the version from the work item, the
 // report/revision/wave from the raw payload — so it needs no application
 // services and can be registered from the composition root (Task 23) with
-// RegisterP4TaskContext:
+// RegisterDeliveryTaskContext:
 //
-//	RegisterP4TaskContext(func(_ context.Context, ref TaskRef) (any, bool) {
+//	RegisterDeliveryTaskContext(func(_ context.Context, ref TaskRef) (any, bool) {
 //		return ReportTaskContext(ref)
 //	})
 //

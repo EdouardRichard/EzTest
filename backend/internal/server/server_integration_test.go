@@ -18,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
-	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/deliveryadapter"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
@@ -59,15 +59,21 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
 	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
+	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 )
 
 type testAPI struct {
-	t         *testing.T
-	baseURL   string
-	token     string
-	pool      *pgxpool.Pool
-	reportSvc *deliveryapp.ReportService
-	issueSvc  *deliveryapp.IssueService
+	t               *testing.T
+	baseURL         string
+	token           string
+	pool            *pgxpool.Pool
+	reportSvc       *deliveryapp.ReportService
+	issueSvc        *deliveryapp.IssueService
+	closureSvc      *versionapp.ClosureService
+	versionCloseSvc *versionapp.VersionCloseService
+	waiverSvc       *versionapp.WaiverService
+	factSvc         *versionapp.FactService
+	workItems       *agentpg.WorkItemRepository
 }
 
 // testSeedAdminPassword is the explicit test-only administrator password set
@@ -108,7 +114,7 @@ func newTestAPI(t *testing.T) *testAPI {
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
 	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc := versionapp.NewRequirementService(
-		requirementRepo, versionSvc, resourceSvc, designStale, auditSvc, eventSvc, ids, clk)
+		requirementRepo, versionSvc, designStale, auditSvc, eventSvc, ids, clk)
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
 
@@ -148,34 +154,49 @@ func newTestAPI(t *testing.T) *testAPI {
 		Registry: executionRegistry,
 	})
 
-	// P4 delivery/chain/steward composition (mirrors cmd/eztest with real
-	// repositories and the real adapters).
-	workQueue := agentapp.NewWorkQueue(agentpg.NewWorkItemRepository(pool, ids), clk, 30*time.Second, 3)
+	// P4 delivery/chain composition (mirrors cmd/eztest with real repositories
+	// and the real adapters). GD-17 removed the steward close task ensurer.
+	workItems := agentpg.NewWorkItemRepository(pool, ids)
+	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
 	issueRepo := deliverypg.NewIssueRepository(pool, ids)
 	analysisRepo := deliverypg.NewAnalysisRepository(pool, ids)
 	reportRepo := deliverypg.NewReportRepository(pool, ids)
 	closureRepo := versionpg.NewClosureRepository(pool)
 	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
-	reportRenderer, err := deliveryrender.NewHTMLRenderer("1")
+	// v3 is the production default human-useful template (R-G10b); the fixture
+	// renders the same template production serves so report-content assertions
+	// exercise the real waived/card/AC markup.
+	reportRenderer, err := deliveryrender.NewHTMLRenderer(deliveryrender.TemplateVersionV3)
 	if err != nil {
 		t.Fatalf("report renderer: %v", err)
 	}
-	p4Tasks := p4.NewTaskEnsurer(workQueue, reportRepo, testRequirementVersionLookup{repo: requirementRepo})
+	deliveryTasks := deliveryadapter.NewTaskEnsurer(workQueue, reportRepo)
+	// The waiver fact service is built before the read deps so the report read
+	// model can project the waiver reason/operator (version + requirement scope).
+	factSvc := versionapp.NewFactService(versionpostgres.NewFactRepository(pool, ids), ids, eventSvc,
+		versionapp.WithFactAudit(auditSvc))
 	readDeps := deliveryadapters.Deps{
 		Versions: versionSvc, Requirements: requirementSvc, Closures: closureRepo, Design: designGraph,
 		Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns, Results: executionRepo.Results,
 		Evidence: executionRepo.Evidence, SUTContexts: executionRepo.SUTContexts,
 		Intents: executionRepo.Intents, Humans: executionRepo.Humans, Issues: issueRepo,
 		Triage: analysisRepo,
+		// v0.2.4-G T9: wave frozen fingerprint consumer (SC-G6 P15). The judge
+		// port is optional here (this fixture builds no judge service); the full
+		// judge wiring is exercised by the cmd/eztest closed-loop integration.
+		WaveFingerprints: deliveryadapters.NewExecutionWaveFingerprintReader(),
+		// v0.2.4-G T10/final fix wave #1: waiver fact projection (version +
+		// requirement scope) so the waived report lists reason/operator.
+		WaiverFacts: factSvc,
 	}
 	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
 	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
 	issueSvc := deliveryapp.NewIssueService(
-		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
+		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, deliveryTasks)
 	issueSvc.WithTriageReader(analysisRepo)
 	reportSvc := deliveryapp.NewReportService(
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
-		deliveryEvents, deliveryAudit, clk, p4Tasks,
+		deliveryEvents, deliveryAudit, clk, deliveryTasks,
 		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true})
 	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
 		Requirements: requirementRepo, Design: designGraph, CaseRuns: executionRepo.CaseRuns,
@@ -186,13 +207,18 @@ func newTestAPI(t *testing.T) *testAPI {
 		Versions: versionRepo, WorkItems: closureReaders, Execution: versionadapters.NewVersionCloseExecution(closureReaders),
 		HumanRequests: closureReaders, Requirements: requirementRepo,
 		Reports: versionadapters.NewReportStatusReader(reportSvc), ReportStaler: reportSvc,
-		Tasks: p4Tasks, Audit: auditSvc, Events: eventSvc, Clock: clk,
+		Audit: auditSvc, Events: eventSvc, Clock: clk,
 	})
 	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
 		Closures: closureRepo, Requirements: requirementRepo, Cases: closureReaders,
 		Runs: closureReaders, Coverage: closureReaders, Issues: closureReaders,
-		WorkItems: closureReaders, Versions: versionCloseSvc, Tasks: p4Tasks,
+		WorkItems: closureReaders, Versions: versionCloseSvc,
 		Audit: auditSvc, Events: eventSvc, IDs: ids, Clock: clk,
+	})
+	waiverSvc := versionapp.NewWaiverService(versionapp.WaiverServiceDeps{
+		Versions: versionRepo, Closer: versionCloseSvc, Requirements: requirementRepo,
+		Waivers: requirementRepo, Reports: versionadapters.NewWaivedReportRegenerator(reportSvc),
+		Facts: factSvc, Audit: auditSvc, Events: eventSvc, Clock: clk,
 	})
 	requirementSvc.SetVersionReopener(versionCloseSvc)
 	designGraph.SetVersionReopener(versionCloseSvc)
@@ -232,10 +258,12 @@ func newTestAPI(t *testing.T) *testAPI {
 		Chain:         chainHandler,
 		Closure:       closureSvc,
 		VersionClose:  versionCloseSvc,
+		Waivers:       waiverSvc,
 	})
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
-	return &testAPI{t: t, baseURL: httpServer.URL, pool: pool, reportSvc: reportSvc, issueSvc: issueSvc}
+	return &testAPI{t: t, baseURL: httpServer.URL, pool: pool, reportSvc: reportSvc, issueSvc: issueSvc,
+		closureSvc: closureSvc, versionCloseSvc: versionCloseSvc, waiverSvc: waiverSvc, factSvc: factSvc, workItems: workItems}
 }
 
 func (a *testAPI) do(method, path string, body any, wantStatus int) map[string]any {
@@ -306,7 +334,7 @@ func (a *testAPI) listData(body map[string]any) []any {
 	return data
 }
 
-func TestP0EndToEndFlow(t *testing.T) {
+func TestEndToEndFlow(t *testing.T) {
 	api := newTestAPI(t)
 
 	api.login("admin", testSeedAdminPassword)
@@ -316,8 +344,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 87 {
-		t.Fatalf("settings count = %d, want 87 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(settings))
+	if len(settings) != 86 {
+		t.Fatalf("settings count = %d, want 86 (v0.22 catalog: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases, v0.2.4-B removes 7 visual.* keys, v0.2.4-C T6 adds execution.evidence_max_per_case_run, T17 adds execution.max_case_turns, v0.2.4-E T1 adds 4 quality-gate keys, v0.2.4-F removes the 3 quota keys and adds max_concurrent_case_runs, v0.2.4-G adds 2 report evidence display caps)", len(settings))
 	}
 	settingKeys := make(map[string]bool, len(settings))
 	for _, raw := range settings {
@@ -333,31 +361,34 @@ func TestP0EndToEndFlow(t *testing.T) {
 		}
 	}
 	api.do(http.MethodPatch, "/api/admin/settings/gc.retention_days", map[string]any{"value": 7}, http.StatusNotFound)
-	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
+	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.max_concurrent_case_runs", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
 		t.Fatalf("updated setting = %#v", updated)
 	}
 
-	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "Order Center", "intro": "e2e"}, http.StatusCreated))
-	sutID := sut["id"].(string)
-	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	// v0.2.4-B: the environment is top-level and owns SUTs; pages/APIs/databases
+	// hang off the SUT, accounts are a global pool, and the version binds the
+	// environment directly (base_url lives on the SUT).
+	environment := api.data(api.do(http.MethodPost, "/api/resources/environments", map[string]any{"name": "dev"}, http.StatusCreated))
 	environmentID := environment["id"].(string)
-	page := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/pages", map[string]any{"name": "Home", "url": "http://localhost:8080/home", "route_template": "/home"}, http.StatusCreated))
+	sut := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/suts", map[string]any{"name": "Order Center", "intro": "e2e", "base_url": "http://localhost:8080"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	page := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/pages", map[string]any{"name": "Home", "url": "http://localhost:8080/home", "route_template": "/home"}, http.StatusCreated))
 	pageID := page["id"].(string)
-	apiEndpoint := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/apis", map[string]any{"name": "Orders", "method": "GET", "path_template": "/api/orders"}, http.StatusCreated))
+	apiEndpoint := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/apis", map[string]any{"name": "Orders", "method": "GET", "path_template": "/api/orders"}, http.StatusCreated))
 	apiID := apiEndpoint["id"].(string)
-	database := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/databases", map[string]any{"environment_id": environmentID, "name": "order_db", "dsn": "postgres://localhost/order", "username": "readonly", "password": "secret", "read_only": true}, http.StatusCreated))
+	database := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/databases", map[string]any{"name": "order_db", "dsn": "postgres://localhost/order", "username": "readonly", "password": "secret", "read_only": true}, http.StatusCreated))
 	databaseID := database["id"].(string)
 	if database["password_set"] != true {
 		t.Fatalf("database password_set = %#v", database["password_set"])
 	}
-	account := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/accounts", map[string]any{"environment_id": environmentID, "username": "buyer", "password": "secret", "roles": []string{"buyer"}}, http.StatusCreated))
+	account := api.data(api.do(http.MethodPost, "/api/resources/accounts", map[string]any{"sut_id": sutID, "username": "buyer", "password": "secret", "roles": []string{"buyer"}}, http.StatusCreated))
 	accountID := account["id"].(string)
 	repository := api.data(api.do(http.MethodPost, "/api/resources/code-repos", map[string]any{"name": "order-service", "path": "D:/repo", "branch": "main"}, http.StatusCreated))
 	repositoryID := repository["id"].(string)
 
 	catalog := api.data(api.do(http.MethodGet, "/api/resources/catalog", nil, http.StatusOK))
-	if len(catalog["suts"].([]any)) != 1 || len(catalog["repositories"].([]any)) != 1 {
+	if len(catalog["environments"].([]any)) != 1 || len(catalog["repositories"].([]any)) != 1 {
 		t.Fatalf("catalog = %#v", catalog)
 	}
 	// API-15 no longer accepts explicit page/API/database/account/repository
@@ -379,12 +410,12 @@ func TestP0EndToEndFlow(t *testing.T) {
 		t.Fatalf("version = %#v", version)
 	}
 	detail := api.data(api.do(http.MethodGet, "/api/versions/"+versionID, nil, http.StatusOK))
-	bindings := detail["bindings"].([]any)
-	if len(bindings) != 1 {
-		t.Fatalf("detail = %#v", detail)
-	}
-	binding := bindings[0].(map[string]any)
-	if binding["sut"].(map[string]any)["name"] != "Order Center" {
+	// v0.2.4-B: the version detail carries a single resolved environment binding
+	// (the effective-scope catalog), not the old per-SUT bindings array. The flat
+	// pages/accounts are the effective scope; the account auto-binds at creation.
+	binding := detail["binding"].(map[string]any)
+	boundSUTs := binding["environment"].(map[string]any)["suts"].([]any)
+	if len(boundSUTs) != 1 || boundSUTs[0].(map[string]any)["name"] != "Order Center" {
 		t.Fatalf("binding = %#v", binding)
 	}
 	if len(binding["pages"].([]any)) != 1 || len(binding["accounts"].([]any)) != 1 {
@@ -474,14 +505,13 @@ func TestP0EndToEndFlow(t *testing.T) {
 	t.Logf("P0 flow ok: version=%s sha=%s", versionID, upload.Data.SHA256)
 }
 
-func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
+func TestDesignRoutesAndEmptyGraph(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
 
-	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P2 Design SUT", "intro": "p2"}, http.StatusCreated))
-	sutID := sut["id"].(string)
-	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	environment := api.data(api.do(http.MethodPost, "/api/resources/environments", map[string]any{"name": "dev"}, http.StatusCreated))
 	environmentID := environment["id"].(string)
+	api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/suts", map[string]any{"name": "P2 Design SUT", "intro": "p2", "base_url": "http://localhost:8080"}, http.StatusCreated))
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
 		"title":          "P2 Design Version",
 		"environment_id": environmentID,
@@ -527,21 +557,20 @@ func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
 	api.login("admin", testSeedAdminPassword)
 }
 
-// TestP3ExecutionRoutes pins the P3 routing/auth/empty-state contract (spec
+// TestExecutionRoutes pins the P3 routing/auth/empty-state contract (spec
 // §9.2): 401 without a session, an empty but well-formed overview, empty list
 // envelopes, 404 for unknown wave/evidence/human ids and admin-only executor
 // management.
-func TestP3ExecutionRoutes(t *testing.T) {
+func TestExecutionRoutes(t *testing.T) {
 	api := newTestAPI(t)
 
 	// Unauthenticated execution routes are 401.
 	api.do(http.MethodGet, "/api/versions/1/execution/overview", nil, http.StatusUnauthorized)
 
 	api.login("admin", testSeedAdminPassword)
-	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Execution SUT", "intro": "p3"}, http.StatusCreated))
-	sutID := sut["id"].(string)
-	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
+	environment := api.data(api.do(http.MethodPost, "/api/resources/environments", map[string]any{"name": "dev"}, http.StatusCreated))
 	environmentID := environment["id"].(string)
+	api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/suts", map[string]any{"name": "P3 Execution SUT", "intro": "p3", "base_url": "http://127.0.0.1:13335"}, http.StatusCreated))
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
 		"title":          "P3 Execution Version",
 		"environment_id": environmentID,
@@ -566,9 +595,12 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	if executor["status"] != "offline" || executor["endpoint"] != "http://127.0.0.1:13336" {
 		t.Fatalf("executor = %#v", executor)
 	}
+	// v0.2.4-F design P5: the quotas projection is a SINGLE global limit
+	// (execution.max_concurrent_case_runs), 0 = unlimited by default. The
+	// retired global/per_sut/cross_system trio must be gone from the wire.
 	quotas := overview["quotas"].(map[string]any)
-	if quotas["global"] != float64(3) || quotas["per_sut"] != float64(2) || quotas["cross_system"] != float64(1) {
-		t.Fatalf("quotas = %#v", quotas)
+	if len(quotas) != 1 || quotas["max_concurrent_case_runs"] != float64(0) {
+		t.Fatalf("quotas = %#v, want exactly {max_concurrent_case_runs: 0}", quotas)
 	}
 	if overview["human_request_timeout_seconds"] != float64(1800) {
 		t.Fatalf("human_request_timeout_seconds = %#v", overview["human_request_timeout_seconds"])
@@ -626,19 +658,18 @@ func TestP3ExecutionRoutes(t *testing.T) {
 	api.do(http.MethodGet, "/api/versions/1/execution/overview", nil, http.StatusNotFound)
 }
 
-// TestP3ExecutionReadAPIAndHumanResolve is the server-level happy path that does
+// TestExecutionReadAPIAndHumanResolve is the server-level happy path that does
 // not need a live executor or LLM: a paused wave/case with a real content-ledger
 // evidence blob and an open login takeover are read through the P3 API, the
 // evidence bytes are downloaded and sha-verified, the human request is resolved
 // and the wave is cancelled.
-func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
+func TestExecutionReadAPIAndHumanResolve(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
 
-	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P3 Happy SUT", "intro": "p3"}, http.StatusCreated))
-	sutID := sut["id"].(string)
-	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://127.0.0.1:13335", "is_default": true}, http.StatusCreated))
+	environment := api.data(api.do(http.MethodPost, "/api/resources/environments", map[string]any{"name": "dev"}, http.StatusCreated))
 	environmentID := environment["id"].(string)
+	api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/suts", map[string]any{"name": "P3 Happy SUT", "intro": "p3", "base_url": "http://127.0.0.1:13335"}, http.StatusCreated))
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
 		"title":          "P3 Happy Version",
 		"environment_id": environmentID,
@@ -693,24 +724,24 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 		{`INSERT INTO run_wave (id, version_id, status, trigger, counts, started_at, paused_at, pause_reason, pause_mode)
 		  VALUES ($1, $2, 'paused', 'manual', $3::jsonb, now(), now(), 'waiting_human', 'graceful')`,
 			[]any{int64(910001), versionIDValue, `{"total":1,"paused":1}`}},
-		{`INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids, environment_fingerprint, purpose, status, dedupe_key)
+		{`INSERT INTO execution_intent (id, version_id, case_version_id, sut_ids, environment_fingerprint, purpose, status, dedupe_key)
 		  VALUES ($1, $2, $3, $4::jsonb, $5, 'manual', 'running', 'exec:happy')`,
 			[]any{int64(920001), versionIDValue, int64(999001), `[1]`, strings.Repeat("a", 64)}},
 		{`INSERT INTO case_run (id, wave_id, intent_id, case_version_id, status, attempts, summary, started_at, paused_at, pause_reason, dispatch_epoch)
 		  VALUES ($1, $2, $3, $4, 'paused', 1, $5::jsonb, now(), now(), 'waiting_human', 2)`,
 			[]any{int64(930001), int64(910001), int64(920001), int64(999001), `{"assertion_total":1,"assertion_failed":0,"step_total":1,"step_failed":0,"evidence_count":1}`}},
-		{`INSERT INTO step_result (id, case_run_id, seq, target_version_sut_id, status, observed, error)
+		{`INSERT INTO step_result (id, case_run_id, seq, target_sut_id, status, observed, error)
 		  VALUES ($1, $2, 1, $3, 'passed', $4::jsonb, '')`,
 			[]any{int64(940001), int64(930001), int64(1), `{"summary":"clicked login"}`}},
-		{`INSERT INTO assertion_result (id, case_run_id, step_seq, assertion_seq, kind, verdict, reason, expected, actual, target_version_sut_id)
+		{`INSERT INTO assertion_result (id, case_run_id, step_seq, assertion_seq, kind, verdict, reason, expected, actual, target_sut_id)
 		  VALUES ($1, $2, 1, 1, 'ui', 'passed', '', 'home visible', 'home visible', $3)`,
 			[]any{int64(950001), int64(930001), int64(1)}},
-		{`INSERT INTO evidence (id, case_run_id, version_sut_id, step_seq, assertion_seq, kind, content_ref_id, sha256, size_bytes, mime, filename)
+		{`INSERT INTO evidence (id, case_run_id, sut_id, step_seq, assertion_seq, kind, content_ref_id, sha256, size_bytes, mime, filename)
 		  VALUES ($1, $2, $3, 1, NULL, 'screenshot', 555, $4, $5, $6, 'p3-shot.txt')`,
 			[]any{int64(960001), int64(930001), int64(1), upload.Data.SHA256, upload.Data.Size, upload.Data.MIME}},
 		{`INSERT INTO human_request (id, version_id, case_run_id, kind, payload, status, expires_at)
 		  VALUES ($1, $2, $3, 'login_takeover', $4::jsonb, 'pending', now() + interval '30 minutes')`,
-			[]any{int64(970001), versionIDValue, int64(930001), `{"reason":"2FA code required","version_sut_id":"1","account_role":"admin","page_url":"http://127.0.0.1:13337/p3/2fa","challenge_kind":"totp"}`}},
+			[]any{int64(970001), versionIDValue, int64(930001), `{"reason":"2FA code required","sut_id":"1","account_role":"admin","page_url":"http://127.0.0.1:13337/p3/2fa","challenge_kind":"totp"}`}},
 	}
 	for _, item := range seed {
 		if _, err := api.pool.Exec(ctx, item.statement, item.args...); err != nil {
@@ -748,8 +779,8 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	if runView["id"] != "930001" || runView["status"] != "paused" || runView["evidence_count"] != float64(1) {
 		t.Fatalf("case run view = %#v", runView)
 	}
-	if suts := runView["version_sut_ids"].([]any); len(suts) != 1 || suts[0] != "1" {
-		t.Fatalf("case run version_sut_ids = %#v", runView["version_sut_ids"])
+	if suts := runView["sut_ids"].([]any); len(suts) != 1 || suts[0] != "1" {
+		t.Fatalf("case run sut_ids = %#v", runView["sut_ids"])
 	}
 
 	detail := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/case-runs/930001", nil, http.StatusOK))
@@ -847,22 +878,25 @@ func TestP3ExecutionReadAPIAndHumanResolve(t *testing.T) {
 	}
 }
 
-// TestP3ManualIntentForPassedRerun pins Task 119 (Release-T7): a passed case
+// TestExecutionManualIntentForPassedRerun pins Task 119 (Release-T7): a passed case
 // has no failed result, so rerunning it from the UI must create purpose=manual.
 // The API keeps the retest gate unchanged (400 for a passed or never-run case)
 // while the manual intent is accepted (201) and stored with purpose=manual.
-func TestP3ManualIntentForPassedRerun(t *testing.T) {
+func TestExecutionManualIntentForPassedRerun(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
 
-	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{
-		"name": "T119 Rerun SUT", "intro": "task 119",
-	}, http.StatusCreated))
-	sutID := sut["id"].(string)
-	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{
-		"name": "dev", "base_url": "http://127.0.0.1:13338", "is_default": true,
+	// v0.2.4-B: the hierarchy is inverted — an environment is top-level and owns
+	// SUTs, and a version binds an environment directly (the version_sut chain is
+	// gone). base_url now lives on the SUT, not the environment.
+	environment := api.data(api.do(http.MethodPost, "/api/resources/environments", map[string]any{
+		"name": "dev",
 	}, http.StatusCreated))
 	environmentID := environment["id"].(string)
+	sut := api.data(api.do(http.MethodPost, "/api/resources/environments/"+environmentID+"/suts", map[string]any{
+		"name": "T119 Rerun SUT", "intro": "task 119", "base_url": "http://127.0.0.1:13338",
+	}, http.StatusCreated))
+	sutID := sut["id"].(string)
 	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
 		"title":          "T119 Manual Rerun Version",
 		"environment_id": environmentID,
@@ -874,13 +908,14 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	var versionSUTID int64
-	if err := api.pool.QueryRow(ctx,
-		`SELECT id FROM version_sut WHERE version_id = $1 ORDER BY id LIMIT 1`, versionIDValue,
-	).Scan(&versionSUTID); err != nil {
-		t.Fatalf("read version_sut id: %v", err)
+	// The seeded execution intents carry the bound SUT id (the version_sut row id
+	// the old fixture read no longer exists). The API-created intents derive their
+	// SUT set from the version binding themselves.
+	sutIDValue, err := strconv.ParseInt(sutID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse sut id: %v", err)
 	}
-	versionSUTIDs := "[" + strconv.FormatInt(versionSUTID, 10) + "]"
+	sutIDsJSON := "[" + strconv.FormatInt(sutIDValue, 10) + "]"
 
 	const (
 		requirementID         int64 = 830001
@@ -897,12 +932,18 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 		}
 	}
 	// The design read requires a current+confirmed case version reachable from
-	// the version's scenario/requirement revision.
+	// the version's scenario/requirement revision. The requirement carries the
+	// v0.2.4-B natural-language contract (user_story + acceptance_criteria with a
+	// server-shaped AC id) so the case's covered_acs can reference a real AC.
 	execSQL(`INSERT INTO requirement (id, version_id, current_version_id, status)
 		VALUES ($1, $2, $3, 'clarified')`, requirementID, versionIDValue, requirementVersionID)
-	execSQL(`INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash)
-		VALUES ($1, $2, 1, 'T119 rerun requirement', $3)`,
-		requirementVersionID, requirementID, strings.Repeat("a", 64))
+	execSQL(`INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash,
+		user_story, sut_description, acceptance_criteria)
+		VALUES ($1, $2, 1, 'T119 rerun requirement', $3,
+		$4::jsonb, 'the order center', $5::jsonb)`,
+		requirementVersionID, requirementID, strings.Repeat("a", 64),
+		`{"as_a":"tester","i_want":"rerun a passed case","so_that":"I can verify it again"}`,
+		`[{"id":"AC-1","given":"a passed case","when":"a rerun is requested","then":"a manual intent is created"}]`)
 	execSQL(`INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name)
 		VALUES ($1, $2, $3, $4, 'T119 rerun scenario')`,
 		scenarioID, versionIDValue, requirementID, requirementVersionID)
@@ -911,12 +952,15 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 		t.Helper()
 		execSQL(`INSERT INTO case_entity (id, scenario_id, current_version_id, status)
 			VALUES ($1, $2, $3, 'confirmed')`, caseID, scenarioID, caseVersionID)
+		// v0.2.4-B (T9): case_version describes its target in prose (sut_description)
+		// plus the requirement ACs it covers (covered_acs); the resource-id target
+		// columns (default_version_sut_id / version_sut_ids) were dropped.
 		execSQL(`INSERT INTO case_version (id, case_id, revision, title, description, priority,
-			default_version_sut_id, version_sut_ids, status, content_hash)
-			VALUES ($1, $2, 1, $3, '', 'P2', $4, $5::jsonb, 'confirmed', $6)`,
-			caseVersionID, caseID, title, versionSUTID, versionSUTIDs, strings.Repeat("b", 64))
-		execSQL(`INSERT INTO case_step (id, case_version_id, seq, action)
-			VALUES ($1, $2, 1, 'open the page')`, caseVersionID+100000, caseVersionID)
+			sut_description, covered_acs, status, content_hash)
+			VALUES ($1, $2, 1, $3, '', 'P2', 'the order center', $4::jsonb, 'confirmed', $5)`,
+			caseVersionID, caseID, title, `["AC-1"]`, strings.Repeat("b", 64))
+		execSQL(`INSERT INTO case_step (id, case_version_id, seq, action, target_description)
+			VALUES ($1, $2, 1, 'open the page', 'the result page')`, caseVersionID+100000, caseVersionID)
 		execSQL(`INSERT INTO case_assertion (id, case_version_id, step_seq, kind, target, expected)
 			VALUES ($1, $2, 1, 'ui', '#result', 'ok')`, caseVersionID+200000, caseVersionID)
 	}
@@ -928,10 +972,10 @@ func TestP3ManualIntentForPassedRerun(t *testing.T) {
 		t.Helper()
 		execSQL(`INSERT INTO run_wave (id, version_id, status, trigger, counts, started_at, finished_at)
 			VALUES ($1, $2, 'done', 'auto', '{}'::jsonb, now(), now())`, waveID, versionIDValue)
-		execSQL(`INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids,
+		execSQL(`INSERT INTO execution_intent (id, version_id, case_version_id, sut_ids,
 			environment_fingerprint, purpose, status, dedupe_key)
 			VALUES ($1, $2, $3, $4::jsonb, $5, 'initial', 'done', $6)`,
-			intentID, versionIDValue, caseVersionID, versionSUTIDs, strings.Repeat("c", 64),
+			intentID, versionIDValue, caseVersionID, sutIDsJSON, strings.Repeat("c", 64),
 			"t119-seed-intent-"+strconv.FormatInt(intentID, 10))
 		execSQL(`INSERT INTO case_run (id, wave_id, intent_id, case_version_id, status, attempts,
 			failure_class, summary, started_at, finished_at)

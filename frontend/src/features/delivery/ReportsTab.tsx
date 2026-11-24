@@ -16,6 +16,7 @@ import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { listEvidence } from "@/features/execution/api"
 import { EvidenceViewer, revokeSoon } from "@/features/execution/EvidenceViewer"
 import type { Evidence } from "@/features/execution/types"
+import { ReportInsights } from "@/features/reports/ReportInsights"
 import { formatDateTime } from "@/lib/format"
 
 import {
@@ -702,6 +703,14 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
           onOpenEvidence={setViewerEvidence}
         />
       </div>
+
+      <ReportInsights
+        versionId={versionId}
+        reportId={detail?.id ?? null}
+        revisionNumber={effectiveRevisionNumber}
+        htmlAvailable={revision?.html_available === true}
+        onChanged={refreshNow}
+      />
 
       <EvidenceViewer
         versionId={versionId}

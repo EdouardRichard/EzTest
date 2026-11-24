@@ -93,8 +93,6 @@ $requiredEnvKeys = @(
     "EZTEST_DATABASE_URL",
     "EZTEST_ADMIN_USERNAME",
     "EZTEST_ADMIN_PASSWORD",
-    "EZTEST_SECRET_KEYS",
-    "EZTEST_SECRET_KEY_ACTIVE",
     "llm_base_url",
     "llm_key",
     "llm_model_name"
@@ -902,18 +900,6 @@ try {
     $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
     $script:secretValues = @($adminPassword, $llmKey, $databaseUrl)
     $script:resultData.llmModel = $llmModel
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-            $script:secretValues += $rawSecretKeys
-            try {
-                $secretObject = $rawSecretKeys | ConvertFrom-Json
-                foreach ($property in $secretObject.PSObject.Properties) { $script:secretValues += [string]$property.Value }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
     Add-CheckResult -Name "gate and .env keys" -Status "passed" -Detail "EZTEST_RUN_REAL_LLM=1; llm_base_url/llm_key/llm_model_name present"
 
     Write-Step "Validating the database URL before any destructive statement"
@@ -976,7 +962,7 @@ try {
     Assert-PortFree -Port $executorPort
     $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:$executorPort"
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
-    $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "4"
+    $env:EZTEST_EXECUTOR_MAX_SESSIONS = "4"
     $executorOut = Join-Path $tmpDir "acceptance-p6-real-executor.out.log"
     $executorErr = Join-Path $tmpDir "acceptance-p6-real-executor.err.log"
     Remove-Item -LiteralPath $executorOut, $executorErr -ErrorAction SilentlyContinue
@@ -997,9 +983,6 @@ try {
     if (-not $executorHealthy) { throw "the Playwright executor did not become healthy on :$executorPort (see .tmp/acceptance-p6-real-executor.err.log)" }
 
     Write-Step "Starting the API on :$apiPort with the real LLM configuration"
-    $evidenceDir = Join-Path $tmpDir "p6-real-evidence"
-    if (Test-Path -LiteralPath $evidenceDir) { Remove-Item -LiteralPath $evidenceDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $targetDatabaseUrl
     $env:EZTEST_HTTP_ADDR = ":$apiPort"
@@ -1008,7 +991,6 @@ try {
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "p6-real-objects")
     $env:EZTEST_EXECUTOR_URL = "http://127.0.0.1:$executorPort"
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
-    $env:EZTEST_EVIDENCE_DIR = $evidenceDir
     $env:EZTEST_EXEC_WORKER_INTERVAL_MS = "200"
     # One case at a time: the imported fixture session has one lease slot, so
     # this keeps the real-LLM acceptance deterministic and serial.
@@ -1017,7 +999,7 @@ try {
     $env:EZTEST_OPENAPI_PATH = (Join-Path $repoRoot "docs\openapi\api.yaml")
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
     }
     Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue

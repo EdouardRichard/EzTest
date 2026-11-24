@@ -28,7 +28,11 @@ func newIDs(t *testing.T) platformid.Generator {
 func createVersion(t *testing.T, pool *pgxpool.Pool, id int64) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO version (id, title, created_by) VALUES ($1, 'integration version', 1)`, id); err != nil {
+		`INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING`); err != nil {
+		t.Fatalf("seed fixture environment: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO version (id, title, created_by, environment_id) VALUES ($1, 'integration version', 1, 990001)`, id); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
 }

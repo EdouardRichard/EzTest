@@ -9,9 +9,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// fakeP6DesignReader is the design-context P6 read source used by the query
+// fakeDesignQueryReader is the design-context P6 read source used by the query
 // port tests. Every call is recorded so normalization and batching are visible.
-type fakeP6DesignReader struct {
+type fakeDesignQueryReader struct {
 	countNum   int
 	countDenom int
 	countErr   error
@@ -34,33 +34,33 @@ type fakeP6DesignReader struct {
 	pendingCalls  int
 }
 
-func (f *fakeP6DesignReader) CountCaseConfirmation(_ context.Context, versionID *int64) (int, int, error) {
+func (f *fakeDesignQueryReader) CountCaseConfirmation(_ context.Context, versionID *int64) (int, int, error) {
 	f.countCalls++
 	f.countScope = versionID
 	return f.countNum, f.countDenom, f.countErr
 }
 
-func (f *fakeP6DesignReader) SearchCases(_ context.Context, q string, limit int) ([]CaseSearchRow, error) {
+func (f *fakeDesignQueryReader) SearchCases(_ context.Context, q string, limit int) ([]CaseSearchRow, error) {
 	f.caseCalls++
 	f.caseQ, f.caseLimit = q, limit
 	return f.caseRows, f.caseErr
 }
 
-func (f *fakeP6DesignReader) ListDraftCases(_ context.Context, limit int) ([]DraftCaseRow, error) {
+func (f *fakeDesignQueryReader) ListDraftCases(_ context.Context, limit int) ([]DraftCaseRow, error) {
 	f.draftCalls++
 	f.draftLimit = limit
 	return f.draftRows, f.draftErr
 }
 
-func (f *fakeP6DesignReader) PendingDesignCounts(_ context.Context, versionIDs []int64) (map[int64]int, error) {
+func (f *fakeDesignQueryReader) PendingDesignCounts(_ context.Context, versionIDs []int64) (map[int64]int, error) {
 	f.pendingCalls++
 	f.pendingIDs = append([]int64(nil), versionIDs...)
 	return f.pendingResult, f.pendingErr
 }
 
-func TestP6CountCaseConfirmation(t *testing.T) {
+func TestCountCaseConfirmation(t *testing.T) {
 	t.Run("empty store returns zero counts", func(t *testing.T) {
-		reader := &fakeP6DesignReader{}
+		reader := &fakeDesignQueryReader{}
 		service := NewQueryService(reader)
 
 		num, denom, err := service.CountCaseConfirmation(context.Background(), nil)
@@ -76,7 +76,7 @@ func TestP6CountCaseConfirmation(t *testing.T) {
 	})
 
 	t.Run("version filter is forwarded", func(t *testing.T) {
-		reader := &fakeP6DesignReader{countNum: 4, countDenom: 6}
+		reader := &fakeDesignQueryReader{countNum: 4, countDenom: 6}
 		service := NewQueryService(reader)
 
 		num, denom, err := service.CountCaseConfirmation(context.Background(), int64Ptr(7))
@@ -92,7 +92,7 @@ func TestP6CountCaseConfirmation(t *testing.T) {
 	})
 
 	t.Run("zero denominator is reported without error", func(t *testing.T) {
-		service := NewQueryService(&fakeP6DesignReader{countNum: 0, countDenom: 0})
+		service := NewQueryService(&fakeDesignQueryReader{countNum: 0, countDenom: 0})
 
 		num, denom, err := service.CountCaseConfirmation(context.Background(), nil)
 		if err != nil {
@@ -104,7 +104,7 @@ func TestP6CountCaseConfirmation(t *testing.T) {
 	})
 
 	t.Run("non-positive version is rejected", func(t *testing.T) {
-		reader := &fakeP6DesignReader{}
+		reader := &fakeDesignQueryReader{}
 		service := NewQueryService(reader)
 
 		if _, _, err := service.CountCaseConfirmation(context.Background(), int64Ptr(0)); err == nil {
@@ -117,7 +117,7 @@ func TestP6CountCaseConfirmation(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := NewQueryService(&fakeP6DesignReader{countErr: want})
+		service := NewQueryService(&fakeDesignQueryReader{countErr: want})
 
 		if _, _, err := service.CountCaseConfirmation(context.Background(), nil); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)
@@ -125,8 +125,8 @@ func TestP6CountCaseConfirmation(t *testing.T) {
 	})
 }
 
-func TestP6SearchCases(t *testing.T) {
-	reader := &fakeP6DesignReader{caseRows: []CaseSearchRow{
+func TestSearchCases(t *testing.T) {
+	reader := &fakeDesignQueryReader{caseRows: []CaseSearchRow{
 		{CaseID: 9, CaseVersionID: 19, VersionID: 7, VersionTitle: "Login SUT", Title: "Login success", Status: "confirmed"},
 	}}
 	service := NewQueryService(reader)
@@ -164,9 +164,9 @@ func TestP6SearchCases(t *testing.T) {
 	}
 }
 
-func TestP6ListDraftCasesBuildsTodos(t *testing.T) {
+func TestListDraftCasesBuildsTodos(t *testing.T) {
 	created := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
-	reader := &fakeP6DesignReader{draftRows: []DraftCaseRow{
+	reader := &fakeDesignQueryReader{draftRows: []DraftCaseRow{
 		{CaseID: 9, VersionID: 7, VersionTitle: "Login SUT", Title: "Login success", CreatedAt: created},
 	}}
 	service := NewQueryService(reader)
@@ -208,8 +208,8 @@ func TestP6ListDraftCasesBuildsTodos(t *testing.T) {
 	}
 }
 
-func TestP6PendingDesignCountsBatchesAndDeduplicates(t *testing.T) {
-	reader := &fakeP6DesignReader{pendingResult: map[int64]int{3: 2, 4: 1}}
+func TestPendingDesignCountsBatchesAndDeduplicates(t *testing.T) {
+	reader := &fakeDesignQueryReader{pendingResult: map[int64]int{3: 2, 4: 1}}
 	service := NewQueryService(reader)
 
 	counts, err := service.PendingDesignCounts(context.Background(), []int64{3, 3, 0, -1, 4})
@@ -239,16 +239,16 @@ func TestP6PendingDesignCountsBatchesAndDeduplicates(t *testing.T) {
 	}
 }
 
-func TestP6PendingDesignCountsPropagatesReaderError(t *testing.T) {
+func TestPendingDesignCountsPropagatesReaderError(t *testing.T) {
 	want := errors.New("boom")
-	service := NewQueryService(&fakeP6DesignReader{pendingErr: want})
+	service := NewQueryService(&fakeDesignQueryReader{pendingErr: want})
 
 	if _, err := service.PendingDesignCounts(context.Background(), []int64{3}); !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
 }
 
-func TestP6DesignQueryServiceRequiresReader(t *testing.T) {
+func TestDesignQueryServiceRequiresReader(t *testing.T) {
 	service := NewQueryService(nil)
 	_, _, err := service.CountCaseConfirmation(context.Background(), nil)
 	if err == nil {

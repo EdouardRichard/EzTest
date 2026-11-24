@@ -15,23 +15,22 @@ import (
 // the same hard caps; the tools clamp first so a model cannot ask for a page
 // larger than the contract.
 const (
-	p5TreeLimit    = 50
-	p5SearchLimit  = 50
-	p5FactsLimit   = 100
-	p5FactsRoute   = 100
-	p5APILimit     = 100
-	p5DiffLimit    = 200
-	p5ImpactLimit  = 200
-	p5AnchorsLimit = 200
-	// p5CursorMaxChars and p5QueryMaxChars bound the free-text arguments.
-	p5CursorMaxChars = 256
-	p5QueryMaxChars  = 200
-	p5PathMaxChars   = 4096
+	codeIntelTreeLimit    = 50
+	codeIntelSearchLimit  = 50
+	codeIntelFactsLimit   = 100
+	codeIntelFactsRoute   = 100
+	codeIntelAPILimit     = 100
+	codeIntelDiffLimit    = 200
+	codeIntelImpactLimit  = 200
+	codeIntelAnchorsLimit = 200
+	// codeIntelCursorMaxChars and codeIntelQueryMaxChars bound the free-text arguments.
+	codeIntelCursorMaxChars = 256
+	codeIntelQueryMaxChars  = 200
+	codeIntelPathMaxChars   = 4096
 )
 
-// p5Tools returns the P5 tools implemented by this package. execution.visual_assert
-// is provided by the execution agent_tool group (RegisterP5ToolGroup).
-func p5Tools(deps Deps) []Tool {
+// codeIntelTools returns the P5 tools implemented by this package.
+func codeIntelTools(deps Deps) []Tool {
 	return []Tool{
 		&codeTreeTool{deps: deps},
 		&codeReadTool{deps: deps},
@@ -62,7 +61,7 @@ func (t *codeTreeTool) Parameters() json.RawMessage {
 		"commit": map[string]any{"type": "string", "description": "40-character commit SHA; defaults to the version baseline commit"},
 		"path":   map[string]any{"type": "string", "description": "normalized repo-relative path prefix"},
 		"cursor": map[string]any{"type": "string", "description": "opaque cursor from a previous page"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5TreeLimit},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelTreeLimit},
 	})
 }
 
@@ -77,30 +76,30 @@ func (t *codeTreeTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	if err := decodeParams(raw, &args); err != nil {
 		return nil, err
 	}
-	if t.deps.P5.Index == nil {
+	if t.deps.CodeIntel.Index == nil {
 		return nil, missingDep("codeintel index service")
 	}
-	repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+	repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := p5DefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
+	commit, err := codeIntelDefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
 	if err != nil {
 		return nil, err
 	}
 	path := strings.TrimSpace(args.Path)
-	cursor, err := p5Cursor(args.Cursor)
+	cursor, err := codeIntelCursor(args.Cursor)
 	if err != nil {
 		return nil, err
 	}
-	entries, next, hasMore, err := t.deps.P5.Index.Tree(ctx, repo.RepoID, commit, path, cursor,
-		p5Limit(args.Limit, p5TreeLimit, p5TreeLimit))
+	entries, next, hasMore, err := t.deps.CodeIntel.Index.Tree(ctx, repo.RepoID, commit, path, cursor,
+		codeIntelLimit(args.Limit, codeIntelTreeLimit, codeIntelTreeLimit))
 	if err != nil {
-		return nil, p5MapError(err, "code tree")
+		return nil, codeIntelMapError(err, "code tree")
 	}
 	mapped := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
-		mapped = append(mapped, p5TreeEntry(entry))
+		mapped = append(mapped, codeIntelTreeEntry(entry))
 	}
 	return map[string]any{
 		"repo_id":     idString(repo.RepoID),
@@ -111,7 +110,7 @@ func (t *codeTreeTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	}, nil
 }
 
-func p5TreeEntry(entity codeintel.Entity) map[string]any {
+func codeIntelTreeEntry(entity codeintel.Entity) map[string]any {
 	return map[string]any{
 		"path":      entity.Path,
 		"name":      entity.Name,
@@ -155,7 +154,7 @@ func (t *codeReadTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	if path == "" {
 		return nil, Invalid("path", "path is required")
 	}
-	if len([]rune(path)) > p5PathMaxChars {
+	if len([]rune(path)) > codeIntelPathMaxChars {
 		return nil, Invalid("path", "path is too long")
 	}
 	if args.StartLine < 0 || args.EndLine < 0 {
@@ -164,20 +163,20 @@ func (t *codeReadTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	if args.StartLine > 0 && args.EndLine > 0 && args.EndLine < args.StartLine {
 		return nil, Invalid("endLine", "endLine must not be before startLine")
 	}
-	if t.deps.P5.Query == nil {
+	if t.deps.CodeIntel.Query == nil {
 		return nil, missingDep("codeintel query service")
 	}
-	repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+	repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := p5DefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
+	commit, err := codeIntelDefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
 	if err != nil {
 		return nil, err
 	}
-	window, err := t.deps.P5.Query.File(ctx, repo.RepoID, commit, path, args.StartLine, args.EndLine)
+	window, err := t.deps.CodeIntel.Query.File(ctx, repo.RepoID, commit, path, args.StartLine, args.EndLine)
 	if err != nil {
-		return nil, p5MapError(err, "code file")
+		return nil, codeIntelMapError(err, "code file")
 	}
 	lines := window.Lines
 	if lines == nil {
@@ -211,7 +210,7 @@ func (t *codeSearchTool) Parameters() json.RawMessage {
 		"q":      map[string]any{"type": "string", "description": "path/name substring"},
 		"kind":   map[string]any{"type": "string", "enum": []string{"file", "module", "route", "api", "client_call", "component", "page", "symbol"}},
 		"commit": map[string]any{"type": "string"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5SearchLimit},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelSearchLimit},
 	}, "q")
 }
 
@@ -230,32 +229,32 @@ func (t *codeSearchTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 	if query == "" {
 		return nil, Invalid("q", "q is required")
 	}
-	if len([]rune(query)) > p5QueryMaxChars {
+	if len([]rune(query)) > codeIntelQueryMaxChars {
 		return nil, Invalid("q", "q is too long")
 	}
 	kind := strings.TrimSpace(args.Kind)
 	if kind != "" && !codeintel.EntityKind(kind).Valid() {
 		return nil, Invalid("kind", "unknown fact kind")
 	}
-	if t.deps.P5.Analysis == nil {
+	if t.deps.CodeIntel.Analysis == nil {
 		return nil, missingDep("codeintel analysis service")
 	}
-	repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+	repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := p5DefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
+	commit, err := codeIntelDefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
 	if err != nil {
 		return nil, err
 	}
-	entities, err := t.deps.P5.Analysis.Search(ctx, repo.RepoID, commit, query, kind,
-		p5Limit(args.Limit, p5SearchLimit, p5SearchLimit))
+	entities, err := t.deps.CodeIntel.Analysis.Search(ctx, repo.RepoID, commit, query, kind,
+		codeIntelLimit(args.Limit, codeIntelSearchLimit, codeIntelSearchLimit))
 	if err != nil {
-		return nil, p5MapError(err, "code search")
+		return nil, codeIntelMapError(err, "code search")
 	}
 	results := make([]map[string]any, 0, len(entities))
 	for _, entity := range entities {
-		results = append(results, p5EntitySummary(entity))
+		results = append(results, codeIntelEntitySummary(entity))
 	}
 	return map[string]any{
 		"repo_id": idString(repo.RepoID),
@@ -265,7 +264,7 @@ func (t *codeSearchTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 	}, nil
 }
 
-func p5EntitySummary(entity codeintel.Entity) map[string]any {
+func codeIntelEntitySummary(entity codeintel.Entity) map[string]any {
 	return map[string]any{
 		"id":         idString(entity.ID),
 		"kind":       string(entity.Kind),
@@ -296,7 +295,7 @@ func (t *codeFactsTool) Parameters() json.RawMessage {
 		"path":   map[string]any{"type": "string", "description": "normalized repo-relative path filter"},
 		"commit": map[string]any{"type": "string"},
 		"cursor": map[string]any{"type": "string"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5FactsLimit},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelFactsLimit},
 	})
 }
 
@@ -316,30 +315,30 @@ func (t *codeFactsTool) Execute(ctx context.Context, scope Scope, raw json.RawMe
 	if kind != "" && !codeintel.EntityKind(kind).Valid() {
 		return nil, Invalid("kind", "unknown fact kind")
 	}
-	if t.deps.P5.Analysis == nil {
+	if t.deps.CodeIntel.Analysis == nil {
 		return nil, missingDep("codeintel analysis service")
 	}
-	repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+	repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := p5DefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
+	commit, err := codeIntelDefaultCommit(ctx, t.deps, repo, args.Commit, "commit")
 	if err != nil {
 		return nil, err
 	}
-	cursor, err := p5Cursor(args.Cursor)
+	cursor, err := codeIntelCursor(args.Cursor)
 	if err != nil {
 		return nil, err
 	}
 	path := strings.TrimSpace(args.Path)
-	facts, next, hasMore, err := t.deps.P5.Analysis.Facts(ctx, repo.RepoID, commit, kind, path, cursor,
-		p5Limit(args.Limit, p5FactsLimit, p5FactsLimit))
+	facts, next, hasMore, err := t.deps.CodeIntel.Analysis.Facts(ctx, repo.RepoID, commit, kind, path, cursor,
+		codeIntelLimit(args.Limit, codeIntelFactsLimit, codeIntelFactsLimit))
 	if err != nil {
-		return nil, p5MapError(err, "code facts")
+		return nil, codeIntelMapError(err, "code facts")
 	}
 	mapped := make([]map[string]any, 0, len(facts))
 	for _, fact := range facts {
-		mapped = append(mapped, p5FactSummary(fact))
+		mapped = append(mapped, codeIntelFactSummary(fact))
 	}
 	return map[string]any{
 		"repo_id":     idString(repo.RepoID),
@@ -350,7 +349,7 @@ func (t *codeFactsTool) Execute(ctx context.Context, scope Scope, raw json.RawMe
 	}, nil
 }
 
-func p5FactSummary(fact codeintel.Fact) map[string]any {
+func codeIntelFactSummary(fact codeintel.Fact) map[string]any {
 	return map[string]any{
 		"id":         idString(fact.ID),
 		"kind":       string(fact.Kind),
@@ -380,7 +379,7 @@ func (t *codeRoutesTool) Parameters() json.RawMessage {
 	return schemaObject(map[string]any{
 		"repoId": map[string]any{"type": "string", "pattern": "^[0-9]+$"},
 		"commit": map[string]any{"type": "string"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5FactsRoute},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelFactsRoute},
 	})
 }
 
@@ -397,7 +396,7 @@ func (t *codeRoutesTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 }
 
 func (t *codeRoutesTool) execute(ctx context.Context, scope Scope, rawRepoID, rawCommit string, limit *int, kinds []string) (any, error) {
-	return p5FactKinds(ctx, t.deps, scope, rawRepoID, rawCommit, limit, kinds, "code routes")
+	return codeIntelFactKinds(ctx, t.deps, scope, rawRepoID, rawCommit, limit, kinds, "code routes")
 }
 
 type codeAPIsTool struct{ deps Deps }
@@ -412,7 +411,7 @@ func (t *codeAPIsTool) Parameters() json.RawMessage {
 	return schemaObject(map[string]any{
 		"repoId": map[string]any{"type": "string", "pattern": "^[0-9]+$"},
 		"commit": map[string]any{"type": "string"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5APILimit},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelAPILimit},
 	})
 }
 
@@ -425,32 +424,32 @@ func (t *codeAPIsTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	if err := decodeParams(raw, &args); err != nil {
 		return nil, err
 	}
-	return p5FactKinds(ctx, t.deps, scope, args.RepoID, args.Commit, args.Limit,
+	return codeIntelFactKinds(ctx, t.deps, scope, args.RepoID, args.Commit, args.Limit,
 		[]string{"api", "client_call"}, "code apis")
 }
 
-// p5FactKinds reads two fact groups and merges them into one bounded list.
-func p5FactKinds(ctx context.Context, deps Deps, scope Scope, rawRepoID, rawCommit string, limit *int, kinds []string, kindName string) (any, error) {
-	if deps.P5.Analysis == nil {
+// codeIntelFactKinds reads two fact groups and merges them into one bounded list.
+func codeIntelFactKinds(ctx context.Context, deps Deps, scope Scope, rawRepoID, rawCommit string, limit *int, kinds []string, kindName string) (any, error) {
+	if deps.CodeIntel.Analysis == nil {
 		return nil, missingDep("codeintel analysis service")
 	}
-	repo, err := p5ResolveRepo(ctx, deps, scope, rawRepoID)
+	repo, err := codeIntelResolveRepo(ctx, deps, scope, rawRepoID)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := p5DefaultCommit(ctx, deps, repo, rawCommit, "commit")
+	commit, err := codeIntelDefaultCommit(ctx, deps, repo, rawCommit, "commit")
 	if err != nil {
 		return nil, err
 	}
-	max := p5Limit(limit, p5FactsRoute, p5FactsRoute)
+	max := codeIntelLimit(limit, codeIntelFactsRoute, codeIntelFactsRoute)
 	merged := make([]map[string]any, 0, max*2)
 	for _, kind := range kinds {
-		facts, _, _, err := deps.P5.Analysis.Facts(ctx, repo.RepoID, commit, kind, "", "", max)
+		facts, _, _, err := deps.CodeIntel.Analysis.Facts(ctx, repo.RepoID, commit, kind, "", "", max)
 		if err != nil {
-			return nil, p5MapError(err, kindName)
+			return nil, codeIntelMapError(err, kindName)
 		}
 		for _, fact := range facts {
-			merged = append(merged, p5FactSummary(fact))
+			merged = append(merged, codeIntelFactSummary(fact))
 			if len(merged) >= max {
 				break
 			}
@@ -482,7 +481,7 @@ func (t *codeDiffTool) Parameters() json.RawMessage {
 		"base":   map[string]any{"type": "string", "description": "40-character base commit SHA; defaults to the version baseline"},
 		"head":   map[string]any{"type": "string", "description": "40-character head commit SHA; defaults to the latest indexed commit"},
 		"path":   map[string]any{"type": "string", "description": "normalized repo-relative path filter"},
-		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": p5DiffLimit},
+		"limit":  map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelDiffLimit},
 	})
 }
 
@@ -497,25 +496,25 @@ func (t *codeDiffTool) Execute(ctx context.Context, scope Scope, raw json.RawMes
 	if err := decodeParams(raw, &args); err != nil {
 		return nil, err
 	}
-	if t.deps.P5.Query == nil {
+	if t.deps.CodeIntel.Query == nil {
 		return nil, missingDep("codeintel query service")
 	}
-	repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+	repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 	if err != nil {
 		return nil, err
 	}
-	base, err := p5BaseCommit(ctx, t.deps, repo, args.Base, "base")
+	base, err := codeIntelBaseCommit(ctx, t.deps, repo, args.Base, "base")
 	if err != nil {
 		return nil, err
 	}
-	head, err := p5HeadCommit(ctx, t.deps, repo, args.Head, "head")
+	head, err := codeIntelHeadCommit(ctx, t.deps, repo, args.Head, "head")
 	if err != nil {
 		return nil, err
 	}
-	result, next, hasMore, err := t.deps.P5.Query.Diff(ctx, repo.RepoID, base, head,
-		strings.TrimSpace(args.Path), "", p5Limit(args.Limit, p5DiffLimit, p5DiffLimit))
+	result, next, hasMore, err := t.deps.CodeIntel.Query.Diff(ctx, repo.RepoID, base, head,
+		strings.TrimSpace(args.Path), "", codeIntelLimit(args.Limit, codeIntelDiffLimit, codeIntelDiffLimit))
 	if err != nil {
-		return nil, p5MapError(err, "code diff")
+		return nil, codeIntelMapError(err, "code diff")
 	}
 	files := make([]map[string]any, 0, len(result.Files))
 	for _, file := range result.Files {
@@ -553,7 +552,7 @@ func (t *codeImpactTool) Parameters() json.RawMessage {
 	return schemaObject(map[string]any{
 		"repoId":     map[string]any{"type": "string", "pattern": "^[0-9]+$"},
 		"analysisId": map[string]any{"type": "string", "pattern": "^[0-9]+$", "description": "decimal code analysis ID; defaults to the latest analysis"},
-		"limit":      map[string]any{"type": "integer", "minimum": 1, "maximum": p5ImpactLimit},
+		"limit":      map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelImpactLimit},
 	})
 }
 
@@ -569,10 +568,10 @@ func (t *codeImpactTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 	if scope.VersionID <= 0 {
 		return nil, Invalid("scope", "the version scope is required")
 	}
-	if t.deps.P5.Impact == nil || t.deps.P5.Analysis == nil {
+	if t.deps.CodeIntel.Impact == nil || t.deps.CodeIntel.Analysis == nil {
 		return nil, missingDep("codeintel impact service")
 	}
-	limit := p5Limit(args.Limit, p5ImpactLimit, p5ImpactLimit)
+	limit := codeIntelLimit(args.Limit, codeIntelImpactLimit, codeIntelImpactLimit)
 	analysisID := int64(0)
 	var views []codeintelapp.ImpactCandidateView
 	switch {
@@ -581,15 +580,15 @@ func (t *codeImpactTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		analysis, getErr := t.deps.P5.Analysis.Get(ctx, parsed)
+		analysis, getErr := t.deps.CodeIntel.Analysis.Get(ctx, parsed)
 		if getErr != nil {
-			return nil, p5MapError(getErr, "code analysis")
+			return nil, codeIntelMapError(getErr, "code analysis")
 		}
 		if analysis.VersionID != scope.VersionID {
 			return nil, NotFound("code analysis")
 		}
 		if strings.TrimSpace(args.RepoID) != "" {
-			repo, repoErr := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+			repo, repoErr := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 			if repoErr != nil {
 				return nil, repoErr
 			}
@@ -597,56 +596,58 @@ func (t *codeImpactTool) Execute(ctx context.Context, scope Scope, raw json.RawM
 				return nil, Invalid("repoId", "the analysis belongs to another repository")
 			}
 		}
-		list, listErr := t.deps.P5.Impact.List(ctx, parsed)
+		list, listErr := t.deps.CodeIntel.Impact.List(ctx, parsed)
 		if listErr != nil {
-			return nil, p5MapError(listErr, "code impact")
+			return nil, codeIntelMapError(listErr, "code impact")
 		}
 		views, analysisID = list, parsed
 	case strings.TrimSpace(args.RepoID) != "":
-		repo, repoErr := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+		repo, repoErr := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 		if repoErr != nil {
 			return nil, repoErr
 		}
-		latest, latestErr := t.deps.P5.Analysis.Latest(ctx, scope.VersionID, repo.RepoID)
+		latest, latestErr := t.deps.CodeIntel.Analysis.Latest(ctx, scope.VersionID, repo.RepoID)
 		if latestErr != nil {
-			if p5IsNotFound(latestErr) {
-				return p5ImpactResult(0, nil, limit), nil
+			if codeIntelIsNotFound(latestErr) {
+				return codeIntelImpactResult(0, nil, limit), nil
 			}
-			return nil, p5MapError(latestErr, "code analysis")
+			return nil, codeIntelMapError(latestErr, "code analysis")
 		}
-		list, listErr := t.deps.P5.Impact.List(ctx, latest.ID)
+		list, listErr := t.deps.CodeIntel.Impact.List(ctx, latest.ID)
 		if listErr != nil {
-			return nil, p5MapError(listErr, "code impact")
+			return nil, codeIntelMapError(listErr, "code impact")
 		}
 		views, analysisID = list, latest.ID
 	default:
-		union, unionErr := t.deps.P5.Impact.Union(ctx, scope.VersionID)
+		union, unionErr := t.deps.CodeIntel.Impact.Union(ctx, scope.VersionID)
 		if unionErr != nil {
-			return nil, p5MapError(unionErr, "code impact")
+			return nil, codeIntelMapError(unionErr, "code impact")
 		}
 		views = union
 	}
-	return p5ImpactResult(analysisID, views, limit), nil
+	return codeIntelImpactResult(analysisID, views, limit), nil
 }
 
-func p5ImpactResult(analysisID int64, views []codeintelapp.ImpactCandidateView, limit int) map[string]any {
+func codeIntelImpactResult(analysisID int64, views []codeintelapp.ImpactCandidateView, limit int) map[string]any {
 	if len(views) > limit {
 		views = views[:limit]
 	}
 	candidates := make([]map[string]any, 0, len(views))
 	for _, view := range views {
+		// The codeintel view is SUT-keyed; the tool output key is sut_ids
+		// (v0.2.4-C T14/U28 renamed it from the stale version-SUT result key).
 		candidates = append(candidates, map[string]any{
-			"id":              idString(view.ID),
-			"analysis_id":     idString(view.AnalysisID),
-			"subject_kind":    string(view.SubjectKind),
-			"subject_id":      idString(view.SubjectID),
-			"reason":          view.Reason,
-			"confidence":      string(view.Confidence),
-			"source":          string(view.Source),
-			"selected":        view.Selected,
-			"repo_id":         idString(view.RepoID),
-			"version_sut_ids": idList(view.VersionSUTIDs),
-			"evidence":        rawJSON(view.Evidence),
+			"id":           idString(view.ID),
+			"analysis_id":  idString(view.AnalysisID),
+			"subject_kind": string(view.SubjectKind),
+			"subject_id":   idString(view.SubjectID),
+			"reason":       view.Reason,
+			"confidence":   string(view.Confidence),
+			"source":       string(view.Source),
+			"selected":     view.Selected,
+			"repo_id":      idString(view.RepoID),
+			"sut_ids":      idList(view.SUTIDs),
+			"evidence":     rawJSON(view.Evidence),
 		})
 	}
 	result := map[string]any{"candidates": candidates}
@@ -671,7 +672,7 @@ func (t *codeAnchorsTool) Parameters() json.RawMessage {
 		"repoId":      map[string]any{"type": "string", "pattern": "^[0-9]+$"},
 		"subjectKind": map[string]any{"type": "string", "enum": []string{"version", "requirement", "requirement_version", "case_version", "issue"}},
 		"subjectId":   map[string]any{"type": "string", "pattern": "^[0-9]+$"},
-		"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": p5AnchorsLimit},
+		"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": codeIntelAnchorsLimit},
 	})
 }
 
@@ -688,7 +689,7 @@ func (t *codeAnchorsTool) Execute(ctx context.Context, scope Scope, raw json.Raw
 	if scope.VersionID <= 0 {
 		return nil, Invalid("scope", "the version scope is required")
 	}
-	if t.deps.P5.Anchors == nil {
+	if t.deps.CodeIntel.Anchors == nil {
 		return nil, missingDep("codeintel anchor service")
 	}
 	subjectKind := strings.TrimSpace(args.SubjectKind)
@@ -705,17 +706,17 @@ func (t *codeAnchorsTool) Execute(ctx context.Context, scope Scope, raw json.Raw
 	}
 	var repoID int64
 	if strings.TrimSpace(args.RepoID) != "" {
-		repo, err := p5ResolveRepo(ctx, t.deps, scope, args.RepoID)
+		repo, err := codeIntelResolveRepo(ctx, t.deps, scope, args.RepoID)
 		if err != nil {
 			return nil, err
 		}
 		repoID = repo.RepoID
 	}
-	anchors, err := t.deps.P5.Anchors.List(ctx, scope.VersionID, subjectKind, subjectID)
+	anchors, err := t.deps.CodeIntel.Anchors.List(ctx, scope.VersionID, subjectKind, subjectID)
 	if err != nil {
-		return nil, p5MapError(err, "code anchors")
+		return nil, codeIntelMapError(err, "code anchors")
 	}
-	limit := p5Limit(args.Limit, p5AnchorsLimit, p5AnchorsLimit)
+	limit := codeIntelLimit(args.Limit, codeIntelAnchorsLimit, codeIntelAnchorsLimit)
 	mapped := make([]map[string]any, 0, len(anchors))
 	for _, anchor := range anchors {
 		if repoID > 0 && anchor.RepoID != repoID {
@@ -757,15 +758,15 @@ func optionalString(value *string) any {
 	return *value
 }
 
-func p5Cursor(value string) (string, error) {
+func codeIntelCursor(value string) (string, error) {
 	cursor := strings.TrimSpace(value)
-	if len([]rune(cursor)) > p5CursorMaxChars {
+	if len([]rune(cursor)) > codeIntelCursorMaxChars {
 		return "", Invalid("cursor", "cursor is too long")
 	}
 	return cursor, nil
 }
 
-func p5IsNotFound(err error) bool {
+func codeIntelIsNotFound(err error) bool {
 	var apiErr *platform.Error
 	return errors.As(err, &apiErr) && (apiErr.Status == 404 || apiErr.Code == "not_found")
 }

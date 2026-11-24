@@ -12,6 +12,10 @@ import {
   diffLines,
   EvidenceViewer,
   findComparisonPair,
+  isBinaryEvidence,
+  isTextMime,
+  parseCommandEvidence,
+  parseNetworkEvidence,
   REVOKE_DELAY_MS,
 } from "./EvidenceViewer"
 import { evidenceScreenshotFixture, evidenceTextFixture } from "./test-fixtures"
@@ -31,6 +35,47 @@ const httpEvidenceFixture: Evidence = {
   kind: "http",
   mime: "application/json",
   filename: "http-request.json",
+}
+
+// X-03 before/after pairing. The behaviour is generic to image evidence kinds,
+// so these fixtures use `screenshot` (they originally used the now-removed
+// visual_actual kind, which GD-22 deleted; the pairing contract itself stayed).
+const earlierCapture: Evidence = {
+  ...evidenceScreenshotFixture,
+  id: "9412",
+  filename: "capture-before.png",
+  created_at: "2026-10-31T12:00:00Z",
+}
+
+const laterCapture: Evidence = {
+  ...earlierCapture,
+  id: "9413",
+  filename: "capture-after.png",
+  created_at: "2026-10-31T12:00:30Z",
+}
+
+const differentStepCapture: Evidence = {
+  ...earlierCapture,
+  id: "9414",
+  step_seq: 1,
+  filename: "other-step.png",
+}
+
+const differentRunCapture: Evidence = {
+  ...laterCapture,
+  id: "9415",
+  case_run_id: "9999",
+  filename: "other-run.png",
+  created_at: "2026-10-31T12:00:10Z",
+}
+
+// `snapshot` is the other surviving image kind: it proves the guard compares
+// kinds for equality rather than merely "is an image".
+const differentKindCapture: Evidence = {
+  ...laterCapture,
+  id: "9416",
+  kind: "snapshot",
+  filename: "snapshot-instead.png",
 }
 
 describe("findComparisonPair same-second captures", () => {
@@ -376,5 +421,363 @@ describe("EvidenceViewer", () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it("pairs before/after screenshots of the same case run and step", async () => {
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob(["png"], { type: "image/png" }), "capture.png"),
+    )
+    createObjectURL
+      .mockReturnValueOnce("blob:compare-before")
+      .mockReturnValueOnce("blob:compare-after")
+
+    render(
+      <EvidenceViewer
+        versionId="2001"
+        evidence={earlierCapture}
+        candidates={[earlierCapture, laterCapture, differentStepCapture]}
+        open
+        onClose={() => {}}
+      />,
+    )
+
+    const compare = await screen.findByTestId("evidence-compare")
+    expect(compare).toHaveTextContent("前后对比")
+    expect(within(compare).getByText("之前")).toBeInTheDocument()
+    expect(within(compare).getByText("之后")).toBeInTheDocument()
+
+    const before = within(screen.getByTestId("evidence-compare-before")).getByRole("img")
+    const after = within(screen.getByTestId("evidence-compare-after")).getByRole("img")
+    expect(before).toHaveAttribute("src", "blob:compare-before")
+    expect(after).toHaveAttribute("src", "blob:compare-after")
+    expect(before.className).toContain("object-contain")
+    expect(after.className).toContain("object-contain")
+
+    // Only the before/after pair is downloaded a second time; the different
+    // step screenshot is never paired.
+    expect(api.downloadEvidence).toHaveBeenCalledWith("2001", "9413")
+    expect(api.downloadEvidence).not.toHaveBeenCalledWith("2001", "9414")
+  })
+
+  it("does not compare evidence from a different step", async () => {
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob(["png"], { type: "image/png" }), "capture.png"),
+    )
+
+    render(
+      <EvidenceViewer
+        versionId="2001"
+        evidence={earlierCapture}
+        candidates={[differentStepCapture]}
+        open
+        onClose={() => {}}
+      />,
+    )
+
+    await screen.findByTestId("evidence-image")
+    expect(screen.queryByTestId("evidence-compare")).not.toBeInTheDocument()
+  })
+
+  it("does not compare evidence from another case run or kind", async () => {
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob(["png"], { type: "image/png" }), "capture.png"),
+    )
+
+    render(
+      <EvidenceViewer
+        versionId="2001"
+        evidence={earlierCapture}
+        candidates={[differentRunCapture, differentKindCapture]}
+        open
+        onClose={() => {}}
+      />,
+    )
+
+    await screen.findByTestId("evidence-image")
+    expect(screen.queryByTestId("evidence-compare")).not.toBeInTheDocument()
+    expect(api.downloadEvidence).not.toHaveBeenCalledWith("2001", "9415")
+    expect(api.downloadEvidence).not.toHaveBeenCalledWith("2001", "9416")
+  })
+
+  /* ------------------------- M4: command/trace/network/file ------------------------- */
+
+  const commandEvidence: Evidence = {
+    ...evidenceTextFixture,
+    id: "9501",
+    kind: "command",
+    mime: "application/json",
+    filename: "command-cmd_1.json",
+  }
+  const commandPayload = {
+    kind: "command",
+    command_id: "cmd_1",
+    argv: ["node", "-e", "console.log('hi')"],
+    shell: false,
+    cwd: "/data/workspaces/run-1",
+    env: { PATH: "/usr/bin", EZTEST_EXECUTOR_TOKEN: "dev-secret" },
+    exit: 0,
+    outcome: "exited",
+    duration: 42,
+    stdout: "hi\n",
+    stderr: "",
+    stdout_truncated: false,
+    stderr_truncated: false,
+    stdout_ref: null,
+    stderr_ref: null,
+    stdout_bytes: 3,
+    stderr_bytes: 0,
+  }
+
+  it("renders command evidence with argv, exit/outcome and stdio panes (M4)", async () => {
+    api.downloadEvidence.mockResolvedValue(
+      download(
+        new Blob([JSON.stringify(commandPayload)], { type: "application/json" }),
+        "command-cmd_1.json",
+      ),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={commandEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-command")
+    expect(pane).toHaveTextContent("node -e console.log('hi')")
+    expect(pane).toHaveTextContent("exit 0")
+    expect(pane).toHaveTextContent("exited")
+    expect(screen.getByTestId("evidence-command-stdout")).toHaveTextContent("hi")
+    // env is full plaintext (GD-01): the token is shown verbatim, not scrubbed.
+    expect(screen.getByTestId("evidence-command-env")).toHaveTextContent(
+      "EZTEST_EXECUTOR_TOKEN=dev-secret",
+    )
+    expect(screen.queryByTestId("evidence-text")).not.toBeInTheDocument()
+  })
+
+  it("shows command stdio truncation flag and spill ref (M4)", async () => {
+    const truncated = {
+      ...commandPayload,
+      stdout: "head…",
+      stdout_truncated: true,
+      stdout_ref: ".eztest/commands/cmd_1.stdout.log",
+      stdout_bytes: 100000,
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(
+        new Blob([JSON.stringify(truncated)], { type: "application/json" }),
+        "command-cmd_1.json",
+      ),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={commandEvidence} open onClose={() => {}} />)
+
+    const stdout = await screen.findByTestId("evidence-command-stdout")
+    expect(stdout).toHaveTextContent("已截断")
+    expect(stdout).toHaveTextContent(".eztest/commands/cmd_1.stdout.log")
+  })
+
+  const networkEvidence: Evidence = {
+    ...evidenceTextFixture,
+    id: "9502",
+    kind: "network",
+    mime: "application/json",
+    filename: "network.json",
+  }
+
+  it("renders network evidence as a request table (M4)", async () => {
+    const payload = {
+      items: [
+        {
+          method: "GET",
+          url: "https://sut.test/login",
+          status: 200,
+          duration_ms: 12,
+          mime: "text/html",
+          resource_type: "document",
+        },
+        {
+          method: "POST",
+          url: "https://sut.test/api",
+          status: null,
+          duration_ms: 5,
+          mime: "",
+          resource_type: "xhr",
+          error: "net::ERR_FAILED",
+        },
+      ],
+      recording: false,
+      degraded: false,
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob([JSON.stringify(payload)], { type: "application/json" }), "network.json"),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={networkEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-network")
+    expect(pane).toHaveTextContent("https://sut.test/login")
+    expect(pane).toHaveTextContent("net::ERR_FAILED")
+    expect(pane).toHaveTextContent("2 条")
+    expect(screen.queryByTestId("evidence-network-degraded")).not.toBeInTheDocument()
+  })
+
+  it("renders the captured network body preview and discloses truncation (H-D6)", async () => {
+    const payload = {
+      items: [
+        {
+          method: "POST",
+          url: "https://sut.test/login",
+          status: 200,
+          duration_ms: 8,
+          mime: "application/json",
+          resource_type: "xhr",
+          body_preview: '{"token":"abc"}',
+          body_truncated: false,
+          body_bytes: 15,
+        },
+        {
+          method: "GET",
+          url: "https://sut.test/big",
+          status: 200,
+          duration_ms: 20,
+          mime: "text/html",
+          resource_type: "document",
+          body_preview: "<html>partial",
+          body_truncated: true,
+          body_bytes: 9000,
+        },
+      ],
+      recording: true,
+      degraded: false,
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob([JSON.stringify(payload)], { type: "application/json" }), "network.json"),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={networkEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-network")
+    // The captured body text is actually rendered, not parsed and silently dropped.
+    expect(pane).toHaveTextContent('{"token":"abc"}')
+    expect(pane).toHaveTextContent("<html>partial")
+    // A truncated body must be labelled, so the operator never believes they saw
+    // the full response.
+    expect(pane).toHaveTextContent("已截断")
+    expect(pane).toHaveTextContent("8.8 KB")
+  })
+
+  it("surfaces an explicit network degradation record (M4, never silent)", async () => {
+    const payload = { items: [], recording: false, degraded: true, reason: "cdp_inject_failed" }
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob([JSON.stringify(payload)], { type: "application/json" }), "network.json"),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={networkEvidence} open onClose={() => {}} />)
+
+    const banner = await screen.findByTestId("evidence-network-degraded")
+    expect(banner).toHaveTextContent("cdp_inject_failed")
+  })
+
+  it("renders a text file evidence preview with metadata (M4)", async () => {
+    const fileEvidence: Evidence = {
+      ...evidenceTextFixture,
+      id: "9503",
+      kind: "file",
+      mime: "text/plain",
+      filename: "seed.sql",
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(new Blob(["INSERT INTO t VALUES (1);"], { type: "text/plain" }), "seed.sql"),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={fileEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-file")
+    expect(pane).toHaveTextContent("seed.sql")
+    expect(screen.getByTestId("evidence-file-text")).toHaveTextContent("INSERT INTO t VALUES (1);")
+  })
+
+  it("renders a binary file evidence as a download notice, not mojibake (M4)", async () => {
+    const fileEvidence: Evidence = {
+      ...evidenceTextFixture,
+      id: "9504",
+      kind: "file",
+      mime: "application/octet-stream",
+      filename: "blob.bin",
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(
+        new Blob([new Uint8Array([0, 1, 2, 255])], { type: "application/octet-stream" }),
+        "blob.bin",
+      ),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={fileEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-file")
+    expect(pane).toHaveTextContent("二进制文件")
+    expect(screen.queryByTestId("evidence-file-text")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("evidence-text")).not.toBeInTheDocument()
+  })
+
+  it("renders trace evidence as a download-oriented panel with show-trace hint (M4)", async () => {
+    const traceEvidence: Evidence = {
+      ...evidenceTextFixture,
+      id: "9505",
+      kind: "trace",
+      mime: "application/zip",
+      filename: "trace.zip",
+    }
+    api.downloadEvidence.mockResolvedValue(
+      download(
+        new Blob([new Uint8Array([0x50, 0x4b, 3, 4])], { type: "application/zip" }),
+        "trace.zip",
+      ),
+    )
+    render(<EvidenceViewer versionId="2001" evidence={traceEvidence} open onClose={() => {}} />)
+
+    const pane = await screen.findByTestId("evidence-trace")
+    expect(pane).toHaveTextContent("playwright show-trace")
+    expect(pane).toHaveTextContent("trace.zip")
+    expect(screen.queryByTestId("evidence-text")).not.toBeInTheDocument()
+  })
+})
+
+describe("M4 evidence parsers", () => {
+  it("parseCommandEvidence accepts a command record and rejects non-command JSON", () => {
+    const record = parseCommandEvidence(
+      JSON.stringify({ kind: "command", argv: ["echo", "hi"], exit: 0, stdout: "hi" }),
+    )
+    expect(record).not.toBeNull()
+    expect(record?.argv).toEqual(["echo", "hi"])
+    expect(record?.exit).toBe(0)
+    expect(parseCommandEvidence(JSON.stringify({ kind: "file" }))).toBeNull()
+    expect(parseCommandEvidence(JSON.stringify({ request: {}, response: {} }))).toBeNull()
+    expect(parseCommandEvidence("not json")).toBeNull()
+    expect(parseCommandEvidence(JSON.stringify({ kind: "command", argv: [1] }))).toBeNull()
+  })
+
+  it("parseCommandEvidence reports a killed command exit as null", () => {
+    const record = parseCommandEvidence(
+      JSON.stringify({ kind: "command", argv: ["sleep"], exit: null, outcome: "cancelled" }),
+    )
+    expect(record?.exit).toBeNull()
+    expect(record?.outcome).toBe("cancelled")
+  })
+
+  it("parseNetworkEvidence accepts items and degradation records, rejects others", () => {
+    const record = parseNetworkEvidence(
+      JSON.stringify({ items: [{ method: "GET", url: "u", status: 200 }], degraded: false }),
+    )
+    expect(record?.items).toHaveLength(1)
+    expect(record?.items[0].status).toBe(200)
+    const degraded = parseNetworkEvidence(
+      JSON.stringify({ items: [], degraded: true, reason: "x" }),
+    )
+    expect(degraded?.degraded).toBe(true)
+    expect(degraded?.reason).toBe("x")
+    expect(parseNetworkEvidence(JSON.stringify({ kind: "command" }))).toBeNull()
+    expect(parseNetworkEvidence("nope")).toBeNull()
+  })
+
+  it("isTextMime / isBinaryEvidence classify file/trace/download kinds", () => {
+    expect(isTextMime("text/plain")).toBe(true)
+    expect(isTextMime("application/json")).toBe(true)
+    expect(isTextMime("application/zip")).toBe(false)
+    const base = { ...evidenceTextFixture }
+    expect(isBinaryEvidence({ ...base, kind: "trace" })).toBe(true)
+    expect(isBinaryEvidence({ ...base, kind: "download" })).toBe(true)
+    expect(isBinaryEvidence({ ...base, kind: "file", mime: "text/plain" })).toBe(false)
+    expect(isBinaryEvidence({ ...base, kind: "file", mime: "application/octet-stream" })).toBe(true)
+    expect(isBinaryEvidence({ ...base, kind: "command" })).toBe(false)
   })
 })

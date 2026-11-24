@@ -50,12 +50,17 @@ describe("CaseDetailPanel", () => {
     expect(screen.getByText(/审核通过后 T\+1 个工作日原路退回/)).toBeInTheDocument()
     expect(screen.getByText("订单已支付")).toBeInTheDocument()
     expect(screen.getByText("P1")).toBeInTheDocument()
+    // v0.2.4-B natural-language contract: sut_description + covered_acs replace
+    // the deleted default-SUT/page id cells.
+    expect(screen.getByText("支付网关退款页面")).toBeInTheDocument()
+    expect(screen.getByText("AC-1")).toBeInTheDocument()
 
     expect(screen.getByText("打开退款详情页")).toBeInTheDocument()
     expect(screen.getByText("显示退款按钮")).toBeInTheDocument()
     expect(screen.getByText("点击确认退款")).toBeInTheDocument()
-    expect(screen.getByText(/SUT 1002/)).toBeInTheDocument()
-    expect(screen.getByText(/页面 2301/)).toBeInTheDocument()
+    // Per-step prose target_description replaces the deleted SUT/page/API id columns.
+    expect(screen.getByText("支付网关退款详情页")).toBeInTheDocument()
+    expect(screen.getByText("支付网关确认退款接口")).toBeInTheDocument()
 
     expect(screen.getByText(/UI · 退款按钮/)).toBeInTheDocument()
     expect(screen.getByText(/可见可点击/)).toBeInTheDocument()
@@ -65,6 +70,28 @@ describe("CaseDetailPanel", () => {
     expect(screen.getByText(/v1 · stale/)).toBeInTheDocument()
     expect(screen.queryByText("查看执行结果")).not.toBeInTheDocument()
     expect(api.getDesignCase).toHaveBeenCalledWith("2001", "7001", undefined)
+  })
+
+  it("names the SUT a db assertion reads (sut_id, not a database id)", async () => {
+    api.getDesignCase.mockResolvedValue({
+      ...designCaseDetailFixture,
+      selected: {
+        ...designCaseDetailFixture.selected,
+        assertions: [
+          {
+            step_seq: 2,
+            kind: "db" as const,
+            target: "refund_order.status",
+            expected: "refunded",
+            sut_id: "1002",
+          },
+        ],
+      },
+    })
+    renderPanel()
+
+    expect(await screen.findByText(/DB · refund_order.status/)).toBeInTheDocument()
+    expect(screen.getByText("SUT 1002")).toBeInTheDocument()
   })
 
   it("confirms a draft case and requests a change without sending", async () => {
@@ -133,7 +160,7 @@ describe("CaseDetailPanel", () => {
     expect(api.getDesignCase).toHaveBeenCalledTimes(2)
   })
 
-  it("shows a low-confidence discovery draft with manual confirmation", async () => {
+  it("shows a judgment_pending discovery draft awaiting judge review (no auto-confirm)", async () => {
     api.getDesignCase.mockResolvedValue({
       ...designCaseDetailFixture,
       selected: {
@@ -152,8 +179,11 @@ describe("CaseDetailPanel", () => {
     })
     renderPanel()
 
-    expect(await screen.findByText("低置信草案")).toBeInTheDocument()
-    expect(screen.getByText(/需人工确认/)).toBeInTheDocument()
+    // R-E2r: an inferred discovery draft awaits judge review + human confirm; it
+    // is never presented as an auto-confirmation.
+    expect(await screen.findByText("待裁判审查")).toBeInTheDocument()
+    expect(screen.getByText(/等待裁判审查后由人工确认/)).toBeInTheDocument()
+    expect(screen.queryByText("自动确认")).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "回滚" })).not.toBeInTheDocument()
   })
 

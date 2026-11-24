@@ -88,7 +88,6 @@ const apiValues: ApiFormValues = {
 }
 
 const databaseValues: DatabaseFormValues = {
-  environmentId: "1101",
   name: "order_db",
   dsn: "postgres://order-db:5432/order",
   username: "order",
@@ -97,7 +96,6 @@ const databaseValues: DatabaseFormValues = {
 }
 
 const accountValues: AccountFormValues = {
-  environmentId: "1101",
   username: "buyer",
   password: "secret",
   roles: "buyer, order_admin",
@@ -114,8 +112,7 @@ const repositoryValues: RepositoryFormValues = {
 
 const environmentValues: EnvironmentFormValues = {
   name: "测试环境",
-  baseUrl: "https://order.test",
-  isDefault: true,
+  description: "订单与支付联调环境",
   status: "active",
 }
 
@@ -158,11 +155,11 @@ describe("resources API", () => {
       .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
       .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
 
-    await createSut({ name: "订单中心", intro: "订单主链路" })
+    await createSut("1101", { name: "订单中心", intro: "订单主链路" })
     await updateSut("1001", { name: "订单中心 v2", intro: "新简介" })
 
     const [createUrl, createInit] = fetchMock.mock.calls[0]
-    expect(createUrl).toBe("http://localhost:13333/api/resources/suts")
+    expect(createUrl).toBe("http://localhost:13333/api/resources/environments/1101/suts")
     expect(createInit?.method).toBe("POST")
     expect(readBody(createInit)).toEqual({ name: "订单中心", intro: "订单主链路" })
 
@@ -177,7 +174,7 @@ describe("resources API", () => {
       .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
       .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
 
-    await createSut({ name: "订单中心", intro: "订单主链路", family: "payments" })
+    await createSut("1101", { name: "订单中心", intro: "订单主链路", family: "payments" })
     await updateSut("1001", { name: "订单中心", intro: "订单主链路", family: "order-center" })
 
     expect(readBody(fetchMock.mock.calls[0][1])).toEqual({
@@ -192,6 +189,62 @@ describe("resources API", () => {
     })
   })
 
+  it("clears the SUT family on PATCH with an explicit empty string (create keeps omitting)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    // Create keeps the omit-when-blank semantics (the server owns the default).
+    await createSut("1101", { name: "订单中心", intro: "订单主链路", family: "" })
+    // PATCH must SEND family:"" so the backend (Family *string, empty clears it)
+    // actually clears it; omitting the key means "leave unchanged".
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路", family: "" })
+
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+    })
+    const updateBody = readBody(fetchMock.mock.calls[1][1])
+    expect(updateBody).toEqual({ name: "订单中心", intro: "订单主链路", family: "" })
+    // Present-but-empty, not merely an absent/undefined key.
+    expect(Object.hasOwn(updateBody as Record<string, unknown>, "family")).toBe(true)
+  })
+
+  it("omits the SUT family on PATCH when it is not provided (leave unchanged)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路" })
+
+    const updateBody = readBody(fetchMock.mock.calls[0][1])
+    expect(updateBody).toEqual({ name: "订单中心", intro: "订单主链路" })
+    expect(Object.hasOwn(updateBody as Record<string, unknown>, "family")).toBe(false)
+  })
+
+  it("omits a blank base_url on PATCH (empty is invalid, not a clear)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    // base_url is required, so "" is not a "clear" (the backend would 400); a blank
+    // or whitespace value must be omitted to leave the stored value unchanged.
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路", baseUrl: "" })
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路", baseUrl: "   " })
+    for (const call of fetchMock.mock.calls) {
+      expect(Object.hasOwn(readBody(call[1]) as Record<string, unknown>, "base_url")).toBe(false)
+    }
+
+    // A non-empty base_url is still a real update.
+    await updateSut("1001", {
+      name: "订单中心",
+      intro: "订单主链路",
+      baseUrl: "https://order.test",
+    })
+    expect((readBody(fetchMock.mock.calls[2][1]) as Record<string, unknown>).base_url).toBe(
+      "https://order.test",
+    )
+  })
+
   it("deletes a SUT with DELETE", async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
 
@@ -202,10 +255,10 @@ describe("resources API", () => {
     expect(init?.method).toBe("DELETE")
   })
 
-  it("creates the SUT and then its default environment in one flow", async () => {
+  it("creates the environment and then the SUT under it in one flow", async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
       .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
 
     const result = await createSutWithDefaultEnvironment({
       sut: { name: "订单中心", intro: "订单主链路" },
@@ -215,24 +268,27 @@ describe("resources API", () => {
     expect(result).toEqual({ sut: sutListItemFixture, environment: environmentFixture })
     expect(fetchMock).toHaveBeenCalledTimes(2)
 
-    const [sutUrl, sutInit] = fetchMock.mock.calls[0]
-    expect(sutUrl).toBe("http://localhost:13333/api/resources/suts")
-    expect(readBody(sutInit)).toEqual({ name: "订单中心", intro: "订单主链路" })
-
-    const [environmentUrl, environmentInit] = fetchMock.mock.calls[1]
-    expect(environmentUrl).toBe("http://localhost:13333/api/resources/suts/1001/environments")
+    const [environmentUrl, environmentInit] = fetchMock.mock.calls[0]
+    expect(environmentUrl).toBe("http://localhost:13333/api/resources/environments")
     expect(readBody(environmentInit)).toEqual({
       name: "测试环境",
-      base_url: "https://order.test",
-      is_default: true,
+      description: "",
       status: "active",
+    })
+
+    const [sutUrl, sutInit] = fetchMock.mock.calls[1]
+    expect(sutUrl).toBe("http://localhost:13333/api/resources/environments/1101/suts")
+    expect(readBody(sutInit)).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+      base_url: "https://order.test",
     })
   })
 
-  it("keeps the created SUT when the default environment fails", async () => {
+  it("keeps the created environment when the SUT create fails", async () => {
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
-      .mockResolvedValueOnce(errorResponse(409, "conflict", "environment name already exists"))
+      .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }, 201))
+      .mockResolvedValueOnce(errorResponse(409, "conflict", "sut name already exists"))
 
     const caught = await createSutWithDefaultEnvironment({
       sut: { name: "订单中心", intro: "订单主链路" },
@@ -241,9 +297,9 @@ describe("resources API", () => {
 
     expect(caught).toBeInstanceOf(DefaultEnvironmentError)
     if (caught instanceof DefaultEnvironmentError) {
-      expect(caught.sut.id).toBe("1001")
-      expect(caught.message).toContain("默认环境创建失败")
-      expect(caught.message).toContain("environment name already exists")
+      expect(caught.environment.id).toBe("1101")
+      expect(caught.message).toContain("SUT 创建失败")
+      expect(caught.message).toContain("sut name already exists")
     }
   })
 
@@ -253,16 +309,15 @@ describe("resources API", () => {
       .mockResolvedValueOnce(jsonResponse({ data: environmentFixture }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
-    await createEnvironment("1001", environmentValues)
+    await createEnvironment(environmentValues)
     await updateEnvironment("1101", { ...environmentValues, name: "预发环境" })
     await deleteEnvironment("1101")
 
     const [createUrl, createInit] = fetchMock.mock.calls[0]
-    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/environments")
+    expect(createUrl).toBe("http://localhost:13333/api/resources/environments")
     expect(readBody(createInit)).toEqual({
       name: "测试环境",
-      base_url: "https://order.test",
-      is_default: true,
+      description: "订单与支付联调环境",
       status: "active",
     })
 
@@ -271,8 +326,7 @@ describe("resources API", () => {
     expect(updateInit?.method).toBe("PATCH")
     expect(readBody(updateInit)).toEqual({
       name: "预发环境",
-      base_url: "https://order.test",
-      is_default: true,
+      description: "订单与支付联调环境",
       status: "active",
     })
 
@@ -290,15 +344,15 @@ describe("resources API", () => {
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
-    await createPage("1101", pageValues)
+    await createPage("1001", pageValues)
     await updatePage("1301", { ...pageValues, name: "订单列表 v2" })
-    const imported = await importPages("1101", [pageValues])
+    const imported = await importPages("1001", [pageValues])
     await deletePage("1301")
 
     expect(imported).toEqual({ created: 1, skipped: 0, items: [pageFixture] })
 
     const [createUrl, createInit] = fetchMock.mock.calls[0]
-    expect(createUrl).toBe("http://localhost:13333/api/resources/environments/1101/pages")
+    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/pages")
     expect(readBody(createInit)).toEqual({
       name: "订单列表",
       url: "https://order.test/orders",
@@ -313,7 +367,7 @@ describe("resources API", () => {
     expect(updateInit?.method).toBe("PATCH")
 
     const [importUrl, importInit] = fetchMock.mock.calls[2]
-    expect(importUrl).toBe("http://localhost:13333/api/resources/environments/1101/pages/import")
+    expect(importUrl).toBe("http://localhost:13333/api/resources/suts/1001/pages/import")
     expect(readBody(importInit)).toEqual({
       items: [
         {
@@ -341,15 +395,15 @@ describe("resources API", () => {
       )
       .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
-    await createApi("1101", apiValues)
+    await createApi("1001", apiValues)
     await updateApi("1401", { ...apiValues, name: "查询订单 v2" })
-    const imported = await importApis("1101", [apiValues])
+    const imported = await importApis("1001", [apiValues])
     await deleteApi("1401")
 
     expect(imported).toEqual({ created: 1, skipped: 0, items: [apiFixture] })
 
     const [createUrl, createInit] = fetchMock.mock.calls[0]
-    expect(createUrl).toBe("http://localhost:13333/api/resources/environments/1101/apis")
+    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/apis")
     expect(readBody(createInit)).toEqual({
       method: "GET",
       path_template: "/api/orders",
@@ -363,7 +417,7 @@ describe("resources API", () => {
     expect(updateInit?.method).toBe("PATCH")
 
     const [importUrl, importInit] = fetchMock.mock.calls[2]
-    expect(importUrl).toBe("http://localhost:13333/api/resources/environments/1101/apis/import")
+    expect(importUrl).toBe("http://localhost:13333/api/resources/suts/1001/apis/import")
     expect(readBody(importInit)).toEqual({
       items: [
         {
@@ -381,7 +435,7 @@ describe("resources API", () => {
     expect(deleteInit?.method).toBe("DELETE")
   })
 
-  it("creates a target database under the SUT with environment_id", async () => {
+  it("creates a target database under the SUT", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ data: databaseFixture }, 201))
 
     await createDatabase("1001", databaseValues)
@@ -389,7 +443,6 @@ describe("resources API", () => {
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe("http://localhost:13333/api/resources/suts/1001/databases")
     expect(readBody(init)).toEqual({
-      environment_id: "1101",
       name: "order_db",
       dsn: "postgres://order-db:5432/order",
       username: "order",
@@ -437,9 +490,9 @@ describe("resources API", () => {
     await deleteAccount("1601")
 
     const [createUrl, createInit] = fetchMock.mock.calls[0]
-    expect(createUrl).toBe("http://localhost:13333/api/resources/suts/1001/accounts")
+    expect(createUrl).toBe("http://localhost:13333/api/resources/accounts")
     expect(readBody(createInit)).toEqual({
-      environment_id: "1101",
+      sut_id: "1001",
       username: "buyer",
       password: "secret",
       roles: ["buyer", "order_admin"],

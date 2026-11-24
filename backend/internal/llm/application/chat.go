@@ -49,10 +49,12 @@ const (
 var ErrContextOverflow = errors.New("llm context overflow")
 
 // ErrNotImplemented marks a protocol adapter capability whose wire
-// implementation has not landed yet. The OpenAI Responses adapter is fully
-// implemented in infrastructure/responses.go; chat-completions streaming still
-// fails closed instead of silently falling back to another protocol. Callers
-// must surface this error rather than pretend the request succeeded.
+// implementation has not landed yet. Both current adapters (chat-completions
+// and Responses) implement Chat and Stream, and the agent runner consumes
+// Stream; the sentinel stays for future capabilities so they fail closed
+// instead of silently falling back to another protocol or to non-streaming
+// Chat. Callers must surface this error rather than pretend the request
+// succeeded.
 var ErrNotImplemented = errors.New("llm protocol adapter is not implemented")
 
 // IsContextOverflow reports whether err is a classified context-window
@@ -144,12 +146,17 @@ type ChatResponse struct {
 // payload field is set per chunk: Content for assistant text, ReasoningContent
 // for thinking text, ToolCall for one function-call fragment. The terminal
 // chunk carries FinishReason and, when the upstream reports it, Usage.
+// ReasoningItems carries the opaque provider-issued reasoning output items
+// captured at the terminal chunk (Responses protocol) so the runner can replay
+// them on the next turn exactly like the non-streaming ChatResponse; it is nil
+// for chat-completions turns, which only have reasoning_content text.
 type Delta struct {
 	Content          string
 	ReasoningContent string
 	ToolCall         *ToolCallDelta
 	FinishReason     string
 	Usage            map[string]int
+	ReasoningItems   []json.RawMessage
 }
 
 // ToolCallDelta is one streamed fragment of a function call. Index identifies
@@ -199,14 +206,20 @@ type ModelInfo struct {
 // ChatGateway is the agent runtime's LLM port. ResolveModel selects the
 // configuration (explicit cfgID or the default config) and a catalog model
 // (explicit model name or the config's default_model_id), then validates that
-// the model can serve the caller's capabilities; Chat performs one completion.
+// the model can serve the caller's capabilities; Chat performs one completion
+// and Stream performs one streaming completion, emitting normalized deltas.
+// The agent runner consumes Stream; direct non-streaming consumers (summary,
+// codeintel extraction, vision captioning) keep using Chat.
 //
-// Implementations must never leak the configured API key through returned
-// errors, and must classify context-window overflows with ErrContextOverflow.
+// Implementations classify context-window overflows with ErrContextOverflow.
+// GD-01 (Q05=B): returned error messages are plaintext (no key redaction).
 type ChatGateway interface {
 	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+	Stream(ctx context.Context, req ChatRequest, onDelta func(Delta)) error
 	ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...ModelRequirements) (ModelInfo, error)
 }
+
+var _ ChatGateway = (*Service)(nil)
 
 // Option configures optional P1 dependencies of Service without changing the
 // frozen P0 constructor.
@@ -304,9 +317,41 @@ func validateThinkingSettings(cfg llm.Config) error {
 // (including the reasoning settings) so the direct path used by the summarizer
 // cannot send reasoning parameters to a non-reasoning model (R42).
 func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	cfg, chosen, err := s.resolveModelTarget(ctx, 0, req.Model)
+	cfg, prepared, err := s.prepareChat(ctx, req)
 	if err != nil {
 		return ChatResponse{}, err
+	}
+	response, err := s.chat.Chat(ctx, cfg, prepared)
+	if err != nil {
+		return ChatResponse{}, mapChatError(err)
+	}
+	return response, nil
+}
+
+// Stream performs one streaming completion against the default
+// OpenAI-compatible upstream, forwarding normalized deltas to onDelta. It goes
+// through the same capability gate, settings overrides and request defaults as
+// Chat (R42), so the runner's streaming path can never bypass the reasoning
+// gate or the output limit. A streaming failure is surfaced as a classified
+// error; it is never silently retried through the non-streaming Chat path.
+func (s *Service) Stream(ctx context.Context, req ChatRequest, onDelta func(Delta)) error {
+	cfg, prepared, err := s.prepareChat(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := s.chat.Stream(ctx, cfg, prepared, onDelta); err != nil {
+		return mapChatError(err)
+	}
+	return nil
+}
+
+// prepareChat resolves the target through the shared capability gate and
+// applies the settings overrides and request defaults. Chat and Stream share
+// it so both paths keep one resolution contract (single source, R42).
+func (s *Service) prepareChat(ctx context.Context, req ChatRequest) (llm.Config, ChatRequest, error) {
+	cfg, chosen, err := s.resolveModelTarget(ctx, 0, req.Model)
+	if err != nil {
+		return llm.Config{}, ChatRequest{}, err
 	}
 	if s.settings != nil {
 		// Settings are the P1 source of truth; a missing/failed read keeps the
@@ -321,16 +366,14 @@ func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, erro
 
 	req.Model = chosen.Model
 	if req.MaxOutputTokens <= 0 {
-		// R-A1-5: the request-side output limit is O = min(max_output or 4096,
-		// 16000), so an upstream-reported 393K is never forwarded verbatim.
+		// R-A1-5: when the request leaves max_output unset (<=0), resolve a
+		// request-side DEFAULT O = min(model.max_output or 4096, 16000). A positive
+		// request limit is forwarded VERBATIM (the runner passes the model's
+		// configured max_output here); the 16000 cap applies only to this default
+		// branch, never to a configured value (constitution II.7 / SC-H8, H-E12).
 		req.MaxOutputTokens = int(EffectiveMaxOutput(chosen))
 	}
-
-	response, err := s.chat.Chat(ctx, cfg, req)
-	if err != nil {
-		return ChatResponse{}, mapChatError(err, cfg.APIKey)
-	}
-	return response, nil
+	return cfg, req, nil
 }
 
 // resolveChatTarget selects the configuration and one catalog model. It
@@ -523,22 +566,22 @@ func contextOverflowError() *platform.Error {
 // typed 400s with an actionable next step, classified transient failures stay a
 // retryable 503 ai_unavailable, and unclassified errors keep the legacy generic
 // 503. Infrastructure types are never imported (R25); classification travels
-// through errors.Is/errors.As. The API key is always redacted.
-func mapChatError(err error, secret string) error {
+// through errors.Is/errors.As. GD-01 (Q05=B): messages are kept verbatim
+// (credentials are plaintext by design); no redaction is applied.
+func mapChatError(err error) error {
 	if IsContextOverflow(err) {
 		return contextOverflowError()
 	}
 	if classified, ok := classifyLLMError(err); ok {
-		return classifiedPlatformError(classified, secret)
+		return classifiedPlatformError(classified)
 	}
 	var apiErr *platform.Error
 	if errors.As(err, &apiErr) {
-		apiErr.Message = redact(apiErr.Message, secret)
 		return apiErr
 	}
 	message := strings.TrimSpace(err.Error())
 	if message == "" {
 		message = "llm chat request failed"
 	}
-	return aiUnavailable(redact(message, secret))
+	return aiUnavailable(message)
 }

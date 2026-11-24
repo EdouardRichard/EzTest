@@ -268,6 +268,13 @@ function MessagePartView({
 }
 
 function partKey(part: RenderablePart): string {
+  // Streamed parts carry their 1-based seq: keying by it keeps the React
+  // element stable while an increment grows the text (a content key would
+  // remount the paragraph on every token and reset a reader's expanded
+  // thinking block when duration_ms arrives). One seq == one rendered part,
+  // so the accumulated text stays a single paragraph, not per-fragment bubbles.
+  const seq = (part as { seq?: unknown }).seq
+  if (typeof seq === "number" && Number.isInteger(seq) && seq > 0) return `seq:${seq}`
   switch (part.type) {
     case "text":
       return `text:${part.text.slice(0, 32)}`
@@ -366,6 +373,18 @@ function MessageBubble({
       </div>
       <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
         {formatDateTime(message.created_at)}
+        {/* v0.2.4-D: an incremental reply is still growing. The state comes from
+            the server (SSE full frame or the HTTP snapshot's stream_state), so a
+            thread reloaded mid-reply reads as generating, not as finished. */}
+        {!isUser && message.stream_state === "streaming" ? (
+          <span
+            data-testid="message-streaming-badge"
+            title="回复正在生成"
+            className="rounded-full border border-border bg-muted px-1.5 py-0.5 font-medium"
+          >
+            生成中
+          </span>
+        ) : null}
         {/* 0.2.1: the assistant message shows the model that actually generated
             it (from the linked agent_run), never the currently selected one. */}
         {!isUser && (message.actual_model ?? "").trim() !== "" ? (

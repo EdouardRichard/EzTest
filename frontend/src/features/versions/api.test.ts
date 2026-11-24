@@ -37,6 +37,7 @@ import {
   versionFixture,
   versionSummaryFixture,
 } from "./test-fixtures"
+import type { UpdateBindingRequest } from "./types"
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -109,7 +110,7 @@ describe("versions API", () => {
     expect(JSON.parse(String(init?.body))).toEqual(payload)
   })
 
-  it("reads and updates the version binding with the Task 29 DTO", async () => {
+  it("reads and updates the version binding with the v0.2.4-B contract", async () => {
     fetchMock.mockImplementation(async () => jsonResponse({ data: bindingOverviewFixture }))
 
     await expect(getVersionBinding("2001")).resolves.toEqual(bindingOverviewFixture)
@@ -118,17 +119,19 @@ describe("versions API", () => {
     expect(url).toBe("http://localhost:13333/api/versions/2001/binding")
     expect(init?.method).toBe("GET")
 
-    const patch = {
-      repository_ids: ["1201", "1202"],
-      account_ids: ["1601"],
-      scope_exclude: { pages: ["1302"], apis: [], databases: ["1501"] },
-    }
+    // Typed as the real contract so the excess-property check fires: only
+    // environment_id and account_ids are writable in v0.2.4-B.
+    const patch: UpdateBindingRequest = { environment_id: "1101", account_ids: ["1601"] }
     await expect(updateVersionBinding("2001", patch)).resolves.toEqual(bindingOverviewFixture)
 
     ;[url, init] = fetchMock.mock.calls[1]
     expect(url).toBe("http://localhost:13333/api/versions/2001/binding")
     expect(init?.method).toBe("PUT")
-    expect(JSON.parse(String(init?.body))).toEqual(patch)
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+    expect(body).toEqual({ environment_id: "1101", account_ids: ["1601"] })
+    // Negative pin: the deleted version_sut-chain fields must never round-trip.
+    expect(body).not.toHaveProperty("repository_ids")
+    expect(body).not.toHaveProperty("scope_exclude")
   })
 
   it("lists and adds SUT-level repositories through API-17", async () => {
@@ -163,7 +166,7 @@ describe("versions API", () => {
       ),
     )
     const invalid = await updateVersionBinding("2001", {
-      scope_exclude: { pages: ["9999"], apis: [], databases: [] },
+      account_ids: ["9999"],
     }).catch((error: unknown) => error)
     expect(bindingErrorDetails(invalid)).toEqual({
       status: 400,

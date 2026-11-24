@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Recreates the deterministic P4 code-intelligence E2E fixture repository.

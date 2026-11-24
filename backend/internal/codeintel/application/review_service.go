@@ -133,7 +133,7 @@ func (s *ReviewService) factOfVersion(ctx context.Context, versionID, factID int
 	if err != nil {
 		return codeintel.Fact{}, mapDomainError(err, "code fact")
 	}
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return codeintel.Fact{}, err
 	}

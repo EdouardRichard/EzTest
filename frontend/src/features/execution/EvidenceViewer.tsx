@@ -28,12 +28,7 @@ export type EvidenceViewerProps = {
 }
 
 /** Kinds whose bytes are an image and can be previewed as a thumbnail. */
-const IMAGE_EVIDENCE_KINDS = new Set<Evidence["kind"]>([
-  "screenshot",
-  "snapshot",
-  "visual_actual",
-  "visual_diff",
-])
+const IMAGE_EVIDENCE_KINDS = new Set<Evidence["kind"]>(["screenshot", "snapshot"])
 
 /**
  * X-05: a blob URL may still be referenced by an `<img>` that is in the middle
@@ -166,6 +161,173 @@ export function buildCurl(request: HttpRequestRecord): string {
     parts.push(`--data-raw ${shellQuote(request.body)}`)
   }
   return parts.join(" ")
+}
+
+/* ------------------------- command evidence (M4) ------------------------- */
+
+/**
+ * The persisted `command` evidence payload written by the executor v2 recording
+ * layer (`executor/src/recording.mjs` CommandRecorder): argv/cwd/env FULL
+ * plaintext (GD-01), exit/outcome/duration and stdio with explicit truncation
+ * flags + spill refs. Returns null for anything that is not that shape so the
+ * viewer can fall back to a plain text pane.
+ */
+export type CommandEvidenceRecord = {
+  command_id: string
+  argv: string[]
+  shell: boolean
+  cwd: string
+  env: Record<string, string>
+  exit: number | null
+  outcome: string
+  duration: number
+  stdout: string
+  stderr: string
+  stdout_truncated: boolean
+  stderr_truncated: boolean
+  stdout_ref: string | null
+  stderr_ref: string | null
+  stdout_bytes: number
+  stderr_bytes: number
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+function numberValue(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function stringMap(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return out
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === "string") out[key] = item
+  }
+  return out
+}
+
+export function parseCommandEvidence(text: string): CommandEvidenceRecord | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const record = parsed as Record<string, unknown>
+  if (record.kind !== "command") return null
+  if (!Array.isArray(record.argv) || record.argv.some((a) => typeof a !== "string")) return null
+  const exit = record.exit
+  return {
+    command_id: stringValue(record.command_id),
+    argv: record.argv as string[],
+    shell: record.shell === true,
+    cwd: stringValue(record.cwd),
+    env: stringMap(record.env),
+    exit: typeof exit === "number" && Number.isFinite(exit) ? exit : null,
+    outcome: stringValue(record.outcome),
+    duration: numberValue(record.duration),
+    stdout: stringValue(record.stdout),
+    stderr: stringValue(record.stderr),
+    stdout_truncated: record.stdout_truncated === true,
+    stderr_truncated: record.stderr_truncated === true,
+    stdout_ref: typeof record.stdout_ref === "string" ? record.stdout_ref : null,
+    stderr_ref: typeof record.stderr_ref === "string" ? record.stderr_ref : null,
+    stdout_bytes: numberValue(record.stdout_bytes),
+    stderr_bytes: numberValue(record.stderr_bytes),
+  }
+}
+
+/* ------------------------- network evidence (M4) ------------------------- */
+
+/**
+ * The persisted `network` evidence payload written by the passive CDP traffic
+ * recorder (`executor/src/traffic_recorder.mjs`): `{items:[...]}` plus explicit
+ * recording/degradation flags. A degradation record (`{degraded:true,reason,
+ * items:[]}`) is itself evidence — the viewer surfaces it, never hides it.
+ */
+export type NetworkItem = {
+  method: string
+  url: string
+  status: number | null
+  duration_ms: number
+  mime: string
+  resource_type: string
+  error: string
+  body_preview: string
+  body_truncated: boolean
+  body_bytes: number
+}
+
+export type NetworkEvidenceRecord = {
+  items: NetworkItem[]
+  recording: boolean
+  degraded: boolean
+  reason: string
+}
+
+export function parseNetworkEvidence(text: string): NetworkEvidenceRecord | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const record = parsed as Record<string, unknown>
+  if (!Array.isArray(record.items)) return null
+  const items: NetworkItem[] = []
+  for (const entry of record.items) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue
+    const item = entry as Record<string, unknown>
+    const status = item.status
+    items.push({
+      method: stringValue(item.method),
+      url: stringValue(item.url),
+      status: typeof status === "number" && Number.isFinite(status) ? status : null,
+      duration_ms: numberValue(item.duration_ms),
+      mime: stringValue(item.mime),
+      resource_type: stringValue(item.resource_type),
+      error: stringValue(item.error),
+      body_preview: stringValue(item.body_preview),
+      body_truncated: item.body_truncated === true,
+      body_bytes: numberValue(item.body_bytes),
+    })
+  }
+  return {
+    items,
+    recording: record.recording === true,
+    degraded: record.degraded === true,
+    reason: stringValue(record.reason),
+  }
+}
+
+/* --------------------------- binary evidence (M4) ------------------------ */
+
+/** Kinds whose bytes are never text (a trace zip / a downloaded binary). */
+const BINARY_EVIDENCE_KINDS = new Set<Evidence["kind"]>(["trace", "download"])
+
+/** Whether a MIME type is human-readable text (for the `file` kind preview). */
+export function isTextMime(mime: string): boolean {
+  const m = mime.toLowerCase()
+  return (
+    m.startsWith("text/") ||
+    m === "application/json" ||
+    m === "application/xml" ||
+    m === "application/javascript" ||
+    m.endsWith("+json") ||
+    m.endsWith("+xml") ||
+    m === ""
+  )
+}
+
+/** A `file` evidence row is binary when its MIME is not text-like. */
+export function isBinaryEvidence(evidence: Evidence): boolean {
+  if (BINARY_EVIDENCE_KINDS.has(evidence.kind)) return true
+  if (evidence.kind === "file") return !isTextMime(evidence.mime)
+  return false
 }
 
 /* --------------------------------- JSON diff -------------------------------- */
@@ -478,6 +640,234 @@ function HeaderList({ headers, testId }: { headers: HttpHeaders; testId: string 
   )
 }
 
+/* --------------------------- M4 evidence panes --------------------------- */
+
+function StdioPane({
+  label,
+  testId,
+  body,
+  truncated,
+  spillRef,
+  bytes,
+}: {
+  label: string
+  testId: string
+  body: string
+  truncated: boolean
+  spillRef: string | null
+  bytes: number
+}) {
+  return (
+    <section
+      data-testid={testId}
+      aria-label={label}
+      className="min-w-0 rounded-lg border border-border bg-muted/30 p-2"
+    >
+      <h3 className="text-[11px] font-semibold text-foreground">
+        {label} <span className="font-normal text-muted-foreground">· {formatBytes(bytes)}</span>
+        {truncated ? <span className="text-warning"> · 已截断</span> : null}
+      </h3>
+      {spillRef !== null ? (
+        <p className="mt-0.5 break-all font-mono text-[10px] text-muted-foreground">
+          全量：{spillRef}
+        </p>
+      ) : null}
+      <pre className="mt-1 max-h-64 overflow-auto break-all whitespace-pre-wrap rounded border border-border bg-card p-2 text-[10px] leading-relaxed">
+        {body}
+      </pre>
+    </section>
+  )
+}
+
+/** `command` evidence (M4): argv/cwd/env full plaintext + exit/outcome + stdio panes. */
+function CommandEvidencePane({ record }: { record: CommandEvidenceRecord }) {
+  const envEntries = Object.entries(record.env)
+  return (
+    <div data-testid="evidence-command" className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <span className="font-semibold text-foreground">命令</span>
+        <span>exit {record.exit === null ? "null" : record.exit}</span>
+        <span>· {record.outcome}</span>
+        <span>· {record.duration}ms</span>
+        {record.shell ? <Badge tone="neutral">shell</Badge> : null}
+      </div>
+      <pre className="overflow-auto break-all whitespace-pre-wrap rounded-lg border border-border bg-muted/40 p-2 font-mono text-[11px] leading-relaxed">
+        {record.argv.join(" ")}
+      </pre>
+      {record.cwd.length > 0 ? (
+        <p className="break-all font-mono text-[10px] text-muted-foreground">cwd: {record.cwd}</p>
+      ) : null}
+      <div className="grid gap-2 md:grid-cols-2">
+        <StdioPane
+          label="stdout"
+          testId="evidence-command-stdout"
+          body={record.stdout}
+          truncated={record.stdout_truncated}
+          spillRef={record.stdout_ref}
+          bytes={record.stdout_bytes}
+        />
+        <StdioPane
+          label="stderr"
+          testId="evidence-command-stderr"
+          body={record.stderr}
+          truncated={record.stderr_truncated}
+          spillRef={record.stderr_ref}
+          bytes={record.stderr_bytes}
+        />
+      </div>
+      <details className="rounded-lg border border-border bg-muted/20 p-2">
+        <summary className="cursor-pointer text-[11px] font-semibold text-foreground">
+          环境变量（{envEntries.length}，全量明文）
+        </summary>
+        <dl
+          data-testid="evidence-command-env"
+          className="mt-1 space-y-0.5 font-mono text-[10px] text-muted-foreground"
+        >
+          {envEntries.map(([name, value]) => (
+            <div key={name} className="break-all">
+              <dt className="inline font-semibold text-foreground">{name}</dt>
+              <dd className="inline">={value}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+    </div>
+  )
+}
+
+/** `network` evidence (M4): passive CDP capture table + explicit degradation banner. */
+function NetworkEvidencePane({ record }: { record: NetworkEvidenceRecord }) {
+  return (
+    <div data-testid="evidence-network" className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <span className="font-semibold text-foreground">浏览器流量</span>
+        <span>{record.items.length} 条</span>
+        {record.recording ? <Badge tone="info">录制中</Badge> : null}
+      </div>
+      {record.degraded ? (
+        <p
+          role="alert"
+          data-testid="evidence-network-degraded"
+          className="rounded-lg border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning"
+        >
+          流量录制已降级（仅浏览器录制）：{record.reason || "未知原因"}。命令通道流量不经此录制。
+        </p>
+      ) : null}
+      {record.items.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">无流量记录。</p>
+      ) : (
+        <div className="max-h-[420px] overflow-auto rounded-lg border border-border">
+          <table className="w-full border-collapse text-[10px]">
+            <thead className="sticky top-0 bg-muted/60 text-left text-muted-foreground">
+              <tr>
+                <th className="p-1.5 font-semibold">方法</th>
+                <th className="p-1.5 font-semibold">状态</th>
+                <th className="p-1.5 font-semibold">耗时</th>
+                <th className="p-1.5 font-semibold">类型</th>
+                <th className="p-1.5 font-semibold">URL</th>
+                <th className="p-1.5 font-semibold">响应体</th>
+              </tr>
+            </thead>
+            <tbody>
+              {record.items.map((item, index) => (
+                <tr
+                  // biome-ignore lint/suspicious/noArrayIndexKey: network items are positional capture rows
+                  key={index}
+                  className="border-t border-border align-top"
+                >
+                  <td className="p-1.5 font-mono font-semibold text-foreground">{item.method}</td>
+                  <td className="p-1.5 font-mono">
+                    {item.error.length > 0 ? (
+                      <span className="text-destructive">{item.error}</span>
+                    ) : (
+                      (item.status ?? "—")
+                    )}
+                  </td>
+                  <td className="p-1.5 font-mono text-muted-foreground">{item.duration_ms}ms</td>
+                  <td className="p-1.5 text-muted-foreground">{item.resource_type || item.mime}</td>
+                  <td className="break-all p-1.5 font-mono text-muted-foreground">{item.url}</td>
+                  <td className="p-1.5 align-top">
+                    {/* The passive CDP recorder captures a bounded body preview for
+                        textual responses (body_preview/body_truncated/body_bytes). It
+                        was parsed but never rendered (H-D6); a truncated body is
+                        labelled so the operator never believes they saw the whole
+                        response. Body-less rows (binary/evicted) show a dash. */}
+                    {item.body_preview.length > 0 ? (
+                      <details data-testid="evidence-network-body" className="min-w-[160px]">
+                        <summary className="cursor-pointer text-muted-foreground">
+                          响应体 · {formatBytes(item.body_bytes)}
+                          {item.body_truncated ? "（已截断，仅预览）" : ""}
+                        </summary>
+                        <pre className="mt-1 max-h-40 max-w-[360px] overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-[10px] text-muted-foreground">
+                          {item.body_preview}
+                        </pre>
+                      </details>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** `file` evidence (M4): workspace file metadata + text preview or binary notice. */
+function FileEvidencePane({ evidence, text }: { evidence: Evidence; text: string | null }) {
+  const binary = !isTextMime(evidence.mime)
+  return (
+    <div data-testid="evidence-file" className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+        <span className="font-semibold text-foreground">工作区文件</span>
+        <span>{evidence.mime || "application/octet-stream"}</span>
+        <span>· {formatBytes(evidence.size_bytes)}</span>
+      </div>
+      {evidence.filename.length > 0 ? (
+        <p className="break-all font-mono text-[10px] text-muted-foreground">{evidence.filename}</p>
+      ) : null}
+      {binary ? (
+        <p className="rounded-lg border border-border bg-muted/30 p-2 text-[11px] text-muted-foreground">
+          二进制文件，不做文本预览。请用下方「下载」取回原文件。
+        </p>
+      ) : text !== null ? (
+        <pre
+          data-testid="evidence-file-text"
+          className="max-h-[420px] overflow-auto rounded-lg border border-border bg-muted/40 p-3 text-[11px] leading-relaxed"
+        >
+          {text}
+        </pre>
+      ) : null}
+    </div>
+  )
+}
+
+/** Binary evidence (M4): trace zip / downloaded binary — download-oriented, no mojibake. */
+function BinaryEvidencePane({ evidence }: { evidence: Evidence }) {
+  const isTrace = evidence.kind === "trace"
+  return (
+    <div
+      data-testid={isTrace ? "evidence-trace" : "evidence-binary"}
+      className="space-y-2 rounded-lg border border-border bg-muted/30 p-3"
+    >
+      <p className="text-[11px] font-semibold text-foreground">
+        {isTrace ? "Playwright trace" : "二进制证据"}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        {isTrace
+          ? "trace 为 zip 归档，不做文本预览。下载后用 `playwright show-trace <file>` 打开回放。"
+          : "该证据为二进制内容，不做文本预览。请用下方「下载」取回原文件。"}
+      </p>
+      {evidence.filename.length > 0 ? (
+        <p className="break-all font-mono text-[10px] text-muted-foreground">{evidence.filename}</p>
+      ) : null}
+    </div>
+  )
+}
+
 /**
  * Evidence dialog (spec §12.1): the bytes always come from the authenticated
  * `apiDownload` path, screenshots render through a delayed-revoke object URL,
@@ -523,6 +913,10 @@ export function EvidenceViewer({
         if (IMAGE_EVIDENCE_KINDS.has(evidence.kind)) {
           objectUrl = URL.createObjectURL(result.blob)
           setPreviewUrl(objectUrl)
+        } else if (isBinaryEvidence(evidence)) {
+          // Binary kinds (trace zip / downloaded binary / non-text file): never
+          // decode bytes as text (mojibake). The viewer renders a download panel.
+          setText(null)
         } else {
           setText(await result.blob.text())
         }
@@ -582,6 +976,15 @@ export function EvidenceViewer({
     if (before === null || after === null) return null
     return diffLines(before, after)
   }, [httpRecord])
+
+  const commandRecord = useMemo(
+    () => (text === null || evidence?.kind !== "command" ? null : parseCommandEvidence(text)),
+    [text, evidence?.kind],
+  )
+  const networkRecord = useMemo(
+    () => (text === null || evidence?.kind !== "network" ? null : parseNetworkEvidence(text)),
+    [text, evidence?.kind],
+  )
 
   if (evidence === null) return null
 
@@ -697,7 +1100,15 @@ export function EvidenceViewer({
               </div>
             ) : null}
 
-            {httpRecord !== null ? (
+            {commandRecord !== null ? (
+              <CommandEvidencePane record={commandRecord} />
+            ) : networkRecord !== null ? (
+              <NetworkEvidencePane record={networkRecord} />
+            ) : evidence.kind === "file" ? (
+              <FileEvidencePane evidence={evidence} text={text} />
+            ) : isBinaryEvidence(evidence) ? (
+              <BinaryEvidencePane evidence={evidence} />
+            ) : httpRecord !== null ? (
               <div className="space-y-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[11px] text-muted-foreground">HTTP 请求 / 响应</span>

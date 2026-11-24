@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
@@ -23,7 +24,7 @@ const runColumns = `id, profile_key, work_item_id, conversation_id, status, term
 	model, config_id, fallback_from, tokens, cache`
 
 const messageColumns = `id, run_id, conversation_id, role, parts, tool_calls, tool_call_id,
-	usage, created_at`
+	usage, stream_state, created_at`
 
 const packetColumns = `id, run_id, version_id, sections, token_counts, hash, created_at`
 
@@ -117,13 +118,14 @@ func (r *RuntimeRepository) ListProfiles(ctx context.Context) ([]agent.AgentProf
 	return profiles, nil
 }
 
-// ApplyProfileSeedBackfill writes the one-time v0.2.3 seed reconciliation. The
+// ApplyProfileSeedBackfill writes the one-time seed reconciliation. The
 // update is fenced by seed_version so a concurrent writer or a second startup
 // cannot apply it twice. The tool increment is unioned against the row being
-// updated and the budget upgrade only applies while the stored budgets still
-// equal the legacy snapshot, so a concurrent administrator PATCH is never
-// overwritten with values read before it. It reports whether a row changed and
-// returns the current row when the marker already advanced.
+// updated, the exact removal names are dropped from that same union (v0.2.4-C
+// seed 3 retired-tool cleanup), and the budget upgrade only applies while the
+// stored budgets still equal the legacy snapshot, so a concurrent administrator
+// PATCH is never overwritten with values read before it. It reports whether a
+// row changed and returns the current row when the marker already advanced.
 func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 	ctx context.Context,
 	key string,
@@ -143,6 +145,10 @@ func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 	if err != nil {
 		return agent.AgentProfile{}, false, err
 	}
+	removals := update.RemoveAllowedTools
+	if removals == nil {
+		removals = []string{}
+	}
 	var encodedLegacyBudgets, encodedCurrentBudgets any
 	if update.BudgetUpgrade != nil {
 		encodedLegacyBudgets, err = encodeJSONObject(
@@ -159,13 +165,14 @@ func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 	stored, err := scanProfile(r.pool.QueryRow(ctx, `
 		UPDATE agent_profile
 		SET allowed_tools = CASE
-		        WHEN jsonb_array_length($2::jsonb) = 0 THEN allowed_tools
+		        WHEN jsonb_array_length($2::jsonb) = 0 AND cardinality($6::text[]) = 0 THEN allowed_tools
 		        ELSE (
 		            SELECT COALESCE(jsonb_agg(value ORDER BY first_ord), '[]'::jsonb)
 		            FROM (
 		                SELECT DISTINCT ON (value) value, ord AS first_ord
 		                FROM jsonb_array_elements_text(allowed_tools || $2::jsonb)
 		                     WITH ORDINALITY AS entries(value, ord)
+		                WHERE NOT (value = ANY($6::text[]))
 		                ORDER BY value, ord
 		            ) deduped
 		        )
@@ -178,7 +185,7 @@ func (r *RuntimeRepository) ApplyProfileSeedBackfill(
 		    updated_at = now()
 		WHERE key = $1 AND seed_version < $5
 		RETURNING `+profileColumns,
-		key, encodedTools, encodedLegacyBudgets, encodedCurrentBudgets, update.SeedVersion))
+		key, encodedTools, encodedLegacyBudgets, encodedCurrentBudgets, update.SeedVersion, removals))
 	if err == nil {
 		return stored, true, nil
 	}
@@ -260,9 +267,20 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 	return stored, nil
 }
 
-// FinishRun persists the terminal status and counters, fenced by lease_epoch.
-// It only requires the run identity and status so a worker that holds the
-// stored run ID can finish without re-supplying the immutable run fields.
+// FinishRun persists the terminal status and counters, fenced by lease_epoch AND
+// by the run still being running. It only requires the run identity and status so
+// a worker that holds the stored run ID can finish without re-supplying the
+// immutable run fields.
+//
+// The running-only condition (v0.2.4-H T12) makes a terminal run FROZEN, exactly
+// as UpdateMessage freezes a terminal transcript row. It is required because
+// agent_run.lease_epoch is never bumped after CreateRun: an attempt whose WORK
+// ITEM lease expired and was recovered can still write its own terminal, so the
+// run-level crash sweep (H-E2) — which selects on status='running' and writes a
+// few round trips later — must not be able to overwrite a terminal that the
+// attempt itself wrote in that window. Zero matching rows keeps reporting
+// ErrLeaseLost: the fenced terminal write did not land, and the caller must not
+// retry it (a run that became terminal is no longer selected by the sweep).
 func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) error {
 	if run.ID <= 0 {
 		return platform.Invalid("id", "must be a positive decimal ID")
@@ -306,9 +324,9 @@ func (r *RuntimeRepository) FinishRun(ctx context.Context, run agent.AgentRun) e
 		UPDATE agent_run
 		SET status = $3, terminal_reason = $4, turns = $5, usage = $6::jsonb,
 		    tokens = $7::jsonb, cache = $8::jsonb, finished_at = $9
-		WHERE id = $1 AND lease_epoch = $2
+		WHERE id = $1 AND lease_epoch = $2 AND status = $10
 	`, run.ID, run.LeaseEpoch, string(run.Status), reason, run.Turns,
-		encodedUsage, encodedTokens, encodedCache, finishedAt)
+		encodedUsage, encodedTokens, encodedCache, finishedAt, string(agent.AgentRunRunning))
 	if err != nil {
 		return wrapDB("finish agent run", err)
 	}
@@ -326,27 +344,7 @@ func (r *RuntimeRepository) AppendMessage(ctx context.Context, message agent.Age
 	if message.ID <= 0 {
 		message.ID = r.ids.Next()
 	}
-	parts := message.Parts
-	if parts == nil {
-		parts = []agent.MessagePart{}
-	}
-	encodedParts, err := encodeJSONArray("message parts", parts)
-	if err != nil {
-		return agent.AgentMessage{}, err
-	}
-	calls := message.ToolCalls
-	if calls == nil {
-		calls = []agent.ToolCall{}
-	}
-	encodedCalls, err := encodeJSONArray("message tool calls", calls)
-	if err != nil {
-		return agent.AgentMessage{}, err
-	}
-	usage := message.Usage
-	if usage == nil {
-		usage = map[string]int{}
-	}
-	encodedUsage, err := encodeJSONObject("message usage", usage)
+	encodedParts, encodedCalls, encodedUsage, err := encodeMessageContent(message)
 	if err != nil {
 		return agent.AgentMessage{}, err
 	}
@@ -354,28 +352,118 @@ func (r *RuntimeRepository) AppendMessage(ctx context.Context, message agent.Age
 
 	stored, err := scanMessage(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_message (id, run_id, conversation_id, role, parts, tool_calls,
-			tool_call_id, usage, created_at)
-		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9)
+			tool_call_id, usage, stream_state, created_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8::jsonb, $9, $10)
 		RETURNING `+messageColumns,
 		message.ID, message.RunID, message.ConversationID, string(message.Role),
-		encodedParts, encodedCalls, message.ToolCallID, encodedUsage, createdAt))
+		encodedParts, encodedCalls, message.ToolCallID, encodedUsage,
+		agent.NormalizeMessageStreamState(message.StreamState), createdAt))
 	if err != nil {
 		return agent.AgentMessage{}, wrapDB("append agent message", err)
 	}
 	return stored, nil
 }
 
+// UpdateMessage rewrites one streaming transcript row in place (v0.2.4-D T8).
+// The guard is the row's own stream_state: only a streaming row may be rewritten
+// or sealed, so a terminal row is frozen against every late write — including a
+// batch/legacy row, which is complete from insert. The streaming predicate is
+// passed as the domain constant, never re-spelled as a SQL literal (constitution
+// 五.4). Zero matching rows is disambiguated into "missing" vs "frozen" so the
+// caller can tell a lost row from a sealed one.
+func (r *RuntimeRepository) UpdateMessage(ctx context.Context, message agent.AgentMessage) error {
+	if message.ID <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if err := message.Validate(); err != nil {
+		return err
+	}
+	encodedParts, encodedCalls, encodedUsage, err := encodeMessageContent(message)
+	if err != nil {
+		return err
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE agent_message
+		SET parts = $2::jsonb, tool_calls = $3::jsonb, usage = $4::jsonb, stream_state = $5
+		WHERE id = $1 AND stream_state = $6
+	`, message.ID, encodedParts, encodedCalls, encodedUsage,
+		agent.NormalizeMessageStreamState(message.StreamState), agent.MessageStreamStateStreaming)
+	if err != nil {
+		return wrapDB("update agent message", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	var state string
+	if err := r.pool.QueryRow(ctx, `SELECT stream_state FROM agent_message WHERE id = $1`, message.ID).Scan(&state); err != nil {
+		return wrapDB("update agent message", err)
+	}
+	return agent.ErrMessageStreamClosed
+}
+
+// encodeMessageContent renders the three mutable JSON columns of a transcript
+// row, defaulting to empty collections so a nil slice never becomes SQL NULL.
+func encodeMessageContent(message agent.AgentMessage) (parts string, calls string, usage string, err error) {
+	partsValue := message.Parts
+	if partsValue == nil {
+		partsValue = []agent.MessagePart{}
+	}
+	if parts, err = encodeJSONArray("message parts", partsValue); err != nil {
+		return "", "", "", err
+	}
+	callsValue := message.ToolCalls
+	if callsValue == nil {
+		callsValue = []agent.ToolCall{}
+	}
+	if calls, err = encodeJSONArray("message tool calls", callsValue); err != nil {
+		return "", "", "", err
+	}
+	usageValue := message.Usage
+	if usageValue == nil {
+		usageValue = map[string]int{}
+	}
+	if usage, err = encodeJSONObject("message usage", usageValue); err != nil {
+		return "", "", "", err
+	}
+	return parts, calls, usage, nil
+}
+
+// noLimit is the caller-facing sentinel that tells queryRunMessages to read the
+// WHOLE run (no SQL LIMIT). It is spelled as a name, not a bare 0, because `0`
+// reads to a human as "zero rows" while it means "unlimited" to the query
+// (H-E20 double meaning). Only the admin Agent Center transcript passes it; the
+// runtime repository always passes a bounded positive page (defaultRunMessagePage).
+const noLimit = 0
+
+// defaultRunMessagePage is the bounded default ListRunMessages applies when its
+// caller passes a non-positive limit — a safety page, NOT "unlimited". Keeping it
+// distinct from noLimit makes the two limit semantics unambiguous.
+const defaultRunMessagePage = 200
+
 // ListRunMessages returns a run's transcript in ID order.
 func (r *RuntimeRepository) ListRunMessages(ctx context.Context, runID int64, limit int) ([]agent.AgentMessage, error) {
 	if limit <= 0 {
-		limit = 200
+		limit = defaultRunMessagePage
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+messageColumns+` FROM agent_message
+	return queryRunMessages(ctx, r.pool, runID, limit)
+}
+
+// queryRunMessages is the ONE transcript read of the agent context, shared by
+// the runtime repository (prompt assembly, bounded page) and the admin-only
+// Agent Center transcript (limit == noLimit reads the whole run: a hidden default
+// page would silently truncate what the administrator is shown — constitution 七.6).
+func queryRunMessages(ctx context.Context, pool *pgxpool.Pool, runID int64, limit int) ([]agent.AgentMessage, error) {
+	query := `
+		SELECT ` + messageColumns + ` FROM agent_message
 		WHERE run_id = $1
-		ORDER BY id ASC
-		LIMIT $2
-	`, runID, limit)
+		ORDER BY id ASC`
+	args := []any{runID}
+	if limit > noLimit {
+		query += `
+		LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list agent messages: %w", err)
 	}
@@ -390,6 +478,113 @@ func (r *RuntimeRepository) ListRunMessages(ctx context.Context, runID int64, li
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list agent messages: %w", err)
+	}
+	return messages, nil
+}
+
+// crashedRunUnleasedStatuses are the work-item statuses that prove the item is no
+// longer leased by ANY attempt: reopened for a retry (open), settled at the
+// attempt cap (dead for the legacy queue, failed for the 0.2.1 queue), or finished
+// (done). waiting_human is deliberately absent: a parked run awaiting a human is
+// not a crash. Bound as a query parameter so the status vocabulary has one
+// authority (agent/domain), never a SQL-inline mirror.
+var crashedRunUnleasedStatuses = []string{
+	string(agent.WorkItemOpen),
+	string(agent.WorkItemDead),
+	string(agent.WorkItemDone),
+	string(agent.WorkItemFailed),
+}
+
+// ListCrashedRuns returns the runs whose attempt no longer owns their work item
+// (v0.2.4-H T12, H-E2). The predicate is a lease fact, not an age heuristic:
+// either the item is in a state that holds no lease at all, or its lease_epoch
+// moved past the epoch this run was created with (a later attempt took over).
+// A live attempt — claimed/running with the matching epoch — is never returned,
+// so the sweep can never finish a run that is still executing.
+//
+// The read is bounded (limit must be positive): a backlog is drained over
+// successive recovery ticks rather than through one unbounded scan.
+func (r *RuntimeRepository) ListCrashedRuns(ctx context.Context, limit int) ([]agentapp.CrashedRun, error) {
+	if limit <= 0 {
+		return nil, platform.Invalid("limit", "must be a positive integer")
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT run.id, run.lease_epoch, run.work_item_id, item.version_id,
+		       COALESCE(run.conversation_id, 0), run.profile_key, run.turns,
+		       run.usage, run.tokens, run.cache
+		FROM agent_run run
+		JOIN work_item item ON item.id = run.work_item_id
+		WHERE run.status = $1
+		  AND (item.status = ANY($2::text[]) OR item.lease_epoch <> run.lease_epoch)
+		ORDER BY run.id
+		LIMIT $3
+	`, string(agent.AgentRunRunning), crashedRunUnleasedStatuses, limit)
+	if err != nil {
+		return nil, wrapDB("list crashed agent runs", err)
+	}
+	defer rows.Close()
+	runs := make([]agentapp.CrashedRun, 0)
+	for rows.Next() {
+		var run agentapp.CrashedRun
+		var usageRaw, tokensRaw, cacheRaw []byte
+		if err := rows.Scan(&run.ID, &run.LeaseEpoch, &run.WorkItemID, &run.VersionID,
+			&run.ConversationID, &run.ProfileKey, &run.Turns, &usageRaw, &tokensRaw, &cacheRaw); err != nil {
+			return nil, fmt.Errorf("scan crashed agent run: %w", err)
+		}
+		counters := []struct {
+			name   string
+			raw    []byte
+			target *map[string]int
+		}{
+			{"usage", usageRaw, &run.Usage},
+			{"tokens", tokensRaw, &run.Tokens},
+			{"cache", cacheRaw, &run.Cache},
+		}
+		for _, counter := range counters {
+			*counter.target = map[string]int{}
+			if len(counter.raw) == 0 {
+				continue
+			}
+			if err := json.Unmarshal(counter.raw, counter.target); err != nil {
+				return nil, fmt.Errorf("decode crashed run %s: %w", counter.name, err)
+			}
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list crashed agent runs: %w", err)
+	}
+	return runs, nil
+}
+
+// ListStreamingRunMessages returns EVERY still-streaming transcript row of one
+// run, oldest first. It is the crash sweep's read: unlike ListRunMessages it has
+// no page bound, because a hidden cap would leave heads streaming forever
+// (constitution 七.6). In practice a run holds at most one streaming row per
+// interrupted turn; the read is indexed by run_id.
+func (r *RuntimeRepository) ListStreamingRunMessages(ctx context.Context, runID int64) ([]agent.AgentMessage, error) {
+	if runID <= 0 {
+		return nil, platform.Invalid("run_id", "must be a positive decimal ID")
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+messageColumns+` FROM agent_message
+		WHERE run_id = $1 AND stream_state = $2
+		ORDER BY id ASC
+	`, runID, agent.MessageStreamStateStreaming)
+	if err != nil {
+		return nil, wrapDB("list streaming agent messages", err)
+	}
+	defer rows.Close()
+	messages := make([]agent.AgentMessage, 0)
+	for rows.Next() {
+		message, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan streaming agent message: %w", err)
+		}
+		messages = append(messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list streaming agent messages: %w", err)
 	}
 	return messages, nil
 }
@@ -565,10 +760,11 @@ func scanMessage(row rowScanner) (agent.AgentMessage, error) {
 	var role string
 	var partsRaw, callsRaw, usageRaw []byte
 	if err := row.Scan(&message.ID, &message.RunID, &message.ConversationID, &role,
-		&partsRaw, &callsRaw, &message.ToolCallID, &usageRaw, &message.CreatedAt); err != nil {
+		&partsRaw, &callsRaw, &message.ToolCallID, &usageRaw, &message.StreamState, &message.CreatedAt); err != nil {
 		return agent.AgentMessage{}, err
 	}
 	message.Role = agent.MessageRole(role)
+	message.StreamState = agent.NormalizeMessageStreamState(message.StreamState)
 	message.Parts = []agent.MessagePart{}
 	message.ToolCalls = []agent.ToolCall{}
 	message.Usage = map[string]int{}

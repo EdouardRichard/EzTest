@@ -16,8 +16,6 @@ func snapshotPassingSample() SnapshotSample {
 		ConfirmedCases:        8,
 		ExecutionPassed:       9,
 		ExecutionFinished:     10,
-		VisualPassed:          9,
-		VisualEvaluated:       10,
 	}
 }
 
@@ -32,16 +30,16 @@ func snapshotMetricByName(t *testing.T, metrics []Metric, name string) Metric {
 	return Metric{}
 }
 
-// TestEvaluateSnapshotDerivesFourMetrics pins the W2-14 metric contract: the
-// snapshot track derives design_coverage, execution_pass_rate, case_coverage and
-// visual_classification_accuracy in order, from real product counters only.
-func TestEvaluateSnapshotDerivesFourMetrics(t *testing.T) {
+// TestEvaluateSnapshotDerivesThreeMetrics pins the W2-14 metric contract: the
+// snapshot track derives design_coverage, execution_pass_rate and case_coverage
+// in order, from real product counters only.
+func TestEvaluateSnapshotDerivesThreeMetrics(t *testing.T) {
 	status, metrics := EvaluateSnapshot(snapshotPassingSample(), nil, 0.05)
 	if status != StatusPassed {
 		t.Fatalf("status = %q, want passed", status)
 	}
-	if len(metrics) != 4 {
-		t.Fatalf("metrics = %d, want 4", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("metrics = %d, want 3", len(metrics))
 	}
 	want := SnapshotMetricOrder
 	for index, name := range want {
@@ -61,10 +59,6 @@ func TestEvaluateSnapshotDerivesFourMetrics(t *testing.T) {
 	if math.Abs(cases.Value-0.8) > 1e-9 || cases.Threshold != ThresholdCaseCoverage {
 		t.Fatalf("case coverage metric = %+v", cases)
 	}
-	visual := snapshotMetricByName(t, metrics, MetricVisualClassificationAccuracy)
-	if math.Abs(visual.Value-0.9) > 1e-9 {
-		t.Fatalf("visual metric = %+v", visual)
-	}
 }
 
 // TestEvaluateSnapshotZeroDenominatorsNeverPass proves a missing opportunity is
@@ -74,8 +68,8 @@ func TestEvaluateSnapshotZeroDenominatorsNeverPass(t *testing.T) {
 	if status != StatusFailed {
 		t.Fatalf("status = %q, want failed", status)
 	}
-	if len(metrics) != 4 {
-		t.Fatalf("metrics = %d, want 4", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("metrics = %d, want 3", len(metrics))
 	}
 	for _, metric := range metrics {
 		if metric.Passed {
@@ -111,17 +105,16 @@ func TestEvaluateSnapshotCaseCoverageCapsAtOne(t *testing.T) {
 // returns the full derived series (nothing is blocked or dropped).
 func TestEvaluateSnapshotBaselineRegressionWarnsOnly(t *testing.T) {
 	baseline := map[string]float64{
-		MetricDesignCoverage:               0.99,
-		MetricExecutionPassRate:            0.99,
-		MetricCaseCoverage:                 0.99,
-		MetricVisualClassificationAccuracy: 0.99,
+		MetricDesignCoverage:    0.99,
+		MetricExecutionPassRate: 0.99,
+		MetricCaseCoverage:      0.99,
 	}
 	status, metrics := EvaluateSnapshot(snapshotPassingSample(), baseline, 0.05)
 	if status != StatusFailed {
 		t.Fatalf("status = %q, want failed", status)
 	}
-	if len(metrics) != 4 {
-		t.Fatalf("metrics = %d, want 4", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("metrics = %d, want 3", len(metrics))
 	}
 	design := snapshotMetricByName(t, metrics, MetricDesignCoverage)
 	if !design.Detail.Regressed || design.Passed || design.Detail.Reason != ReasonBaselineRegression {
@@ -136,7 +129,6 @@ func TestValidateSnapshotRejectsImpossibleCounters(t *testing.T) {
 	invalid := []SnapshotSample{
 		{ConfirmedRequirements: 5, CoveredRequirements: 6},
 		{ExecutionFinished: 5, ExecutionPassed: 6},
-		{VisualEvaluated: 5, VisualPassed: 6},
 		{ConfirmedCases: -1},
 	}
 	for _, sample := range invalid {

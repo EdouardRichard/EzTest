@@ -35,9 +35,6 @@ func Definitions(executorURL string) []settings.Definition {
 	}
 
 	minNode, maxNode := numberRange(0, 1023)
-	minConcurrency, maxConcurrency := numberRange(1, 32)
-	minPerSUT, maxPerSUT := numberRange(1, 16)
-	minCross, maxCross := numberRange(1, 8)
 	minTurns, maxTurns := numberRange(1, 100)
 	minRuns, maxRuns := numberRange(1, 64)
 	minThreshold, maxThreshold := numberRange(0.5, 0.9)
@@ -56,14 +53,8 @@ func Definitions(executorURL string) []settings.Definition {
 	minExcerptLines, maxExcerptLines := numberRange(1, 200)
 	minAnalysisTimeout, maxAnalysisTimeout := numberRange(10, 1800)
 	minConcurrentAnalyses, maxConcurrentAnalyses := numberRange(1, 4)
-	minVisualThreshold, maxVisualThreshold := numberRange(0, 0.1)
-	minBaselineBytes, maxBaselineBytes := numberRange(65536, 20971520)
 	minRateLimit, maxRateLimit := numberRange(0, 60000)
 	minEventDays, maxEventDays := numberRange(1, 3650)
-	minViewport, maxViewport := numberRange(1, 10000)
-	minDPR, maxDPR := numberRange(0.5, 4)
-	minCompareTimeout, maxCompareTimeout := numberRange(5, 300)
-	minWaitTimeout, maxWaitTimeout := numberRange(1, 120)
 	minSearchResults, maxSearchResults := numberRange(1, 20)
 	minTodoItems, maxTodoItems := numberRange(1, 200)
 	minEvalRegression, maxEvalRegression := numberRange(0, 1)
@@ -87,13 +78,17 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "instance.offline_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which an API instance is marked offline."},
 		{Key: "paths.data_root", Category: "paths", Type: settings.TypeString, Default: str("./.data"), RestartRequired: true, Description: "Root directory for runtime content (relative to the process CWD)."},
 
-		{Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(3), Integer: true, Min: minConcurrency, Max: maxConcurrency, Description: "Maximum concurrent case runs across the instance."},
-		{Key: "execution.per_sut_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minPerSUT, Max: maxPerSUT, Description: "Maximum concurrent case runs per version SUT."},
-		{Key: "execution.cross_system_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minCross, Max: maxCross, Description: "Maximum concurrent cross-SUT case runs."},
+		// v0.2.4-F (design P5): the single global concurrent-case-run limit
+		// replaces the retired execution.global_concurrency / per_sut_concurrency /
+		// cross_system_concurrency trio (deletion recorded in the shared release
+		// notes per constitution VI.6).
+		{Key: "execution.max_concurrent_case_runs", Category: "execution", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Maximum concurrent case runs across the instance; 0 means no admin cap (default). Dispatch admission also follows real resources: worker claim headroom (agent.max_concurrent_runs) and executor free contexts."},
 		{Key: "execution.executor_url", Category: "execution", Type: settings.TypeString, Default: str(executorURL), Description: "Playwright executor base URL (seeded from EZTEST_EXECUTOR_PORT)."},
 		{Key: "execution.executor_urls", Category: "execution", Type: settings.TypeString, Default: str(""), Description: "Additional comma-separated executor endpoints; empty reuses execution.executor_url."},
 		{Key: "execution.evidence_max_bytes", Category: "execution", Type: settings.TypeNumber, Default: num(5 * 1024 * 1024), Integer: true, Min: number(0, 0), Description: "Maximum single evidence file size in bytes."},
-		{Key: "execution.case_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(900), Integer: true, Min: number(1, 0), Description: "Hard timeout for one case run in seconds."},
+		{Key: "execution.evidence_max_per_case_run", Category: "execution", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Maximum evidence rows per case run; 0 keeps every row (unlimited). Overflow drops emit evidence.skipped events."},
+		{Key: "execution.case_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Opt-in hard timeout for one case run in seconds; 0 disables it (default). When enabled the run winds down orderly (stop dispatch -> drain -> cancel -> timeout). No hard-kill default; runs end through soft winding / the stall gate / the defensive loop floor."},
+		{Key: "execution.max_case_turns", Category: "execution", Type: settings.TypeNumber, Default: num(0), Integer: true, Min: number(0, 0), Description: "Turn budget for one case executor run; 0 means unlimited (default, bounded only by the 10000 defensive loop floor). Overrides the case_executor profile seed. Default open; exceeding it winds down to settlement then exhausted (inconclusive, never failed)."},
 		{Key: "execution.executor_token", Category: "execution", Type: settings.TypeString, Default: str("eztest-dev-executor-token"), Secret: true, Description: "Bearer token sent by the API to the Playwright executor; masked in the admin API."},
 		{Key: "execution.executor_heartbeat_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: minHeartbeat, Max: maxHeartbeat, Description: "Interval between executor /healthz polls in seconds."},
 		{Key: "execution.executor_offline_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which the executor is marked offline."},
@@ -109,14 +104,6 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "codeintel.max_concurrent_analyses", Category: "codeintel", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minConcurrentAnalyses, Max: maxConcurrentAnalyses, Description: "Maximum concurrent code analyses per codeintel worker."},
 		{Key: "codeintel.prompt_version", Category: "codeintel", Type: settings.TypeString, Default: str("p5.1"), Description: "T1 prompt version; a change produces new fact versions."},
 		{Key: "codeintel.exclude_globs", Category: "codeintel", Type: settings.TypeJSON, Default: rawJSON(`["**/.git/**","**/node_modules/**","**/dist/**","**/build/**","**/vendor/**"]`), Description: "Path globs excluded from indexing (slash-normalized, exclude wins)."},
-
-		{Key: "visual.default_threshold", Category: "visual", Type: settings.TypeNumber, Default: num(0.005), Min: minVisualThreshold, Max: maxVisualThreshold, Description: "Default pixel diff threshold for new visual assertions."},
-		{Key: "visual.baseline_max_bytes", Category: "visual", Type: settings.TypeNumber, Default: num(5 * 1024 * 1024), Integer: true, Min: minBaselineBytes, Max: maxBaselineBytes, Description: "Maximum visual baseline/actual PNG size in bytes."},
-		{Key: "visual.default_viewport_width", Category: "visual", Type: settings.TypeNumber, Default: num(1280), Integer: true, Min: minViewport, Max: maxViewport, Description: "Default visual comparison viewport width."},
-		{Key: "visual.default_viewport_height", Category: "visual", Type: settings.TypeNumber, Default: num(720), Integer: true, Min: minViewport, Max: maxViewport, Description: "Default visual comparison viewport height."},
-		{Key: "visual.default_device_scale_factor", Category: "visual", Type: settings.TypeNumber, Default: num(1), Min: minDPR, Max: maxDPR, Description: "Default visual comparison device scale factor."},
-		{Key: "visual.compare_timeout_seconds", Category: "visual", Type: settings.TypeNumber, Default: num(60), Integer: true, Min: minCompareTimeout, Max: maxCompareTimeout, Description: "Executor visual.compare action timeout in seconds."},
-		{Key: "visual.wait_timeout_seconds", Category: "visual", Type: settings.TypeNumber, Default: num(15), Integer: true, Min: minWaitTimeout, Max: maxWaitTimeout, Description: "Maximum visual capture wait for network/fonts/stability in seconds."},
 
 		{Key: "agent.max_turns", Category: "agent", Type: settings.TypeNumber, Default: num(12), Integer: true, Min: minTurns, Max: maxTurns, Description: "Maximum model turns per agent run."},
 		{Key: "agent.run_soft_timeout_seconds", Category: "agent", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: number(1, 0), Description: "Soft timeout for one agent run in seconds."},
@@ -160,7 +147,7 @@ func Definitions(executorURL string) []settings.Definition {
 		// control (gc.max_bytes) is not implemented in v0.22 (residual) and must
 		// not be reintroduced as a dead key.
 
-		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
+		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("3"), Description: "Built-in report template version (\"1\", \"2\" or \"3\"; \"3\" is the v0.2.4-G human-useful fixed report, the default)."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},
 		{Key: "report.section_appendix", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the appendix section in v2 reports."},
 		{Key: "report.render_max_attempts", Category: "report", Type: settings.TypeNumber, Default: num(3), Integer: true, Min: minRenderAttempts, Max: maxRenderAttempts, Description: "Maximum PDF render attempts before a revision is marked failed."},
@@ -172,6 +159,13 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "report.section_issues", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the issues section in reports."},
 		{Key: "report.section_coverage", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the coverage section in reports."},
 		{Key: "report.section_evidence", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the evidence section in reports."},
+		// v0.2.4-G (SC-G7, R-G2/R-C I-4): the report evidence DISPLAY projection
+		// caps. They bound only the report snapshot/render projection; the
+		// execution write cap (execution.evidence_max_per_case_run, default 0)
+		// stays independent and is never reverse-limited by these (C R-C5). The
+		// fingerprint evidence digest always covers ALL evidence regardless.
+		{Key: "report.evidence_max_per_case_run", Category: "report", Type: settings.TypeNumber, Default: num(100), Integer: true, Min: number(0, 0), Description: "Maximum evidence rows displayed per case run in a report; 0 means unlimited. Display projection only — the fingerprint digest covers all evidence."},
+		{Key: "report.evidence_max_total", Category: "report", Type: settings.TypeNumber, Default: num(2000), Integer: true, Min: number(0, 0), Description: "Maximum evidence rows displayed across a whole report (aggregate cap); 0 means unlimited. Display projection only — the fingerprint digest covers all evidence."},
 
 		{Key: "chain.max_nodes", Category: "chain", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: minChainNodes, Max: maxChainNodes, Description: "Maximum exploration-chain nodes before truncation."},
 		{Key: "chain.max_edges", Category: "chain", Type: settings.TypeNumber, Default: num(600), Integer: true, Min: minChainEdges, Max: maxChainEdges, Description: "Maximum exploration-chain edges before truncation."},
@@ -190,5 +184,10 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "search.max_results_per_type", Category: "search", Type: settings.TypeNumber, Default: num(5), Integer: true, Min: minSearchResults, Max: maxSearchResults, Description: "Default maximum results per type for global search (query parameter may override)."},
 		{Key: "todos.max_items", Category: "workspace", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minTodoItems, Max: maxTodoItems, Description: "Default maximum items returned by the todos center (query parameter may override)."},
 		{Key: "quality.eval_baseline_regression", Category: "quality", Type: settings.TypeNumber, Default: num(0.05), Min: minEvalRegression, Max: maxEvalRegression, Description: "Tolerance marking an eval metric as a baseline regression (report-only, non-blocking)."},
+
+		{Key: "validation.placeholder_terms", Category: "validation", Type: settings.TypeJSON, Default: rawJSON(`["TBD","TODO","待定","待补充","xxx","占位","placeholder","暂无","略"]`), Description: "Whole-value placeholder terms rejected at requirement confirmation (trim+lowercase exact match)."},
+		{Key: "validation.min_description_chars", Category: "validation", Type: settings.TypeNumber, Default: num(20), Integer: true, Min: number(1, 0), Description: "Minimum sut_description length enforced at requirement confirmation."},
+		{Key: "design.max_rework_rounds", Category: "design", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: number(0, 0), Description: "Maximum judge-fail rework rounds per logical case before human escalation."},
+		{Key: "design.judge_model", Category: "design", Type: settings.TypeString, Default: str(""), Description: "LLM model id for design_judge; empty inherits the platform default model."},
 	}
 }

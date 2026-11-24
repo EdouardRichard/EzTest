@@ -89,13 +89,13 @@ func TestExecutorCapabilityLimitationNotIssueCandidate(t *testing.T) {
 	})
 	deps.Design.(*fakeDesign).cases[7] = append(deps.Design.(*fakeDesign).cases[7], designapp.ExecutableCaseView{
 		CaseID: 208, CaseVersionID: caseVersion, RequirementID: 108, RequirementVersionID: 1208,
-		Title: "正文图片上传并插入", Priority: "P1", VersionSUTIDs: []int64{sutRef},
+		Title: "正文图片上传并插入", Priority: "P1",
 	})
 	deps.Results.(*fakeResults).steps[caseRunID] = []execution.StepResult{
 		{ID: 6008, CaseRunID: caseRunID, Seq: 1, Status: execution.StepPassed},
 		{
 			ID: 6009, CaseRunID: caseRunID, Seq: 2, Status: execution.StepBlocked,
-			TargetVersionSUTID: &sutRef,
+			TargetSUTID: &sutRef,
 			Observed: map[string]any{
 				"summary":                       "无法选择本地文件（工具不支持文件选择）",
 				execution.ExecutorLimitationKey: map[string]any{"code": "file_chooser_unavailable"},

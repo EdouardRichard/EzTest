@@ -71,8 +71,6 @@ $requiredEnvKeys = @(
     "EZTEST_DATABASE_URL",
     "EZTEST_ADMIN_USERNAME",
     "EZTEST_ADMIN_PASSWORD",
-    "EZTEST_SECRET_KEYS",
-    "EZTEST_SECRET_KEY_ACTIVE",
     "llm_base_url",
     "llm_key",
     "llm_model_name"
@@ -407,20 +405,6 @@ try {
     $script:secretValues.Add($adminPassword) | Out-Null
     $script:secretValues.Add($llmKey) | Out-Null
     $script:secretValues.Add($databaseUrl) | Out-Null
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-            $script:secretValues.Add($rawSecretKeys) | Out-Null
-            try {
-                $secretObject = $rawSecretKeys | ConvertFrom-Json
-                foreach ($property in $secretObject.PSObject.Properties) {
-                    $script:secretValues.Add([string]$property.Value) | Out-Null
-                }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
     Add-CheckResult -Name "gate and .env keys" -Status "passed" -Detail "EZTEST_RUN_REAL_LLM=1; llm_base_url/llm_key/llm_model_name present"
 
     Write-Step "Validating the database URL before any destructive statement"
@@ -480,16 +464,12 @@ try {
     Wait-ForHttp -Url "$fixtureBaseUrl/health" -TimeoutSeconds 30 -Process $script:fixtureProcess -Label "fixture target"
     $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:$executorPort"
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
-    $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "4"
+    $env:EZTEST_EXECUTOR_MAX_SESSIONS = "4"
     $script:executorProcess = Start-Process -FilePath $nodeExe -ArgumentList "`"executor/src/server.mjs`"" `
         -WorkingDirectory $repoRoot -RedirectStandardOutput $executorOut -RedirectStandardError $executorErr -WindowStyle Hidden -PassThru
     Wait-ForHttp -Url "$executorBaseUrl/healthz" -TimeoutSeconds 120 -Process $script:executorProcess -Label "executor"
 
     Write-Step "Starting the API on :$apiPort with the real LLM configuration"
-    $evidenceStore = Join-Path $tmpDir "evidence"
-    $reportStore = Join-Path $tmpDir "reports"
-    New-Item -ItemType Directory -Force -Path $evidenceStore | Out-Null
-    New-Item -ItemType Directory -Force -Path $reportStore | Out-Null
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $targetDatabaseUrl
     $env:EZTEST_HTTP_ADDR = ":$apiPort"
@@ -498,8 +478,6 @@ try {
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "objects")
     $env:EZTEST_EXECUTOR_URL = $executorBaseUrl
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
-    $env:EZTEST_EVIDENCE_DIR = $evidenceStore
-    $env:EZTEST_REPORT_DIR = $reportStore
     $env:EZTEST_VERSION_ATTACHMENT_DIR = (Join-Path $tmpDir "attachments")
     $env:EZTEST_EXEC_MAX_CONCURRENT_CASES = "1"
     $env:EZTEST_EXEC_WORKER_INTERVAL_MS = "200"
@@ -507,7 +485,7 @@ try {
     $env:EZTEST_OPENAPI_PATH = (Join-Path $repoRoot "docs\openapi\api.yaml")
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
     }
     Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue
@@ -520,8 +498,6 @@ try {
     Remove-Item Env:llm_base_url -ErrorAction SilentlyContinue
     Remove-Item Env:llm_model_name -ErrorAction SilentlyContinue
     Remove-Item Env:EZTEST_DATABASE_URL -ErrorAction SilentlyContinue
-    Remove-Item Env:EZTEST_SECRET_KEYS -ErrorAction SilentlyContinue
-    Remove-Item Env:EZTEST_SECRET_KEY_ACTIVE -ErrorAction SilentlyContinue
 
     Write-Step "Checking health, migrations and the default LLM configuration"
     $health = Invoke-Api -Method Get -Path "/api/health"

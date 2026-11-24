@@ -34,7 +34,7 @@ type contextTaskPack struct{ deps Deps }
 func (t *contextTaskPack) Name() string { return ToolContextTaskPack }
 
 func (t *contextTaskPack) Description() string {
-	return "读取当前任务目标、约束、验收标准与注入的作用域标识。"
+	return "读取当前任务目标、约束、验收标准与注入的作用域标识；执行任务还返回用例快照（execution：sut_description/covered_acs/preconditions、每步 target_description、SUT 目录与已完成步骤/断言）。"
 }
 
 func (t *contextTaskPack) Parameters() json.RawMessage { return emptyObjectSchema }

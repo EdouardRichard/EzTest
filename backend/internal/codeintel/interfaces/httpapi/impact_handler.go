@@ -57,8 +57,8 @@ func toImpactCandidateDTO(view codeintelapp.ImpactCandidateView) codeCandidateDT
 	if view.RepoID > 0 {
 		dto.RepoID = stringPtr(platformid.Format(view.RepoID))
 	}
-	if len(view.VersionSUTIDs) > 0 {
-		dto.VersionSUTID = stringPtr(platformid.Format(view.VersionSUTIDs[0]))
+	if len(view.SUTIDs) > 0 {
+		dto.SUTID = stringPtr(platformid.Format(view.SUTIDs[0]))
 	}
 	if content.SelectionUpdatedBy != nil {
 		dto.SelectionUpdatedBy = stringPtr(platformid.Format(*content.SelectionUpdatedBy))

@@ -80,7 +80,7 @@ export function Sidebar() {
       </nav>
 
       <div className="border-t border-sidebar-border px-4 py-4 text-[10px] leading-relaxed text-sidebar-muted">
-        <p className="font-medium text-sidebar-foreground">开发测试环境 · 受控网络</p>
+        <p className="font-medium text-sidebar-foreground">自托管测试环境</p>
         <p>AI 可读取测试账号凭据</p>
       </div>
     </aside>

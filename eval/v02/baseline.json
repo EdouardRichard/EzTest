@@ -9,8 +9,7 @@
     "impact_precision": 0.8,
     "classification_accuracy": 0.9,
     "issue_false_positive_rate": 0.1,
-    "supplement_hit_rate": 0.8,
-    "visual_classification_accuracy": 0.9
+    "supplement_hit_rate": 0.8
   },
   "thresholds": {
     "design_coverage": 0.8,
@@ -18,8 +17,7 @@
     "impact_precision": 0.6,
     "classification_accuracy": 0.8,
     "issue_false_positive_rate": 0.15,
-    "supplement_hit_rate": 0.5,
-    "visual_classification_accuracy": 0.8
+    "supplement_hit_rate": 0.5
   },
   "regression_tolerance": 0.05
 }

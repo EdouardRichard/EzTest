@@ -35,12 +35,14 @@ type Client interface {
 	Test(ctx context.Context, cfg llm.Config) (TestResult, error)
 }
 
-// ChatClient is the OpenAI-compatible chat-completions transport used by the
-// P1 agent runtime. Implementations must never include the configured API key
-// (or request headers) in returned errors, and must classify context-window
-// overflows with ErrContextOverflow.
+// ChatClient is the OpenAI-compatible transport used by the agent runtime:
+// Chat performs one completion and Stream performs one streaming completion
+// against the protocol selected from cfg. Implementations must never include
+// the configured API key (or request headers) in returned errors, and must
+// classify context-window overflows with ErrContextOverflow.
 type ChatClient interface {
 	Chat(ctx context.Context, cfg llm.Config, req ChatRequest) (ChatResponse, error)
+	Stream(ctx context.Context, cfg llm.Config, req ChatRequest, onDelta func(Delta)) error
 }
 
 // SettingsReader is the small settings port consumed by the chat gateway for

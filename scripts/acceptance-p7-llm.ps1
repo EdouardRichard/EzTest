@@ -1706,8 +1706,6 @@ function Invoke-DegradedAcceptance {
         Set-ScopedEnv -Name "EZTEST_WEB_ORIGIN" -Value "http://localhost:6868"
         Set-ScopedEnv -Name "EZTEST_ENABLE_TEST_ENDPOINTS" -Value "true"
         Set-ScopedEnv -Name "EZTEST_STORAGE_DIR" -Value $degradedStorageDir
-        Set-ScopedEnv -Name "EZTEST_REPORT_DIR" -Value $degradedReportRoot
-        Set-ScopedEnv -Name "EZTEST_EVIDENCE_DIR" -Value $degradedEvidenceDir
         Set-ScopedEnv -Name "EZTEST_EXECUTOR_URL" -Value "http://127.0.0.1:$executorPort"
         Set-ScopedEnv -Name "EZTEST_EXECUTOR_TOKEN" -Value $executorToken
         Set-ScopedEnv -Name "EZTEST_ADMIN_USERNAME" -Value $AdminUsername
@@ -2195,19 +2193,6 @@ function Invoke-Acceptance {
         if ($probe -ne "1") { throw "PostgreSQL SELECT 1 returned '$probe'" }
         Add-CheckResult -Name "PostgreSQL reachable" -Status "passed" -Detail "local PostgreSQL answered SELECT 1"
 
-        if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-            $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-            if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-                $script:secretValues += $rawSecretKeys
-                try {
-                    $secretObject = $rawSecretKeys | ConvertFrom-Json
-                    foreach ($property in $secretObject.PSObject.Properties) { $script:secretValues += [string]$property.Value }
-                } catch {
-                    # A malformed keyring is reported by the API at startup.
-                }
-            }
-        }
-
         Assert-PortFree -Port $apiPort
         Assert-PortFree -Port $executorPort
         Assert-AcceptanceDatabaseName -DatabaseName $dbName
@@ -2276,8 +2261,6 @@ server.listen(port, "127.0.0.1");
         Set-ScopedEnv -Name "EZTEST_WEB_ORIGIN" -Value "http://localhost:6868"
         Set-ScopedEnv -Name "EZTEST_ENABLE_TEST_ENDPOINTS" -Value "true"
         Set-ScopedEnv -Name "EZTEST_STORAGE_DIR" -Value $storageDir
-        Set-ScopedEnv -Name "EZTEST_REPORT_DIR" -Value $reportRoot
-        Set-ScopedEnv -Name "EZTEST_EVIDENCE_DIR" -Value $evidenceDir
         Set-ScopedEnv -Name "EZTEST_EXECUTOR_URL" -Value "http://127.0.0.1:$executorPort"
         Set-ScopedEnv -Name "EZTEST_EXECUTOR_TOKEN" -Value $executorToken
         Set-ScopedEnv -Name "EZTEST_ADMIN_USERNAME" -Value $adminUsername
@@ -2287,7 +2270,7 @@ server.listen(port, "127.0.0.1");
         Set-ScopedEnv -Name "EZTEST_EXEC_CASE_TIMEOUT_MS" -Value "300000"
         Set-ScopedEnv -Name "EZTEST_AUTONOMY_BATCHES_PER_TICK" -Value "4"
         Set-ScopedEnv -Name "EZTEST_LOG_LEVEL" -Value "info"
-        foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+        foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
             if ($envValues.ContainsKey($key)) { Set-ScopedEnv -Name $key -Value ([string]$envValues[$key]) }
         }
         Clear-ScopedEnv -Name "EZTEST_TEST_DATABASE_URL"

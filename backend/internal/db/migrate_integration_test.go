@@ -5,6 +5,7 @@ package db_test
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -12,6 +13,32 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// orderedMigrationNames returns every migration name listed in order.txt, in
+// order (non-comment, non-empty lines). Counts and pending tails are derived
+// from it so appended migrations do not need to touch these tests.
+func orderedMigrationNames(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile("migrations/order.txt")
+	if err != nil {
+		t.Fatalf("read migrations/order.txt: %v", err)
+	}
+	var names []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names
+}
+
+// expectedMigrationCount derives the migration count from order.txt.
+func expectedMigrationCount(t *testing.T) int {
+	t.Helper()
+	return len(orderedMigrationNames(t))
+}
 
 func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
@@ -21,8 +48,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
+	if want := expectedMigrationCount(t); len(applied) != want {
+		t.Fatalf("applied %d migrations, want %d: %v", len(applied), want, applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -36,10 +63,10 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	expected := []string{
 		"app_user", "auth_token", "audit_log", "code_repository", "content_object",
 		"content_ref", "event", "event_channel", "llm_config", "llm_model",
-		"schema_migrations", "sut", "sut_api", "sut_environment", "sut_page",
+		"schema_migrations", "environment", "sut", "sut_api", "sut_page",
 		"system_setting", "system_setting_revision", "target_database", "test_account",
-		"version", "version_sut", "version_sut_resource",
-		"sut_repository", "version_repository_override", "version_account",
+		"version",
+		"sut_repository", "version_account",
 		"clarification_handoff",
 		"work_item", "work_item_attempt", "team_room_post", "team_room_digest",
 		"agent_profile", "agent_run", "agent_message", "context_packet",
@@ -59,7 +86,6 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"delivery_analysis_run", "requirement_closure",
 		"code_index_run", "code_entity", "code_edge", "code_fact", "code_analysis",
 		"code_impact_candidate", "code_anchor", "code_fact_review",
-		"visual_assertion", "visual_baseline", "visual_diff",
 		"eval_run", "eval_metric", "agent_profile_prompt_revision",
 		"knowledge_item", "knowledge_revision", "knowledge_usage",
 		"gc_run", "gc_tombstone", "api_instance",
@@ -89,9 +115,18 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 			t.Fatalf("missing table %s (found %v)", name, found)
 		}
 	}
+	// v0.2.4-B (GD-05): the inverted hierarchy and the direct environment
+	// binding remove these tables; they must not come back.
+	for _, name := range []string{
+		"sut_environment", "version_sut", "version_sut_resource", "version_repository_override",
+	} {
+		if found[name] {
+			t.Errorf("table %s must be dropped by the v0.2.4-B migrations", name)
+		}
+	}
 }
 
-func TestP2SchemaNames(t *testing.T) {
+func TestDesignSchemaNames(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 	if _, err := db.Migrate(ctx, pool); err != nil {
@@ -176,15 +211,15 @@ func TestP2SchemaNames(t *testing.T) {
 	}
 }
 
-func TestP3ExecutionTables(t *testing.T) {
+func TestExecutionTables(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 	applied, err := db.Migrate(ctx, pool)
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
+	if want := expectedMigrationCount(t); len(applied) != want {
+		t.Fatalf("applied %d migrations, want %d: %v", len(applied), want, applied)
 	}
 
 	tables := []string{
@@ -285,9 +320,9 @@ func TestP3ExecutionTables(t *testing.T) {
 		"idx_execution_intent_version_status", "idx_execution_intent_case_version",
 		"idx_execution_intent_dedupe", "idx_run_wave_version", "idx_run_wave_status",
 		"idx_case_run_wave", "idx_case_run_intent", "idx_case_run_case_version",
-		"idx_case_run_lease", "idx_case_run_sut_context_run", "idx_case_run_sut_context_context",
+		"idx_case_run_lease", "idx_case_run_sut_context_run", "idx_case_run_sut_context_session",
 		"idx_step_result_run", "idx_assertion_result_run",
-		"idx_evidence_case_run", "idx_evidence_version_sut", "idx_evidence_content_ref",
+		"idx_evidence_case_run", "idx_evidence_sut", "idx_evidence_content_ref",
 		"idx_evidence_kind", "idx_evidence_ref_owner", "idx_executor_instance_status",
 		"idx_human_request_version_status", "idx_human_request_case_run", "idx_human_request_expiry",
 	}
@@ -314,9 +349,81 @@ func TestP3ExecutionTables(t *testing.T) {
 			t.Errorf("missing P3 index %s", name)
 		}
 	}
+
+	// v0.2.4-B (T11) execution_0008_v024_rekey: every execution column that
+	// carried a version_sut binding-row id now carries a SUT id, so the column,
+	// index and auto-named CHECK names follow. The old names must be gone, not
+	// merely shadowed by new ones, and the two UNIQUE identities must keep their
+	// constraint names while their definitions move to sut_id.
+	for _, renamed := range []struct{ table, oldColumn, newColumn string }{
+		{"execution_intent", "version_sut_ids", "sut_ids"},
+		{"step_result", "target_version_sut_id", "target_sut_id"},
+		{"assertion_result", "target_version_sut_id", "target_sut_id"},
+		{"evidence", "version_sut_id", "sut_id"},
+		{"case_run_sut_context", "version_sut_id", "sut_id"},
+		{"execution_discovery_observation", "version_sut_id", "sut_id"},
+	} {
+		requireNoColumn(t, pool, renamed.table, renamed.oldColumn)
+		requireColumn(t, pool, renamed.table, renamed.newColumn)
+	}
+	requireIndex(t, pool, "idx_evidence_sut")
+	var checkCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_constraint
+		WHERE conname = 'execution_intent_sut_ids_check'
+		  AND connamespace = current_schema()::regnamespace
+	`).Scan(&checkCount); err != nil {
+		t.Fatalf("read execution_intent_sut_ids_check: %v", err)
+	}
+	if checkCount != 1 {
+		t.Errorf("execution_intent_sut_ids_check count = %d, want 1", checkCount)
+	}
+	for _, want := range []struct{ constraint, definition string }{
+		{"uk_case_run_sut_context", "UNIQUE (case_run_id, sut_id, account_role)"},
+		{"uk_execution_discovery_observation",
+			"UNIQUE (version_id, sut_id, kind, method, resource_template)"},
+	} {
+		var got string
+		if err := pool.QueryRow(ctx, `
+			SELECT pg_get_constraintdef(oid) FROM pg_constraint
+			WHERE conname = $1 AND connamespace = current_schema()::regnamespace
+		`, want.constraint).Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", want.constraint, err)
+		}
+		if got != want.definition {
+			t.Errorf("%s = %q, want %q", want.constraint, got, want.definition)
+		}
+	}
+
+	// v0.2.4-C (T10) execution_0010_v024_executor_sessions: the per-binding
+	// reservation holds a v2 SESSION id (the v1 browser-context column is gone,
+	// not shadowed), the durable recording-ledger cursor exists, and case_run
+	// carries the evidence-drop FACT the verdict aggregation reads.
+	requireNoColumn(t, pool, "case_run_sut_context", "browser_context_id")
+	requireColumn(t, pool, "case_run_sut_context", "session_id")
+	requireColumn(t, pool, "case_run_sut_context", "artifact_cursor")
+	requireColumn(t, pool, "case_run", "evidence_dropped")
+	requireIndex(t, pool, "idx_case_run_sut_context_session")
+	for _, want := range []struct{ table, column string }{
+		{"case_run_sut_context", "artifact_cursor"},
+		{"case_run", "evidence_dropped"},
+	} {
+		var nullable, defaulted string
+		if err := pool.QueryRow(ctx, `
+			SELECT is_nullable, coalesce(column_default, '')
+			FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		`, want.table, want.column).Scan(&nullable, &defaulted); err != nil {
+			t.Fatalf("read %s.%s: %v", want.table, want.column, err)
+		}
+		if nullable != "NO" || defaulted == "" {
+			t.Errorf("%s.%s nullable=%q default=%q, want NOT NULL with a zero default",
+				want.table, want.column, nullable, defaulted)
+		}
+	}
 }
 
-func TestP4DeliverySchema(t *testing.T) {
+func TestDeliverySchema(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 
@@ -324,8 +431,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
+	if want := expectedMigrationCount(t); len(applied) != want {
+		t.Fatalf("applied %d migrations, want %d: %v", len(applied), want, applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -564,7 +671,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO version (id, title, created_by) VALUES (20, 'v', 1)
+		INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING;
+		INSERT INTO version (id, title, created_by, environment_id) VALUES (20, 'v', 1, 990001)
 	`); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
@@ -597,9 +705,9 @@ func TestP4DeliverySchema(t *testing.T) {
 	}
 }
 
-// TestP6QualityPromptSchema pins the two P6 migrations: eval tables (#32) and
+// TestQualityPromptSchema pins the two P6 migrations: eval tables (#32) and
 // append-only prompt revisions (#33).
-func TestP6QualityPromptSchema(t *testing.T) {
+func TestQualityPromptSchema(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 	if _, err := db.Migrate(ctx, pool); err != nil {
@@ -689,10 +797,10 @@ func TestP6QualityPromptSchema(t *testing.T) {
 	}
 }
 
-// TestP7P9Schema pins the seven P7 migrations (#34-#40): knowledge, GC ledger,
+// TestControlPlaneAnalysisSchema pins the seven P7 migrations (#34-#40): knowledge, GC ledger,
 // report PDF metadata, API instances, SUT family, issue recurrence and the
 // deterministic ops work-item team.
-func TestP7P9Schema(t *testing.T) {
+func TestControlPlaneAnalysisSchema(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 	if _, err := db.Migrate(ctx, pool); err != nil {
@@ -822,7 +930,9 @@ func TestP7P9Schema(t *testing.T) {
 	}
 
 	// #40: deterministic worker tasks (report.render_pdf) own the ops team so the
-	// generic agent worker (five product teams) can never claim them.
+	// generic agent worker (four product teams after GD-17 removed steward) can
+	// never claim them. The DB CHECK below still accepts the historical 'steward'
+	// value (append-only migrations); the Go enum no longer produces it.
 	var teamCheck string
 	if err := pool.QueryRow(ctx, `
 		SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -875,42 +985,50 @@ func TestSchemaConstraints(t *testing.T) {
 		t.Fatal("case-insensitive username uniqueness missing")
 	}
 
-	if _, err := pool.Exec(ctx, `INSERT INTO sut (id, name, created_by) VALUES (10, 'Order', 1)`); err != nil {
-		t.Fatalf("insert sut: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO sut (id, name, created_by) VALUES (11, 'order', 1)`); err == nil {
-		t.Fatal("case-insensitive sut name uniqueness missing")
-	}
-
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_environment (id, sut_id, name, base_url, is_default)
-		VALUES (20, 10, 'dev', 'http://localhost:8080', true)
-	`); err != nil {
+	// v0.2.4-B hierarchy: environment is top-level, the SUT belongs to it and
+	// its name is unique per environment only.
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (20, 'prod', 'active')`); err != nil {
 		t.Fatalf("insert environment: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_environment (id, sut_id, name, base_url, is_default)
-		VALUES (21, 10, 'dev2', 'http://localhost:8081', true)
-	`); err == nil {
-		t.Fatal("second default environment accepted")
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (21, 'dev', 'active')`); err != nil {
+		t.Fatalf("insert second environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO environment (id, name, status) VALUES (22, 'PROD', 'active')`); err == nil {
+		t.Fatal("case-insensitive environment name uniqueness missing")
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO version (id, title, created_by) VALUES (30, 'v1', 1)
+		INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (10, 20, 'Order', 'https://order.example.com', 1)
+	`); err != nil {
+		t.Fatalf("insert sut: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (11, 20, 'order', 'https://order2.example.com', 1)
+	`); err == nil {
+		t.Fatal("case-insensitive sut name uniqueness missing inside one environment")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (12, 21, 'order', 'https://dev.order.example.com', 1)
+	`); err != nil {
+		t.Fatalf("sut name must be unique per environment only: %v", err)
+	}
+
+	// v0.2.4-B binding: a version binds its environment directly on the version
+	// row; the derived version_sut chain is gone.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO version (id, title, created_by, environment_id) VALUES (30, 'v1', 1, 20)
 	`); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO version_sut (id, version_id, sut_id, environment_id)
-		VALUES (40, 30, 10, 20)
-	`); err != nil {
-		t.Fatalf("insert version_sut: %v", err)
+	var boundEnvironment int64
+	if err := pool.QueryRow(ctx, `SELECT environment_id FROM version WHERE id = 30`).Scan(&boundEnvironment); err != nil {
+		t.Fatalf("read version.environment_id: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO version_sut (id, version_id, sut_id, environment_id)
-		VALUES (41, 30, 10, 20)
-	`); err == nil {
-		t.Fatal("duplicate version+sut accepted")
+	if boundEnvironment != 20 {
+		t.Fatalf("version.environment_id = %d, want 20", boundEnvironment)
 	}
 
 	if _, err := pool.Exec(ctx, `
@@ -1085,7 +1203,7 @@ func TestSchemaConstraints(t *testing.T) {
 	}
 }
 
-func TestP8HardeningSchema(t *testing.T) {
+func TestRetentionSchema(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
 
@@ -1093,8 +1211,8 @@ func TestP8HardeningSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
+	if want := expectedMigrationCount(t); len(applied) != want {
+		t.Fatalf("applied %d migrations, want %d: %v", len(applied), want, applied)
 	}
 
 	columns := []struct {
@@ -1314,10 +1432,14 @@ func TestV022ABSchema(t *testing.T) {
 	}
 }
 
-// TestV022CSchema pins the C-domain v0.22 schema: version description/goal, the
-// version_sut single-repository column removal and exclusion-document rename,
-// the SUT/version repository bindings, the global test-account pool with
-// per-version enablement, and the clarification handoff artifact.
+// TestV022CSchema pins the C-domain v0.22 schema that v0.2.4-B keeps: version
+// description/goal, the SUT repository bindings, the global test-account pool
+// with per-version enablement, and the clarification handoff artifact.
+// The parts of the v0.22 C shape that v0.2.4-B removes (version_sut with its
+// scope_exclude document and code_baseline_commit, version_sut_resource and
+// version_repository_override) are pinned as absent by
+// TestMigrateAppliesAllTablesAndIsIdempotent and
+// TestV024VersionBindsEnvironmentDirectly instead.
 // See docs/superpowers/specs/2026-11-05-eztest-v0.22-design.md §5 DB-10..DB-15,
 // DB-22 and docs/version-V0.22/C-version-sut-resources.md §3.
 func TestV022CSchema(t *testing.T) {
@@ -1325,21 +1447,17 @@ func TestV022CSchema(t *testing.T) {
 
 	// DB-10: version information and the blocked exit. version.blocker already
 	// exists as TEXT and stays unchanged (lead ruling C6); only presence is
-	// pinned here. DB-11: scope is renamed in place to scope_exclude.
+	// pinned here.
 	for _, c := range []struct{ table, column string }{
 		{"version", "description"},
 		{"version", "goal"},
 		{"version", "blocker"},
-		{"version_sut", "scope_exclude"},
 	} {
 		requireColumn(t, pool, c.table, c.column)
 	}
-	// DB-11: the single-repository column moves to sut_repository.
-	requireNoColumn(t, pool, "version_sut", "code_repo_id")
 
 	for _, table := range []string{
 		"sut_repository",
-		"version_repository_override",
 		"version_account",
 		"clarification_handoff",
 	} {
@@ -1355,7 +1473,6 @@ func TestV022CSchema(t *testing.T) {
 	// pk_<table> instead of PostgreSQL's implicit <table>_pkey.
 	for _, constraint := range []string{
 		"pk_sut_repository",
-		"pk_version_repository_override",
 		"pk_version_account",
 		"pk_clarification_handoff",
 	} {
@@ -1366,7 +1483,6 @@ func TestV022CSchema(t *testing.T) {
 	// repo/account references.
 	for _, index := range []string{
 		"uk_sut_repository_sut_repo",
-		"uk_version_repository_override_version_repo",
 		"uk_version_account_version_account",
 		"uk_clarification_handoff_version_revision",
 		"idx_sut_repository_repo",
@@ -1376,8 +1492,9 @@ func TestV022CSchema(t *testing.T) {
 	}
 
 	// DB-15: test accounts are a global, case-insensitively unique pool. The old
-	// uniqueness was scoped to environment_id, which is gone.
-	requireNoColumn(t, pool, "test_account", "sut_id")
+	// uniqueness was scoped to environment_id, which is gone. v0.2.4-B adds
+	// sut_id back as a NULLABLE affinity column only, so the pool itself and the
+	// global username uniqueness are unchanged.
 	requireNoColumn(t, pool, "test_account", "environment_id")
 	var testAccountIndexDef string
 	if err := pool.QueryRow(context.Background(), `
@@ -1392,8 +1509,19 @@ func TestV022CSchema(t *testing.T) {
 	if !strings.Contains(testAccountIndexDef, "lower(") || !strings.Contains(testAccountIndexDef, "username") {
 		t.Errorf("uk_test_account_username does not cover lower(username): %s", testAccountIndexDef)
 	}
-	if strings.Contains(testAccountIndexDef, "environment_id") {
-		t.Errorf("uk_test_account_username is still environment-scoped: %s", testAccountIndexDef)
+	if strings.Contains(testAccountIndexDef, "environment_id") || strings.Contains(testAccountIndexDef, "sut_id") {
+		t.Errorf("uk_test_account_username is no longer global: %s", testAccountIndexDef)
+	}
+	var sutAffinityNullable string
+	if err := pool.QueryRow(context.Background(), `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'test_account' AND column_name = 'sut_id'
+	`).Scan(&sutAffinityNullable); err != nil {
+		t.Fatalf("read test_account.sut_id nullability: %v", err)
+	}
+	if sutAffinityNullable != "YES" {
+		t.Errorf("test_account.sut_id nullable = %s, want YES (affinity column on a global pool)", sutAffinityNullable)
 	}
 }
 
@@ -1536,8 +1664,8 @@ func TestV022EEXSchema(t *testing.T) {
 		requireColumn(t, pool, "human_request", column)
 	}
 	requireCheckSet(t, pool, "chk_human_request_kind",
-		[]string{"clarification_question", "approval", "blocked_recovery", "login_takeover", "conflict", "other"},
-		[]string{"escalation"})
+		[]string{"clarification_question", "approval", "blocked_recovery", "login_takeover", "conflict"},
+		[]string{"escalation", "other"})
 	requireCheckSet(t, pool, "chk_human_request_status",
 		[]string{"pending", "answered", "expired", "cancelled"}, []string{"open", "resolved"})
 	requireIndex(t, pool, "idx_human_request_conversation")
@@ -1587,7 +1715,7 @@ func TestV022EEXSchema(t *testing.T) {
 	// is the observation identity; sensitive request payload columns must not
 	// exist (N-16/T8).
 	for _, column := range []string{
-		"id", "version_id", "wave_id", "case_run_id", "version_sut_id",
+		"id", "version_id", "wave_id", "case_run_id", "sut_id",
 		"environment_id", "kind", "method", "host", "resource_template",
 		"status_code", "mime", "source_kind", "fingerprint", "occurrences",
 		"first_seen_at", "last_seen_at", "decision", "resource_id", "fact_id",
@@ -1602,9 +1730,10 @@ func TestV022EEXSchema(t *testing.T) {
 		requireNoColumn(t, pool, "execution_discovery_observation", column)
 	}
 	requirePKConstraint(t, pool, "pk_execution_discovery_observation")
-	// version_sut_id is part of the observation identity, so it must be
-	// non-null or NULLS DISTINCT would defeat the unique key.
-	requireColumnNotNull(t, pool, "execution_discovery_observation", "version_sut_id")
+	// sut_id is part of the observation identity, so it must be non-null or
+	// NULLS DISTINCT would defeat the unique key. It was version_sut_id until
+	// execution_0008_v024_rekey renamed it; the identity is unchanged.
+	requireColumnNotNull(t, pool, "execution_discovery_observation", "sut_id")
 	requireCheckSet(t, pool, "chk_execution_discovery_observation_kind",
 		[]string{"page", "api"}, []string{"bogus"})
 	requireCheckSet(t, pool, "chk_execution_discovery_observation_decision",
@@ -1627,14 +1756,14 @@ func TestV022EEXSchema(t *testing.T) {
 	`).Scan(&uniqueDef); err != nil {
 		t.Fatalf("read uk_execution_discovery_observation: %v", err)
 	}
-	wantUniqueDef := "UNIQUE (version_id, version_sut_id, kind, method, resource_template)"
+	wantUniqueDef := "UNIQUE (version_id, sut_id, kind, method, resource_template)"
 	if uniqueDef != wantUniqueDef {
 		t.Errorf("uk_execution_discovery_observation = %q, want %q", uniqueDef, wantUniqueDef)
 	}
 	var decision, sourceKind string
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO execution_discovery_observation
-			(id, version_id, version_sut_id, kind, resource_template)
+			(id, version_id, sut_id, kind, resource_template)
 		VALUES (9401, 9400, 9410, 'page', '/orders/42')
 		RETURNING decision, source_kind
 	`).Scan(&decision, &sourceKind); err != nil {
@@ -1645,14 +1774,14 @@ func TestV022EEXSchema(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO execution_discovery_observation
-			(id, version_id, version_sut_id, kind, resource_template)
+			(id, version_id, sut_id, kind, resource_template)
 		VALUES (9402, 9400, 9410, 'page', '/orders/42')
 	`); err == nil {
 		t.Error("duplicate execution_discovery_observation identity accepted")
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO execution_discovery_observation
-			(id, version_id, version_sut_id, kind, resource_template)
+			(id, version_id, sut_id, kind, resource_template)
 		VALUES (9403, 9400, 9410, 'api', '/orders/42')
 	`); err != nil {
 		t.Errorf("distinct discovery observation kind rejected: %v", err)
@@ -1674,7 +1803,7 @@ func TestV022EEXSchema(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO execution_discovery_observation
-			(id, version_id, version_sut_id, kind, resource_template)
+			(id, version_id, sut_id, kind, resource_template)
 		VALUES (9404, 9400, 9410, 'bogus', '/orders/43')
 	`); err == nil {
 		t.Error("execution_discovery_observation accepts kind 'bogus'")
@@ -1684,7 +1813,7 @@ func TestV022EEXSchema(t *testing.T) {
 			(id, version_id, kind, resource_template)
 		VALUES (9405, 9400, 'page', '/orders/44')
 	`); err == nil {
-		t.Error("execution_discovery_observation accepts a NULL version_sut_id")
+		t.Error("execution_discovery_observation accepts a NULL sut_id")
 	}
 
 	// DB-30: discovery-delta case versions and the auto-confirmation audit.
@@ -1769,6 +1898,38 @@ func TestV022EEXSchema(t *testing.T) {
 	`); err != nil {
 		t.Errorf("case_confirmation rejects trigger rollback: %v", err)
 	}
+}
+
+// TestV024VisualDomainDropped pins GD-22 (v0.2.4-B): the visual assertion
+// domain is removed from the database. The three visual tables are dropped and
+// the kind CHECK constraints are restored to their pre-visual value sets.
+func TestV024VisualDomainDropped(t *testing.T) {
+	pool := integrationDB(t)
+	ctx := context.Background()
+
+	for _, table := range []string{"visual_assertion", "visual_baseline", "visual_diff"} {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+			t.Fatalf("check table %s: %v", table, err)
+		}
+		if exists {
+			t.Errorf("table %s still exists after the visual domain removal", table)
+		}
+	}
+
+	// evidence.kind's allowed value set is pinned to the execution-domain
+	// registry by TestEvidenceKindCheckDerivesFromDomain in
+	// execution/infrastructure/postgres: the expected set is DERIVED from
+	// execution.EvidenceKinds() and asserted EQUAL to the DB CHECK (H-D1). That
+	// derived assertion lives in the execution context's own integration test
+	// because db_test is platform facility and must not reverse-import a context
+	// domain (review M1). The visual kinds stay removed by construction —
+	// EvidenceKinds() carries no visual kind, so the set equality excludes them.
+	// case_assertion.kind / assertion_result.kind lose the visual kind.
+	requireCheckSet(t, pool, "case_assertion_kind_check",
+		[]string{"ui", "api", "db", "text"}, []string{"visual"})
+	requireCheckSet(t, pool, "assertion_result_kind_check",
+		[]string{"ui", "api", "db", "text"}, []string{"visual"})
 }
 
 // integrationDB returns a fresh, fully migrated test schema.

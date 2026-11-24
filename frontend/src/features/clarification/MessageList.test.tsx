@@ -277,4 +277,156 @@ describe("MessageList", () => {
     expect(screen.getByTestId("question-card")).toHaveAttribute("data-question-id", "102")
     expect(screen.getByTestId("pending-question-todo")).toHaveTextContent("1")
   })
+
+  describe("incremental stream rendering (T7, SC-D2)", () => {
+    function streamingMessage(text: string): ConversationMessage {
+      return {
+        id: "9001",
+        conversation_id: "2",
+        role: "assistant",
+        parts: [{ seq: 1, type: "text", text } as unknown as MessagePart],
+        refs: [],
+        created_at: "2026-11-17T10:00:00Z",
+        stream_state: "streaming",
+      }
+    }
+
+    function renderThread(message: ConversationMessage) {
+      return render(
+        <MessageList
+          versionId="2001"
+          messages={[message]}
+          activity={null}
+          onRequirementSelect={vi.fn()}
+        />,
+      )
+    }
+
+    it("accumulates a streamed text part into ONE paragraph, not per-fragment bubbles", () => {
+      const { rerender } = renderThread(streamingMessage("Hel"))
+      expect(screen.getAllByTestId("rich-text")).toHaveLength(1)
+      expect(screen.getByTestId("rich-text")).toHaveTextContent("Hel")
+
+      rerender(
+        <MessageList
+          versionId="2001"
+          messages={[streamingMessage("Hello")]}
+          activity={null}
+          onRequirementSelect={vi.fn()}
+        />,
+      )
+      expect(screen.getAllByTestId("rich-text")).toHaveLength(1)
+      expect(screen.getByTestId("rich-text")).toHaveTextContent("Hello")
+
+      // A duplicated streamed row (replayed frame) never renders twice.
+      const duplicated = streamingMessage("Hello")
+      duplicated.parts = [...duplicated.parts, ...duplicated.parts]
+      rerender(
+        <MessageList
+          versionId="2001"
+          messages={[duplicated]}
+          activity={null}
+          onRequirementSelect={vi.fn()}
+        />,
+      )
+      expect(screen.getAllByTestId("rich-text")).toHaveLength(1)
+      expect(screen.getByTestId("rich-text")).toHaveTextContent("Hello")
+    })
+
+    it("keeps the text paragraph's DOM identity stable across increments (no remount churn)", () => {
+      const { rerender } = renderThread(streamingMessage("Hel"))
+      const paragraph = screen.getByTestId("rich-text")
+
+      rerender(
+        <MessageList
+          versionId="2001"
+          messages={[streamingMessage("Hello")]}
+          activity={null}
+          onRequirementSelect={vi.fn()}
+        />,
+      )
+      // A seq-keyed part keeps the same React element while the text grows;
+      // a content-keyed part would remount on every token of the first 32 chars.
+      expect(screen.getByTestId("rich-text")).toBe(paragraph)
+    })
+
+    it("keeps thinking collapsed and preserves the expanded state when duration arrives", () => {
+      const thinkingMessage = (durationMs: number): ConversationMessage => ({
+        id: "9002",
+        conversation_id: "2",
+        role: "assistant",
+        parts: [
+          {
+            seq: 1,
+            type: "thinking",
+            text: "核对退款时效",
+            duration_ms: durationMs,
+          } as unknown as MessagePart,
+        ],
+        refs: [],
+        created_at: "2026-11-17T10:00:00Z",
+        stream_state: "streaming",
+      })
+
+      const { rerender } = renderThread(thinkingMessage(0))
+      expect(screen.getByTestId("thinking-block")).toHaveTextContent("思考了 0s")
+      expect(screen.queryByText("核对退款时效")).not.toBeInTheDocument()
+
+      // The reader expands the block mid-stream.
+      fireEvent.click(screen.getByRole("button", { name: /思考了/ }))
+      expect(screen.getByText("核对退款时效")).toBeInTheDocument()
+
+      // duration_ms arrives via a replace-mode delta / full frame: the label
+      // updates but the reader's expanded state must survive (no remount).
+      rerender(
+        <MessageList
+          versionId="2001"
+          messages={[thinkingMessage(2000)]}
+          activity={null}
+          onRequirementSelect={vi.fn()}
+        />,
+      )
+      expect(screen.getByTestId("thinking-block")).toHaveTextContent("思考了 2s")
+      expect(screen.getByText("核对退款时效")).toBeInTheDocument()
+    })
+  })
+  // v0.2.4-D fix wave (M-1/T7 deferred badge): the streaming state is server
+  // truth (SSE full frame or the REST snapshot), so a resumed in-flight reply is
+  // legible as generating and a finished one is not.
+  describe("streaming indicator", () => {
+    function assistant(state?: "streaming" | "complete" | "interrupted"): ConversationMessage {
+      return {
+        id: "7001",
+        conversation_id: "2",
+        role: "assistant",
+        parts: [{ type: "text", text: "已经生成的一半" }],
+        refs: [],
+        created_at: "2026-11-17T10:00:00Z",
+        ...(state === undefined ? {} : { stream_state: state }),
+      }
+    }
+
+    for (const [state, visible] of [
+      ["streaming", true],
+      ["complete", false],
+      ["interrupted", false],
+      [undefined, false],
+    ] as const) {
+      it(`shows the badge only for stream_state=${state ?? "absent"}`, () => {
+        render(
+          <MessageList
+            versionId="2001"
+            messages={[assistant(state)]}
+            activity={null}
+            onRequirementSelect={vi.fn()}
+          />,
+        )
+        if (visible) {
+          expect(screen.getByTestId("message-streaming-badge")).toHaveTextContent("生成中")
+        } else {
+          expect(screen.queryByTestId("message-streaming-badge")).not.toBeInTheDocument()
+        }
+      })
+    }
+  })
 })

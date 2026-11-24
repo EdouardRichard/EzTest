@@ -78,7 +78,7 @@ func TestConversationPartWriterIntegration(t *testing.T) {
 	// A conflicting batch must leave neither the head nor any part row behind.
 	conflicting := version.Message{
 		ID: ids.Next(), ConversationID: conversation.ID, Role: version.MessageRoleAssistant,
-		Parts:      []version.MessagePart{{Type: "text", Text: "conflict"}},
+		Parts: []version.MessagePart{{Type: "text", Text: "conflict"}},
 		StreamParts: []version.ConversationMessagePart{
 			{Seq: 1, Type: "text", Payload: json.RawMessage(`{"type":"text","text":"a"}`), CreatedAt: testTime},
 			{Seq: 1, Type: "text", Payload: json.RawMessage(`{"type":"text","text":"b"}`), CreatedAt: testTime},

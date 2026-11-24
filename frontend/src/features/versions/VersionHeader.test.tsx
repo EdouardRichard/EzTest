@@ -27,7 +27,7 @@ const openRequest: HumanRequest = {
   status: "pending",
   payload: {
     reason: "需要输入短信验证码",
-    version_sut_id: "3001",
+    sut_id: "3001",
     account_role: "buyer",
     page_url: "https://order.test/login",
     challenge_kind: "sms",

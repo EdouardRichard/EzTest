@@ -22,6 +22,7 @@ import {
   listLLMModels,
 } from "./api"
 import { ProfileEditor } from "./ProfileEditor"
+import { RunTranscriptDrawer } from "./RunTranscriptDrawer"
 import {
   AGENT_RUN_STATUS_LABEL,
   AGENT_RUN_STATUS_TONE,
@@ -52,10 +53,11 @@ const TAB_VALUES: AgentCenterTab[] = ["catalog", "runs", "quality", "config"]
 const RUN_PAGE_LIMIT = 20
 
 /**
- * P6 Agent center: read-only catalog/runs/quality for every logged-in user and
- * an admin-only configuration tab with the prompt version editor. Prompts and
- * transcripts never appear in the read models; normal users never request the
- * admin endpoints.
+ * Agent center: read-only catalog/runs/quality for every logged-in user, an
+ * admin-only configuration tab with the prompt version editor, and an
+ * admin-only live transcript drawer opened from a runs row. The metadata read
+ * models carry no prompts or transcripts; normal users never request the admin
+ * endpoints (the server enforces the gate independently of this UI).
  */
 export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageProps) {
   const router = useRouter()
@@ -67,6 +69,7 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
       ? (initialProfile ?? null)
       : null,
   )
+  const [selectedRun, setSelectedRun] = useState<AgentRunView | null>(null)
 
   const [catalog, setCatalog] = useState<AgentCatalog | null>(null)
   const [catalogLoading, setCatalogLoading] = useState(true)
@@ -285,8 +288,7 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
             2 个对话 Host（clarification/design）是对话的唯一写者；design_author/design_critic
             是后台作业，只出作业卡、无对话入口。执行 / 分析 profile
-            的目录、运行观察与质量投影只读展示，不返回 prompt 或
-            transcript；配置与提示词版本仅管理员可编辑。
+            的目录、运行观察与质量投影只读展示；实时转录与配置、提示词版本仅管理员可见。
           </p>
         </div>
         <Button variant="secondary" size="sm" onClick={refresh}>
@@ -320,6 +322,8 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
           statusFilter={runStatusFilter}
           hasMore={runsHasMore}
           loadingMore={runsLoadingMore}
+          isAdmin={isAdmin}
+          onSelectRun={setSelectedRun}
           onProfileChange={changeRunProfile}
           onStatusChange={changeRunStatus}
           onRetry={refresh}
@@ -354,6 +358,10 @@ export function AgentCenterPage({ initialTab, initialProfile }: AgentCenterPageP
           onClose={closeEditor}
           onSaved={refresh}
         />
+      ) : null}
+
+      {isAdmin && selectedRun !== null ? (
+        <RunTranscriptDrawer run={selectedRun} onClose={() => setSelectedRun(null)} />
       ) : null}
     </div>
   )
@@ -504,6 +512,8 @@ function RunsPanel({
   statusFilter,
   hasMore,
   loadingMore,
+  isAdmin,
+  onSelectRun,
   onProfileChange,
   onStatusChange,
   onRetry,
@@ -517,6 +527,8 @@ function RunsPanel({
   statusFilter: string
   hasMore: boolean
   loadingMore: boolean
+  isAdmin: boolean
+  onSelectRun: (run: AgentRunView) => void
   onProfileChange: (value: string) => void
   onStatusChange: (value: string) => void
   onRetry: () => void
@@ -528,7 +540,9 @@ function RunsPanel({
         <div>
           <h2 className="text-sm font-semibold text-foreground">运行观察</h2>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            仅展示 run 元数据；不返回 message/transcript。
+            {isAdmin
+              ? "点击运行行查看该 run 的实时转录（仅管理员可见）。"
+              : "仅展示 run 元数据；不返回 message/transcript。"}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -596,7 +610,24 @@ function RunsPanel({
               </thead>
               <tbody>
                 {runs.map((run) => (
-                  <tr key={run.id} data-testid={`agent-center-run-${run.id}`}>
+                  <tr
+                    key={run.id}
+                    data-testid={`agent-center-run-${run.id}`}
+                    role={isAdmin ? "button" : undefined}
+                    tabIndex={isAdmin ? 0 : undefined}
+                    className={isAdmin ? "cursor-pointer hover:bg-muted/40" : undefined}
+                    onClick={isAdmin ? () => onSelectRun(run) : undefined}
+                    onKeyDown={
+                      isAdmin
+                        ? (event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault()
+                              onSelectRun(run)
+                            }
+                          }
+                        : undefined
+                    }
+                  >
                     <td className="border-b border-border px-2 py-1.5 font-mono text-foreground">
                       #{run.id}
                     </td>

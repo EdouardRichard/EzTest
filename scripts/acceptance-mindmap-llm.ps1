@@ -97,8 +97,6 @@ $requiredEnvKeys = @(
     "EZTEST_DATABASE_URL",
     "EZTEST_ADMIN_USERNAME",
     "EZTEST_ADMIN_PASSWORD",
-    "EZTEST_SECRET_KEYS",
-    "EZTEST_SECRET_KEY_ACTIVE",
     "llm_base_url",
     "llm_key",
     "llm_model_name"
@@ -728,22 +726,6 @@ try {
     $llmModel = Get-RequiredValue -Values $envValues -Key "llm_model_name"
     $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
     $script:secretValues = @($adminPassword, $llmKey, $databaseUrl)
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-            $script:secretValues += $rawSecretKeys
-            try {
-                $secretObject = $rawSecretKeys | ConvertFrom-Json
-                foreach ($property in $secretObject.PSObject.Properties) {
-                    if ($null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                        $script:secretValues += [string]$property.Value
-                    }
-                }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
     Add-CheckResult -Name "gate and .env keys" -Status "passed" -Detail "EZTEST_RUN_REAL_LLM=1; llm_base_url/llm_key/llm_model_name present"
 
     Write-Step "Validating the database URL before any destructive statement"
@@ -815,21 +797,19 @@ try {
         $env:EZTEST_WEB_ORIGIN = "http://localhost:6868"
         $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
         $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
-        $env:EZTEST_EXPORT_DIR = $exportDir
         $env:EZTEST_OPENAPI_PATH = (Join-Path $repoRoot "docs\openapi\api.yaml")
         $env:EZTEST_ADMIN_USERNAME = $adminUsername
         $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-        foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+        foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
             if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
         }
         foreach ($key in @($envValues.Keys)) {
-            if ([string]$key -like "EZTEST_MINDMAP_*" -or [string]$key -like "EZTEST_EXPLORE_*" -or [string]$key -eq "EZTEST_EXPORT_DIR") {
+            if ([string]$key -like "EZTEST_MINDMAP_*" -or [string]$key -like "EZTEST_EXPLORE_*") {
                 if (-not [string]::IsNullOrWhiteSpace([string]$envValues[$key])) {
                     Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
                 }
             }
         }
-        $env:EZTEST_EXPORT_DIR = $exportDir
         Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue
 
         $apiOut = Join-Path $tmpDir "acceptance-mindmap-llm-api.out.log"
@@ -1240,7 +1220,7 @@ try {
             }
             if ($recordedHash -ne $download.Sha256) { throw "export $format sha256 mismatch" }
             $storedPath = Get-PsqlScalar -Database $e2eDbName -Sql "SELECT file_path FROM case_export WHERE version_id = $($script:state.VersionId) AND id = $exportId;"
-            if (-not (Test-Path -LiteralPath (Join-Path $exportDir ($storedPath -replace "/", "\")))) { throw "export $format file is missing under EZTEST_EXPORT_DIR" }
+            if (-not (Test-Path -LiteralPath (Join-Path $exportDir ($storedPath -replace "/", "\")))) { throw "export $format file is missing under the export root" }
             $content = [System.IO.File]::ReadAllText($downloadFile, [System.Text.Encoding]::UTF8)
             foreach ($needle in $expectedContent[$format]) {
                 if ($content -notmatch [regex]::Escape($needle)) { throw "export $format is missing '$needle'" }

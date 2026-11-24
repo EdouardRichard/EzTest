@@ -44,9 +44,6 @@ export function RequirementNode({ data }: NodeProps) {
       <p className="mt-1 text-[11px] text-muted-foreground">
         场景 {requirement.scenarios.length} · 用例 {caseCount} · draft {draftCount}
       </p>
-      <p className="text-[11px] text-muted-foreground">
-        SUT {requirement.target_version_sut_ids.length} 个目标
-      </p>
       {node.actions.caseReviewEnabled === false ||
       node.destructiveActionsDisabled === true ? null : (
         <Button

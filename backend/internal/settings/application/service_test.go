@@ -6,7 +6,6 @@ import (
 	"errors"
 	"slices"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -139,8 +138,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 87 {
-		t.Fatalf("catalog has %d keys, want 87 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(defs))
+	if len(defs) != 86 {
+		t.Fatalf("catalog has %d keys, want 86 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases, v0.2.4-B removes 7 visual.* keys, v0.2.4-C adds evidence_max_per_case_run + max_case_turns, v0.2.4-E adds 4 quality-gate keys, v0.2.4-F removes the 3 quota keys and adds max_concurrent_case_runs, v0.2.4-G adds 2 report evidence display caps)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -168,9 +167,9 @@ func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	}
 }
 
-// TestP3ExecutionSettings pins the five P3 keys (spec §11.2, P3-D-19): types,
+// TestExecutionSettings pins the five P3 keys (spec §11.2, P3-D-19): types,
 // defaults, ranges and the first secret-semantics setting.
-func TestP3ExecutionSettings(t *testing.T) {
+func TestExecutionSettings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
 	cases := []struct {
 		key     string
@@ -207,13 +206,13 @@ func TestP3ExecutionSettings(t *testing.T) {
 		}
 	}
 	if executionKeys != 12 {
-		t.Fatalf("execution settings = %d, want 12 (6 frozen + 5 P3 + 1 P7)", executionKeys)
+		t.Fatalf("execution settings = %d, want 12 (3 frozen + 5 P3 + 1 P7 + evidence_max_per_case_run + max_case_turns + max_concurrent_case_runs; v0.2.4-F retired the 3-dimension quota keys)", executionKeys)
 	}
 }
 
-// TestP4ChainSettings pins the four P4 chain keys (spec §4.5/settings.md
+// TestChainSettings pins the four P4 chain keys (spec §4.5/settings.md
 // §4d): number, non-secret, integer and the configured range/default.
-func TestP4ChainSettings(t *testing.T) {
+func TestChainSettings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
 	cases := []struct {
 		key string
@@ -246,10 +245,10 @@ func TestP4ChainSettings(t *testing.T) {
 	}
 }
 
-// TestP5CodeintelVisualSettings pins the 16 P5 keys (spec §4.5): nine
-// codeintel.* and seven visual.* settings, plus the JSON-array exclude globs.
-// Every key is non-secret and only lowers the hard domain limits.
-func TestP5CodeintelVisualSettings(t *testing.T) {
+// TestCodeIntelSettings pins the nine P5 codeintel.* keys (spec §4.5) plus
+// the JSON-array exclude globs. Every key is non-secret and only lowers the
+// hard domain limits.
+func TestCodeIntelSettings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
 	cases := []struct {
 		key     string
@@ -267,25 +266,14 @@ func TestP5CodeintelVisualSettings(t *testing.T) {
 		{"codeintel.analysis_timeout_seconds", settings.TypeNumber, "180", true, floatPtr(10), floatPtr(1800)},
 		{"codeintel.max_concurrent_analyses", settings.TypeNumber, "1", true, floatPtr(1), floatPtr(4)},
 		{"codeintel.prompt_version", settings.TypeString, `"p5.1"`, false, nil, nil},
-		{"visual.default_threshold", settings.TypeNumber, "0.005", false, floatPtr(0), floatPtr(0.1)},
-		{"visual.baseline_max_bytes", settings.TypeNumber, "5242880", true, floatPtr(65536), floatPtr(20971520)},
-		{"visual.default_viewport_width", settings.TypeNumber, "1280", true, floatPtr(1), floatPtr(10000)},
-		{"visual.default_viewport_height", settings.TypeNumber, "720", true, floatPtr(1), floatPtr(10000)},
-		{"visual.default_device_scale_factor", settings.TypeNumber, "1", false, floatPtr(0.5), floatPtr(4)},
-		{"visual.compare_timeout_seconds", settings.TypeNumber, "60", true, floatPtr(5), floatPtr(300)},
-		{"visual.wait_timeout_seconds", settings.TypeNumber, "15", true, floatPtr(1), floatPtr(120)},
 	}
 	for _, tc := range cases {
 		def := defs[indexOf(t, defs, tc.key)]
-		wantCategory := "codeintel"
-		if strings.HasPrefix(tc.key, "visual.") {
-			wantCategory = "visual"
-		}
 		if def.Type != tc.typ || string(def.Default) != tc.def || def.Secret || def.Integer != tc.integer {
 			t.Fatalf("%s = %+v, want type=%s default=%s non-secret integer=%v", tc.key, def, tc.typ, tc.def, tc.integer)
 		}
-		if def.Category != wantCategory {
-			t.Fatalf("%s category = %q, want %q", tc.key, def.Category, wantCategory)
+		if def.Category != "codeintel" {
+			t.Fatalf("%s category = %q, want %q", tc.key, def.Category, "codeintel")
 		}
 		if !floatPtrEqual(def.Min, tc.min) || !floatPtrEqual(def.Max, tc.max) {
 			t.Fatalf("%s range = %v..%v, want %v..%v", tc.key, def.Min, def.Max, tc.min, tc.max)
@@ -312,14 +300,11 @@ func TestP5CodeintelVisualSettings(t *testing.T) {
 	if counts["codeintel"] != 9 {
 		t.Fatalf("codeintel settings = %d, want 9", counts["codeintel"])
 	}
-	if counts["visual"] != 7 {
-		t.Fatalf("visual settings = %d, want 7", counts["visual"])
-	}
 }
 
-// TestP6SearchTodosQualitySettings pins the three P6 keys (spec §4.5):
+// TestSearchTodosQualitySettings pins the three P6 keys (spec §4.5):
 // number, non-secret, hot-reloadable (no restart) and their defaults/ranges.
-func TestP6SearchTodosQualitySettings(t *testing.T) {
+func TestSearchTodosQualitySettings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
 	cases := []struct {
 		key      string
@@ -375,20 +360,20 @@ func TestSeedDefaultsIsIdempotentAndPreservesValues(t *testing.T) {
 	if repo.seedCalls != 1 {
 		t.Fatalf("seed calls = %d", repo.seedCalls)
 	}
-	first, err := svc.Int(ctx, "execution.global_concurrency")
-	if err != nil || first != 3 {
-		t.Fatalf("concurrency = %d, %v", first, err)
+	first, err := svc.Int(ctx, "execution.max_concurrent_case_runs")
+	if err != nil || first != 0 {
+		t.Fatalf("max concurrent case runs = %d, %v (want the 0 = unlimited default)", first, err)
 	}
 
 	// A prior user value must survive a restart seed.
-	repo.items["execution.global_concurrency"] = settings.Setting{
-		Key: "execution.global_concurrency", Value: json.RawMessage("7"),
+	repo.items["execution.max_concurrent_case_runs"] = settings.Setting{
+		Key: "execution.max_concurrent_case_runs", Value: json.RawMessage("7"),
 		Category: "execution", Type: settings.TypeNumber,
 	}
 	if err := svc.SeedDefaults(ctx); err != nil {
 		t.Fatalf("second SeedDefaults: %v", err)
 	}
-	second, err := svc.Int(ctx, "execution.global_concurrency")
+	second, err := svc.Int(ctx, "execution.max_concurrent_case_runs")
 	if err != nil || second != 7 {
 		t.Fatalf("second concurrency = %d, %v", second, err)
 	}
@@ -402,22 +387,22 @@ func TestUpdateWritesRevisionAndHotReloads(t *testing.T) {
 		t.Fatalf("SeedDefaults: %v", err)
 	}
 
-	updated, err := svc.Update(ctx, "execution.global_concurrency", 5, 42)
+	updated, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 5, 42)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if updated.Version != 2 || updated.UpdatedBy == nil || *updated.UpdatedBy != 42 {
 		t.Fatalf("updated = %#v", updated)
 	}
-	value, err := svc.Int(ctx, "execution.global_concurrency")
+	value, err := svc.Int(ctx, "execution.max_concurrent_case_runs")
 	if err != nil || value != 5 {
 		t.Fatalf("hot value = %d, %v", value, err)
 	}
-	revisions, err := svc.Revisions(ctx, "execution.global_concurrency", 10, nil)
+	revisions, err := svc.Revisions(ctx, "execution.max_concurrent_case_runs", 10, nil)
 	if err != nil || len(revisions) != 1 {
 		t.Fatalf("revisions = %#v, %v", revisions, err)
 	}
-	if string(revisions[0].OldValue) != "3" || string(revisions[0].NewValue) != "5" {
+	if string(revisions[0].OldValue) != "0" || string(revisions[0].NewValue) != "5" {
 		t.Fatalf("revision = %#v", revisions[0])
 	}
 	if len(audit.events) != 1 || audit.events[0].Action != "settings.updated" {
@@ -443,10 +428,12 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 		key   string
 		value any
 	}{
-		{"execution.global_concurrency", "abc"},
-		{"execution.global_concurrency", 0},
-		{"execution.global_concurrency", 33},
-		{"execution.global_concurrency", 1.5},
+		// v0.2.4-F: the single global quota key is an integer >= 0 with no upper
+		// bound; 0 = unlimited is VALID (pinned below), so the invalid shapes are
+		// a non-number, a negative value and a non-integer.
+		{"execution.max_concurrent_case_runs", "abc"},
+		{"execution.max_concurrent_case_runs", -1},
+		{"execution.max_concurrent_case_runs", 1.5},
 		{"retention.gc_dry_run", "yes"},
 		{"context.compact_threshold", 0.95},
 		{"context.compact_threshold", 0.2},
@@ -460,9 +447,6 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 		{"codeintel.max_changed_files", 201},
 		{"codeintel.max_concurrent_analyses", 5},
 		{"codeintel.prompt_version", 1},
-		{"visual.default_threshold", 0.11},
-		{"visual.default_device_scale_factor", 0.4},
-		{"visual.compare_timeout_seconds", 4},
 	}
 	for _, tc := range cases {
 		if _, err := svc.Update(ctx, tc.key, tc.value, 1); err == nil {
@@ -472,6 +456,17 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 
 	if _, err := svc.Update(ctx, "does.not.exist", 1, 1); !isNotFound(err) {
 		t.Fatalf("unknown key error = %v, want not found", err)
+	}
+	// The retired key must be gone, not silently accepted.
+	if _, err := svc.Update(ctx, "execution.global_concurrency", 5, 1); !isNotFound(err) {
+		t.Fatalf("retired quota key error = %v, want not found", err)
+	}
+	// 0 (unlimited) and large positive limits are valid under the new contract.
+	if _, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 0, 1); err != nil {
+		t.Fatalf("valid zero (unlimited) rejected: %v", err)
+	}
+	if _, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 33, 1); err != nil {
+		t.Fatalf("valid positive limit rejected: %v", err)
 	}
 	if _, err := svc.Update(ctx, "context.compact_threshold", 0.75, 1); err != nil {
 		t.Fatalf("valid float rejected: %v", err)
@@ -496,10 +491,10 @@ func TestUpdateAuditRecordsOldAndNewValues(t *testing.T) {
 		t.Fatalf("SeedDefaults: %v", err)
 	}
 
-	if _, err := svc.Update(ctx, "execution.global_concurrency", 5, 42); err != nil {
+	if _, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 5, 42); err != nil {
 		t.Fatalf("first Update: %v", err)
 	}
-	if _, err := svc.Update(ctx, "execution.global_concurrency", 6, 42); err != nil {
+	if _, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 6, 42); err != nil {
 		t.Fatalf("second Update: %v", err)
 	}
 	if len(audit.events) != 2 {
@@ -524,15 +519,15 @@ func TestUpdateUsesAtomicPreviousValue(t *testing.T) {
 
 	repo.getCalls = 0
 	repo.getErr = errors.New("service must not pre-read settings")
-	if _, err := svc.Update(ctx, "execution.global_concurrency", 5, 42); err != nil {
+	if _, err := svc.Update(ctx, "execution.max_concurrent_case_runs", 5, 42); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if repo.getCalls != 0 {
 		t.Fatalf("Update called repository Get %d time(s), want 0", repo.getCalls)
 	}
 	metadata := audit.events[0].Metadata
-	if metadata["old_value"] != "3" || metadata["new_value"] != "5" {
-		t.Fatalf("metadata = %#v, want old_value=3 new_value=5", metadata)
+	if metadata["old_value"] != "0" || metadata["new_value"] != "5" {
+		t.Fatalf("metadata = %#v, want old_value=0 new_value=5", metadata)
 	}
 }
 
@@ -584,11 +579,11 @@ func TestTypedGetters(t *testing.T) {
 	if err != nil || threshold != 0.7 {
 		t.Fatalf("threshold = %v, %v", threshold, err)
 	}
-	concurrency, err := svc.Float(ctx, "execution.global_concurrency")
-	if err != nil || concurrency != 3 {
+	concurrency, err := svc.Float(ctx, "execution.max_concurrent_case_runs")
+	if err != nil || concurrency != 0 {
 		t.Fatalf("widened integer = %v, %v", concurrency, err)
 	}
-	if _, err := svc.String(ctx, "execution.global_concurrency"); err == nil {
+	if _, err := svc.String(ctx, "execution.max_concurrent_case_runs"); err == nil {
 		t.Fatal("String() accepted a number setting")
 	}
 	if _, err := svc.Float(ctx, "paths.data_root"); err == nil {

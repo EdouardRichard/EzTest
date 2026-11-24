@@ -92,6 +92,12 @@ var executorLimitationCodes = map[string]struct{}{
 	"drag_unavailable":         {},
 	"unsupported_action":       {},
 	"action_unsupported":       {},
+	// browser_cli_unavailable is the executor's typed code for a missing
+	// official playwright CLI runtime (executor/src/browser_cli.mjs). Unlike a
+	// generic *_unavailable suffix it is a CONCRETE executor-host capability
+	// gap that can never describe a SUT defect, so a missing CLI blocks the run
+	// (terminal_cause=executor_capability) instead of producing an issue.
+	"browser_cli_unavailable": {},
 }
 
 // StepExecutorLimitation reads the structured executor limitation marker of one
@@ -438,7 +444,7 @@ func nounBeforeMarkerAdjacent(gap, noun, marker string) bool {
 
 // termHasWordBoundary rejects ASCII terms embedded inside a selector, path or
 // identifier token (for example the "schedule" inside "selector #scheduled-at"
-// or the "missing" inside "missing_visual_baseline"). Chinese terms need no
+// or the "missing" inside "missing_field_baseline"). Chinese terms need no
 // boundary check.
 func termHasWordBoundary(clause string, at, end int) bool {
 	if !isASCIITerm(clause[at:end]) {

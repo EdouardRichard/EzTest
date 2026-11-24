@@ -11,36 +11,34 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
-// budgetVisualCaseSnapshot is the QA release T9 shape (run 376172868880306177):
-// four steps, one passing assertion on step 2 and one visual assertion on step
-// 4. The token budget ended the run after steps 1-3 were recorded, so the
-// visual step was never reached and no visual result exists.
-func budgetVisualCaseSnapshot() execution.CaseSnapshot {
+// budgetCaseSnapshot is the QA release T9 shape: four steps and one passing
+// assertion on step 2. The token budget ended the run after steps 1-3 were
+// recorded, so step 4 was never reached and no result exists for it.
+func budgetCaseSnapshot() execution.CaseSnapshot {
 	snapshot := fourStepCaseSnapshot()
 	snapshot.Assertions = []execution.CaseAssertion{
-		{StepSeq: 2, AssertionSeq: 1, Kind: execution.AssertionKindUI, Expected: "发布请求成功", TargetVersionSUTID: 7},
-		{StepSeq: 4, AssertionSeq: 1, Kind: execution.AssertionKindVisual, Expected: "发布页视觉一致", TargetVersionSUTID: 7},
+		{StepSeq: 2, AssertionSeq: 1, Kind: execution.AssertionKindUI, Expected: "发布请求成功", SUTID: 7},
 	}
 	return snapshot
 }
 
-// prepareBudgetVisualRun prepares the QA-shaped case and records the step
-// results the budget-ended run produced before the stop.
-func prepareBudgetVisualRun(t *testing.T, fixture *caseRunnerFixture, recordedSteps int) {
+// prepareBudgetRun prepares the QA-shaped case and records the step results the
+// budget-ended run produced before the stop.
+func prepareBudgetRun(t *testing.T, fixture *caseRunnerFixture, recordedSteps int) {
 	t.Helper()
-	fixture.cases.snapshot = budgetVisualCaseSnapshot()
+	fixture.cases.snapshot = budgetCaseSnapshot()
 	fixture.cases.executable = []execution.CaseSnapshot{fixture.cases.snapshot}
-	if _, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItem()); err != nil {
+	if _, err := fixture.runner.Prepare(fixture.runCtx, executionWorkItem()); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	for seq := 1; seq <= recordedSteps; seq++ {
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 			Seq: seq, Status: "passed", Observed: "步骤完成", VersionSUTID: int64ptr(7),
 		}); err != nil {
 			t.Fatalf("StepRecord(%d): %v", seq, err)
 		}
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 2, AssertionSeq: 1, Verdict: "passed", Actual: "POST /api/v1/posts 201", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
@@ -73,16 +71,14 @@ func budgetHandoffPost(posts []executionapp.TeamPost) *executionapp.TeamPost {
 	return nil
 }
 
-// TestBudgetCauseWinsOverVisualSymptom reproduces QA release T9: a token-budget
-// stop before the visual step made the aggregate report
-// inconclusive(visual_assertion_not_run), and the settlement persisted
-// terminal_cause=visual_assertion_not_run / next_action=repair_visual_baseline
-// even though the baseline/config existed. The explicit budget cause must win
-// over that downstream symptom, the verdict itself must not change (no gate
-// relaxation, no fake pass), and the run keeps its observed usage.
-func TestBudgetCauseWinsOverVisualSymptom(t *testing.T) {
+// TestBudgetCauseWinsOverIncompleteSymptom reproduces QA release T9: a
+// token-budget stop before the final step made the aggregate report
+// inconclusive(incomplete). The explicit budget cause must win over that
+// downstream symptom, the verdict itself must not change (no gate relaxation,
+// no fake pass), and the run keeps its observed usage.
+func TestBudgetCauseWinsOverIncompleteSymptom(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
-	prepareBudgetVisualRun(t, fixture, 3)
+	prepareBudgetRun(t, fixture, 3)
 
 	finalizeBudgetEndedRun(t, fixture)
 
@@ -90,17 +86,17 @@ func TestBudgetCauseWinsOverVisualSymptom(t *testing.T) {
 	if stored.Status != execution.CaseRunInconclusive {
 		t.Fatalf("status = %q, want the unchanged inconclusive verdict", stored.Status)
 	}
-	if stored.Summary.VerdictReason != execution.VerdictReasonVisualAssertionNotRun {
+	if stored.Summary.VerdictReason != execution.VerdictReasonIncomplete {
 		t.Fatalf("verdict reason = %q, want the deterministic %q (the cause fix must not rewrite the verdict)",
-			stored.Summary.VerdictReason, execution.VerdictReasonVisualAssertionNotRun)
+			stored.Summary.VerdictReason, execution.VerdictReasonIncomplete)
 	}
 	if stored.Summary.TerminalCause != execution.TerminalCauseTokenBudget {
-		t.Fatalf("terminal cause = %q, want %q: the run ended on the token budget, the visual step was never reached",
+		t.Fatalf("terminal cause = %q, want %q: the run ended on the token budget, step 4 was never reached",
 			stored.Summary.TerminalCause, execution.TerminalCauseTokenBudget)
 	}
 	if stored.Summary.NextAction != execution.NextActionRerun {
-		t.Fatalf("next action = %q, want %q (not %q)",
-			stored.Summary.NextAction, execution.NextActionRerun, execution.NextActionRepairVisual)
+		t.Fatalf("next action = %q, want %q",
+			stored.Summary.NextAction, execution.NextActionRerun)
 	}
 	if !strings.Contains(stored.Summary.LastError, "token budget") ||
 		!strings.Contains(stored.Summary.LastError, "1251485") ||
@@ -125,7 +121,7 @@ func TestBudgetCauseWinsOverVisualSymptom(t *testing.T) {
 	}
 
 	// The budget stop still needs a human (rerun with a fresh budget); the
-	// handoff must name the budget, not a missing visual baseline.
+	// handoff must name the budget cause.
 	handoff := budgetHandoffPost(fixture.room.posts)
 	if handoff == nil {
 		t.Fatalf("posts = %+v, want the terminal handoff", fixture.room.posts)
@@ -134,79 +130,15 @@ func TestBudgetCauseWinsOverVisualSymptom(t *testing.T) {
 		!strings.Contains(handoff.Content, execution.NextActionRerun) {
 		t.Fatalf("handoff content = %q, want the budget cause and the rerun next action", handoff.Content)
 	}
-	if strings.Contains(handoff.Content, execution.NextActionRepairVisual) {
-		t.Fatalf("handoff content = %q, must not tell the human to repair a baseline", handoff.Content)
-	}
-}
-
-// TestVisualNotRunCauseOnlyWhenReached pins the precedence boundary: a visual
-// symptom may only keep the visual cause when the run actually reached the
-// visual step. A budget stop before that step is a run-level stop; a visual
-// result recorded on the reached step (or a recorded step without a visual
-// result) is a real observation and keeps its own cause/next action.
-func TestVisualNotRunCauseOnlyWhenReached(t *testing.T) {
-	t.Run("budget stop before the visual step", func(t *testing.T) {
-		fixture := newCaseRunnerFixture(t)
-		prepareBudgetVisualRun(t, fixture, 3)
-		finalizeBudgetEndedRun(t, fixture)
-
-		stored := fixture.caseRuns.get(t, 3001)
-		if stored.Summary.TerminalCause != execution.TerminalCauseTokenBudget ||
-			stored.Summary.NextAction != execution.NextActionRerun {
-			t.Fatalf("stored cause/action = %q/%q, want %q/%q (the visual step was never reached)",
-				stored.Summary.TerminalCause, stored.Summary.NextAction,
-				execution.TerminalCauseTokenBudget, execution.NextActionRerun)
-		}
-	})
-
-	t.Run("visual step reached without a visual result", func(t *testing.T) {
-		fixture := newCaseRunnerFixture(t)
-		prepareBudgetVisualRun(t, fixture, 4)
-		finalizeBudgetEndedRun(t, fixture)
-
-		stored := fixture.caseRuns.get(t, 3001)
-		if stored.Summary.VerdictReason != execution.VerdictReasonVisualAssertionNotRun {
-			t.Fatalf("verdict reason = %q, want %q", stored.Summary.VerdictReason, execution.VerdictReasonVisualAssertionNotRun)
-		}
-		if stored.Summary.TerminalCause != execution.VerdictReasonVisualAssertionNotRun ||
-			stored.Summary.NextAction != execution.NextActionRepairVisual {
-			t.Fatalf("stored cause/action = %q/%q, want %q/%q: the visual step was reached and skipped",
-				stored.Summary.TerminalCause, stored.Summary.NextAction,
-				execution.VerdictReasonVisualAssertionNotRun, execution.NextActionRepairVisual)
-		}
-	})
-
-	t.Run("visual assertion attempted but missing a baseline", func(t *testing.T) {
-		fixture := newCaseRunnerFixture(t)
-		prepareBudgetVisualRun(t, fixture, 4)
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
-			StepSeq: 4, AssertionSeq: 1, Verdict: "inconclusive", Reason: "missing_visual_baseline",
-			Actual: "no approved baseline", VersionSUTID: int64ptr(7),
-		}); err != nil {
-			t.Fatalf("AssertionRecord(visual): %v", err)
-		}
-		finalizeBudgetEndedRun(t, fixture)
-
-		stored := fixture.caseRuns.get(t, 3001)
-		if stored.Summary.VerdictReason != "missing_visual_baseline" {
-			t.Fatalf("verdict reason = %q, want missing_visual_baseline", stored.Summary.VerdictReason)
-		}
-		if stored.Summary.TerminalCause != "missing_visual_baseline" ||
-			stored.Summary.NextAction != execution.NextActionRepairVisual {
-			t.Fatalf("stored cause/action = %q/%q, want the observed missing baseline and %q",
-				stored.Summary.TerminalCause, stored.Summary.NextAction, execution.NextActionRepairVisual)
-		}
-	})
 }
 
 // TestCoverageNotMisledByBudget pins that the settlement correction does not
 // fake coverage: a budget-ended run stays a real execution coverage gap (no
-// pass is invented), the gap keeps the execution_failed_coverage reason instead
-// of a visual-baseline reason, and the run itself explains the gap as a budget
-// stop that needs a rerun.
+// pass is invented), the gap keeps the execution_failed_coverage reason, and
+// the run itself explains the gap as a budget stop that needs a rerun.
 func TestCoverageNotMisledByBudget(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
-	prepareBudgetVisualRun(t, fixture, 3)
+	prepareBudgetRun(t, fixture, 3)
 	finalizeBudgetEndedRun(t, fixture)
 
 	out, err := fixture.runner.CoverageRead(context.Background(), tools.Scope{VersionID: 10})
@@ -235,7 +167,7 @@ func TestCoverageNotMisledByBudget(t *testing.T) {
 	stored := fixture.caseRuns.get(t, 3001)
 	if stored.Summary.TerminalCause != execution.TerminalCauseTokenBudget ||
 		stored.Summary.NextAction != execution.NextActionRerun {
-		t.Fatalf("stored cause/action = %q/%q, want %q/%q so the coverage gap is explained as a budget stop, not a visual defect",
+		t.Fatalf("stored cause/action = %q/%q, want %q/%q so the coverage gap is explained as a budget stop",
 			stored.Summary.TerminalCause, stored.Summary.NextAction,
 			execution.TerminalCauseTokenBudget, execution.NextActionRerun)
 	}

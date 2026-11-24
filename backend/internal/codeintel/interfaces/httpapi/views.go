@@ -451,7 +451,7 @@ type codeCandidateDTO struct {
 	ID                 string           `json:"id"`
 	AnalysisID         string           `json:"analysis_id"`
 	RepoID             *string          `json:"repo_id"`
-	VersionSUTID       *string          `json:"version_sut_id"`
+	SUTID              *string          `json:"sut_id"`
 	SubjectKind        string           `json:"subject_kind"`
 	SubjectID          string           `json:"subject_id"`
 	Reason             string           `json:"reason"`

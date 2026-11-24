@@ -35,12 +35,12 @@ func TestChainFilterNormalize(t *testing.T) {
 
 	t.Run("drops non-positive IDs", func(t *testing.T) {
 		got := ChainFilter{
-			VersionSUTID: int64Ptr(0),
-			PageID:       int64Ptr(-1),
-			WaveID:       int64Ptr(77),
+			SUTID:  int64Ptr(0),
+			PageID: int64Ptr(-1),
+			WaveID: int64Ptr(77),
 		}.Normalize()
-		if got.VersionSUTID != nil {
-			t.Errorf("VersionSUTID = %d, want nil", *got.VersionSUTID)
+		if got.SUTID != nil {
+			t.Errorf("SUTID = %d, want nil", *got.SUTID)
 		}
 		if got.PageID != nil {
 			t.Errorf("PageID = %d, want nil", *got.PageID)
@@ -92,13 +92,13 @@ func TestChainFilterNormalize(t *testing.T) {
 
 	t.Run("does not mutate the receiver", func(t *testing.T) {
 		in := ChainFilter{
-			VersionSUTID: int64Ptr(5),
-			Status:       " Open ",
-			EventFrom:    int64Ptr(9),
-			EventTo:      int64Ptr(4),
+			SUTID:     int64Ptr(5),
+			Status:    " Open ",
+			EventFrom: int64Ptr(9),
+			EventTo:   int64Ptr(4),
 		}
 		_ = in.Normalize()
-		if *in.VersionSUTID != 5 || in.Status != " Open " {
+		if *in.SUTID != 5 || in.Status != " Open " {
 			t.Fatalf("Normalize mutated the receiver: %+v", in)
 		}
 		if *in.EventFrom != 9 || *in.EventTo != 4 {
@@ -137,23 +137,23 @@ func TestChainFilterLimitNormalize(t *testing.T) {
 	})
 }
 
-func TestNodeVersionSUTIDs(t *testing.T) {
+func TestNodeSUTIDs(t *testing.T) {
 	primary := int64(11)
 	labels := []int64{11, 22}
-	node := Node{VersionSUTID: &primary, VersionSUTIDs: labels}
-	if node.VersionSUTID == nil || *node.VersionSUTID != 11 {
-		t.Fatalf("VersionSUTID = %v, want 11", node.VersionSUTID)
+	node := Node{SUTID: &primary, SUTIDs: labels}
+	if node.SUTID == nil || *node.SUTID != 11 {
+		t.Fatalf("SUTID = %v, want 11", node.SUTID)
 	}
-	if len(node.VersionSUTIDs) != 2 || node.VersionSUTIDs[0] != 11 || node.VersionSUTIDs[1] != 22 {
-		t.Fatalf("VersionSUTIDs = %v, want [11 22]", node.VersionSUTIDs)
+	if len(node.SUTIDs) != 2 || node.SUTIDs[0] != 11 || node.SUTIDs[1] != 22 {
+		t.Fatalf("SUTIDs = %v, want [11 22]", node.SUTIDs)
 	}
 
 	empty := Node{}
-	if empty.VersionSUTID != nil {
-		t.Fatalf("zero Node VersionSUTID = %v, want nil", empty.VersionSUTID)
+	if empty.SUTID != nil {
+		t.Fatalf("zero Node SUTID = %v, want nil", empty.SUTID)
 	}
-	if empty.VersionSUTIDs != nil {
-		t.Fatalf("zero Node VersionSUTIDs = %v, want nil", empty.VersionSUTIDs)
+	if empty.SUTIDs != nil {
+		t.Fatalf("zero Node SUTIDs = %v, want nil", empty.SUTIDs)
 	}
 }
 

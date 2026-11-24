@@ -24,7 +24,7 @@ func (c fakeClock) Now() time.Time { return c.now }
 // handed to every constructor argument and records which ports were called.
 type fakeProviders struct {
 	requirements     []chain.Node
-	versionSUTs      []chain.Node
+	suts             []chain.Node
 	scenarios        []chain.Node
 	cases            []chain.Node
 	historical       map[int64]chain.Node
@@ -79,11 +79,11 @@ func (f *fakeProviders) Requirements(ctx context.Context, versionID int64, limit
 	return f.requirements, nil
 }
 
-func (f *fakeProviders) VersionSUTs(ctx context.Context, versionID int64) ([]chain.Node, error) {
-	if err := f.begin("version_suts", versionID); err != nil {
+func (f *fakeProviders) SUTs(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	if err := f.begin("suts", versionID); err != nil {
 		return nil, err
 	}
-	return f.versionSUTs, nil
+	return f.suts, nil
 }
 
 func (f *fakeProviders) Scenarios(ctx context.Context, versionID int64) ([]chain.Node, error) {
@@ -199,7 +199,7 @@ func completeFakes() *fakeProviders {
 
 	requirement := chainNode(chain.NodeRequirement, 1, "Checkout")
 	requirement.Status = "clarified"
-	requirement.Meta = map[string]any{"target_version_sut_ids": []int64{5}}
+	requirement.Meta = map[string]any{"target_sut_ids": []int64{5}}
 
 	scenario := chainNode(chain.NodeScenario, 10, "Happy path")
 	scenario.RequirementID = ptr(1)
@@ -207,8 +207,8 @@ func completeFakes() *fakeProviders {
 	caseVersion := chainNode(chain.NodeCaseVersion, 100, "Pays with card")
 	caseVersion.RequirementID = ptr(1)
 	caseVersion.ScenarioID = ptr(10)
-	caseVersion.VersionSUTID = ptr(5)
-	caseVersion.VersionSUTIDs = []int64{5}
+	caseVersion.SUTID = ptr(5)
+	caseVersion.SUTIDs = []int64{5}
 	caseVersion.PageID = ptr(50)
 	caseVersion.Status = "confirmed"
 	caseVersion.Meta = map[string]any{
@@ -221,7 +221,7 @@ func completeFakes() *fakeProviders {
 	caseRun := chainNode(chain.NodeCaseRun, 200, "Pays with card")
 	caseRun.CaseVersionID = ptr(100)
 	caseRun.WaveID = ptr(7)
-	caseRun.VersionSUTIDs = []int64{5}
+	caseRun.SUTIDs = []int64{5}
 	caseRun.Status = "done"
 	caseRun.Meta = map[string]any{"evidence_count": 2}
 
@@ -240,8 +240,8 @@ func completeFakes() *fakeProviders {
 	closure.RequirementID = ptr(1)
 
 	fakes.requirements = []chain.Node{requirement}
-	fakes.versionSUTs = []chain.Node{{
-		ID:    "version_sut:5",
+	fakes.suts = []chain.Node{{
+		ID:    "sut:5",
 		RefID: "5",
 		Label: "Pay (version binding)",
 	}}
@@ -350,7 +350,7 @@ func TestChainServiceReadAssemblesView(t *testing.T) {
 	}
 
 	for _, operation := range []string{
-		"requirements", "version_suts", "scenarios", "cases", "waves",
+		"requirements", "suts", "scenarios", "cases", "waves",
 		"case_runs", "issues", "reports", "closures", "sut_names", "page_names", "cursor",
 	} {
 		if !slices.Contains(fakes.calls, operation) {
@@ -547,8 +547,8 @@ func TestChainServiceErrors(t *testing.T) {
 		{name: "requirements", operation: "requirements", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
 			f.errs["requirements"] = errProviderBoom
 		}},
-		{name: "version suts", operation: "version_suts", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
-			f.errs["version_suts"] = errProviderBoom
+		{name: "version suts", operation: "suts", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
+			f.errs["suts"] = errProviderBoom
 		}},
 		{name: "scenarios", operation: "scenarios", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
 			f.errs["scenarios"] = errProviderBoom
@@ -915,7 +915,7 @@ func TestChainServiceLimitOverride(t *testing.T) {
 }
 
 func sameFilter(left, right chain.ChainFilter) bool {
-	return samePtr(left.VersionSUTID, right.VersionSUTID) &&
+	return samePtr(left.SUTID, right.SUTID) &&
 		samePtr(left.PageID, right.PageID) &&
 		samePtr(left.WaveID, right.WaveID) &&
 		left.Status == right.Status &&

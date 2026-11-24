@@ -4,7 +4,7 @@ import type { BadgeTone } from "@/components/ui/Badge"
  * Wire types for the P7 cross-version knowledge page (spec §6.1/§10).
  *
  * Field names and enum values are pinned by the frozen P7 contract
- * (`docs/version-V0.2/contracts/openapi.yaml`): IDs are decimal strings,
+ * (`docs/openapi/api.yaml`): IDs are decimal strings,
  * timestamps are RFC3339 UTC, list endpoints use `{data, next_cursor,
  * has_more}` and detail endpoints use `{data: ...}`. `source_stale` is computed
  * at read time and is never a status.
@@ -56,9 +56,20 @@ export type KnowledgeRevisionView = {
   created_at: string
 }
 
-/** `GET /api/knowledge/items/{id}`: the item plus its revisions. */
+/**
+ * `KnowledgeUsageStatsView`: read-time knowledge_usage aggregates for one item
+ * (derived COUNT/MAX, never stored). `last_used_at` is null when the item has
+ * never been injected.
+ */
+export type KnowledgeUsageStatsView = {
+  injection_count: number
+  last_used_at: string | null
+}
+
+/** `GET /api/knowledge/items/{id}`: the item plus its revisions and usage. */
 export type KnowledgeDetailView = KnowledgeItemView & {
   revisions: KnowledgeRevisionView[]
+  usage: KnowledgeUsageStatsView
 }
 
 /* --------------------------------- requests -------------------------------- */

@@ -160,6 +160,7 @@ func TestFailedStepMissingFeatureWithErrorIsApplication(t *testing.T) {
 			Observed: map[string]any{"summary": "页面无发布时间或定时发布控件，无法设置未来时间 T。"},
 			Error:    "编辑页无「发布时间/预约发布」入口（状态仅草稿、已发布、已下架），无法设置未来时间 T，期望不可达",
 		}},
+		EvidenceCount: 1,
 	}
 	status, class, summary, err := Aggregate(in)
 	if err != nil {

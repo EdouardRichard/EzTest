@@ -27,11 +27,11 @@ func completeSource() SourceGraph {
 	requirement.Status = "clarified"
 	requirement.CreatedAt = created
 	requirement.UpdatedAt = created.Add(3 * time.Hour)
-	requirement.Meta = map[string]any{"target_version_sut_ids": []int64{5, 6}}
+	requirement.Meta = map[string]any{"target_sut_ids": []int64{5, 6}}
 
 	scenario := testNode(NodeScenario, 10, "Happy path")
 	scenario.RequirementID = int64Ptr(1)
-	scenario.VersionSUTIDs = []int64{5, 6}
+	scenario.SUTIDs = []int64{5, 6}
 	scenario.CreatedAt = created
 	scenario.Meta = map[string]any{
 		"page_ids": []int64{50, 51},
@@ -40,8 +40,8 @@ func completeSource() SourceGraph {
 	caseVersion := testNode(NodeCaseVersion, 100, "Pays with card")
 	caseVersion.RequirementID = int64Ptr(1)
 	caseVersion.ScenarioID = int64Ptr(10)
-	caseVersion.VersionSUTID = int64Ptr(5)
-	caseVersion.VersionSUTIDs = []int64{5, 6}
+	caseVersion.SUTID = int64Ptr(5)
+	caseVersion.SUTIDs = []int64{5, 6}
 	caseVersion.PageID = int64Ptr(50)
 	caseVersion.Status = "confirmed"
 	caseVersion.Result = "failed"
@@ -59,8 +59,8 @@ func completeSource() SourceGraph {
 	caseRun := testNode(NodeCaseRun, 200, "Pays with card")
 	caseRun.CaseVersionID = int64Ptr(100)
 	caseRun.WaveID = int64Ptr(7)
-	caseRun.VersionSUTID = int64Ptr(5)
-	caseRun.VersionSUTIDs = []int64{5, 6}
+	caseRun.SUTID = int64Ptr(5)
+	caseRun.SUTIDs = []int64{5, 6}
 	caseRun.PageID = int64Ptr(51)
 	caseRun.Status = "done"
 	caseRun.Result = "failed"
@@ -80,7 +80,7 @@ func completeSource() SourceGraph {
 	issue.ReportID = int64Ptr(900)
 	issue.MergedIntoID = int64Ptr(301)
 	issue.Status = "open"
-	issue.VersionSUTIDs = []int64{5, 6}
+	issue.SUTIDs = []int64{5, 6}
 	issue.PageID = int64Ptr(51)
 	issue.CreatedAt = created.Add(90 * time.Minute)
 	issue.Meta = map[string]any{
@@ -98,7 +98,7 @@ func completeSource() SourceGraph {
 	report.WaveID = int64Ptr(7)
 	report.Status = "published"
 	report.PageID = int64Ptr(51)
-	report.VersionSUTIDs = []int64{5, 6}
+	report.SUTIDs = []int64{5, 6}
 	report.CreatedAt = created.Add(2 * time.Hour)
 	report.Meta = map[string]any{
 		"page_ids": []int64{51},
@@ -270,55 +270,55 @@ func filterSource() SourceGraph {
 	src := completeSource()
 
 	src.Requirements[0].Meta = map[string]any{
-		"target_version_sut_ids": []int64{5, 6},
-		"page_ids":               []int64{50, 51},
+		"target_sut_ids": []int64{5, 6},
+		"page_ids":       []int64{50, 51},
 	}
 	src.Scenarios[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{50, 51},
+		"sut_ids":  []int64{5, 6},
+		"page_ids": []int64{50, 51},
 	}
 	src.Cases[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{50, 51},
-		"wave_ids":        []int64{7},
-		"revision":        2,
+		"sut_ids":  []int64{5, 6},
+		"page_ids": []int64{50, 51},
+		"wave_ids": []int64{7},
+		"revision": 2,
 	}
 	src.CaseRuns[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{51},
-		"wave_ids":        []int64{7},
-		"evidence_count":  2,
+		"sut_ids":        []int64{5, 6},
+		"page_ids":       []int64{51},
+		"wave_ids":       []int64{7},
+		"evidence_count": 2,
 	}
 	src.Issues[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{51},
-		"wave_ids":        []int64{7},
-		"severity":        "major",
+		"sut_ids":  []int64{5, 6},
+		"page_ids": []int64{51},
+		"wave_ids": []int64{7},
+		"severity": "major",
 	}
 	src.Reports[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{51},
-		"wave_ids":        []int64{7},
-		"kind":            "wave",
+		"sut_ids":  []int64{5, 6},
+		"page_ids": []int64{51},
+		"wave_ids": []int64{7},
+		"kind":     "wave",
 	}
 	src.Closures[0].Meta = map[string]any{
-		"version_sut_ids": []int64{5, 6},
-		"page_ids":        []int64{51},
+		"sut_ids":  []int64{5, 6},
+		"page_ids": []int64{51},
 	}
-	src.Closures[0].VersionSUTIDs = []int64{5, 6}
+	src.Closures[0].SUTIDs = []int64{5, 6}
 
 	secondCase := testNode(NodeCaseVersion, 101, "Second case")
 	secondCase.RequirementID = int64Ptr(1)
 	secondCase.ScenarioID = int64Ptr(10)
-	secondCase.VersionSUTID = int64Ptr(7)
-	secondCase.VersionSUTIDs = []int64{7}
+	secondCase.SUTID = int64Ptr(7)
+	secondCase.SUTIDs = []int64{7}
 	secondCase.PageID = int64Ptr(52)
 	secondCase.Status = "draft"
 	secondCase.Result = "passed"
 	secondCase.Meta = map[string]any{
-		"version_sut_ids": []int64{7},
-		"page_ids":        []int64{52},
-		"wave_ids":        []int64{8},
+		"sut_ids":  []int64{7},
+		"page_ids": []int64{52},
+		"wave_ids": []int64{8},
 	}
 
 	secondWave := testNode(NodeWave, 8, "Wave 2")
@@ -327,15 +327,15 @@ func filterSource() SourceGraph {
 	secondRun := testNode(NodeCaseRun, 201, "Second case")
 	secondRun.CaseVersionID = int64Ptr(101)
 	secondRun.WaveID = int64Ptr(8)
-	secondRun.VersionSUTID = int64Ptr(7)
-	secondRun.VersionSUTIDs = []int64{7}
+	secondRun.SUTID = int64Ptr(7)
+	secondRun.SUTIDs = []int64{7}
 	secondRun.PageID = int64Ptr(52)
 	secondRun.Status = "done"
 	secondRun.Result = "passed"
 	secondRun.Meta = map[string]any{
-		"version_sut_ids": []int64{7},
-		"page_ids":        []int64{52},
-		"wave_ids":        []int64{8},
+		"sut_ids":  []int64{7},
+		"page_ids": []int64{52},
+		"wave_ids": []int64{8},
 	}
 
 	secondReport := testNode(NodeReport, 901, "Wave 2 report")
@@ -362,7 +362,7 @@ func TestBuildChainFilters(t *testing.T) {
 	}{
 		{
 			name:    "SUT filter keeps both SUT tags of a cross-SUT case",
-			filter:  ChainFilter{VersionSUTID: int64Ptr(6)},
+			filter:  ChainFilter{SUTID: int64Ptr(6)},
 			present: []string{"requirement:1", "scenario:10", "case_version:100", "case_run:200", "issue:300", "report:900", "closure:400"},
 			absent:  []string{"case_version:101", "case_run:201", "wave:7", "wave:8", "report:901", "issue:301"},
 			edges: []edgeKey{
@@ -625,17 +625,17 @@ func filteredRootSource() SourceGraph {
 	for index := int64(1); index <= 3; index++ {
 		requirement := testNode(NodeRequirement, index, "Requirement "+itoa(index))
 		requirement.Status = "clarified"
-		requirement.VersionSUTIDs = []int64{6}
+		requirement.SUTIDs = []int64{6}
 		requirement.CreatedAt = start.Add(time.Duration(index) * time.Hour)
 
 		scenario := testNode(NodeScenario, 10+index, "Scenario "+itoa(index))
 		scenario.RequirementID = int64Ptr(index)
-		scenario.VersionSUTIDs = []int64{6}
+		scenario.SUTIDs = []int64{6}
 
 		caseVersion := testNode(NodeCaseVersion, 100+index, "Case "+itoa(index))
 		caseVersion.RequirementID = int64Ptr(index)
 		caseVersion.ScenarioID = int64Ptr(10 + index)
-		caseVersion.VersionSUTIDs = []int64{6}
+		caseVersion.SUTIDs = []int64{6}
 
 		src.Requirements = append(src.Requirements, requirement)
 		src.Scenarios = append(src.Scenarios, scenario)
@@ -646,20 +646,20 @@ func filteredRootSource() SourceGraph {
 	orphan.Status = "clarified"
 	scenario := testNode(NodeScenario, 14, "Scenario 4")
 	scenario.RequirementID = int64Ptr(4)
-	scenario.VersionSUTIDs = []int64{6}
+	scenario.SUTIDs = []int64{6}
 	caseVersion := testNode(NodeCaseVersion, 104, "Case 4")
 	caseVersion.RequirementID = int64Ptr(4)
 	caseVersion.ScenarioID = int64Ptr(14)
-	caseVersion.VersionSUTIDs = []int64{6}
+	caseVersion.SUTIDs = []int64{6}
 	caseRun := testNode(NodeCaseRun, 204, "Run 4")
 	caseRun.CaseVersionID = int64Ptr(104)
-	caseRun.VersionSUTIDs = []int64{6}
+	caseRun.SUTIDs = []int64{6}
 	issue := testNode(NodeIssue, 304, "Issue 4")
 	issue.CaseRunID = int64Ptr(204)
-	issue.VersionSUTIDs = []int64{6}
+	issue.SUTIDs = []int64{6}
 	closure := testNode(NodeClosure, 404, "Closed 4")
 	closure.RequirementID = int64Ptr(4)
-	closure.VersionSUTIDs = []int64{6}
+	closure.SUTIDs = []int64{6}
 
 	src.Requirements = append(src.Requirements, orphan)
 	src.Scenarios = append(src.Scenarios, scenario)
@@ -675,7 +675,7 @@ func TestBuildChainRequirementBudgetKeepsFilteredRootDescendants(t *testing.T) {
 
 	view := BuildChain(
 		filteredRootSource(),
-		ChainFilter{VersionSUTID: int64Ptr(6)},
+		ChainFilter{SUTID: int64Ptr(6)},
 		Budget{MaxRequirements: 2},
 		0,
 		now,
@@ -894,8 +894,8 @@ func TestBuildChainCrossSUTLabels(t *testing.T) {
 	if got := caseNode.Meta["page_labels"]; !slices.Equal(anyStrings(t, got), []string{"Checkout", "Cart"}) {
 		t.Errorf("case_version page_labels = %v, want [Checkout Cart]", got)
 	}
-	if !slices.Equal(caseNode.VersionSUTIDs, []int64{5, 6}) {
-		t.Errorf("case_version VersionSUTIDs = %v, want [5 6]", caseNode.VersionSUTIDs)
+	if !slices.Equal(caseNode.SUTIDs, []int64{5, 6}) {
+		t.Errorf("case_version SUTIDs = %v, want [5 6]", caseNode.SUTIDs)
 	}
 
 	requirement := nodes["requirement:1"]
@@ -987,7 +987,7 @@ func equalInt64Ptr(left, right *int64) bool {
 }
 
 func equalFilters(left, right ChainFilter) bool {
-	return equalInt64Ptr(left.VersionSUTID, right.VersionSUTID) &&
+	return equalInt64Ptr(left.SUTID, right.SUTID) &&
 		equalInt64Ptr(left.PageID, right.PageID) &&
 		equalInt64Ptr(left.WaveID, right.WaveID) &&
 		left.Status == right.Status &&

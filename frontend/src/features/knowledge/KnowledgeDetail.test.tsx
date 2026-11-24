@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
+import { formatDateTime } from "@/lib/format"
+
 import type { KnowledgeDetailView, KnowledgeItemView } from "./types"
 
 const knowledgeApi = vi.hoisted(() => ({
@@ -71,7 +73,12 @@ const revisions = [
 ]
 
 function detail(overrides: Partial<KnowledgeDetailView> = {}): KnowledgeDetailView {
-  return { ...baseItem, revisions, ...overrides }
+  return {
+    ...baseItem,
+    revisions,
+    usage: { injection_count: 0, last_used_at: null },
+    ...overrides,
+  }
 }
 
 function props(overrides: Partial<Parameters<typeof KnowledgeDetail>[0]> = {}) {
@@ -127,6 +134,27 @@ describe("KnowledgeDetail", () => {
     expect(knowledgeApi.getKnowledge).toHaveBeenCalledWith("7001")
   })
 
+  it("shows the injection count and last-used time from the usage stats", async () => {
+    knowledgeApi.getKnowledge.mockResolvedValue(
+      detail({ usage: { injection_count: 5, last_used_at: updatedAt } }),
+    )
+    render(<KnowledgeDetail {...props()} />)
+
+    expect(await screen.findByTestId("knowledge-detail")).toBeInTheDocument()
+    expect(screen.getByTestId("knowledge-injection-count")).toHaveTextContent("5")
+    expect(screen.getByTestId("knowledge-last-used-at")).toHaveTextContent(
+      formatDateTime(updatedAt),
+    )
+  })
+
+  it("renders a never-used item with zero count and an em dash", async () => {
+    render(<KnowledgeDetail {...props()} />)
+
+    expect(await screen.findByTestId("knowledge-detail")).toBeInTheDocument()
+    expect(screen.getByTestId("knowledge-injection-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("knowledge-last-used-at")).toHaveTextContent("—")
+  })
+
   it("shows no edit affordance for an approved item", async () => {
     knowledgeApi.getKnowledge.mockResolvedValue(detail({ status: "approved" }))
     render(<KnowledgeDetail {...props({ isAdmin: true })} />)
@@ -166,6 +194,9 @@ describe("KnowledgeDetail", () => {
 
   it("refreshes the detail and notifies the parent after approve", async () => {
     const onChanged = vi.fn()
+    knowledgeApi.getKnowledge.mockResolvedValue(
+      detail({ usage: { injection_count: 2, last_used_at: updatedAt } }),
+    )
     knowledgeApi.approveKnowledge.mockResolvedValue({
       ...baseItem,
       status: "approved",
@@ -179,6 +210,9 @@ describe("KnowledgeDetail", () => {
     await waitFor(() => expect(knowledgeApi.approveKnowledge).toHaveBeenCalledWith("7001"))
     await waitFor(() => expect(screen.getByTestId("knowledge-status")).toHaveTextContent("已通过"))
     expect(onChanged).toHaveBeenCalledTimes(1)
+    // The review response is a KnowledgeItemView without usage; merging it must
+    // keep the detail's usage aggregates on screen.
+    expect(screen.getByTestId("knowledge-injection-count")).toHaveTextContent("2")
   })
 
   it("shows the loading and error states with retry", async () => {

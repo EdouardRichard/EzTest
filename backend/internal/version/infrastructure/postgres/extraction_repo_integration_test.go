@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -303,23 +304,25 @@ func TestExtractionUpsertNoDowngradeIntegration(t *testing.T) {
 	if counts.Updated != 1 {
 		t.Fatalf("catalog upsert counts=%+v, want one update", counts)
 	}
-	var title, description, acceptance, priority, constraintsJSON string
+	// v0.2.4-B (T8): the extracted prose description is stored in rules (the
+	// §5.1 field for free text that is not the user story) and the flat
+	// acceptance statements are stored as the structured JSONB array with
+	// server-assigned ids.
+	var title, rules, acceptanceJSON, priority, constraintsJSON string
 	var confidence float64
 	if err := pool.QueryRow(ctx, `
-		SELECT v.title, v.description, v.acceptance_criteria, v.priority,
+		SELECT v.title, v.rules, v.acceptance_criteria::text, v.priority,
 		       v.constraints::text, r.confidence
 		FROM requirement r
 		JOIN requirement_version v ON v.id = r.current_version_id
 		WHERE r.version_id = $1 AND r.external_id = 'FR-131'
-	`, versionID).Scan(&title, &description, &acceptance, &priority, &constraintsJSON, &confidence); err != nil {
+	`, versionID).Scan(&title, &rules, &acceptanceJSON, &priority, &constraintsJSON, &confidence); err != nil {
 		t.Fatalf("read merged requirement: %v", err)
 	}
-	if title != body.Title || description != body.Description {
-		t.Fatalf("catalog row downgraded title/description: %q / %q", title, description)
+	if title != body.Title || rules != body.Description {
+		t.Fatalf("catalog row downgraded title/rules: %q / %q", title, rules)
 	}
-	if acceptance != "场景 1\n场景 2" {
-		t.Fatalf("catalog row downgraded AC: %q", acceptance)
-	}
+	assertExtractionCriteria(t, acceptanceJSON, "场景 1", "场景 2")
 	if priority != "P1" {
 		t.Fatalf("priority = %q, want P1", priority)
 	}
@@ -366,10 +369,13 @@ func TestExtractionUpsertNoDowngradeIntegration(t *testing.T) {
 }
 
 // TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration is the C-03
-// re-upload regression: an acceptance criterion containing newlines is stored
-// newline-joined, then re-read and split on the next upsert. Replace mode must
-// take the incoming criteria instead of unioning them with the current ones, so
-// a second identical emit keeps the same content hash and creates no revision.
+// re-upload regression: an acceptance criterion containing newlines must survive
+// the store -> re-read -> merge round trip as ONE criterion. Under v0.2.4-B the
+// criteria live in a JSONB array rather than a newline-joined TEXT column, so the
+// newlines are structural and can no longer be mistaken for a criterion
+// separator. Replace mode must take the incoming criteria instead of unioning
+// them with the current ones, so a second identical emit keeps the same content
+// hash and creates no revision.
 func TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration(t *testing.T) {
 	pool := testutil.NewDB(t)
 	ids := newIDs(t)
@@ -424,14 +430,14 @@ func TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration(t *testing.T) {
 		t.Fatalf("second upsert counts=%+v, want one update", counts)
 	}
 
-	var secondHash, acceptance string
+	var secondHash, acceptanceJSON string
 	var revisionCount int
 	if err := pool.QueryRow(ctx, `
-		SELECT v.content_hash, v.acceptance_criteria
+		SELECT v.content_hash, v.acceptance_criteria::text
 		FROM requirement r
 		JOIN requirement_version v ON v.id = r.current_version_id
 		WHERE r.version_id = $1 AND r.external_id = 'FR-211'
-	`, versionID).Scan(&secondHash, &acceptance); err != nil {
+	`, versionID).Scan(&secondHash, &acceptanceJSON); err != nil {
 		t.Fatalf("read current revision: %v", err)
 	}
 	if secondHash != firstHash {
@@ -447,8 +453,42 @@ func TestExtractionUpsertMultiLineAcceptanceCriteriaIntegration(t *testing.T) {
 	if revisionCount != firstRevision {
 		t.Fatalf("revision count = %d, want the unchanged %d (multi-line AC duplicated)", revisionCount, firstRevision)
 	}
-	if acceptance != "场景 1：正确密码登录\nGiven 已注册用户\nWhen 输入正确密码\nThen 登录成功\n场景 2：错误密码登录" {
-		t.Fatalf("acceptance criteria = %q", acceptance)
+	// The multi-line statement is one criterion whose then keeps its newlines:
+	// the JSONB document holds it structurally, so the old newline-join can no
+	// longer split it into extra criteria on the next upsert.
+	assertExtractionCriteria(t, acceptanceJSON,
+		"场景 1：正确密码登录\nGiven 已注册用户\nWhen 输入正确密码\nThen 登录成功",
+		"场景 2：错误密码登录")
+}
+
+// assertExtractionCriteria decodes the stored acceptance_criteria JSONB document
+// and checks it is exactly len(wantThen) criteria, in AC-1..AC-n order, whose
+// then values are wantThen and whose given/when are still empty (extraction
+// emits flat statements; filling in the Gherkin parts is clarification's job).
+func assertExtractionCriteria(t *testing.T, raw string, wantThen ...string) {
+	t.Helper()
+	var criteria []struct {
+		ID    string `json:"id"`
+		Given string `json:"given"`
+		When  string `json:"when"`
+		Then  string `json:"then"`
+	}
+	if err := json.Unmarshal([]byte(raw), &criteria); err != nil {
+		t.Fatalf("decode acceptance_criteria %q: %v", raw, err)
+	}
+	if len(criteria) != len(wantThen) {
+		t.Fatalf("acceptance_criteria = %s, want %d criteria", raw, len(wantThen))
+	}
+	for i, want := range wantThen {
+		if criteria[i].Then != want {
+			t.Fatalf("acceptance_criteria[%d].then = %q, want %q", i, criteria[i].Then, want)
+		}
+		if wantID := "AC-" + strconv.Itoa(i+1); criteria[i].ID != wantID {
+			t.Fatalf("acceptance_criteria[%d].id = %q, want the server-assigned %q", i, criteria[i].ID, wantID)
+		}
+		if criteria[i].Given != "" || criteria[i].When != "" {
+			t.Fatalf("acceptance_criteria[%d] = %#v, want a then-only extraction criterion", i, criteria[i])
+		}
 	}
 }
 

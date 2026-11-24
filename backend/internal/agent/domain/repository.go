@@ -15,6 +15,10 @@ var (
 	ErrLeaseLost = errors.New("agent: lease lost")
 	// ErrConflict means a uniqueness constraint rejected the write.
 	ErrConflict = errors.New("agent: conflict")
+	// ErrMessageStreamClosed means an in-place transcript update targeted a row
+	// whose stream is already terminal (complete/interrupted). Terminal
+	// transcript rows are frozen; the caller must not retry the write.
+	ErrMessageStreamClosed = errors.New("agent: message stream closed")
 )
 
 // WorkItemRepository is the persistence port for the single execution queue.
@@ -141,8 +145,24 @@ type RuntimeRepository interface {
 	FinishRun(ctx context.Context, run AgentRun) error
 	// AppendMessage inserts one transcript row.
 	AppendMessage(ctx context.Context, message AgentMessage) (AgentMessage, error)
+	// UpdateMessage rewrites parts/tool_calls/usage/stream_state of one row in
+	// place while it is streaming, and seals it by writing a terminal
+	// stream_state. A row that is already terminal is frozen: the write is
+	// refused with ErrMessageStreamClosed (a missing row is ErrNotFound).
+	UpdateMessage(ctx context.Context, message AgentMessage) error
 	// ListRunMessages returns a run's transcript in ID order.
 	ListRunMessages(ctx context.Context, runID int64, limit int) ([]AgentMessage, error)
+	// InsertActivity writes one agent_activity fact keyed (run_id, seq). It is
+	// an idempotent UPSERT: the first write of a seq inserts the row, a later
+	// write of the same seq folds into it (a tool call's end adds ended_at,
+	// error and payload keys) and never duplicates the fact. The recorded start
+	// and outcome are never erased by a replayed earlier write.
+	//
+	// The READ side of this ledger is deliberately NOT on this port: the runtime
+	// never reads its own activity facts, so a read method here would have no
+	// production caller (DoD "no unwired code"). The production reader is
+	// AgentCenterReader.RunActivity, over the same single query.
+	InsertActivity(ctx context.Context, activity Activity) error
 	// SaveContextPacket inserts a packet and points its run at it.
 	SaveContextPacket(ctx context.Context, packet ContextPacket) (ContextPacket, error)
 	// GetContextPacket loads one packet, or ErrNotFound.

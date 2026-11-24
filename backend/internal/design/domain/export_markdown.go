@@ -16,7 +16,6 @@ func RenderMarkdown(data ExportData) ([]byte, error) {
 	}
 	for _, requirement := range data.Requirements {
 		fmt.Fprintf(&builder, "## 需求：%s（v%d，%s）\n\n", requirement.Title, requirement.Revision, requirement.Status)
-		fmt.Fprintf(&builder, "- 目标 SUT：%s\n\n", formatIDs(requirement.TargetVersionSUTIDs))
 		if len(requirement.Scenarios) == 0 {
 			builder.WriteString("未设计\n\n")
 			continue
@@ -42,10 +41,8 @@ func renderMarkdownCase(builder *strings.Builder, item ExportCase) {
 	fmt.Fprintf(builder, "#### 用例：%s（v%d，%s，%s）\n\n", item.Title, item.Revision, item.Status, item.Priority)
 	fmt.Fprintf(builder, "- 用例 ID：%s\n", formatInt64(item.CaseID))
 	fmt.Fprintf(builder, "- 版本 ID：%s\n", formatInt64(item.VersionID))
-	fmt.Fprintf(builder, "- 默认目标 SUT：%s\n", formatOptionalID(item.DefaultVersionSUTID))
-	fmt.Fprintf(builder, "- 版本 SUT：%s\n", formatIDs(item.VersionSUTIDs))
-	fmt.Fprintf(builder, "- 页面：%s\n", formatIDs(item.PageIDs))
-	fmt.Fprintf(builder, "- API：%s\n", formatIDs(item.APIIDs))
+	fmt.Fprintf(builder, "- 被测系统：%s\n", exportText(item.SutDescription))
+	fmt.Fprintf(builder, "- 覆盖验收标准：%s\n", formatACList(item.CoveredACs))
 	builder.WriteString("\n")
 	if strings.TrimSpace(item.Description) != "" {
 		fmt.Fprintf(builder, "%s\n\n", item.Description)
@@ -61,16 +58,15 @@ func renderMarkdownCase(builder *strings.Builder, item ExportCase) {
 		fmt.Fprintf(builder, "**测试数据**：`%s`\n\n", string(testData))
 	}
 
-	builder.WriteString("| 序号 | 动作 | 预期 | 目标 SUT | 页面 | API | 账号角色 |\n")
-	builder.WriteString("|---|---|---|---|---|---|---|\n")
+	builder.WriteString("| 序号 | 动作 | 预期 | 目标 | 账号角色 |\n")
+	builder.WriteString("|---|---|---|---|---|\n")
 	if len(item.Steps) == 0 {
-		builder.WriteString("| - | 未设计 | - | - | - | - | - |\n")
+		builder.WriteString("| - | 未设计 | - | - | - |\n")
 	}
 	for _, step := range item.Steps {
-		fmt.Fprintf(builder, "| %d | %s | %s | %s | %s | %s | %s |\n",
+		fmt.Fprintf(builder, "| %d | %s | %s | %s | %s |\n",
 			step.Seq, escapeMarkdownCell(step.Action), escapeMarkdownCell(step.Expected),
-			formatOptionalID(step.TargetVersionSUTID), formatOptionalID(step.TargetPageID),
-			formatOptionalID(step.TargetAPIID), step.AccountRole)
+			escapeMarkdownCell(exportText(step.TargetDescription)), step.AccountRole)
 	}
 	builder.WriteString("\n")
 

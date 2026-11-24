@@ -206,7 +206,7 @@ func (in NewWorkItem) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !Team(in.Team).Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, code, ops")
 	}
 	if strings.TrimSpace(in.Type) == "" {
 		return platform.Invalid("type", "must not be empty")
@@ -330,7 +330,7 @@ func (in CreateWorkItemParams) Validate() error {
 		}
 	}
 	if in.Team != "" && !in.Team.Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, code, ops")
 	}
 	if in.MaxAttempts != 0 && (in.MaxAttempts < MinMaxAttempts || in.MaxAttempts > MaxMaxAttempts) {
 		return platform.Invalid("max_attempts", "must be between 1 and 10")

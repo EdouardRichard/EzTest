@@ -14,10 +14,10 @@ import (
 )
 
 type fakeService struct {
-	entries   []audit.Entry
-	hasMore   bool
-	err       error
-	lastLimit int
+	entries    []audit.Entry
+	hasMore    bool
+	err        error
+	lastLimit  int
 	lastBefore *int64
 	lastFilter audit.Filter
 }

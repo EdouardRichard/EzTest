@@ -19,20 +19,25 @@ func TestFailureSubmitUsesCanonicalSeverityAndSanitizesSummary(t *testing.T) {
 	fixture.cases.snapshot.Priority = "P2"
 	fixture.cases.snapshot.Assertions[0].Kind = "api"
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "failed"}); err != nil {
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "failed"}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "500", Reason: "boom",
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed}); err != nil {
+	if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+		Kind: "text", Text: "failure evidence",
+	}); err != nil {
+		t.Fatalf("EvidenceText: %v", err)
+	}
+	if _, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed}); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
 	const summary = "定时发布能力整体缺失，重跑无法修复。severity 由 minor 上调为 major：整条 P2 能力完全缺失。"
-	if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+	if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 		CaseRunID: 3001, FailureClass: "application", Category: "ui", Severity: "major", Summary: summary,
 	}); err != nil {
 		t.Fatalf("FailureSubmit: %v", err)

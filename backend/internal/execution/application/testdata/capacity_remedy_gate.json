@@ -1,0 +1,8 @@
+{
+  "remedies": [
+    {
+      "reason": "context_requirement_exceeds_capacity",
+      "remedy": "需要提高执行器容量（max_contexts）或减少用例的账号角色数后重新执行"
+    }
+  ]
+}

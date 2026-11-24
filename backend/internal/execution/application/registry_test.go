@@ -110,18 +110,12 @@ func (f *fakeExecutorRepo) only(t *testing.T) execution.ExecutorInstance {
 type fakeExecutorProbe struct {
 	health    executionapp.ExecutorHealth
 	healthErr error
-	contexts  []executionapp.ExecutorContextRef
-	listErr   error
 	calls     int
 }
 
 func (f *fakeExecutorProbe) Health(context.Context) (executionapp.ExecutorHealth, error) {
 	f.calls++
 	return f.health, f.healthErr
-}
-
-func (f *fakeExecutorProbe) ListContexts(context.Context) ([]executionapp.ExecutorContextRef, error) {
-	return f.contexts, f.listErr
 }
 
 type fakeRegistrySettings struct {
@@ -192,7 +186,7 @@ func newRegistryFixture(t *testing.T) (*executionapp.Registry, *fakeExecutorRepo
 	t.Helper()
 	repo := newFakeExecutorRepo()
 	probe := &fakeExecutorProbe{health: executionapp.ExecutorHealth{
-		Status: "ok", Version: "0.2.0-p3", Contexts: 2, MaxContexts: 8,
+		Status: "ok", Version: "0.2.0-p3", Sessions: 2, MaxSessions: 8,
 	}}
 	clock := &registryClock{now: time.Date(2026, 11, 1, 1, 0, 0, 0, time.UTC)}
 	registry := executionapp.NewRegistry(executionapp.RegistryDeps{
@@ -248,7 +242,7 @@ func TestRegistryPollRegistersHealthyExecutor(t *testing.T) {
 func TestRegistryPollDegradedStillHeartbeats(t *testing.T) {
 	registry, repo, probe, _ := newRegistryFixture(t)
 	probe.health = executionapp.ExecutorHealth{
-		Status: "degraded", Version: "0.2.0-p3", Contexts: 0, MaxContexts: 8,
+		Status: "degraded", Version: "0.2.0-p3", Sessions: 0, MaxSessions: 8,
 		Error: "browser unavailable",
 	}
 	if err := registry.PollOnce(context.Background()); err != nil {
@@ -269,7 +263,7 @@ func TestRegistryPollDegradedStillHeartbeats(t *testing.T) {
 func TestRegistryPollDegradedWithEmptyErrorStillDegraded(t *testing.T) {
 	registry, repo, probe, _ := newRegistryFixture(t)
 	probe.health = executionapp.ExecutorHealth{
-		Status: "degraded", Version: "0.2.0-p3", Contexts: 0, MaxContexts: 8,
+		Status: "degraded", Version: "0.2.0-p3", Sessions: 0, MaxSessions: 8,
 	}
 	if err := registry.PollOnce(context.Background()); err != nil {
 		t.Fatalf("PollOnce: %v", err)
@@ -357,7 +351,7 @@ func TestRegistryPollKeepsDrainingAndMarksOffline(t *testing.T) {
 	// A recovered heartbeat reactivates an offline executor (but not a drained
 	// one, as proven above).
 	probe.healthErr = nil
-	probe.health = executionapp.ExecutorHealth{Status: "ok", Version: "0.2.0-p3", Contexts: 1, MaxContexts: 8}
+	probe.health = executionapp.ExecutorHealth{Status: "ok", Version: "0.2.0-p3", Sessions: 1, MaxSessions: 8}
 	if err := registry.PollOnce(context.Background()); err != nil {
 		t.Fatalf("PollOnce: %v", err)
 	}
@@ -519,9 +513,9 @@ func TestRegistryPollUpsertsEveryConfiguredEndpoint(t *testing.T) {
 	primary := "http://127.0.0.1:13336"
 	extras := " http://127.0.0.1:13337/ , http://127.0.0.1:13338 , http://127.0.0.1:13337 , , not-a-url, ftp://bad-host "
 	probes := map[string]*fakeExecutorProbe{
-		primary:                  {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Contexts: 2, MaxContexts: 8}},
-		"http://127.0.0.1:13337": {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Contexts: 0, MaxContexts: 4}},
-		"http://127.0.0.1:13338": {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Contexts: 3, MaxContexts: 16}},
+		primary:                  {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Sessions: 2, MaxSessions: 8}},
+		"http://127.0.0.1:13337": {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Sessions: 0, MaxSessions: 4}},
+		"http://127.0.0.1:13338": {health: executionapp.ExecutorHealth{Status: "ok", Version: "p7", Sessions: 3, MaxSessions: 16}},
 	}
 	registry, repo, factory, clock := newMultiRegistryFixture(t, primary, extras, probes)
 
@@ -556,7 +550,7 @@ func TestRegistryPollUpsertsEveryConfiguredEndpoint(t *testing.T) {
 
 func TestRegistryPollSingleEndpointKeepsLegacyShape(t *testing.T) {
 	registry, repo, probe, _ := newRegistryFixture(t)
-	probe.health = executionapp.ExecutorHealth{Status: "ok", Version: "p3", Contexts: 1, MaxContexts: 8}
+	probe.health = executionapp.ExecutorHealth{Status: "ok", Version: "p3", Sessions: 1, MaxSessions: 8}
 	if err := registry.PollOnce(context.Background()); err != nil {
 		t.Fatalf("PollOnce: %v", err)
 	}
@@ -802,5 +796,171 @@ func TestRegistryGetByID(t *testing.T) {
 	}
 	if _, err := registry.Get(context.Background(), 99); !errors.Is(err, execution.ErrNotFound) {
 		t.Fatalf("Get(99) error = %v, want not found", err)
+	}
+}
+
+// TestRegistryMaxDispatchableCapacityIsAnUpperBoundOnWhatSelectCanReach is the
+// producer test review round 5, Important C demanded. Until now
+// Registry.MaxDispatchableCapacity had NO test anywhere: every scheduler test's
+// fleet maximum was a fixture integer set by fiat (fakeExecutorRegistry.
+// fleetCapacity), so round 3's fake replaced Select and round 4's fake replaced
+// MaxDispatchableCapacity -- the same defect, one layer down. These cases call the
+// real method over the real repo rows, reusing the fixtures the Select tests
+// already established.
+//
+// The invariant under test: the result is an upper bound on what Select can return
+// NOW OR LATER, computed over exactly the rows Select is allowed to reach. A
+// filter is dropped only when it is transient AND still proof of capacity; it is
+// kept when it defines the reachable set.
+func TestRegistryMaxDispatchableCapacityIsAnUpperBoundOnWhatSelectCanReach(t *testing.T) {
+	primary := "http://127.0.0.1:13336"
+	extras := "http://127.0.0.1:13337"
+
+	t.Run("a degraded row still counts (Important A)", func(t *testing.T) {
+		// The exact fixture TestRegistrySelectSkipsDegradedInMultiEndpoint uses:
+		// Select returns the healthy capacity-8 secondary and skips the degraded
+		// capacity-32 primary. Pointed at this fixture the old implementation
+		// returned 8, so a 16-context run hit the structural reject, the ceiling
+		// confirmed 16 > 8, and the run was PERMANENTLY terminally blocked -- even
+		// though degraded is set by a single failed probe and cleared by the next
+		// poll a second later, and the executor keeps its capacity throughout. One
+		// dropped healthz packet on the largest executor killed the run.
+		registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+		repo.rows = map[int64]execution.ExecutorInstance{
+			1: {
+				ID: 1, Endpoint: primary, Status: execution.ExecutorActive, Capacity: 32,
+				Labels: map[string]any{"eztest.degraded": true},
+			},
+			2: {ID: 2, Endpoint: extras, Status: execution.ExecutorActive, Capacity: 8},
+		}
+		selected, err := registry.Select(context.Background())
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if selected == nil || selected.ID != 2 {
+			t.Fatalf("selected = %+v, want the healthy id 2 -- the fixture premise", selected)
+		}
+		got, err := registry.MaxDispatchableCapacity(context.Background())
+		if err != nil {
+			t.Fatalf("MaxDispatchableCapacity: %v", err)
+		}
+		if got != 32 {
+			t.Fatalf("fleet ceiling = %d, want 32: a degraded executor is still an active "+
+				"fleet member and still has its capacity, so it must count. Returning the "+
+				"selected row's 8 terminally blocks runs the fleet can serve", got)
+		}
+	})
+
+	t.Run("a full row still counts", func(t *testing.T) {
+		// Fullness is momentary load, not a capacity statement: contexts are
+		// released as runs finish, so a saturated executor is still proof the
+		// fleet can serve a larger run.
+		registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+		repo.rows = map[int64]execution.ExecutorInstance{
+			1: {ID: 1, Endpoint: primary, Status: execution.ExecutorActive, Capacity: 32, ActiveContexts: 32},
+			2: {ID: 2, Endpoint: extras, Status: execution.ExecutorActive, Capacity: 8},
+		}
+		got, err := registry.MaxDispatchableCapacity(context.Background())
+		if err != nil {
+			t.Fatalf("MaxDispatchableCapacity: %v", err)
+		}
+		if got != 32 {
+			t.Fatalf("fleet ceiling = %d, want 32: a full executor still has its capacity", got)
+		}
+	})
+
+	t.Run("non-dispatchable statuses are excluded", func(t *testing.T) {
+		// Status is fleet MEMBERSHIP, not a condition on a member: offline means
+		// the probe failed inside the offline window (positive evidence it is not
+		// serving) and draining is an operator decision to stop taking work.
+		// Neither is proof of currently usable capacity, and Select reaches
+		// neither, so the ceiling must not count them.
+		registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+		repo.rows = map[int64]execution.ExecutorInstance{
+			1: {ID: 1, Endpoint: primary, Status: execution.ExecutorDraining, Capacity: 32},
+			2: {ID: 2, Endpoint: extras, Status: execution.ExecutorOffline, Capacity: 64},
+			3: {ID: 3, Endpoint: extras, Status: execution.ExecutorActive, Capacity: 8},
+		}
+		got, err := registry.MaxDispatchableCapacity(context.Background())
+		if err != nil {
+			t.Fatalf("MaxDispatchableCapacity: %v", err)
+		}
+		if got != 8 {
+			t.Fatalf("fleet ceiling = %d, want 8: draining and offline rows are not reachable", got)
+		}
+	})
+
+	t.Run("nothing dispatchable yields zero", func(t *testing.T) {
+		registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+		repo.rows = map[int64]execution.ExecutorInstance{
+			1: {ID: 1, Endpoint: primary, Status: execution.ExecutorOffline, Capacity: 32},
+		}
+		got, err := registry.MaxDispatchableCapacity(context.Background())
+		if err != nil {
+			t.Fatalf("MaxDispatchableCapacity: %v", err)
+		}
+		if got != 0 {
+			t.Fatalf("fleet ceiling = %d, want 0", got)
+		}
+	})
+}
+
+// TestRegistryMaxDispatchableCapacityHonoursTheSingleEndpointRestriction pins
+// review round 5, Important B: in endpoint-less single mode the configured
+// primary DEFINES the reachable set, so the ceiling must be restricted to it.
+//
+// Dropping the restriction (as round 4 did) re-opened the original silent wedge in
+// a new form. RegisterPush -- HTTP-exposed at POST /api/internal/executors/register
+// -- creates an active row for any self-reported endpoint; PollOnce iterates only
+// primary+extras, so recordProbeFailure, the only code that degrades or offlines a
+// row, never touches it; and ExecutorRepository has no Delete. Such a row would
+// therefore inflate the ceiling PERMANENTLY, fleetCapacityCeiling would return
+// false forever, and a genuinely impossible run would sit pending with no attempts,
+// no lease and no watchdog -- I-new-1 back, silently.
+func TestRegistryMaxDispatchableCapacityHonoursTheSingleEndpointRestriction(t *testing.T) {
+	// newRegistryFixture is single-endpoint mode: it sets execution.executor_url
+	// and no execution.executor_urls, which is exactly the configuration whose
+	// Select restricts to the primary.
+	registry, repo, _, _ := newRegistryFixture(t)
+	repo.rows = map[int64]execution.ExecutorInstance{
+		1: {ID: 1, Endpoint: registryEndpoint, Status: execution.ExecutorActive, Capacity: 4},
+		// A push-registered row for an endpoint this composition root never polls.
+		// Select can never return it, so it must never raise the ceiling.
+		2: {ID: 2, Endpoint: "http://127.0.0.1:19999", Status: execution.ExecutorActive, Capacity: 64},
+	}
+	selected, err := registry.Select(context.Background())
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if selected == nil || selected.ID != 1 {
+		t.Fatalf("selected = %+v, want the configured primary id 1", selected)
+	}
+	got, err := registry.MaxDispatchableCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("MaxDispatchableCapacity: %v", err)
+	}
+	if got != 4 {
+		t.Fatalf("fleet ceiling = %d, want 4: an unreachable push-registered endpoint must "+
+			"not inflate the ceiling, or a genuinely impossible run stays pending forever", got)
+	}
+}
+
+// TestRegistryMaxDispatchableCapacityIgnoresTheRestrictionInMultiEndpointMode is
+// the other half of Important B: with execution.executor_urls configured, Select
+// considers every active row, so the ceiling must too.
+func TestRegistryMaxDispatchableCapacityIgnoresTheRestrictionInMultiEndpointMode(t *testing.T) {
+	primary := "http://127.0.0.1:13336"
+	extras := "http://127.0.0.1:13337,http://127.0.0.1:13338"
+	registry, repo, _, _ := newMultiRegistryFixture(t, primary, extras, map[string]*fakeExecutorProbe{})
+	repo.rows = map[int64]execution.ExecutorInstance{
+		1: {ID: 1, Endpoint: primary, Status: execution.ExecutorActive, Capacity: 8},
+		2: {ID: 2, Endpoint: "http://127.0.0.1:13338", Status: execution.ExecutorActive, Capacity: 16},
+	}
+	got, err := registry.MaxDispatchableCapacity(context.Background())
+	if err != nil {
+		t.Fatalf("MaxDispatchableCapacity: %v", err)
+	}
+	if got != 16 {
+		t.Fatalf("fleet ceiling = %d, want 16: multi-endpoint mode reaches every active row", got)
 	}
 }

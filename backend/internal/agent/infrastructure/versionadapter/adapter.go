@@ -6,7 +6,7 @@
 // Wiring is owned by cmd/eztest (Lead T13):
 //
 //	adapter := versionadapter.New(requirementService, conversationService, versionService, attachmentService, storageService)
-//	tools.NewP1Registry(tools.Deps{Requirement: adapter, Resource: adapter, ...})
+//	tools.NewBaseRegistry(tools.Deps{Requirement: adapter, Resource: adapter, ...})
 //	agentapp.NewRunner(agentapp.RunnerDeps{Conversations: adapter, Versions: adapter, ...})
 //
 // The constructor accepts the concrete version/storage application services via

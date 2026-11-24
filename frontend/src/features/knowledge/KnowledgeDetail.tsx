@@ -45,9 +45,10 @@ function excerpt(content: string): string {
 
 /**
  * Read-only knowledge detail dialog (spec §10): every frozen field, the
- * read-time `source_stale` badge, review metadata, the append-only revision
- * list and the admin review toolbar. Loading/error states are local so the
- * list behind the dialog stays usable.
+ * read-time `source_stale` badge, review metadata, the usage aggregates
+ * (injection count / last used), the append-only revision list and the admin
+ * review toolbar. Loading/error states are local so the list behind the dialog
+ * stays usable.
  */
 export function KnowledgeDetail({
   knowledgeId,
@@ -187,6 +188,16 @@ export function KnowledgeDetail({
                 <dd className="text-foreground">{formatDateTime(detail.created_at)}</dd>
                 <dt className="text-muted-foreground">更新时间</dt>
                 <dd className="text-foreground">{formatDateTime(detail.updated_at)}</dd>
+                <dt className="text-muted-foreground">注入次数</dt>
+                <dd data-testid="knowledge-injection-count" className="text-foreground">
+                  {detail.usage.injection_count}
+                </dd>
+                <dt className="text-muted-foreground">最近使用</dt>
+                <dd data-testid="knowledge-last-used-at" className="text-foreground">
+                  {detail.usage.last_used_at !== null
+                    ? formatDateTime(detail.usage.last_used_at)
+                    : "—"}
+                </dd>
               </dl>
             </section>
 

@@ -8,89 +8,76 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-const validCodeBaselineCommit = "0123456789abcdef0123456789abcdef01234567"
+// v0.2.4-B: the derived binding chain (version_sut, version_sut_resource,
+// version_repository_override, scope_exclude) is gone. A version binds an
+// environment directly on its own row and persists only the account subset, so
+// the domain invariants left to pin are the mandatory environment binding, the
+// account selection rules and the binding stage gate.
 
-func baselineBinding(commit string) version.Binding {
-	return version.Binding{
-		SUTID:              1001,
-		EnvironmentID:      1101,
-		CodeBaselineCommit: commit,
-		ScopeExclude:       version.NewScopeExclude(nil, nil, nil),
+func TestVersionValidateRequiresAnEnvironmentBinding(t *testing.T) {
+	valid := version.Version{
+		Title: "Q4 orders", Status: version.StatusInitial, EnvironmentID: 1101,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+
+	unbound := valid
+	unbound.EnvironmentID = 0
+	err := unbound.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a version without an environment binding")
+	}
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+		t.Fatalf("err = %v, want a 400 platform error", err)
+	}
+	if field, _ := apiErr.Details["field"].(string); field != "environment_id" {
+		t.Fatalf("field = %q, want environment_id", field)
+	}
+
+	negative := valid
+	negative.EnvironmentID = -1
+	if err := negative.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative environment_id")
+	}
+
+	blank := valid
+	blank.Title = "   "
+	if err := blank.Validate(); err == nil {
+		t.Fatal("Validate accepted a blank title")
 	}
 }
 
-func TestBindingValidateAcceptsEmptyOrFullCommit(t *testing.T) {
-	for _, commit := range []string{"", validCodeBaselineCommit} {
-		if err := baselineBinding(commit).Validate(); err != nil {
-			t.Fatalf("Validate(%q) = %v, want nil", commit, err)
-		}
+func TestValidateAccountsAcceptsAUniquePositiveSelection(t *testing.T) {
+	if err := version.ValidateAccounts(nil); err != nil {
+		t.Fatalf("an empty selection must be valid: %v", err)
+	}
+	if err := version.ValidateAccounts([]version.AccountBinding{{AccountID: 7}, {AccountID: 9}}); err != nil {
+		t.Fatalf("ValidateAccounts = %v, want nil", err)
 	}
 }
 
-func TestBindingValidateRejectsMalformedCommit(t *testing.T) {
-	cases := map[string]string{
-		"short":     "0123456789abcdef",
-		"long":      validCodeBaselineCommit + "0",
-		"uppercase": "0123456789ABCDEF0123456789ABCDEF01234567",
-		"non-hex":   "0123456789abcdef0123456789abcdef0123456g",
+func TestValidateAccountsRejectsInvalidSelections(t *testing.T) {
+	cases := map[string][]version.AccountBinding{
+		"zero":      {{AccountID: 0}},
+		"negative":  {{AccountID: -1}},
+		"duplicate": {{AccountID: 7}, {AccountID: 7}},
 	}
-	for name, commit := range cases {
+	for name, accounts := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := baselineBinding(commit).Validate()
+			err := version.ValidateAccounts(accounts)
 			if err == nil {
-				t.Fatalf("Validate(%q) accepted a malformed commit", commit)
-			}
-			var apiErr *platform.Error
-			if !errors.As(err, &apiErr) {
-				t.Fatalf("err = %v, want a platform error", err)
-			}
-			if field, _ := apiErr.Details["field"].(string); field != "code_baseline_commit" {
-				t.Fatalf("field = %q, want code_baseline_commit", field)
-			}
-		})
-	}
-}
-
-func TestNewScopeExcludeNormalizesEmptyLists(t *testing.T) {
-	scope := version.NewScopeExclude(nil, nil, nil)
-	if scope.Pages == nil || scope.APIs == nil || scope.Databases == nil {
-		t.Fatalf("scope = %#v, want non-nil lists", scope)
-	}
-	if err := scope.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-}
-
-func TestScopeExcludeValidateRejectsNonPositiveIDs(t *testing.T) {
-	cases := map[string]version.ScopeExclude{
-		"pages":     version.NewScopeExclude([]int64{0}, nil, nil),
-		"apis":      version.NewScopeExclude(nil, []int64{-1}, nil),
-		"databases": version.NewScopeExclude(nil, nil, []int64{0}),
-	}
-	for name, scope := range cases {
-		t.Run(name, func(t *testing.T) {
-			err := scope.Validate()
-			if err == nil {
-				t.Fatal("Validate accepted a non-positive ID")
+				t.Fatal("ValidateAccounts accepted an invalid selection")
 			}
 			var apiErr *platform.Error
 			if !errors.As(err, &apiErr) || apiErr.Status != 400 {
 				t.Fatalf("err = %v, want a 400 platform error", err)
 			}
+			if field, _ := apiErr.Details["field"].(string); field != "accounts" {
+				t.Fatalf("field = %q, want accounts", field)
+			}
 		})
-	}
-}
-
-func TestBindingValidateRejectsInvalidOverrides(t *testing.T) {
-	binding := baselineBinding("")
-	binding.RepositoryOverrides = []version.RepositoryOverride{{RepoID: 0, Included: true}}
-	if err := binding.Validate(); err == nil {
-		t.Fatal("Validate accepted a zero repository override ID")
-	}
-	binding.RepositoryOverrides = nil
-	binding.Accounts = []version.AccountBinding{{AccountID: 0}}
-	if err := binding.Validate(); err == nil {
-		t.Fatal("Validate accepted a zero account ID")
 	}
 }
 

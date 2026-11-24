@@ -1,8 +1,10 @@
 package version
 
 // Stage is the version stage machine state (spec §5.3). The string values are
-// persisted in version.stage and must stay in sync with the chk_version_stage
-// CHECK in db/migrations/version_0007_stage_plan_fact.sql. Only the
+// persisted in version.stage and are the single authority for the stage enum
+// (V-0017): the frozen chk_version_stage CHECK in
+// db/migrations/version_0007_stage_plan_fact.sql and the frontend VersionStage
+// union are validated against Stages() rather than hand-maintained. Only the
 // deterministic stage machine writes this value; LLM output never does.
 type Stage string
 
@@ -99,5 +101,19 @@ func isWorkflowStage(s Stage) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// Stages returns every version stage in canonical order: the workflow stages,
+// then completed, then the two suspension stages. It is the SINGLE authority for
+// the stage enum (V-0017). Every derived copy — the frozen chk_version_stage
+// CHECK, the frontend VersionStage union and the OpenAPI stage enums — is
+// validated against this list by the enum-authority gate, so a new stage is
+// added here once and the gate fails until each copy is brought into line.
+func Stages() []Stage {
+	return []Stage{
+		StageCreated, StageClarifying, StageRequirementReview, StageDesigning,
+		StageCaseReview, StageExecuting, StageReporting, StageCompleted,
+		StageBlocked, StagePaused,
 	}
 }

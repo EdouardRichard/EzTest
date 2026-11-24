@@ -22,10 +22,8 @@ function graphWithCases(count: number): DesignGraph {
     title: `用例 ${index + 1}`,
     priority: "P1" as const,
     status: "draft" as const,
-    default_version_sut_id: "1002",
-    version_sut_ids: ["1002"],
-    page_ids: [],
-    api_ids: [],
+    sut_description: "支付网关退款页面",
+    covered_acs: ["AC-1"],
     step_count: 2,
     assertion_count: 1,
     created_at: TIMESTAMP,
@@ -40,16 +38,12 @@ function graphWithCases(count: number): DesignGraph {
         title: "退款到账时效",
         status: "clarified",
         design_status: "draft",
-        target_version_sut_ids: ["1002"],
         scenarios: [
           {
             id: "5001",
             requirement_version_id: "6101",
             name: "正常退款",
             description: "",
-            version_sut_ids: ["1002"],
-            page_ids: [],
-            api_ids: [],
             sort: 0,
             cases,
           },
@@ -106,7 +100,7 @@ describe("layoutDesignGraph", () => {
     const node = layout.nodes.find((candidate) => candidate.id === "case-7003")
     expect(node?.data.kind).toBe("case")
     if (node?.data.kind !== "case") throw new Error("expected a case node")
-    expect(node.data.case.version_sut_ids).toEqual(["1001", "1002"])
+    expect(node.data.case.sut_description).toBe("订单中心与支付网关跨系统退款")
     expect(node.data.case.priority).toBe("P0")
   })
 

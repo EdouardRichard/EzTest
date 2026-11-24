@@ -83,8 +83,8 @@ func sampleChainView() chain.ChainView {
 			RefID:         "200",
 			Label:         "Checkout run",
 			Status:        "failed",
-			VersionSUTID:  int64Ptr(5),
-			VersionSUTIDs: []int64{5, 6},
+			SUTID:         int64Ptr(5),
+			SUTIDs:        []int64{5, 6},
 			CaseVersionID: int64Ptr(100),
 			WaveID:        int64Ptr(7),
 			CaseRunID:     int64Ptr(200),
@@ -117,15 +117,15 @@ func TestChainHandlerParsesFiltersAndMapsView(t *testing.T) {
 		t.Fatalf("service read version = %d, want 42", svc.version)
 	}
 	want := chain.ChainFilter{
-		VersionSUTID: int64Ptr(5),
-		PageID:       int64Ptr(50),
-		WaveID:       int64Ptr(7),
-		Status:       "open",
-		Result:       "failed",
-		EventFrom:    int64Ptr(10),
-		EventTo:      int64Ptr(20),
-		FocusNode:    "issue:300",
-		Limit:        50,
+		SUTID:     int64Ptr(5),
+		PageID:    int64Ptr(50),
+		WaveID:    int64Ptr(7),
+		Status:    "open",
+		Result:    "failed",
+		EventFrom: int64Ptr(10),
+		EventTo:   int64Ptr(20),
+		FocusNode: "issue:300",
+		Limit:     50,
 	}
 	if !sameFilter(svc.filter, want) {
 		t.Errorf("filter = %+v, want %+v", svc.filter, want)
@@ -178,7 +178,7 @@ func TestChainHandlerParsesFiltersAndMapsView(t *testing.T) {
 	if node["id"] != "case_run:200" || node["kind"] != "case_run" || node["ref_id"] != "200" {
 		t.Errorf("node identity = %v", node)
 	}
-	if node["version_sut_id"] != "5" || node["case_version_id"] != "100" ||
+	if node["sut_id"] != "5" || node["case_version_id"] != "100" ||
 		node["wave_id"] != "7" || node["case_run_id"] != "200" {
 		t.Errorf("node id projection = %v", node)
 	}
@@ -317,6 +317,52 @@ func equalStrings(value any, want []string) bool {
 		}
 	}
 	return true
+}
+
+// TestChainHandlerSerializesTypedCaseContract pins U8: the case version's
+// natural-language contract (sut_description / covered_acs) is projected onto
+// typed node fields and serialized at the node top level, not stuffed into the
+// untyped Meta map (constitution 五.1). The chain frontend never read these from
+// meta (its META_KEYS list excludes them), so the promotion is wire-safe.
+func TestChainHandlerSerializesTypedCaseContract(t *testing.T) {
+	view := chain.ChainView{
+		VersionID:   "42",
+		GeneratedAt: time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC),
+		Replay:      chain.ReplayInfo{Mode: chain.ReplayModeLive, Approximate: true},
+		Nodes: []chain.Node{{
+			ID:             "case_version:7",
+			Kind:           chain.NodeCaseVersion,
+			RefID:          "7",
+			Label:          "Checkout coupon",
+			CreatedAt:      time.Date(2026, 11, 1, 3, 0, 0, 0, time.UTC),
+			SutDescription: "The web storefront checkout.",
+			CoveredACs:     []string{"AC-1", "AC-2"},
+			Meta:           map[string]any{"revision": 3},
+		}},
+	}
+	svc := &fakeChainService{view: view}
+	mux := newChainMux(t, svc)
+
+	recorder := getChain(t, mux, "/api/versions/42/exploration-chain")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	data := decodeChainData(t, recorder)
+	node := data["nodes"].([]any)[0].(map[string]any)
+
+	if node["sut_description"] != "The web storefront checkout." {
+		t.Errorf("sut_description = %#v, want the typed top-level field", node["sut_description"])
+	}
+	if got := node["covered_acs"]; !equalStrings(got, []string{"AC-1", "AC-2"}) {
+		t.Errorf("covered_acs = %#v, want [\"AC-1\",\"AC-2\"]", got)
+	}
+	meta, _ := node["meta"].(map[string]any)
+	if _, found := meta["sut_description"]; found {
+		t.Error("sut_description still travels in untyped meta; it must be a typed field")
+	}
+	if _, found := meta["covered_acs"]; found {
+		t.Error("covered_acs still travels in untyped meta; it must be a typed field")
+	}
 }
 
 func TestChainHandlerEmptyGraphIsNot404(t *testing.T) {
@@ -461,7 +507,7 @@ func TestChainHandlerMapsUnknownServiceErrorTo500(t *testing.T) {
 }
 
 func sameFilter(left, right chain.ChainFilter) bool {
-	return sameID(left.VersionSUTID, right.VersionSUTID) &&
+	return sameID(left.SUTID, right.SUTID) &&
 		sameID(left.PageID, right.PageID) &&
 		sameID(left.WaveID, right.WaveID) &&
 		sameID(left.EventFrom, right.EventFrom) &&

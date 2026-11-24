@@ -185,7 +185,7 @@ export function ProfileEditor({ profileKey, tools, models, onClose, onSaved }: P
 
             <fieldset className="space-y-1">
               <legend className="text-[11px] text-muted-foreground">
-                允许的工具（来自 P5 tool registry，保存时为完整覆盖）
+                允许的工具（来自工具目录，保存时为完整覆盖）
               </legend>
               {toolOptions.length === 0 ? (
                 <p className="text-[11px] text-muted-foreground">工具目录为空。</p>

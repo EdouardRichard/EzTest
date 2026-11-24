@@ -13,13 +13,19 @@ import (
 // superseded rows keep their title. The query is version scoped, so a case
 // version of another version is never returned; missing IDs are absent from
 // the result.
+//
+// v0.2.4-G R-G8b: the read also carries the immutable row's natural-language
+// context (description/preconditions/sut_description) and its steps, so a
+// report card of a run referencing a historical version keeps the full NL
+// context instead of reverting to title-only once the case is edited.
 func (r *Repository) ReadCaseVersionsByIDs(ctx context.Context, versionID int64, caseVersionIDs []int64) ([]design.CaseVersionSummary, error) {
 	summaries := make([]design.CaseVersionSummary, 0, len(caseVersionIDs))
 	if versionID <= 0 || len(caseVersionIDs) == 0 {
 		return summaries, nil
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT cv.id, cv.case_id, cv.revision, cv.status, cv.title, cv.created_at, cc.confirmed_at
+		SELECT cv.id, cv.case_id, cv.revision, cv.status, cv.title, cv.created_at, cc.confirmed_at,
+		       cv.description, cv.preconditions, cv.sut_description
 		FROM case_version cv
 		JOIN case_entity ce ON ce.id = cv.case_id
 		JOIN case_scenario s ON s.id = ce.scenario_id
@@ -36,6 +42,7 @@ func (r *Repository) ReadCaseVersionsByIDs(ctx context.Context, versionID int64,
 		if err := rows.Scan(
 			&summary.ID, &summary.CaseID, &summary.Revision, &summary.Status, &summary.Title,
 			&summary.CreatedAt, &summary.ConfirmedAt,
+			&summary.Description, &summary.Preconditions, &summary.SutDescription,
 		); err != nil {
 			return nil, fmt.Errorf("scan historical case version: %w", err)
 		}
@@ -43,6 +50,15 @@ func (r *Repository) ReadCaseVersionsByIDs(ctx context.Context, versionID int64,
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("scan historical case versions: %w", err)
+	}
+	// Steps of each historical version (bounded by the requested IDs), in seq
+	// order — the same step projection the executable reader carries.
+	for index := range summaries {
+		steps, err := loadSteps(ctx, r.pool, summaries[index].ID)
+		if err != nil {
+			return nil, fmt.Errorf("read historical case version steps: %w", err)
+		}
+		summaries[index].Steps = steps
 	}
 	return summaries, nil
 }

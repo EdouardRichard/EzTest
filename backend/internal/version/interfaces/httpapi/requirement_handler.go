@@ -180,6 +180,11 @@ func (h *RequirementHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 // Update PATCH /api/versions/{id}/requirements/{rid}.
+//
+// The body is decoded strictly (R-H5): the documented full-replacement shape is
+// the only accepted payload, so an unknown field (for example a removed
+// `description`, or a client-supplied acceptance-criterion `id`) fails with a
+// typed 400 field error instead of being silently ignored.
 func (h *RequirementHandler) Update(w http.ResponseWriter, r *http.Request) {
 	actorID, ok := requireActor(w, r)
 	if !ok {
@@ -191,7 +196,7 @@ func (h *RequirementHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request updateRequirementRequest
-	if err := decodeBody(w, r, &request); err != nil {
+	if err := decodeStrictBody(w, r, &request); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
@@ -342,9 +347,10 @@ func (h *RequirementHandler) Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 // Merge POST /api/versions/{id}/requirements/merge. Draft sources are folded
-// into the canonical draft target (content/targets union, highest priority);
-// the sources become obsolete and a relation records the merge. Confirmed
-// requirements cannot be targets or sources (typed 409).
+// into the canonical draft requirement (rules and acceptance criteria unioned,
+// highest priority wins); the sources become obsolete and a relation records the
+// merge. Confirmed requirements can be neither the canonical one nor a source
+// (typed 409).
 func (h *RequirementHandler) Merge(w http.ResponseWriter, r *http.Request) {
 	actorID, ok := requireActor(w, r)
 	if !ok {

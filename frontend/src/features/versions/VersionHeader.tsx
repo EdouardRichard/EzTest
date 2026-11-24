@@ -126,9 +126,9 @@ export function VersionHeader({
       {compact ? null : (
         <fieldset className="flex flex-wrap items-center gap-2">
           <legend className="sr-only">版本 SUT</legend>
-          {version.bindings.map((binding) => (
-            <Badge key={binding.id} tone="info">
-              {binding.sut.name}
+          {version.binding.environment.suts.map((sut) => (
+            <Badge key={sut.id} tone="info">
+              {sut.name}
             </Badge>
           ))}
           <span className="text-[11px] text-muted-foreground">

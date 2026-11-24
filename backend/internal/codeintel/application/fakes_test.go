@@ -188,23 +188,24 @@ func (f *fakeEntityRepo) UpsertEdge(_ context.Context, edge codeintel.Edge) erro
 // --- version / resource readers --------------------------------------------------
 
 type baselineSetCall struct {
-	versionSUTID int64
-	commit       string
+	sutID  int64
+	repoID int64
+	commit string
 }
 
 type fakeVersionReader struct {
-	bindings    []VersionSUTBinding
+	bindings    []SUTRepoBinding
 	bindingsErr error
 	setCalls    []baselineSetCall
 	setErr      error
 }
 
-func (f *fakeVersionReader) VersionSUTBindings(_ context.Context, _ int64) ([]VersionSUTBinding, error) {
+func (f *fakeVersionReader) SUTRepoBindings(_ context.Context, _ int64) ([]SUTRepoBinding, error) {
 	return f.bindings, f.bindingsErr
 }
 
-func (f *fakeVersionReader) SetCodeBaselineCommit(_ context.Context, versionSUTID int64, commit string) error {
-	f.setCalls = append(f.setCalls, baselineSetCall{versionSUTID: versionSUTID, commit: commit})
+func (f *fakeVersionReader) SetSUTRepositoryBaselineCommit(_ context.Context, sutID, repoID int64, commit string) error {
+	f.setCalls = append(f.setCalls, baselineSetCall{sutID: sutID, repoID: repoID, commit: commit})
 	return f.setErr
 }
 
@@ -231,12 +232,12 @@ func (f *fakeResourceReader) CodeRepository(_ context.Context, repoID int64) (Re
 	return repository, nil
 }
 
-func (f *fakeResourceReader) SUTPages(_ context.Context, versionSUTID int64) ([]PageRef, error) {
-	return f.pages[versionSUTID], f.pagesErr
+func (f *fakeResourceReader) SUTPages(_ context.Context, sutID int64) ([]PageRef, error) {
+	return f.pages[sutID], f.pagesErr
 }
 
-func (f *fakeResourceReader) SUTAPIs(_ context.Context, versionSUTID int64) ([]APIRef, error) {
-	return f.apis[versionSUTID], f.apisErr
+func (f *fakeResourceReader) SUTAPIs(_ context.Context, sutID int64) ([]APIRef, error) {
+	return f.apis[sutID], f.apisErr
 }
 
 // --- work queue ------------------------------------------------------------------

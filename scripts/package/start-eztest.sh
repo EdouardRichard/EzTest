@@ -7,8 +7,8 @@
 # (runtime/node/bin/node web/server.js) and the PDF renderer
 # (runtime/node/bin/node renderer/src/server.mjs). Each process gets a pid file
 # under run/ and a log under logs/; startup waits for the documented health
-# checks (API /healthz + /api/health db=ok, executor /healthz with a
-# browserVersion, web /login, renderer /healthz with a browser version) before
+# checks (API /healthz + /api/health db=ok, executor /healthz with status=ok
+# (v2 workstation; browser optional), web /login, renderer /healthz with a browser version) before
 # reporting success.
 #
 # EzTest 0.2 keeps its runtime configuration in the database settings center.
@@ -318,7 +318,7 @@ $(log_hint api)"
 }
 
 wait_executor_ready() { # base-url pid seconds
-    local base="$1" pid="$2" seconds="${3:-90}" last="no response" response body status browser status_code
+    local base="$1" pid="$2" seconds="${3:-90}" last="no response" response body status status_code
     local deadline=$((SECONDS + seconds))
     while [ "$SECONDS" -lt "$deadline" ]; do
         if ! process_alive "$pid"; then
@@ -331,12 +331,14 @@ $(log_hint executor)"
             body="${response#*$'\n'}"
             if [ "$status_code" = "200" ]; then
                 status="$(printf '%s' "$body" | json_field 'status' 2>/dev/null || true)"
-                browser="$(printf '%s' "$body" | json_field 'browserVersion' 2>/dev/null || true)"
-                if [ "$status" = "ok" ] && [ -n "$browser" ]; then
-                    EXEC_BROWSER="$browser"
+                # v2 (v0.2.4-C): healthz reports the session service; browserVersion
+                # was removed. Readiness is status=ok (browser optional). Capture the
+                # floating CLI version for display when present.
+                if [ "$status" = "ok" ]; then
+                    EXEC_BROWSER="$(printf '%s' "$body" | json_field 'browserCli.cli_version' 2>/dev/null || true)"
                     return 0
                 fi
-                last="status=${status} browserVersion=${browser}"
+                last="status=${status}"
             else
                 last="HTTP $status_code $body"
             fi
@@ -345,9 +347,9 @@ $(log_hint executor)"
         fi
         sleep 0.5
     done
-    WAIT_LAST="The Playwright executor did not become ready within ${seconds}s (last: ${last}).
-Bundled Chromium could not be launched. On Debian/Ubuntu install the browser system libraries:
-  sudo bash install-linux-deps.sh
+    WAIT_LAST="The executor did not become ready within ${seconds}s (last: ${last}).
+The executor is a general workstation (protocol v2); readiness is /healthz status=ok.
+The browser domain additionally needs the official CLI (npm install -g @playwright/cli@latest).
 See PACKAGE.md troubleshooting and logs/executor.err.log.
 $(log_hint executor)"
     return 1
@@ -581,15 +583,14 @@ ok "ready (version ${api_version:-unknown})"
 printf '[2/4] Playwright executor ...'
 export EZTEST_EXECUTOR_TOKEN="$executor_token"
 export EZTEST_EXECUTOR_ADDR="$exec_addr"
-export EZTEST_EXECUTOR_MAX_CONTEXTS="$(env_value EZTEST_EXECUTOR_MAX_CONTEXTS '8')"
-export EZTEST_EXEC_ALLOWED_HOSTS="$(env_value EZTEST_EXEC_ALLOWED_HOSTS 'localhost,127.0.0.1')"
+export EZTEST_EXECUTOR_MAX_SESSIONS="$(env_value EZTEST_EXECUTOR_MAX_SESSIONS '8')"
 export EZTEST_VISUAL_BASELINE_MAX_BYTES="$(env_value EZTEST_VISUAL_BASELINE_MAX_BYTES '5242880')"
 start_detached executor "$PKG" "$LOGS/executor.log" "$LOGS/executor.err.log" "$NODE" "$EXEC_SERVER"
 exec_pid=$LAST_PID
 if ! wait_executor_ready "$exec_base" "$exec_pid" 120; then
     fail_with_rollback "$WAIT_LAST"
 fi
-ok "ready (browser $EXEC_BROWSER)"
+ok "ready (cli $EXEC_BROWSER)"
 
 # --- web -------------------------------------------------------------------
 printf '[3/4] web ...'

@@ -44,6 +44,12 @@ type Repository struct {
 	Executors    *ExecutorRepository
 	Humans       *HumanRequestRepository
 	Observations *DiscoveryObservationRepository
+	// SUTResolutions is the append-only P16 resolution fact store (v0.2.4-F T9).
+	SUTResolutions *SUTResolutionRepository
+	// AssetRegistrations is the append-only P17 registration fact store (v0.2.4-F T10).
+	AssetRegistrations *AssetRegistrationRepository
+	// SessionFixtures is the append-only P18 session fixture fact store (v0.2.4-F T13).
+	SessionFixtures *SessionFixtureRepository
 }
 
 // NewRepository wires every execution aggregate store over one pgx pool. ids
@@ -51,15 +57,18 @@ type Repository struct {
 func NewRepository(pool *pgxpool.Pool, ids platformid.Generator) *Repository {
 	shared := base{pool: pool, ids: ids}
 	return &Repository{
-		Intents:      &IntentRepository{shared},
-		Waves:        &WaveRepository{shared},
-		CaseRuns:     &CaseRunRepository{shared},
-		SUTContexts:  &SUTContextRepository{shared},
-		Results:      &ResultRepository{shared},
-		Evidence:     &EvidenceRepository{shared},
-		Executors:    &ExecutorRepository{shared},
-		Humans:       &HumanRequestRepository{shared},
-		Observations: &DiscoveryObservationRepository{shared},
+		Intents:            &IntentRepository{shared},
+		Waves:              &WaveRepository{shared},
+		CaseRuns:           &CaseRunRepository{shared},
+		SUTContexts:        &SUTContextRepository{shared},
+		Results:            &ResultRepository{shared},
+		Evidence:           &EvidenceRepository{shared},
+		Executors:          &ExecutorRepository{shared},
+		Humans:             &HumanRequestRepository{shared},
+		Observations:       &DiscoveryObservationRepository{shared},
+		SUTResolutions:     &SUTResolutionRepository{shared},
+		AssetRegistrations: &AssetRegistrationRepository{shared},
+		SessionFixtures:    &SessionFixtureRepository{shared},
 	}
 }
 

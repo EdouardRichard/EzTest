@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     P6 real-LLM evaluation report track (spec section 5.4, P6-D-12/P6-D-21).
@@ -82,8 +82,7 @@ $metricNames = @(
     "impact_precision",
     "classification_accuracy",
     "issue_false_positive_rate",
-    "supplement_hit_rate",
-    "visual_classification_accuracy"
+    "supplement_hit_rate"
 )
 
 # Frozen spec section 5.3 real_llm report thresholds.
@@ -94,7 +93,6 @@ $specThresholds = [ordered]@{
     classification_accuracy        = 0.80
     issue_false_positive_rate      = 0.15
     supplement_hit_rate            = 0.50
-    visual_classification_accuracy = 0.80
 }
 
 function Write-EvalLog {
@@ -355,15 +353,6 @@ function Test-ObservationShape {
     if ($null -eq $Observation.supplement -or $null -eq $Observation.supplement.ai_case_titles) {
         throw "observation.supplement.ai_case_titles is required"
     }
-    if ($null -ne $Observation.visual) {
-        $injected = 0
-        if (-not [int]::TryParse([string]$Observation.visual.injected, [ref]$injected) -or $injected -lt 0) {
-            throw "observation.visual.injected must be a non-negative integer"
-        }
-        if ($null -eq $Observation.visual.cases) {
-            throw "observation.visual.cases is required when visual is present"
-        }
-    }
 }
 
 function Count-Intersection {
@@ -381,8 +370,7 @@ function New-SampleFromObservation {
         $ImpactTruth,
         $ClassificationTruth,
         $IssuesTruth,
-        $SupplementTruth,
-        $VisualTruth
+        $SupplementTruth
     )
     $confirmedKeys = @($Observation.requirements.confirmed_keys | ForEach-Object { [string]$_ })
     $coveredKeys = @($Observation.design.covered_requirement_keys | ForEach-Object { [string]$_ })
@@ -395,7 +383,6 @@ function New-SampleFromObservation {
     $injected = @($ClassificationTruth.injected_failures)
     $truePositiveTitles = @($IssuesTruth.true_positives | ForEach-Object { [string]$_.title })
     $supplementExpected = @($SupplementTruth.expected_cases | ForEach-Object { [string]$_.title })
-    $visualTruthCases = @($VisualTruth.cases)
 
     $correctClassifications = 0
     foreach ($truth in $injected) {
@@ -426,27 +413,6 @@ function New-SampleFromObservation {
         supplement_hits         = (Count-Intersection -Left $supplementTitles -Right $supplementExpected)
     }
 
-    if ($null -ne $Observation.visual) {
-        $visualInjected = [int]$Observation.visual.injected
-        $visualCases = @($Observation.visual.cases)
-        $visualCorrect = 0
-        foreach ($truth in $visualTruthCases) {
-            $title = [string]$truth.case_title
-            $expectedClass = [string]$truth.expected_classification
-            $candidate = $null
-            foreach ($case in $visualCases) {
-                if ([string]$case.case_title -eq $title) { $candidate = $case; break }
-            }
-            if ($null -ne $candidate -and [string]$candidate.classification -eq $expectedClass) {
-                $visualCorrect++
-            }
-        }
-        if ($visualCorrect -gt $visualInjected) {
-            throw "observation.visual.injected ($visualInjected) is smaller than the correct classification count ($visualCorrect)"
-        }
-        $sample["visual_injected"] = $visualInjected
-        $sample["visual_correct"] = $visualCorrect
-    }
     return $sample
 }
 
@@ -475,9 +441,6 @@ function Assert-Sample {
     if ([int]$Sample["supplement_hits"] -gt [int]$Sample["supplement_cases"]) {
         throw "sample.supplement_hits must not exceed supplement_cases"
     }
-    if ($Sample.Contains("visual_injected") -and [int]$Sample["visual_correct"] -gt [int]$Sample["visual_injected"]) {
-        throw "sample.visual_correct must not exceed visual_injected"
-    }
 }
 
 # ---------------------------------------------------------------------------
@@ -499,12 +462,10 @@ function Invoke-Preflight {
     $code = Read-JsonFile -Path (Join-Path $corpusDir "code.json") -Label "corpus/code.json"
     $execution = Read-JsonFile -Path (Join-Path $corpusDir "execution.json") -Label "corpus/execution.json"
     $issues = Read-JsonFile -Path (Join-Path $corpusDir "issues.json") -Label "corpus/issues.json"
-    $visual = Read-JsonFile -Path (Join-Path $corpusDir "visual.json") -Label "corpus/visual.json"
     $impactTruth = Read-JsonFile -Path (Join-Path $truthDir "impact.json") -Label "ground-truth/impact.json"
     $classificationTruth = Read-JsonFile -Path (Join-Path $truthDir "classification.json") -Label "ground-truth/classification.json"
     $issuesTruth = Read-JsonFile -Path (Join-Path $truthDir "issues.json") -Label "ground-truth/issues.json"
     $supplementTruth = Read-JsonFile -Path (Join-Path $truthDir "supplement.json") -Label "ground-truth/supplement.json"
-    $visualTruth = Read-JsonFile -Path (Join-Path $truthDir "visual.json") -Label "ground-truth/visual.json"
     $baseline = Read-JsonFile -Path (Join-Path $evalRoot "baseline.json") -Label "baseline.json"
 
     $corpusVersion = [string]$requirements.corpus_version
@@ -517,12 +478,10 @@ function Invoke-Preflight {
         @{ Name = "code.json"; Value = [string]$code.corpus_version },
         @{ Name = "execution.json"; Value = [string]$execution.corpus_version },
         @{ Name = "issues.json"; Value = [string]$issues.corpus_version },
-        @{ Name = "visual.json"; Value = [string]$visual.corpus_version },
         @{ Name = "ground-truth/impact.json"; Value = [string]$impactTruth.corpus_version },
         @{ Name = "ground-truth/classification.json"; Value = [string]$classificationTruth.corpus_version },
         @{ Name = "ground-truth/issues.json"; Value = [string]$issuesTruth.corpus_version },
         @{ Name = "ground-truth/supplement.json"; Value = [string]$supplementTruth.corpus_version },
-        @{ Name = "ground-truth/visual.json"; Value = [string]$visualTruth.corpus_version },
         @{ Name = "baseline.json"; Value = [string]$baseline.corpus_version }
     )
     foreach ($check in $versionChecks) {
@@ -530,16 +489,16 @@ function Invoke-Preflight {
             throw "$($check.Name) corpus_version '$($check.Value)' does not match '$corpusVersion'"
         }
     }
-    Write-Info "corpus_version = $corpusVersion; 14 artifacts parsed"
+    Write-Info "corpus_version = $corpusVersion; 11 JSON artifacts parsed"
 
-    # Baseline: exactly the seven spec metric names, numeric [0,1], frozen
+    # Baseline: exactly the six spec metric names, numeric [0,1], frozen
     # thresholds, real_llm mode, report-only description.
     if ([string]$baseline.mode -ne "real_llm") {
         throw "baseline.json mode must be real_llm"
     }
     $baselineProperties = @($baseline.metrics.PSObject.Properties)
-    if ($baselineProperties.Count -ne 7) {
-        throw "baseline.json must contain exactly 7 metrics (found $($baselineProperties.Count))"
+    if ($baselineProperties.Count -ne 6) {
+        throw "baseline.json must contain exactly 6 metrics (found $($baselineProperties.Count))"
     }
     foreach ($name in $metricNames) {
         $property = $baseline.metrics.PSObject.Properties[$name]
@@ -639,40 +598,21 @@ function Invoke-Preflight {
         }
     }
 
-    # Supplement / visual truth.
+    # Supplement truth.
     if (@($supplementTruth.expected_cases).Count -eq 0) {
         throw "ground-truth/supplement.json declares no expected cases"
     }
-    $visualAssertions = @($visual.assertions)
-    $visualTruthCases = @($visualTruth.cases)
-    if ([string]$visualTruth.metric -ne "visual_classification_accuracy") {
-        throw "ground-truth/visual.json metric must be visual_classification_accuracy"
-    }
-    if ($visualAssertions.Count -eq 0 -or $visualTruthCases.Count -eq 0) {
-        throw "visual corpus/ground truth must declare at least one case"
-    }
-    if ($visualAssertions.Count -ne $visualTruthCases.Count) {
-        throw "visual corpus and ground truth disagree on the case count"
-    }
-    foreach ($truthCase in $visualTruthCases) {
-        $title = [string]$truthCase.case_title
-        $match = $null
-        foreach ($assertion in $visualAssertions) {
-            if ([string]$assertion.case_title -eq $title) { $match = $assertion; break }
-        }
-        if ($null -eq $match) { throw "visual truth case '$title' is not declared in corpus/visual.json" }
-        if ([string]$match.expected_classification -ne [string]$truthCase.expected_classification) {
-            throw "visual case '$title' classification disagrees between corpus and ground truth"
-        }
-    }
     Write-Info "corpus/ground-truth cross references are consistent"
 
-    # Frozen contract: quality paths/schemas and the P6 frozen marker.
-    $openapiPath = Join-Path $repoRoot "docs\version-V0.2\contracts\openapi.yaml"
+    # Frozen contract: quality paths/schemas and the current frozen/release marker.
+    # The old P6 contract tree retired (R-H3r); the live contract is docs/openapi/api.yaml,
+    # whose release identity is info.version: 0.2.4 plus the top-level x-frozen: 0.2.4.
+    $openapiPath = Join-Path $repoRoot "docs\openapi\api.yaml"
     if (-not (Test-Path -LiteralPath $openapiPath)) { throw "missing frozen OpenAPI contract" }
     $openapi = Get-Content -LiteralPath $openapiPath -Raw -Encoding UTF8
     foreach ($needle in @(
-            "x-frozen: P6",
+            "x-frozen: 0.2.4",
+            "version: 0.2.4",
             "/api/quality/eval-runs:",
             "/api/quality/eval-runs/{id}:",
             "/api/quality/overview:",
@@ -682,7 +622,7 @@ function Invoke-Preflight {
             "QualityOverviewView:"
         )) {
         if (-not $openapi.Contains($needle)) {
-            throw "openapi.yaml is missing the frozen P6 contract fragment '$needle'"
+            throw "api.yaml is missing the frozen contract fragment '$needle'"
         }
     }
     $routesPath = Join-Path $repoRoot "backend\internal\quality\interfaces\httpapi\routes.go"
@@ -698,24 +638,30 @@ function Invoke-Preflight {
             throw "quality routes.go is missing '$needle'"
         }
     }
-    Write-Info "OpenAPI frozen P6 quality paths/schemas and quality routes are present"
+    Write-Info "OpenAPI frozen 0.2.4 quality paths/schemas and quality routes are present"
 
-    # Migration order must be at 33 and hold the eval migration.
+    # Migration order must match the on-disk migrations (1:1, constitution 六.4)
+    # and hold the eval migration. The count is DERIVED from order.txt, never a
+    # hardcoded ordinal (the old fixed-size snapshot was brittle).
     $orderPath = Join-Path $repoRoot "backend\internal\db\migrations\order.txt"
     if (-not (Test-Path -LiteralPath $orderPath)) { throw "missing migrations/order.txt" }
     $ordered = @(Get-Content -LiteralPath $orderPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object {
             $_.Length -gt 0 -and -not $_.StartsWith("#")
         })
-    if ($ordered.Count -ne 33) {
-        throw "migrations/order.txt must list 33 migrations (found $($ordered.Count))"
+    if ($ordered.Count -eq 0) { throw "migrations/order.txt lists no migrations" }
+    $migrationsDir = Join-Path $repoRoot "backend\internal\db\migrations"
+    foreach ($migration in $ordered) {
+        if (-not (Test-Path -LiteralPath (Join-Path $migrationsDir $migration))) {
+            throw "migrations/order.txt lists '$migration' but no such file exists under migrations/"
+        }
     }
-    if ($ordered -notcontains "quality_0001_eval.sql") {
-        throw "migrations/order.txt must contain quality_0001_eval.sql"
+    foreach ($requiredMigration in @("quality_0001_eval.sql", "agent_0005_profile_prompt_revision.sql")) {
+        if ($ordered -notcontains $requiredMigration) {
+            throw "migrations/order.txt must contain $requiredMigration"
+        }
     }
-    if ($ordered -notcontains "agent_0005_profile_prompt_revision.sql") {
-        throw "migrations/order.txt must contain agent_0005_profile_prompt_revision.sql"
-    }
-    Write-Info "migrations/order.txt = 33 entries including quality_0001_eval.sql"
+    $expectedMigrationCount = $ordered.Count
+    Write-Info "migrations/order.txt = $expectedMigrationCount entries, each backed by a file, including quality_0001_eval.sql"
 
     # Environment / database / LLM configuration.
     $envPath = Join-Path $repoRoot ".env"
@@ -746,15 +692,15 @@ function Invoke-Preflight {
         Write-WarnLine "schema_migrations is not readable; the database may be uninitialized"
     }
     if ($ForRealRun) {
-        if ($appliedCount -ge 0 -and $appliedCount -lt 33) {
-            throw "database has $appliedCount migrations; apply #32/#33 before a real-llm evaluation run"
+        if ($appliedCount -ge 0 -and $appliedCount -lt $expectedMigrationCount) {
+            throw "database has $appliedCount migrations; apply the remaining migrations (order.txt lists $expectedMigrationCount) before a real-llm evaluation run"
         }
         $evalTable = Invoke-PsqlQuery -Target $databaseTarget -Sql "SELECT to_regclass('eval_run') IS NOT NULL"
         if ($evalTable -ne "t") {
-            throw "eval_run table is missing; apply quality_0001_eval.sql (#32) before a real-llm run"
+            throw "eval_run table is missing; apply quality_0001_eval.sql before a real-llm run"
         }
-    } elseif ($appliedCount -ge 0 -and $appliedCount -lt 33) {
-        Write-WarnLine "database currently has $appliedCount migrations; real-llm mode requires 33"
+    } elseif ($appliedCount -ge 0 -and $appliedCount -lt $expectedMigrationCount) {
+        Write-WarnLine "database currently has $appliedCount migrations; real-llm mode requires $expectedMigrationCount"
     }
     Write-Info "database reachable: $($databaseTarget.Host):$($databaseTarget.Port)/$($databaseTarget.Database); applied migrations=$appliedCount"
 
@@ -798,8 +744,7 @@ function Invoke-Preflight {
             -ImpactTruth $impactTruth `
             -ClassificationTruth $classificationTruth `
             -IssuesTruth $issuesTruth `
-            -SupplementTruth $supplementTruth `
-            -VisualTruth $visualTruth
+            -SupplementTruth $supplementTruth
         Assert-Sample -Sample $exampleSample
         $impactHitTruth = 0
         foreach ($truth in @($impactTruth.expected)) {
@@ -817,10 +762,6 @@ function Invoke-Preflight {
             true_positive_issues    = [int]$issuesTruth.expected_counts.true_positive_issues
             supplement_cases        = [int]$supplementTruth.expected_counts.supplement_cases
             supplement_hits         = [int]$supplementTruth.expected_counts.supplement_hits
-        }
-        if ($null -ne $exampleObservation.visual) {
-            $expectedSample["visual_injected"] = [int]$visualTruth.expected_counts.visual_injected
-            $expectedSample["visual_correct"] = [int]$visualTruth.expected_counts.visual_correct
         }
         foreach ($key in $expectedSample.Keys) {
             if (-not $exampleSample.Contains($key)) {
@@ -849,12 +790,10 @@ function Invoke-Preflight {
         Code                = $code
         Execution           = $execution
         Issues              = $issues
-        Visual              = $visual
         ImpactTruth         = $impactTruth
         ClassificationTruth = $classificationTruth
         IssuesTruth         = $issuesTruth
         SupplementTruth     = $supplementTruth
-        VisualTruth         = $visualTruth
         Baseline            = $baseline
         EnvValues           = $envValues
         DatabaseTarget      = $databaseTarget
@@ -1013,17 +952,13 @@ try {
         -ImpactTruth $pre.ImpactTruth `
         -ClassificationTruth $pre.ClassificationTruth `
         -IssuesTruth $pre.IssuesTruth `
-        -SupplementTruth $pre.SupplementTruth `
-        -VisualTruth $pre.VisualTruth
+        -SupplementTruth $pre.SupplementTruth
     Assert-Sample -Sample $sample
     Write-Info ("sample = confirmed {0}/{0}, covered {1}, impact {2}/{3} (selected {4}), classification {5}/{6}, ai issues {7} (tp {8}), supplement {9}/{10}" -f `
             $sample["confirmed_requirements"], $sample["covered_requirements"], $sample["impact_hit"], `
             $sample["impact_expected"], $sample["impact_selected"], $sample["correct_classifications"], `
             $sample["injected_failures"], $sample["ai_issues"], $sample["true_positive_issues"], `
             $sample["supplement_hits"], $sample["supplement_cases"])
-    if ($sample.Contains("visual_injected")) {
-        Write-Info ("visual = {0}/{1}" -f $sample["visual_correct"], $sample["visual_injected"])
-    }
 
     $baselineMap = [ordered]@{}
     foreach ($name in $metricNames) {
@@ -1051,12 +986,10 @@ try {
                 "corpus/code.json",
                 "corpus/execution.json",
                 "corpus/issues.json",
-                "corpus/visual.json",
                 "ground-truth/impact.json",
                 "ground-truth/classification.json",
                 "ground-truth/issues.json",
-                "ground-truth/supplement.json",
-                "ground-truth/visual.json"
+                "ground-truth/supplement.json"
             )
         }
     }

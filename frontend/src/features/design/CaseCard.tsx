@@ -6,6 +6,7 @@ import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 
+import { reviewStateLabel, reviewStateTone } from "./judgment"
 import type { DesignNodeData } from "./layout"
 import { CASE_VERSION_STATUS_LABEL, type DesignNodeActions } from "./nodeActions"
 import type { CaseVersionStatus } from "./types"
@@ -25,12 +26,11 @@ const STATUS_TONE: Record<Exclude<CaseVersionStatus, "superseded">, BadgeTone> =
   stale: "warning",
 }
 
-/** One case card: status, priority, SUT/page chips and the draft-only confirm. */
+/** One case card: status, priority, covered ACs, SUT description and the draft-only confirm. */
 export function CaseCard({ data }: NodeProps) {
   const node = data as unknown as CaseData
   const designCase = node.case
   const confirming = node.actions.confirmingKey === `case:${designCase.case_id}`
-  const crossSystem = designCase.version_sut_ids.length > 1
 
   return (
     <div
@@ -64,27 +64,39 @@ export function CaseCard({ data }: NodeProps) {
         <Badge tone={STATUS_TONE[designCase.status]}>
           {CASE_VERSION_STATUS_LABEL[designCase.status]}
         </Badge>
+        {designCase.review_state !== undefined ? (
+          <Badge
+            tone={reviewStateTone(designCase.review_state)}
+            data-testid={`case-review-state-${designCase.case_id}`}
+          >
+            {reviewStateLabel(designCase.review_state)}
+          </Badge>
+        ) : null}
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-1">
         <span className="text-[11px] font-medium text-muted-foreground">{designCase.priority}</span>
-        {designCase.version_sut_ids.map((sutId) => (
+        {/* v0.2.4-B: the natural-language case contract carries covered_acs and a
+            prose sut_description, not SUT/page id arrays. Cross-system is an
+            execution-time quota concept (execution/domain/quota.go derives it from
+            the run's SUT set); the design summary has no authoritative source for
+            it, so no cross-system marker is shown here. */}
+        {designCase.covered_acs.map((ac) => (
           <span
-            key={sutId}
+            key={ac}
             className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] text-accent-foreground"
           >
-            SUT {sutId}
+            {ac}
           </span>
         ))}
-        {designCase.page_ids.map((pageId) => (
-          <span
-            key={pageId}
-            className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-          >
-            页面 {pageId}
-          </span>
-        ))}
-        {crossSystem ? <Badge tone="warning">跨系统</Badge> : null}
       </div>
+      {designCase.sut_description !== "" ? (
+        <p
+          className="mt-1 truncate text-[10px] text-muted-foreground"
+          title={designCase.sut_description}
+        >
+          {designCase.sut_description}
+        </p>
+      ) : null}
       <p className="mt-1 text-[10px] text-muted-foreground">
         v{designCase.revision} · 步骤 {designCase.step_count} · 断言 {designCase.assertion_count}
       </p>

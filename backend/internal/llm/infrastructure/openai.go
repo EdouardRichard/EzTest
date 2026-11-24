@@ -83,8 +83,8 @@ func (c *Client) ListModels(ctx context.Context, cfg llm.Config) ([]llmapp.Remot
 
 // Test probes the upstream: a successful GET {base}/models passes; otherwise a
 // minimal request for the configured protocol is attempted (POST
-// /chat/completions or POST /responses). Any failure is returned as an error
-// that is safe to surface (status code only, no key).
+// /chat/completions or POST /responses). Any failure is returned as a
+// status-only error (the transport discards the upstream body).
 func (c *Client) Test(ctx context.Context, cfg llm.Config) (llmapp.TestResult, error) {
 	start := time.Now()
 	models, modelsErr := c.ListModels(ctx, cfg)
@@ -107,9 +107,9 @@ func (c *Client) Test(ctx context.Context, cfg llm.Config) (llmapp.TestResult, e
 	return llmapp.TestResult{
 			OK:        false,
 			LatencyMS: time.Since(start).Milliseconds(),
-			Error:     redact(probeErr.Error(), cfg.APIKey),
+			Error:     probeErr.Error(),
 		}, fmt.Errorf("llm connectivity test failed: models: %v; probe: %v",
-			modelsErr, redact(probeErr.Error(), cfg.APIKey))
+			modelsErr, probeErr.Error())
 }
 
 // probe attempts one minimal completion on the endpoint of the configured
@@ -308,12 +308,4 @@ func isTimeout(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-// redact removes the configured secret from a message if it somehow leaked.
-func redact(message, secret string) string {
-	if secret == "" || message == "" {
-		return message
-	}
-	return strings.ReplaceAll(message, secret, "[redacted]")
 }

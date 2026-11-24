@@ -31,7 +31,7 @@ var issueToolClassifications = map[string]bool{
 // contracts/agent-profiles-tools.md §7.3). The tools only ever receive the
 // runtime-injected tools.Scope: their JSON schemas never expose the version or
 // task issue IDs. The composition root (Task 23) registers this group through
-// tools.RegisterP4ToolGroup with captured IssueService/AnalysisService values.
+// tools.RegisterToolGroup with captured IssueService/AnalysisService values.
 func IssueTools(svc *IssueService, analysis *AnalysisService) []agenttools.Tool {
 	return []agenttools.Tool{
 		&issueReadTool{svc: svc},
@@ -85,7 +85,7 @@ func (t *issueReadTool) Execute(ctx context.Context, scope agenttools.Scope, raw
 	var params struct {
 		IssueID string `json:"issue_id"`
 	}
-	if err := agenttools.DecodeP4Params(raw, &params); err != nil {
+	if err := agenttools.DecodeDeliveryParams(raw, &params); err != nil {
 		return nil, err
 	}
 	if scope.VersionID <= 0 {
@@ -111,8 +111,8 @@ func (t *issueReadTool) Execute(ctx context.Context, scope agenttools.Scope, raw
 		if ref.Role != "" {
 			entry["role"] = ref.Role
 		}
-		if ref.VersionSUTID != nil && *ref.VersionSUTID > 0 {
-			entry["version_sut_id"] = formatIssueID(*ref.VersionSUTID)
+		if ref.SUTID != nil && *ref.SUTID > 0 {
+			entry["sut_id"] = formatIssueID(*ref.SUTID)
 		}
 		refs = append(refs, entry)
 		if ref.Kind == delivery.IssueRefKindCaseRun && !seenCaseRuns[ref.RefID] {
@@ -181,7 +181,7 @@ func issueCaseRunSummary(snapshot CaseRunSnapshot) map[string]any {
 		"category":               snapshot.Category,
 		"severity":               snapshot.Severity,
 		"evidence_ids":           formatIssueIDs(snapshot.EvidenceIDs),
-		"version_sut_ids":        formatIssueIDs(snapshot.VersionSUTIDs),
+		"sut_ids":                formatIssueIDs(snapshot.SUTIDs),
 	}
 	if snapshot.WaveID > 0 {
 		result["wave_id"] = formatIssueID(snapshot.WaveID)
@@ -189,8 +189,8 @@ func issueCaseRunSummary(snapshot CaseRunSnapshot) map[string]any {
 	if snapshot.RequirementID > 0 {
 		result["requirement_id"] = formatIssueID(snapshot.RequirementID)
 	}
-	if snapshot.VersionSUTID != nil && *snapshot.VersionSUTID > 0 {
-		result["version_sut_id"] = formatIssueID(*snapshot.VersionSUTID)
+	if snapshot.SUTID != nil && *snapshot.SUTID > 0 {
+		result["sut_id"] = formatIssueID(*snapshot.SUTID)
 	}
 	return result
 }
@@ -246,7 +246,7 @@ func (t *issueProposeTool) Execute(ctx context.Context, scope agenttools.Scope, 
 		MergeReason        string   `json:"merge_reason"`
 		Confidence         *float64 `json:"confidence"`
 	}
-	if err := agenttools.DecodeP4Params(raw, &params); err != nil {
+	if err := agenttools.DecodeDeliveryParams(raw, &params); err != nil {
 		return nil, err
 	}
 	if scope.VersionID <= 0 {

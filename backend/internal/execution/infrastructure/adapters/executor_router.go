@@ -10,14 +10,14 @@ import (
 
 // ExecutorLookup resolves the endpoint of one registered executor (Registry
 // implements it). Its List is used to enumerate every live endpoint for
-// context/orphan cleanup.
+// session/orphan cleanup.
 type ExecutorLookup interface {
 	Get(ctx context.Context, id int64) (execution.ExecutorInstance, error)
 	List(ctx context.Context) ([]execution.ExecutorInstance, error)
 }
 
-// ExecutorRouter routes browser/control calls to the executor endpoint that
-// owns a context. executorID 0 (historical rows or single-endpoint mode) uses
+// ExecutorRouter routes execution/control calls to the executor endpoint that
+// owns a session. executorID 0 (historical rows or single-endpoint mode) uses
 // the primary endpoint.
 type ExecutorRouter struct {
 	resolver *executorinfra.Resolver
@@ -41,8 +41,8 @@ type ExecutorRouteDiagnostic struct {
 }
 
 // clientFor routes one call. Unknown or offline owners fall back to the primary
-// endpoint; the action then fails with a typed transport error, which the
-// adapter annotates with registry_hit=false.
+// endpoint; the call then fails with a typed transport error, which the adapter
+// annotates with registry_hit=false.
 func (r *ExecutorRouter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
 	client, _, err := r.clientForDiagnostics(ctx, executorID)
 	return client, err
@@ -84,7 +84,7 @@ type routedClient struct {
 
 // clients returns one client per live executor endpoint. The primary endpoint
 // is always included (with id 0 if no row owns it) so single-endpoint
-// deployments keep P3 semantics.
+// deployments keep single-endpoint semantics.
 func (r *ExecutorRouter) clients(ctx context.Context) ([]routedClient, error) {
 	if r == nil || r.resolver == nil {
 		return nil, errNotConfigured("executor client")

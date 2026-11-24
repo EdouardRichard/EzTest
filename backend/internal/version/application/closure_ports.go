@@ -48,17 +48,16 @@ type ClosureIssueRefReader interface {
 	CaseRunIssueRefs(ctx context.Context, requirementID int64) (map[int64][]int64, error)
 }
 
-// OpenWorkItemCounts splits a requirement's open work items into the total and
-// the requirement.close tasks. The closure service subtracts the latter so the
-// predicate never counts the closure task itself as blocking work.
+// OpenWorkItemCounts is the open-work projection of one requirement. GD-17
+// removed the requirement.close work type, so there is no self-task split: Total
+// is the raw count of open/claimed/running work items scoped to the requirement.
 type OpenWorkItemCounts struct {
-	Total            int
-	RequirementClose int
+	Total int
 }
 
 // ClosureWorkItemReader is the agent task-board slice consumed by closure
 // evaluation. It counts open/claimed/running work items scoped to one
-// requirement (design.gap, design.requirement, requirement.close, ...).
+// requirement (design.gap, design.requirement, ...).
 type ClosureWorkItemReader interface {
 	OpenWorkItems(ctx context.Context, requirementID int64) (OpenWorkItemCounts, error)
 }
@@ -68,12 +67,4 @@ type ClosureWorkItemReader interface {
 // service, and the reconciler remains the fallback when it is best-effort.
 type VersionReopener interface {
 	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
-}
-
-// ClosureTaskEnsurer ensures the requirement.close steward work item for one
-// requirement version and close round. It is idempotent: repeated ensures for
-// the same (requirement, requirement version, close round) return the existing
-// item, while a new revision or close round produces a new work item.
-type ClosureTaskEnsurer interface {
-	EnsureRequirementClose(ctx context.Context, requirementID, requirementVersionID int64, closeRound int32) error
 }

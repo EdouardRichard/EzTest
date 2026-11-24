@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
@@ -22,14 +23,14 @@ const conversationColumns = `c.id, c.version_id, c.kind, c.title, c.status, c.mo
 
 const conversationMessageColumns = `id, conversation_id, role, parts, refs, token_usage,
 	actor_id, agent_run_id, client_message_id, reply_to_message_id, created_at,
-	author_agent, kind`
+	author_agent, kind, stream_state`
 
 // conversationMessageSelectColumns reads a message together with the model that
 // actually generated it. actual_model is empty for user messages and for
 // assistant messages whose run link is absent; the DTO maps empty to null.
 const conversationMessageSelectColumns = `m.id, m.conversation_id, m.role, m.parts, m.refs, m.token_usage,
 	m.actor_id, m.agent_run_id, m.client_message_id, m.reply_to_message_id, m.created_at,
-	m.author_agent, m.kind,
+	m.author_agent, m.kind, m.stream_state,
 	COALESCE(run.model, '')`
 
 const conversationSummaryColumns = `id, conversation_id, summary, pinned_facts,
@@ -231,15 +232,15 @@ func (r *ConversationRepository) FindJobCardMessage(ctx context.Context, version
 		FROM conversation_message m
 		JOIN conversation c ON c.id = m.conversation_id
 		LEFT JOIN agent_run run ON run.id = m.agent_run_id
-		WHERE c.version_id = $1 AND m.conversation_id = $2 AND m.role = 'assistant'
+		WHERE c.version_id = $1 AND m.conversation_id = $2 AND m.role = $4
 		  AND EXISTS (
 			SELECT 1
 			FROM jsonb_array_elements(m.parts) AS part
-			WHERE part->>'type' = 'job_card' AND part->>'job_id' = $3
+			WHERE part->>'type' = $5 AND part->>'job_id' = $3
 		  )
 		ORDER BY m.id DESC
 		LIMIT 1
-	`, versionID, conversationID, platformid.Format(jobID)))
+	`, versionID, conversationID, platformid.Format(jobID), version.MessageRoleAssistant, version.MessagePartJobCard))
 	if err != nil {
 		return nil, wrapMessageDB("find job card message", err)
 	}
@@ -280,9 +281,9 @@ func (r *ConversationRepository) updateJobCardMessage(ctx context.Context, versi
 		FROM conversation_message m
 		JOIN conversation c ON c.id = m.conversation_id
 		WHERE m.id = $1 AND m.conversation_id = $2 AND c.version_id = $3
-		  AND m.role = 'assistant'
+		  AND m.role = $4
 		FOR UPDATE OF m
-	`, messageID, conversationID, versionID).Scan(&raw); err != nil {
+	`, messageID, conversationID, versionID, version.MessageRoleAssistant).Scan(&raw); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return version.ErrMessageNotFound
 		}
@@ -329,8 +330,8 @@ func (r *ConversationRepository) updateJobCardMessage(ctx context.Context, versi
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversation_message_part
 		SET payload = $3::jsonb
-		WHERE message_id = $1 AND part_type = 'job_card' AND payload->>'job_id' = $2
-	`, messageID, platformid.Format(jobID), string(encodedPart)); err != nil {
+		WHERE message_id = $1 AND part_type = $4 AND payload->>'job_id' = $2
+	`, messageID, platformid.Format(jobID), string(encodedPart), version.MessagePartJobCard); err != nil {
 		return fmt.Errorf("update job card message: update part row: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -359,12 +360,12 @@ func (r *ConversationRepository) PostUserMessage(ctx context.Context, conversati
 	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO conversation_message (`+conversationMessageColumns+`)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (conversation_id, client_message_id) DO NOTHING
 	`, message.ID, conversationID, message.Role, parts, refs, tokenUsage,
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
 		message.ReplyToMessageID, message.CreatedAt,
-		message.AuthorAgent, kind)
+		message.AuthorAgent, kind, version.NormalizeMessageStreamState(message.StreamState))
 	if err != nil {
 		return nil, false, wrapConversationDB("insert conversation message", err)
 	}
@@ -476,11 +477,11 @@ func (r *ConversationRepository) insertAssistantMessage(ctx context.Context, tx 
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_message (`+conversationMessageColumns+`)
-		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14)
 	`, message.ID, conversationID, message.Role, parts, refs, tokenUsage,
 		message.ActorID, message.AgentRunID, message.ClientMessageID,
 		message.ReplyToMessageID, message.CreatedAt,
-		message.AuthorAgent, kind); err != nil {
+		message.AuthorAgent, kind, version.NormalizeMessageStreamState(message.StreamState)); err != nil {
 		return wrapConversationDB("insert assistant message", err)
 	}
 	for _, part := range message.StreamParts {
@@ -603,6 +604,19 @@ func (r *ConversationRepository) ReleaseWriter(ctx context.Context, conversation
 // recovery). A repeated client_message_id (the Host turn idempotency key)
 // returns the stored message with created=false.
 func (r *ConversationRepository) AppendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message version.Message, turnID int64, agent string, now, leaseUntil time.Time) (*version.Message, bool, error) {
+	return r.appendAssistantMessageAsWriter(ctx, conversationID, message, turnID, agent, now, leaseUntil)
+}
+
+// BeginAssistantStream inserts the placeholder head of one incremental Host
+// reply under the same fenced writer lease as AppendAssistantMessageAsWriter
+// (the head carries stream_state=streaming and empty parts; the streaming part
+// rows are written later by UpdateStreamPart). Sharing the lease/idempotency
+// transaction keeps the single-writer compare-and-set in one place.
+func (r *ConversationRepository) BeginAssistantStream(ctx context.Context, conversationID int64, message version.Message, turnID int64, agent string, now, leaseUntil time.Time) (*version.Message, bool, error) {
+	return r.appendAssistantMessageAsWriter(ctx, conversationID, message, turnID, agent, now, leaseUntil)
+}
+
+func (r *ConversationRepository) appendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message version.Message, turnID int64, agent string, now, leaseUntil time.Time) (*version.Message, bool, error) {
 	kind, err := normalizeMessageKindForWrite(message.Kind)
 	if err != nil {
 		return nil, false, err
@@ -653,8 +667,8 @@ func (r *ConversationRepository) AppendAssistantMessageAsWriter(ctx context.Cont
 			SELECT `+conversationMessageSelectColumns+`
 			FROM conversation_message m
 			LEFT JOIN agent_run run ON run.id = m.agent_run_id
-			WHERE m.conversation_id = $1 AND m.client_message_id = $2 AND m.role = 'assistant'
-		`, conversationID, *message.ClientMessageID))
+			WHERE m.conversation_id = $1 AND m.client_message_id = $2 AND m.role = $3
+		`, conversationID, *message.ClientMessageID, version.MessageRoleAssistant))
 		switch {
 		case err == nil:
 			if err := tx.Commit(ctx); err != nil {
@@ -675,6 +689,480 @@ func (r *ConversationRepository) AppendAssistantMessageAsWriter(ctx context.Cont
 		return nil, false, fmt.Errorf("append assistant message as writer: commit: %w", err)
 	}
 	return nil, true, nil
+}
+
+// ---------- incremental conversation stream (v0.2.4-D, R-D2/SC-D2) ----------
+
+// lockStreamHead locks the conversation and the addressed assistant message head
+// FOR UPDATE and re-checks the single-writer lease against the message's owning
+// Host turn. The lease holder is derived from stored server facts: the head's
+// reserved turn idempotency key (client_message_id == HostTurnClientMessageID of
+// the lease active_turn_id) and author_agent == active_agent. Begin wrote those
+// under the lease, so only that turn may update/finish the stream — never a
+// caller claim. A foreign live turn is ErrConversationBusy; no live lease
+// (idle/released/expired-and-taken-over) is ErrNotConversationWriter. It returns
+// the head parts JSON and the current stream_state.
+func (r *ConversationRepository) lockStreamHead(ctx context.Context, tx pgx.Tx, conversationID, messageID int64, now time.Time) ([]byte, string, error) {
+	var activeTurnID *int64
+	var activeAgent *string
+	var activeLease *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT active_turn_id, active_agent, lease_until
+		FROM conversation WHERE id = $1
+		FOR UPDATE
+	`, conversationID).Scan(&activeTurnID, &activeAgent, &activeLease); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", version.ErrConversationNotFound
+		}
+		return nil, "", fmt.Errorf("lock stream conversation: %w", err)
+	}
+	var raw []byte
+	var streamState, authorAgent string
+	var clientMessageID *string
+	if err := tx.QueryRow(ctx, `
+		SELECT m.parts, m.stream_state, m.author_agent, m.client_message_id
+		FROM conversation_message m
+		WHERE m.id = $1 AND m.conversation_id = $2 AND m.role = $3
+		FOR UPDATE
+	`, messageID, conversationID, version.MessageRoleAssistant).Scan(&raw, &streamState, &authorAgent, &clientMessageID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", version.ErrMessageNotFound
+		}
+		return nil, "", fmt.Errorf("lock stream message: %w", err)
+	}
+	live := activeTurnID != nil && activeAgent != nil && activeLease != nil && !activeLease.Before(now)
+	if !live {
+		return nil, "", version.ErrNotConversationWriter
+	}
+	turnKey := version.HostTurnClientMessageID(*activeTurnID)
+	if clientMessageID == nil || *clientMessageID != turnKey || authorAgent != *activeAgent {
+		return nil, "", version.ErrConversationBusy
+	}
+	return raw, streamState, nil
+}
+
+// UpdateStreamPart rewrites the full snapshot of one streaming part (seq) in
+// place: the conversation_message_part payload (upsert by the unique
+// (message_id, seq)) and the matching part of the conversation_message.parts head
+// snapshot, in one row-locked transaction. The first update for a seq inserts its
+// row; later updates never grow rows. It returns the previous part payload (nil
+// when the seq had no row) so the application can derive the SSE increment.
+func (r *ConversationRepository) UpdateStreamPart(ctx context.Context, conversationID, messageID int64, seq int, part version.MessagePart, now time.Time) (json.RawMessage, error) {
+	if seq <= 0 {
+		return nil, platform.Invalid("seq", "must be a positive integer")
+	}
+	if !version.IsStreamingMessagePartType(part.Type) {
+		return nil, platform.Invalid("part_type", "must be a streaming conversation_message_part type")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("update stream part: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	raw, streamState, err := r.lockStreamHead(ctx, tx, conversationID, messageID, now)
+	if err != nil {
+		return nil, err
+	}
+	if streamState != version.MessageStreamStateStreaming {
+		return nil, version.ErrMessageStreamClosed
+	}
+	var parts []version.MessagePart
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &parts); err != nil {
+			return nil, fmt.Errorf("update stream part: decode head parts: %w", err)
+		}
+	}
+	streamingCount := 0
+	for _, existing := range parts {
+		if version.IsStreamingMessagePartType(existing.Type) {
+			streamingCount++
+		}
+	}
+	if seq > streamingCount+1 {
+		return nil, platform.Invalid("seq", "must address an existing part or the next contiguous seq")
+	}
+
+	var previous []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT payload FROM conversation_message_part WHERE message_id = $1 AND seq = $2
+	`, messageID, seq).Scan(&previous); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("update stream part: read previous payload: %w", err)
+	}
+	encodedPart, err := json.Marshal(part)
+	if err != nil {
+		return nil, fmt.Errorf("update stream part: encode part: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_message_part (id, message_id, seq, part_type, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+		ON CONFLICT (message_id, seq) DO UPDATE
+		SET payload = EXCLUDED.payload, part_type = EXCLUDED.part_type
+	`, r.ids.Next(), messageID, seq, part.Type, string(encodedPart), now); err != nil {
+		return nil, wrapConversationDB("upsert stream part", err)
+	}
+	parts = replaceStreamPartBySeq(parts, seq, part)
+	encodedParts, err := json.Marshal(parts)
+	if err != nil {
+		return nil, fmt.Errorf("update stream part: encode head parts: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message SET parts = $2::jsonb WHERE id = $1
+	`, messageID, string(encodedParts)); err != nil {
+		return nil, wrapConversationDB("update stream head snapshot", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("update stream part: commit: %w", err)
+	}
+	if len(previous) == 0 {
+		return nil, nil
+	}
+	return json.RawMessage(previous), nil
+}
+
+// FinishAssistantStream sets the terminal stream_state of one streaming head and
+// reconciles its conversation_message_part rows to finalParts (upsert each final
+// streaming seq, delete any extra seq the stream accumulated but the final
+// snapshot dropped). A head already terminal is an idempotent no-op (false). It
+// returns the stored head and a bool reporting whether the head transitioned
+// streaming->terminal so the application publishes the terminal frame exactly
+// once, with the head's original created_at/refs/kind.
+func (r *ConversationRepository) FinishAssistantStream(ctx context.Context, conversationID, messageID int64, finalParts []version.MessagePart, streamState string, now time.Time) (version.Message, bool, error) {
+	if err := version.ValidateMessageStreamState(streamState); err != nil {
+		return version.Message{}, false, err
+	}
+	if streamState == version.MessageStreamStateStreaming {
+		return version.Message{}, false, platform.Invalid("stream_state", "finish target must be complete or interrupted")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return version.Message{}, false, fmt.Errorf("finish assistant stream: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, current, err := r.lockStreamHead(ctx, tx, conversationID, messageID, now)
+	if err != nil {
+		return version.Message{}, false, err
+	}
+	if current != version.MessageStreamStateStreaming {
+		head, err := r.scanStreamHead(ctx, tx, messageID)
+		if err != nil {
+			return version.Message{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return version.Message{}, false, fmt.Errorf("finish assistant stream: commit no-op: %w", err)
+		}
+		return head, false, nil
+	}
+	headParts := finalParts
+	if headParts == nil {
+		headParts = []version.MessagePart{}
+	}
+	encodedParts, err := json.Marshal(headParts)
+	if err != nil {
+		return version.Message{}, false, fmt.Errorf("finish assistant stream: encode head parts: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message SET parts = $2::jsonb, stream_state = $3 WHERE id = $1
+	`, messageID, string(encodedParts), streamState); err != nil {
+		return version.Message{}, false, wrapConversationDB("finish stream head", err)
+	}
+	seq := 0
+	for _, part := range finalParts {
+		if !version.IsStreamingMessagePartType(part.Type) {
+			continue
+		}
+		seq++
+		encodedPart, err := json.Marshal(part)
+		if err != nil {
+			return version.Message{}, false, fmt.Errorf("finish assistant stream: encode part: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO conversation_message_part (id, message_id, seq, part_type, payload, created_at)
+			VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+			ON CONFLICT (message_id, seq) DO UPDATE
+			SET payload = EXCLUDED.payload, part_type = EXCLUDED.part_type
+		`, r.ids.Next(), messageID, seq, part.Type, string(encodedPart), now); err != nil {
+			return version.Message{}, false, wrapConversationDB("finish stream part", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM conversation_message_part WHERE message_id = $1 AND seq > $2
+	`, messageID, seq); err != nil {
+		return version.Message{}, false, fmt.Errorf("finish assistant stream: trim extra parts: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, conversationID, now); err != nil {
+		return version.Message{}, false, wrapConversationDB("touch conversation", err)
+	}
+	head, err := r.scanStreamHead(ctx, tx, messageID)
+	if err != nil {
+		return version.Message{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return version.Message{}, false, fmt.Errorf("finish assistant stream: commit: %w", err)
+	}
+	return head, true, nil
+}
+
+// InterruptOrphanStreams seals the streaming heads left behind by Host turns
+// that no longer own the conversation lease (v0.2.4-D T6, SC-D4 crash recovery).
+// The caller must hold the live lease: the single-writer invariant then makes
+// every OTHER streaming head an orphan by construction, so no run-status guess
+// is needed. Each orphan keeps its accumulated parts and gains errorPart as the
+// next streaming seq; the head becomes interrupted, never complete. The whole
+// sweep is one row-locked transaction and is idempotent (a second call finds no
+// streaming head).
+//
+// H-E2: the sweep is PER-HEAD tolerant. One head the validator refuses (or whose
+// stored snapshot cannot be decoded) used to abort the transaction, leaving EVERY
+// head of the conversation streaming. Such a head is now skipped, left exactly as
+// stored, and reported through *version.OrphanSealError alongside the heads that
+// WERE sealed — a partial recovery is never silent (constitution 七.6).
+func (r *ConversationRepository) InterruptOrphanStreams(ctx context.Context, conversationID, turnID int64, agent string, errorPart version.MessagePart, now time.Time) ([]version.Message, error) {
+	if errorPart.Type != version.MessagePartError {
+		return nil, platform.Invalid("error_part", "must be an error part")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("interrupt orphan streams: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var activeTurnID *int64
+	var activeAgent *string
+	var activeLease *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT active_turn_id, active_agent, lease_until
+		FROM conversation WHERE id = $1
+		FOR UPDATE
+	`, conversationID).Scan(&activeTurnID, &activeAgent, &activeLease); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, version.ErrConversationNotFound
+		}
+		return nil, fmt.Errorf("interrupt orphan streams: lock conversation: %w", err)
+	}
+	live := activeTurnID != nil && activeAgent != nil && activeLease != nil && !activeLease.Before(now)
+	if !live {
+		return nil, version.ErrNotConversationWriter
+	}
+	if *activeTurnID != turnID || *activeAgent != agent {
+		return nil, version.ErrConversationBusy
+	}
+
+	turnKey := version.HostTurnClientMessageID(turnID)
+	heads, err := collectOrphanHeads(ctx, tx, `
+		SELECT id, parts FROM conversation_message
+		WHERE conversation_id = $1 AND role = $4 AND stream_state = $2
+		  AND client_message_id IS DISTINCT FROM $3
+		ORDER BY id
+		FOR UPDATE
+	`, conversationID, version.MessageStreamStateStreaming, turnKey, version.MessageRoleAssistant)
+	if err != nil {
+		return nil, err
+	}
+	return r.commitOrphanSeal(ctx, tx, conversationID, heads, errorPart, now)
+}
+
+// InterruptRunOrphanStreams seals the streaming heads of ONE agent run in this
+// conversation (H-E2). It is the recovery entry for a run the agent crash sweep
+// has proven orphaned — its work item is settled or its lease was taken over —
+// in a conversation that may never get another turn, so no lease holder exists to
+// run InterruptOrphanStreams. The fence is therefore the run binding rather than
+// the lease: the agent context owns agent_run's terminal truth and is the only
+// caller. Heads of other runs are never selected.
+//
+// Content contract and per-head tolerance are shared with InterruptOrphanStreams
+// through sealOrphanHeads, so both recovery paths write the seal exactly one way.
+func (r *ConversationRepository) InterruptRunOrphanStreams(ctx context.Context, conversationID, agentRunID int64, errorPart version.MessagePart, now time.Time) ([]version.Message, error) {
+	if errorPart.Type != version.MessagePartError {
+		return nil, platform.Invalid("error_part", "must be an error part")
+	}
+	if conversationID <= 0 || agentRunID <= 0 {
+		return nil, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("interrupt run orphan streams: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The conversation row is locked so a concurrent lease acquisition and this
+	// recovery serialize, but its lease is deliberately NOT required: the run is
+	// already known to be dead and nobody may hold the lease at all.
+	var exists int64
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM conversation WHERE id = $1 FOR UPDATE
+	`, conversationID).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, version.ErrConversationNotFound
+		}
+		return nil, fmt.Errorf("interrupt run orphan streams: lock conversation: %w", err)
+	}
+	heads, err := collectOrphanHeads(ctx, tx, `
+		SELECT id, parts FROM conversation_message
+		WHERE conversation_id = $1 AND role = $4 AND stream_state = $2
+		  AND agent_run_id = $3
+		ORDER BY id
+		FOR UPDATE
+	`, conversationID, version.MessageStreamStateStreaming, agentRunID, version.MessageRoleAssistant)
+	if err != nil {
+		return nil, err
+	}
+	return r.commitOrphanSeal(ctx, tx, conversationID, heads, errorPart, now)
+}
+
+// orphanHead is one stored streaming head selected by a recovery sweep. The
+// snapshot stays raw until its own seal step: decoding it must not be able to
+// abort the sweep for the other heads.
+type orphanHead struct {
+	id  int64
+	raw []byte
+}
+
+// collectOrphanHeads runs one recovery selection and closes the rows before any
+// write (the seal statements need the same connection).
+func collectOrphanHeads(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]orphanHead, error) {
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, wrapConversationDB("select orphan stream heads", err)
+	}
+	heads := make([]orphanHead, 0)
+	for rows.Next() {
+		var head orphanHead
+		if err := rows.Scan(&head.id, &head.raw); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("interrupt orphan streams: scan head: %w", err)
+		}
+		heads = append(heads, head)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("interrupt orphan streams: list heads: %w", err)
+	}
+	rows.Close()
+	return heads, nil
+}
+
+// commitOrphanSeal seals the selected heads and commits the recovery transaction.
+// It is the ONE commit path of both recovery sweeps.
+func (r *ConversationRepository) commitOrphanSeal(ctx context.Context, tx pgx.Tx, conversationID int64, heads []orphanHead, errorPart version.MessagePart, now time.Time) ([]version.Message, error) {
+	sealed, failures, err := r.sealOrphanHeads(ctx, tx, heads, errorPart, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(sealed) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE conversation SET updated_at = $2 WHERE id = $1`, conversationID, now); err != nil {
+			return nil, wrapConversationDB("touch conversation", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("interrupt orphan streams: commit: %w", err)
+	}
+	if len(failures) > 0 {
+		return sealed, &version.OrphanSealError{Failures: failures}
+	}
+	return sealed, nil
+}
+
+// sealOrphanHeads seals each selected head inside tx, PER HEAD. A head whose
+// stored snapshot cannot be decoded, or whose parts plus errorPart the domain
+// validator refuses, is left untouched and reported: the sweep never fabricates a
+// terminal seal, never drops stored content, and never lets one bad head block
+// the others (H-E2). A transport/DB failure is still fatal for the transaction.
+func (r *ConversationRepository) sealOrphanHeads(ctx context.Context, tx pgx.Tx, heads []orphanHead, errorPart version.MessagePart, now time.Time) ([]version.Message, []version.OrphanSealFailure, error) {
+	sealed := make([]version.Message, 0, len(heads))
+	failures := make([]version.OrphanSealFailure, 0)
+	for _, candidate := range heads {
+		var stored []version.MessagePart
+		if len(candidate.raw) > 0 {
+			if err := json.Unmarshal(candidate.raw, &stored); err != nil {
+				failures = append(failures, version.OrphanSealFailure{
+					MessageID: candidate.id,
+					Err:       fmt.Errorf("decode head parts: %w", err),
+				})
+				continue
+			}
+		}
+		parts := append(append([]version.MessagePart(nil), stored...), errorPart)
+		if err := version.ValidateAssistantMessageParts(parts); err != nil {
+			failures = append(failures, version.OrphanSealFailure{MessageID: candidate.id, Err: err})
+			continue
+		}
+		head, err := r.sealOneOrphanHead(ctx, tx, candidate.id, stored, parts, errorPart, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		sealed = append(sealed, head)
+	}
+	return sealed, failures, nil
+}
+
+// sealOneOrphanHead writes one interrupted head: the full snapshot, the terminal
+// stream_state and the error part at the next contiguous streaming seq.
+func (r *ConversationRepository) sealOneOrphanHead(ctx context.Context, tx pgx.Tx, messageID int64, stored, parts []version.MessagePart, errorPart version.MessagePart, now time.Time) (version.Message, error) {
+	encodedParts, err := json.Marshal(parts)
+	if err != nil {
+		return version.Message{}, fmt.Errorf("interrupt orphan streams: encode head parts: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversation_message SET parts = $2::jsonb, stream_state = $3 WHERE id = $1
+	`, messageID, string(encodedParts), version.MessageStreamStateInterrupted); err != nil {
+		return version.Message{}, wrapConversationDB("interrupt orphan head", err)
+	}
+	seq := 0
+	for _, part := range stored {
+		if version.IsStreamingMessagePartType(part.Type) {
+			seq++
+		}
+	}
+	encodedPart, err := json.Marshal(errorPart)
+	if err != nil {
+		return version.Message{}, fmt.Errorf("interrupt orphan streams: encode error part: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_message_part (id, message_id, seq, part_type, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+		ON CONFLICT (message_id, seq) DO UPDATE
+		SET payload = EXCLUDED.payload, part_type = EXCLUDED.part_type
+	`, r.ids.Next(), messageID, seq+1, errorPart.Type, string(encodedPart), now); err != nil {
+		return version.Message{}, wrapConversationDB("interrupt orphan error part", err)
+	}
+	return r.scanStreamHead(ctx, tx, messageID)
+}
+
+// scanStreamHead reads one message head inside tx for the terminal full-frame
+// republish (created_at/refs/kind/author preserved from the stored row).
+func (r *ConversationRepository) scanStreamHead(ctx context.Context, tx pgx.Tx, messageID int64) (version.Message, error) {
+	head, err := scanMessage(tx.QueryRow(ctx, `
+		SELECT `+conversationMessageSelectColumns+`
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.id = $1
+	`, messageID))
+	if err != nil {
+		return version.Message{}, wrapMessageDB("read stream head", err)
+	}
+	return head, nil
+}
+
+// replaceStreamPartBySeq returns a copy of parts with the seq-th streaming-type
+// part (1-based, counting only IsStreamingMessagePartType parts) replaced by
+// part; a seq one past the current streaming count appends. Snapshot-only parts
+// (image/rollback_proposal/question) keep their position and are never sequenced.
+func replaceStreamPartBySeq(parts []version.MessagePart, seq int, part version.MessagePart) []version.MessagePart {
+	updated := append([]version.MessagePart(nil), parts...)
+	streaming := 0
+	for index := range updated {
+		if !version.IsStreamingMessagePartType(updated[index].Type) {
+			continue
+		}
+		streaming++
+		if streaming == seq {
+			updated[index] = part
+			return updated
+		}
+	}
+	return append(updated, part)
 }
 
 // conversationExists reports whether the conversation row exists.
@@ -746,6 +1234,10 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	if err != nil {
 		return version.ConversationSummary{}, err
 	}
+	pinnedFacts, err := encodeStringSlice(summary.PinnedFacts)
+	if err != nil {
+		return version.ConversationSummary{}, err
+	}
 
 	saved := summary
 	saved.ID = r.ids.Next()
@@ -758,7 +1250,7 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 			COALESCE((SELECT max(version) FROM conversation_summary WHERE conversation_id = $2), 0) + 1,
 			NULLIF($6, 0), NULLIF($7, ''), $8::jsonb, $9)
 		RETURNING version, updated_at
-	`, saved.ID, summary.ConversationID, summary.Summary, encodeStringSlice(summary.PinnedFacts),
+	`, saved.ID, summary.ConversationID, summary.Summary, pinnedFacts,
 		summary.TokenEstimate, summary.CoveredMessageID, summary.CompactionID, summaryMeta,
 		summary.UpdatedAt).Scan(&saved.Version, &saved.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, wrapConversationDB("insert conversation summary", err)
@@ -793,10 +1285,10 @@ func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int
 	rows, err := r.pool.Query(ctx, `
 		SELECT c.id, c.version_id, c.kind
 		FROM conversation c
-		WHERE c.kind IN ('clarification', 'design')
+		WHERE c.kind IN ($2, $3)
 		ORDER BY c.id DESC
 		LIMIT $1
-	`, limit)
+	`, limit, version.ConversationClarification, version.ConversationDesign)
 	if err != nil {
 		return nil, fmt.Errorf("list reconcilable conversations: %w", err)
 	}
@@ -870,7 +1362,7 @@ func scanMessage(row rowScanner) (version.Message, error) {
 	if err := row.Scan(&message.ID, &message.ConversationID, &message.Role, &parts, &refs, &tokenUsage,
 		&message.ActorID, &message.AgentRunID, &message.ClientMessageID,
 		&message.ReplyToMessageID, &message.CreatedAt,
-		&message.AuthorAgent, &message.Kind, &message.ActualModel); err != nil {
+		&message.AuthorAgent, &message.Kind, &message.StreamState, &message.ActualModel); err != nil {
 		return version.Message{}, err
 	}
 	if len(parts) > 0 {
@@ -909,9 +1401,15 @@ func scanSummary(row rowScanner) (version.ConversationSummary, error) {
 		&meta, &summary.UpdatedAt); err != nil {
 		return version.ConversationSummary{}, err
 	}
-	summary.PinnedFacts = decodeStringSlice(pinned)
+	pinnedFacts, err := decodeStringSlice(pinned)
+	if err != nil {
+		return version.ConversationSummary{}, err
+	}
+	summary.PinnedFacts = pinnedFacts
 	if len(meta) > 0 {
-		_ = json.Unmarshal(meta, &summary.SummaryMeta)
+		if err := json.Unmarshal(meta, &summary.SummaryMeta); err != nil {
+			return version.ConversationSummary{}, fmt.Errorf("decode summary meta: %w", err)
+		}
 	}
 	return summary, nil
 }

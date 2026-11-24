@@ -14,6 +14,7 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
+	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -52,6 +53,13 @@ func TestBriefingReaderSQL(t *testing.T) {
 		}
 		if source.Requirements.Confirmed[index].Acceptance == "" {
 			t.Fatalf("confirmed requirement %d lost acceptance criteria", index)
+		}
+		// v0.2.4-B (T8): the column is a JSONB array of {id,given,when,then} now.
+		// The briefing port is still one string, so the adapter renders it -- the
+		// model must never be handed the raw JSON document.
+		wantAcceptance := "AC-1 / 验收：" + want
+		if got := source.Requirements.Confirmed[index].Acceptance; got != wantAcceptance {
+			t.Fatalf("confirmed requirement %d acceptance = %q, want %q", index, got, wantAcceptance)
 		}
 	}
 	if !reflect.DeepEqual(source.Requirements.Gaps, []string{"草稿需求"}) {
@@ -164,8 +172,8 @@ func TestBriefingReaderSQL(t *testing.T) {
 // production plan read: loadBriefingPlan must SELECT the stored revision and
 // scan it into the snapshot, because the Host consumes it to guard plan.update
 // instead of guessing it and absorbing a conflict. The function is called
-// directly so the test stays focused on the plan read (Task 29 updated the
-// sibling knowledge read to the v0.22 version_sut.scope_exclude shape). A row
+// directly so the test stays focused on the plan read (Task 15 updated the
+// sibling knowledge read to the v0.2.4-B environment->SUT catalog shape). A row
 // written without a revision keeps the migration default 1.
 func TestLoadBriefingPlanSQLRevision(t *testing.T) {
 	pool := testutil.NewDB(t)
@@ -176,8 +184,8 @@ func TestLoadBriefingPlanSQLRevision(t *testing.T) {
 			t.Fatalf("seed: %v\nSQL: %s", err, sql)
 		}
 	}
-	exec(`INSERT INTO version (id, title, status, created_by, stage)
-		VALUES (9006, '计划版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, environment_id)
+		VALUES (9006, '计划版本', 'running', 1, 'executing', 7106)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order, revision)
 		VALUES (9511, 9006, 'execute', '准备', 'pending', 0, 4)`)
 	exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order)
@@ -229,7 +237,7 @@ func TestBriefingReaderSQLEmptyAndLimits(t *testing.T) {
 		t.Fatalf("NewBriefingReader: %v", err)
 	}
 
-	exec(`INSERT INTO version (id, title, status, created_by, stage) VALUES (9002, '空版本', 'running', 1, 'created')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, environment_id) VALUES (9002, '空版本', 'running', 1, 'created', 7102)`)
 	empty, err := reader.Load(ctx, 9002)
 	if err != nil {
 		t.Fatalf("Load(empty): %v", err)
@@ -250,7 +258,7 @@ func TestBriefingReaderSQLEmptyAndLimits(t *testing.T) {
 		t.Fatalf("empty version sections are not empty: %#v", empty)
 	}
 
-	exec(`INSERT INTO version (id, title, status, created_by, stage) VALUES (9003, '大版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, environment_id) VALUES (9003, '大版本', 'running', 1, 'executing', 7103)`)
 	for index := 0; index < 25; index++ {
 		requirementID := int64(9301 + index)
 		revisionID := int64(9401 + index)
@@ -259,7 +267,8 @@ func TestBriefingReaderSQLEmptyAndLimits(t *testing.T) {
 			VALUES ($1, 9003, $2, 'clarified')`, requirementID, revisionID)
 		exec(`INSERT INTO requirement_version
 			(id, requirement_id, revision, title, acceptance_criteria, content_hash)
-			VALUES ($1, $2, 1, $3, $4, $5)`,
+			VALUES ($1, $2, 1, $3, jsonb_build_array(jsonb_build_object(
+				'id', 'AC-1', 'given', '', 'when', '', 'then', $4::text)), $5)`,
 			revisionID, requirementID, title, "验收："+title, hash(index+100))
 		exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, sort_order)
 			VALUES ($1, 9003, 'execute', $2, 'pending', $3)`,
@@ -343,8 +352,8 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 		return source
 	}
 
-	exec(`INSERT INTO version (id, title, status, created_by, stage)
-		VALUES (9004, '阻塞版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, environment_id)
+		VALUES (9004, '阻塞版本', 'running', 1, 'executing', 7104)`)
 
 	// A login-takeover pause was resumed: the internal token is still on the
 	// running wave, but the briefing must not show a stale blocker.
@@ -387,7 +396,7 @@ func TestBriefingReaderSQLExecutionBlocker(t *testing.T) {
 	// never truncated by the renderer.
 	longReason := strings.Repeat("验", 300)
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at)
-		VALUES (10012, 9004, 'other', jsonb_build_object('reason', $1::text), 'pending', now())`, longReason)
+		VALUES (10012, 9004, 'clarification_question', jsonb_build_object('reason', $1::text), 'pending', now())`, longReason)
 	source = assertBlocker("cancelled", "")
 	if len(source.OpenQuestions.Questions) != 1 {
 		t.Fatalf("questions = %#v", source.OpenQuestions.Questions)
@@ -418,8 +427,8 @@ func TestBriefingReaderSQLSourceStale(t *testing.T) {
 		t.Fatalf("NewBriefingReader: %v", err)
 	}
 
-	exec(`INSERT INTO version (id, title, status, created_by, stage)
-		VALUES (9005, '源失效版本', 'running', 1, 'executing')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, environment_id)
+		VALUES (9005, '源失效版本', 'running', 1, 'executing', 7105)`)
 	exec(`INSERT INTO knowledge_item (id, scope, title, content, status, confidence, source_version_id)
 		VALUES (12001, 'global', '源版本存在知识', '应注入简报', 'approved', 0.90, 9005)`)
 	exec(`INSERT INTO knowledge_item (id, scope, title, content, status, confidence, source_version_id)
@@ -470,6 +479,185 @@ func TestBriefingReaderSQLSourceStale(t *testing.T) {
 
 // briefingSeedSQL seeds every table the briefing reads plus unrelated credential
 // rows that must never be read.
+// TestBriefingAndHandoffPlanTerminalAgree is the divergence guard for the two
+// readers that feed the same Design Host flow: the agent briefing (SQL filter via
+// the bound terminal set) and the design handoff (the version.PlanItemTerminal Go
+// predicate). Before v0.2.4-B fix round 2 they carried divergent hand-written
+// terminal sets, so a failed/closed item was finished in one and open in the other.
+// For every status the writers produce (and the finished-state synonyms the
+// free-form plan.update tool may write, plus normalization variants), both readers
+// must classify identically and match the single domain authority. A future edit
+// that re-diverges either reader fails here.
+func TestBriefingAndHandoffPlanTerminalAgree(t *testing.T) {
+	statuses := []string{
+		// Writer-produced: planner pending; extraction milestone in_progress/done/failed.
+		"pending", "in_progress", "done", "failed",
+		// Finished-state synonyms the model may write (free-form plan.update).
+		"completed", "cancelled", "canceled", "skipped", "closed",
+		// Normalization variants (trim + lower-case). The whitespace-padded cases pin
+		// M2/M-a: the SQL btrim(status, E' \t\n\r\v\f') must trim the same ASCII
+		// whitespace as the Go predicate's TrimSpace (space, tab, newline, CR, vertical
+		// tab, form feed), or a padded status diverges between the two readers.
+		"Done", "FAILED", " done ", "In_Progress", "\tdone\t", "\nfailed\n", "\rcompleted\r", "\vdone\v", "\fdone\f",
+		// An unknown ongoing value defaults to open.
+		"blocked",
+	}
+	for _, status := range statuses {
+		t.Run(status, func(t *testing.T) {
+			pool := testutil.NewDB(t)
+			ctx := context.Background()
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatalf("seed: %v\nSQL: %s", err, sql)
+				}
+			}
+			exec(`INSERT INTO environment (id, name) VALUES (7101, 'staging')`)
+			exec(`INSERT INTO version (id, title, status, created_by, stage, blocker, environment_id)
+				VALUES (9001, 'plan terminal', 'running', 1, 'executing', '', 7101)`)
+			exec(`INSERT INTO version_plan_item (id, version_id, phase, title, status, depends_on, sort_order)
+				VALUES (9501, 9001, 'execute', 'item', $1, '{}'::bigint[], 0)`, status)
+
+			// Briefing reader: SQL classification via the bound terminal set.
+			tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+			if err != nil {
+				t.Fatalf("begin tx: %v", err)
+			}
+			var source agentcontext.Source
+			if err := loadBriefingPlan(ctx, tx, 9001, &source); err != nil {
+				tx.Rollback(ctx)
+				t.Fatalf("loadBriefingPlan: %v", err)
+			}
+			tx.Rollback(ctx)
+			briefingOpen := len(source.Plan) > 0
+
+			// Handoff reader: the version.PlanItemTerminal Go predicate.
+			plan, err := versionpg.NewHandoffReader(pool).Plan(ctx, 9001)
+			if err != nil {
+				t.Fatalf("handoff Plan: %v", err)
+			}
+			handoffOpen := plan.Current != nil
+
+			terminal := versiondomain.PlanItemTerminal(status)
+			if briefingOpen != !terminal {
+				t.Fatalf("briefing open=%v for status %q, want %v (terminal=%v)", briefingOpen, status, !terminal, terminal)
+			}
+			if handoffOpen != !terminal {
+				t.Fatalf("handoff open=%v for status %q, want %v (terminal=%v)", handoffOpen, status, !terminal, terminal)
+			}
+			if briefingOpen != handoffOpen {
+				t.Fatalf("readers disagree for status %q: briefing open=%v, handoff open=%v", status, briefingOpen, handoffOpen)
+			}
+		})
+	}
+}
+
+// TestBriefingKnowledgeScopeExcludesProposedSUT pins R-B4 in the briefing knowledge
+// scope reader: a proposed or rejected SUT contributes NOTHING to the version's
+// knowledge scope — not its family, not its system id, and not even its approved
+// pages/APIs. Each non-approved SUT here owns an APPROVED page AND an APPROVED API,
+// so the asset-status filter alone would admit them; only the SUT-level gate
+// excludes them whole (a proposed SUT with no assets would prove nothing). An
+// approved SUT's assets still appear. The gate's empty-status branch mirrors
+// IsApproved's resource_0005 backfill compatibility but is unreachable in the DB
+// (chk_sut_status forbids an empty status). The account query is version-bound,
+// not SUT-bound, and is deliberately not SUT-gated.
+func TestBriefingKnowledgeScopeExcludesProposedSUT(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v\nSQL: %s", err, sql)
+		}
+	}
+	exec(`INSERT INTO environment (id, name) VALUES (7101, 'staging')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, blocker, environment_id)
+		VALUES (9001, 'R-B4 scope', 'running', 1, 'executing', '', 7101)`)
+	// Approved SUT with an approved page and API: these stay in scope.
+	exec(`INSERT INTO sut (id, name, created_by, family, environment_id, base_url, status)
+		VALUES (7001, 'Approved SUT', 1, 'payments', 7101, 'https://approved.test', 'approved')`)
+	exec(`INSERT INTO sut_page (id, sut_id, name, url, route_template, status)
+		VALUES (7201, 7001, 'Checkout', 'https://approved.test/checkout', '/checkout', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, method, path_template, name, status)
+		VALUES (7301, 7001, 'POST', '/api/checkout', 'Checkout API', 'approved')`)
+	// Proposed SUT owning an APPROVED page and API: the asset-status filter alone
+	// would admit these; the SUT gate must exclude them whole.
+	exec(`INSERT INTO sut (id, name, created_by, family, environment_id, base_url, status)
+		VALUES (7002, 'Proposed SUT', 1, 'billing', 7101, 'https://proposed.test', 'proposed')`)
+	exec(`INSERT INTO sut_page (id, sut_id, name, url, route_template, status)
+		VALUES (7202, 7002, 'Proposed page', 'https://proposed.test/p', '/proposed-page', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, method, path_template, name, status)
+		VALUES (7302, 7002, 'POST', '/api/proposed', 'Proposed API', 'approved')`)
+	// Rejected SUT: the gate is fail-closed for any explicit non-approved status.
+	exec(`INSERT INTO sut (id, name, created_by, family, environment_id, base_url, status)
+		VALUES (7003, 'Rejected SUT', 1, 'shipping', 7101, 'https://rejected.test', 'rejected')`)
+	exec(`INSERT INTO sut_page (id, sut_id, name, url, route_template, status)
+		VALUES (7203, 7003, 'Rejected page', 'https://rejected.test/p', '/rejected-page', 'approved')`)
+	exec(`INSERT INTO sut_api (id, sut_id, method, path_template, name, status)
+		VALUES (7303, 7003, 'POST', '/api/rejected', 'Rejected API', 'approved')`)
+	// M4: an active account AFFILIATED with the proposed SUT, bound to the version.
+	// Accounts are version-bound (version_account), not SUT-bound: the account query
+	// must NOT gate by SUT status, so this role stays in scope even though its
+	// affinity SUT is proposed. A future contributor adding a SUT gate to the account
+	// query fails here.
+	exec(`INSERT INTO test_account (id, sut_id, username, password, roles, status)
+		VALUES (7601, 7002, 'buyer', 'hunter2', '["auditor"]'::jsonb, 'active')`)
+	exec(`INSERT INTO version_account (id, version_id, account_id, enabled)
+		VALUES (7501, 9001, 7601, true)`)
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	scope, err := readBriefingKnowledgeScope(ctx, tx, 9001)
+	if err != nil {
+		t.Fatalf("readBriefingKnowledgeScope: %v", err)
+	}
+
+	// The approved SUT's assets are present.
+	if _, ok := scope.pageKeys["/checkout"]; !ok {
+		t.Fatalf("approved SUT page missing from scope: %#v", scope.pageKeys)
+	}
+	if _, ok := scope.apiKeys["POST /api/checkout"]; !ok {
+		t.Fatalf("approved SUT API missing from scope: %#v", scope.apiKeys)
+	}
+	if _, ok := scope.families["payments"]; !ok {
+		t.Fatalf("approved SUT family missing from scope: %#v", scope.families)
+	}
+	if _, ok := scope.systemIDs[7001]; !ok {
+		t.Fatalf("approved SUT id missing from scope: %#v", scope.systemIDs)
+	}
+	// Neither the proposed nor the rejected SUT leaks any dimension, despite owning
+	// approved assets.
+	for _, key := range []string{"/proposed-page", "/rejected-page"} {
+		if _, ok := scope.pageKeys[key]; ok {
+			t.Fatalf("non-approved SUT approved page %q leaked into scope: %#v", key, scope.pageKeys)
+		}
+	}
+	for _, key := range []string{"POST /api/proposed", "POST /api/rejected"} {
+		if _, ok := scope.apiKeys[key]; ok {
+			t.Fatalf("non-approved SUT approved API %q leaked into scope: %#v", key, scope.apiKeys)
+		}
+	}
+	for _, family := range []string{"billing", "shipping"} {
+		if _, ok := scope.families[family]; ok {
+			t.Fatalf("non-approved SUT family %q leaked into scope: %#v", family, scope.families)
+		}
+	}
+	for _, id := range []int64{7002, 7003} {
+		if _, ok := scope.systemIDs[id]; ok {
+			t.Fatalf("non-approved SUT id %d leaked into scope: %#v", id, scope.systemIDs)
+		}
+	}
+	// M4: accounts stay ungated by SUT status — the proposed-SUT-affiliated account's
+	// role is still in scope (accounts are version-bound, not SUT-bound).
+	if _, ok := scope.accountRoles["auditor"]; !ok {
+		t.Fatalf("version-bound account role missing (accounts must not be SUT-gated): %#v", scope.accountRoles)
+	}
+}
+
 func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 	t.Helper()
 	hash := func(value int) string { return fmt.Sprintf("%064x", value) }
@@ -480,25 +668,26 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		}
 	}
 
-	exec(`INSERT INTO version (id, title, status, created_by, stage, blocker)
-		VALUES ($1, $2, 'running', 1, 'executing', '')`, 9001, "结算版本")
+	exec(`INSERT INTO environment (id, name) VALUES (7101, 'staging')`)
+	exec(`INSERT INTO version (id, title, status, created_by, stage, blocker, environment_id)
+		VALUES ($1, $2, 'running', 1, 'executing', '', 7101)`, 9001, "结算版本")
 
-	exec(`INSERT INTO sut (id, name, created_by, family) VALUES ($1, $2, 1, 'payments')`, 7001, "Shop")
-	exec(`INSERT INTO sut_environment (id, sut_id, name, base_url)
-		VALUES (7101, 7001, 'staging', 'https://shop.test')`)
-	exec(`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template)
-		VALUES (7201, 7001, 7101, 'Checkout', 'https://shop.test/checkout', '/checkout')`)
-	exec(`INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name)
-		VALUES (7301, 7001, 7101, 'POST', '/api/checkout', 'Checkout API')`)
-	// v0.22 binding shape: version_sut carries the environment exclusions
-	// (empty = whole environment) and accounts are the enabled rows of the
-	// global test-account pool.
-	exec(`INSERT INTO version_sut (id, version_id, sut_id, environment_id)
-		VALUES (7401, 9001, 7001, 7101)`)
+	// v0.2.4-B hierarchy: environment -> SUT -> assets. The version binds the
+	// environment directly (version.environment_id); the SUT belongs to that
+	// environment and owns its pages/APIs/databases by sut_id alone. The old
+	// sut_environment / version_sut chain is gone.
+	exec(`INSERT INTO sut (id, name, created_by, family, environment_id, base_url)
+		VALUES ($1, $2, 1, 'payments', 7101, 'https://shop.test')`, 7001, "Shop")
+	exec(`INSERT INTO sut_page (id, sut_id, name, url, route_template)
+		VALUES (7201, 7001, 'Checkout', 'https://shop.test/checkout', '/checkout')`)
+	exec(`INSERT INTO sut_api (id, sut_id, method, path_template, name)
+		VALUES (7301, 7001, 'POST', '/api/checkout', 'Checkout API')`)
 
 	// Credentials in sibling resource tables must never reach the briefing.
-	exec(`INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username, password)
-		VALUES (7801, 7001, 7101, 'main', 'postgres://user:secret@db/test', 'user', 'db-password')`)
+	exec(`INSERT INTO target_database (id, sut_id, name, dsn, username, password)
+		VALUES (7801, 7001, 'main', 'postgres://user:secret@db/test', 'user', 'db-password')`)
+	// Accounts stay a global pool; the version opts into the enabled subset
+	// through version_account (unchanged by the inversion).
 	exec(`INSERT INTO test_account (id, username, password, roles)
 		VALUES (7601, 'buyer', 'hunter2', '[" buyer ", " auditor ", ""]'::jsonb)`)
 	exec(`INSERT INTO version_account (id, version_id, account_id, enabled)
@@ -519,7 +708,8 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 			VALUES ($1, 9001, $2, $3)`, requirement.id, requirement.currentID, requirement.status)
 		exec(`INSERT INTO requirement_version
 			(id, requirement_id, revision, title, acceptance_criteria, content_hash)
-			VALUES ($1, $2, 1, $3, $4, $5)`,
+			VALUES ($1, $2, 1, $3, jsonb_build_array(jsonb_build_object(
+				'id', 'AC-1', 'given', '', 'when', '', 'then', $4::text)), $5)`,
 			requirement.currentID, requirement.id, requirement.title,
 			"验收："+requirement.title, hash(index+1))
 	}
@@ -604,7 +794,7 @@ func briefingSeedSQL(t *testing.T, pool *pgxpool.Pool, base time.Time) {
 		VALUES (10002, 9001, 'conflict', '{"reason":"账号归属冲突"}'::jsonb, 'pending', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(4*time.Hour))
 	exec(`INSERT INTO human_request (id, version_id, kind, payload, status, expires_at, created_at)
-		VALUES (10003, 9001, 'other', '{"reason":"已处理"}'::jsonb, 'answered', $1, $2)`,
+		VALUES (10003, 9001, 'clarification_question', '{"reason":"已处理"}'::jsonb, 'answered', $1, $2)`,
 		base.Add(5*time.Hour), base.Add(5*time.Hour))
 
 	knowledge := []struct {

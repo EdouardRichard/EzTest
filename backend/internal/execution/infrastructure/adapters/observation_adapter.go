@@ -44,11 +44,16 @@ func (a *DiscoveryObservationAdapter) ListForDelta(ctx context.Context, versionI
 	observations := make([]versionapp.DiscoveryObservation, 0, len(rows))
 	for _, row := range rows {
 		observations = append(observations, versionapp.DiscoveryObservation{
-			ObservationID:    row.ObservationID,
-			VersionID:        row.VersionID,
-			WaveID:           row.WaveID,
-			CaseRunID:        row.CaseRunID,
-			VersionSUTID:     row.VersionSUTID,
+			ObservationID: row.ObservationID,
+			VersionID:     row.VersionID,
+			WaveID:        row.WaveID,
+			CaseRunID:     row.CaseRunID,
+			// v0.2.4-B: the version-side delta projection is keyed by SUT now
+			// that pages/APIs belong to a SUT instead of an environment. Both
+			// sides now name the field SUTID: the execution column was renamed
+			// by execution_0008_v024_rekey, and the value it carries is the SUT
+			// the observation was made against.
+			SUTID:            row.SUTID,
 			EnvironmentID:    row.EnvironmentID,
 			Kind:             row.Kind,
 			Method:           row.Method,

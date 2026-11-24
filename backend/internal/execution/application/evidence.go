@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 
@@ -33,15 +34,15 @@ type ContentStore interface {
 }
 
 // EvidenceInput is one evidence upload. Auto marks evidence produced by a tool
-// or executor artifact (screenshot/console/network/http/db/download and the P5
-// visual_actual/visual_diff captures) rather than execution.evidence.
+// or executor artifact (screenshot/console/network/http/db/download and the
+// recording-layer command/file/trace kinds) rather than execution.evidence.
 type EvidenceInput struct {
 	Kind         execution.EvidenceKind
 	Data         []byte
 	Filename     string
 	StepSeq      *int
 	AssertionSeq *int
-	VersionSUTID *int64
+	SUTID        *int64
 	Auto         bool
 }
 
@@ -75,22 +76,35 @@ func (s *CaseRunner) addEvidenceForRun(ctx context.Context, caseRun execution.Ca
 			Message: fmt.Sprintf("evidence exceeds the %d byte limit", maxBytes),
 		}
 	}
-	count, err := s.evidence.CountByCaseRun(ctx, caseRun.ID)
-	if err != nil {
-		return execution.Evidence{}, mapExecutionError(err, "evidence")
+	// The per-case-run row cap is configurable (0 = unlimited, the default):
+	// the recording layer must not silently lose command/file/trace evidence
+	// to a hard-coded limit. A configured cap still drops overflow without
+	// failing the run, but every drop is explicit — one evidence.skipped event
+	// per dropped item makes it countable from the append-only event ledger.
+	if maxPerRun := s.intSetting("execution.evidence_max_per_case_run", 0); maxPerRun > 0 {
+		count, err := s.evidence.CountByCaseRun(ctx, caseRun.ID)
+		if err != nil {
+			return execution.Evidence{}, mapExecutionError(err, "evidence")
+		}
+		if int64(count) >= maxPerRun {
+			// cap and evidence_count are the same Go type (int64) in the
+			// evidence.skipped payload — one event shape, one numeric type (T22,
+			// T6 routing).
+			s.recordEvidenceDrops(ctx, caseRun, 1, "evidence_cap_reached", in.Kind, map[string]any{
+				"cap":            maxPerRun,
+				"evidence_count": int64(count),
+			})
+			return execution.Evidence{}, nil
+		}
 	}
-	if count >= evidenceMaxPerCaseRun {
-		// Overflow is dropped and counted, never failed (P3-D-21).
-		return execution.Evidence{}, nil
+	sutID := in.SUTID
+	if sutID != nil && *sutID <= 0 {
+		sutID = nil
 	}
-	versionSUTID := in.VersionSUTID
-	if versionSUTID != nil && *versionSUTID <= 0 {
-		versionSUTID = nil
-	}
-	if versionSUTID == nil {
-		// Single-SUT runs and tools that omit version_sut_id must still produce
-		// per-SUT evidence (P3 §13.2-2/4: everything carries version_sut_id).
-		versionSUTID = s.defaultEvidenceVersionSUT(ctx, caseRun)
+	if sutID == nil {
+		// Single-SUT runs and tools that omit sut_id must still produce
+		// per-SUT evidence (P3 §13.2-2/4: everything carries sut_id).
+		sutID = s.defaultEvidenceSUT(ctx, caseRun)
 	}
 	evidenceID := s.nextID()
 	filename := sanitizeEvidenceFilename(in.Filename)
@@ -107,7 +121,7 @@ func (s *CaseRunner) addEvidenceForRun(ctx context.Context, caseRun execution.Ca
 	evidence := execution.Evidence{
 		ID:             evidenceID,
 		CaseRunID:      caseRun.ID,
-		VersionSUTID:   versionSUTID,
+		SUTID:          sutID,
 		StepSeq:        in.StepSeq,
 		AssertionSeq:   in.AssertionSeq,
 		Kind:           in.Kind,
@@ -127,22 +141,22 @@ func (s *CaseRunner) addEvidenceForRun(ctx context.Context, caseRun execution.Ca
 	return evidence, nil
 }
 
-// defaultEvidenceVersionSUT resolves the SUT attribution for evidence created
-// without an explicit version_sut_id: a single-SUT intent is unambiguous, then
+// defaultEvidenceSUT resolves the SUT attribution for evidence created
+// without an explicit sut_id: a single-SUT intent is unambiguous, then
 // the case default target is used. Cross-system runs should pass the target
 // explicitly from the tool scope; nil remains allowed only if the case has no
 // resolvable SUT metadata.
-func (s *CaseRunner) defaultEvidenceVersionSUT(ctx context.Context, caseRun execution.CaseRun) *int64 {
+func (s *CaseRunner) defaultEvidenceSUT(ctx context.Context, caseRun execution.CaseRun) *int64 {
 	if s.intents != nil {
-		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil && len(intent.VersionSUTIDs) == 1 && intent.VersionSUTIDs[0] > 0 {
-			id := intent.VersionSUTIDs[0]
+		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil && len(intent.SUTIDs) == 1 && intent.SUTIDs[0] > 0 {
+			id := intent.SUTIDs[0]
 			return &id
 		}
 	}
 	if s.cases != nil {
 		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil {
-			if snapshot, err := s.cases.GetCaseVersion(ctx, intent.VersionID, caseRun.CaseVersionID); err == nil && snapshot.DefaultVersionSUTID > 0 {
-				id := snapshot.DefaultVersionSUTID
+			if snapshot, err := s.cases.GetCaseVersion(ctx, intent.VersionID, caseRun.CaseVersionID); err == nil && snapshot.DefaultSUTID > 0 {
+				id := snapshot.DefaultSUTID
 				return &id
 			}
 		}
@@ -162,7 +176,10 @@ func (s *CaseRunner) EvidenceText(ctx context.Context, scope tools.Scope, in too
 		return nil, err
 	}
 	if evidence.ID == 0 {
-		return map[string]any{"skipped": true, "reason": "evidence_cap_reached"}, nil
+		// Unified drop shape (v0.2.4-C T11): every tool result reports the dropped
+		// COUNT as evidence_skipped plus evidence_skipped_reason — the same
+		// contract as the browser/http/db/general-execution paths.
+		return map[string]any{"evidence_skipped": 1, "evidence_skipped_reason": "evidence_cap_reached"}, nil
 	}
 	return map[string]any{
 		"evidence_id": platformid.Format(evidence.ID),
@@ -197,8 +214,8 @@ func (s *CaseRunner) EvidenceRead(ctx context.Context, scope tools.Scope, in too
 		"size_bytes":  evidence.SizeBytes,
 		"sha256":      evidence.SHA256,
 	}
-	if evidence.VersionSUTID != nil {
-		result["version_sut_id"] = platformid.Format(*evidence.VersionSUTID)
+	if evidence.SUTID != nil {
+		result["sut_id"] = platformid.Format(*evidence.SUTID)
 	}
 	if evidence.StepSeq != nil {
 		result["step_seq"] = *evidence.StepSeq
@@ -294,6 +311,45 @@ func (s *CaseRunner) publishEvidenceEvent(caseRun execution.CaseRun, evidence ex
 		"size_bytes":  evidence.SizeBytes,
 	}
 	publishEvent(context.Background(), s.events, EventEvidenceCreated, s.versionForCaseRun(caseRun), scope, payload, nil)
+}
+
+// recordEvidenceDrops persists the evidence-drop FACT and emits one
+// evidence.skipped event per dropped item. The fact (case_run.evidence_dropped)
+// is what the verdict aggregation reads to degrade the run to inconclusive
+// (constitution art.4.5); the event is the append-only audit trail. Both are
+// written here so no drop path can produce one without the other.
+//
+// A repository failure is logged loudly and still emits the event: the drop must
+// never become invisible, and the settlement re-reads the fact before writing the
+// terminal state.
+func (s *CaseRunner) recordEvidenceDrops(ctx context.Context, caseRun execution.CaseRun, count int64, reason string, kind execution.EvidenceKind, extra map[string]any) {
+	if count <= 0 {
+		return
+	}
+	if s.caseRuns != nil {
+		if _, err := s.caseRuns.AddEvidenceDrop(ctx, caseRun.ID, count); err != nil {
+			slog.ErrorContext(ctx, "could not persist the evidence drop fact",
+				"case_run_id", caseRun.ID, "dropped", count, "reason", reason, "error", err)
+		}
+	}
+	if s.events == nil {
+		return
+	}
+	scope := map[string]any{
+		"case_run_id": platformid.Format(caseRun.ID),
+		"wave_id":     platformid.Format(caseRun.WaveID),
+	}
+	for i := int64(0); i < count; i++ {
+		payload := map[string]any{
+			"case_run_id": platformid.Format(caseRun.ID),
+			"kind":        string(kind),
+			"reason":      reason,
+		}
+		for key, value := range extra {
+			payload[key] = value
+		}
+		publishEvent(context.Background(), s.events, EventEvidenceSkipped, s.versionForCaseRun(caseRun), scope, payload, nil)
+	}
 }
 
 func sanitizeEvidenceFilename(name string) string {

@@ -4,15 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"strings"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Reconcile scans candidate versions and repairs missed design rounds, scopes,
-// tasks and stale markers. It is called by the agent reconciler on its P1 3s
-// cycle; every operation is idempotent.
+// tasks and stale markers. It is called by the agent reconciler, which is
+// event-driven (every persisted event wakes a coalescing pass) with a periodic
+// scan as the safety net; every operation is idempotent.
 func (p *Planner) Reconcile(ctx context.Context) error {
 	versionIDs, err := p.repo.ListCandidateVersionIDs(ctx, 100)
 	if err != nil {
@@ -37,9 +42,11 @@ func (p *Planner) Reconcile(ctx context.Context) error {
 
 // convergeCompleteDesign applies the designing -> case_review edge when every
 // activated, still-clarified requirement has usable case coverage (a scenario
-// and a current draft/confirmed case, no stale current case). Missing coverage
-// or an uncovered requirement leaves the version designing; the stage machine is
-// the final guard and only transitions a version that is still designing.
+// and a current draft/confirmed case, no stale current case) AND the shared
+// review gate passes (AC coverage complete + every current draft review-complete,
+// T9). Missing coverage, an uncovered requirement or a closed review gate leaves
+// the version designing; the stage machine is the final guard and only
+// transitions a version that is still designing.
 func (p *Planner) convergeCompleteDesign(ctx context.Context, versionID int64) error {
 	if p == nil || p.converger == nil {
 		return nil
@@ -50,7 +57,7 @@ func (p *Planner) convergeCompleteDesign(ctx context.Context, versionID int64) e
 	}
 	considered := 0
 	for _, item := range coverage {
-		if !strings.EqualFold(strings.TrimSpace(item.Requirement.Status), "clarified") {
+		if !strings.EqualFold(strings.TrimSpace(item.Requirement.Status), string(version.RequirementClarified)) {
 			continue
 		}
 		considered++
@@ -59,6 +66,35 @@ func (p *Planner) convergeCompleteDesign(ctx context.Context, versionID int64) e
 		}
 	}
 	if considered == 0 {
+		return nil
+	}
+	// T9 shared review gate: the SAME predicate the manual stage advance calls
+	// (versionapp.DesignReviewGate). NeedsRedesign above keeps the legacy
+	// zero-coverage/stale redesign trigger; the gate adds the AC-coverage and
+	// judge-review completeness checks. A closed gate (coverage gap / unreviewed
+	// drafts) leaves the version designing quietly: converge is best-effort
+	// idempotent and the next reconciler pass retries. An UNREADABLE gate also
+	// leaves it designing but is logged at WARN (an infra fault is not a verdict).
+	// An unwired gate fails closed the same way the manual edge does (T13 wires
+	// the real gate).
+	if p.reviewGate == nil {
+		return nil
+	}
+	if err := p.reviewGate.ReviewGate(ctx, versionID); err != nil {
+		// A typed 409 is the gate's VERDICT (coverage gap / unreviewed drafts):
+		// the designed outcome of every pass while the author still works, so it
+		// stays quiet. Anything else is an infrastructure fault — a persistent
+		// judgment-store outage would otherwise pin the version in designing with
+		// no signal at all (constitution VII.6 no silent degradation, VII.7
+		// observability is a feature). Log it with the version and the cause;
+		// still do not converge, and still return nil so one unreadable version
+		// cannot abort the whole reconcile pass.
+		if apiErr := platform.AsError(err); apiErr == nil || apiErr.Status != http.StatusConflict {
+			p.log().WarnContext(ctx, "design converge: review gate unreadable; version stays designing",
+				slog.Int64("version_id", versionID),
+				slog.String("error", err.Error()),
+			)
+		}
 		return nil
 	}
 	return p.converger.ConvergeDesign(ctx, versionID)
@@ -149,7 +185,7 @@ func (p *Planner) ScanVersion(ctx context.Context, versionID int64) error {
 		if err := p.ensureCoverageRepairTasks(ctx, versionID, redesign, latestConversation, round.ID); err != nil {
 			return err
 		}
-		return p.ensureCriticAndDataPlanTasks(ctx, versionID)
+		return p.ensureCriticTasks(ctx, versionID)
 	})
 }
 
@@ -221,7 +257,7 @@ func (p *Planner) autoStartIfEnabled(ctx context.Context, versionID int64) error
 		if err := p.ensureRequirementTasks(ctx, versionID, pending, "auto_new", conversationID, round.ID); err != nil {
 			return err
 		}
-		if err := p.ensureCriticAndDataPlanTasks(ctx, versionID); err != nil {
+		if err := p.ensureCriticTasks(ctx, versionID); err != nil {
 			return err
 		}
 		p.markRunning(ctx, versionID)

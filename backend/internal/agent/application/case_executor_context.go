@@ -12,39 +12,45 @@ import (
 // Task 98: per-turn cost and budget-exit recording of the case executor.
 //
 // Usage is cumulative across the turns of one execute.case run and every turn
-// re-sends the whole transcript. The browser read tools return large payloads
-// (browser.snapshot is capped at 12KB ARIA by the executor protocol), so
-// replaying every older page read made the S5 retry-7 four-step case spend
-// 406,167 tokens in 23 turns while still on step 1/4. Only the newest page reads
+// re-sends the whole transcript. Read tools return large payloads (a page
+// snapshot read through the execution surface, a file body, a schema summary),
+// so replaying every older read made the S5 retry-7 four-step case spend
+// 406,167 tokens in 23 turns while still on step 1/4. Only the newest reads
 // are replayed verbatim; older ones become a bounded stub. The tools are
-// re-readable and a stale page tree is not needed to act on the current page.
+// re-readable and a stale read is not needed to act on the current state.
 const (
-	// caseExecutorKeepRecentBrowserReads is the number of newest browser read
-	// results kept verbatim in the prompt transcript.
-	caseExecutorKeepRecentBrowserReads = 2
-	// caseExecutorPrunedBrowserRead is the bounded replacement of one older
-	// browser read tool result. It names the tool so the model knows it can ask
-	// for the current page state again instead of trusting a stale tree.
-	caseExecutorPrunedBrowserRead = `{"pruned":true,"tool":%q,"note":"older browser read elided to bound the transcript; call this tool again if the current page state is still needed"}`
+	// caseExecutorKeepRecentReads is the number of newest read-tool results
+	// kept verbatim in the prompt transcript.
+	caseExecutorKeepRecentReads = 2
+	// caseExecutorPrunedRead is the bounded replacement of one older read tool
+	// result. It names the tool so the model knows it can read the current
+	// state again instead of trusting a stale payload.
+	caseExecutorPrunedRead = `{"pruned":true,"tool":%q,"note":"older tool read elided to bound the transcript; read it again if the content is still needed"}`
 	// caseExecutorPendingAssertionLimit bounds the settlement instructions.
 	caseExecutorPendingAssertionLimit = 12
 )
 
-// caseExecutorBrowserReadTools are the page-read tools whose older results are
-// pruned from the prompt transcript. They are re-readable and their full content
-// is also kept by the auto-evidence path (console/network) where applicable.
-var caseExecutorBrowserReadTools = map[string]struct{}{
-	tools.ToolBrowserSnapshot:     {},
-	tools.ToolBrowserConsole:      {},
-	tools.ToolBrowserNetwork:      {},
-	tools.ToolBrowserStorageState: {},
+// caseExecutorPrunableReadTools are the pure read tools whose older results are
+// pruned from the prompt transcript (v0.2.4-C T13: the retired browser.* read
+// actions are replaced by the capability-domain read surface). They are
+// re-readable and carry no side effects, so eliding an older result never hides
+// an action the model must remember; side-effectful tools (exec.run,
+// http.request, db.query) are deliberately NOT pruned here.
+var caseExecutorPrunableReadTools = map[string]struct{}{
+	tools.ToolShellRead:             {},
+	tools.ToolFileRead:              {},
+	tools.ToolFileList:              {},
+	tools.ToolPTYRead:               {},
+	tools.ToolDatabaseSchemaRead:    {},
+	tools.ToolExecutionEvidenceRead: {},
+	tools.ToolToolResultRead:        {},
 }
 
 // caseExecutorSettlementTools is the recording-only tool surface of a budget
 // settlement turn. The turn may write the results of steps it already executed
 // (the server still overwrites expected from the P2 assertion truth and
-// aggregates the verdict deterministically); it may not start a new browser,
-// network or database action. execution.case_finish is deliberately absent: the
+// aggregates the verdict deterministically); it may not start a new SUT action
+// (any general-execution/HTTP/database tool). execution.case_finish is deliberately absent: the
 // deterministic Finalize after the run aggregates the recorded results and
 // writes the terminal verdict together with the budget cause/handoff (Task 92).
 // Unexecuted steps stay unrecorded and therefore cannot become a pass.
@@ -73,7 +79,7 @@ func isCaseExecutorSettlementTool(name string) bool {
 }
 
 // caseExecutorSettlementRejection is the tool error of a call outside the
-// recording-only settlement surface (a browser/network action or
+// recording-only settlement surface (any SUT action tool or
 // execution.case_finish). It never reaches the SUT and explicitly tells the
 // model who writes the terminal verdict.
 func caseExecutorSettlementRejection(name string) *tools.Error {
@@ -99,13 +105,13 @@ func caseExecutorSettlementDefinitions(state *runState) []llmapp.ToolDefinition 
 	return definitions
 }
 
-// pruneCaseExecutorBrowserReads rewrites the in-memory prompt transcript of a
-// case-executor run: the newest caseExecutorKeepRecentBrowserReads browser read
-// results stay verbatim and every older one becomes a bounded stub. The tool
-// call identity is preserved (the assistant tool_call/tool message pairing stays
+// pruneCaseExecutorReads rewrites the in-memory prompt transcript of a
+// case-executor run: the newest caseExecutorKeepRecentReads read-tool results
+// stay verbatim and every older one becomes a bounded stub. The tool call
+// identity is preserved (the assistant tool_call/tool message pairing stays
 // valid) and the persisted transcript is not touched; only the per-turn model
 // prompt is bounded.
-func (r *Runner) pruneCaseExecutorBrowserReads(state *runState) {
+func (r *Runner) pruneCaseExecutorReads(state *runState) {
 	if state == nil || state.profile.Key != ProfileKeyCaseExecutor || len(state.messages) == 0 {
 		return
 	}
@@ -125,14 +131,14 @@ func (r *Runner) pruneCaseExecutorBrowserReads(state *runState) {
 			continue
 		}
 		name := callNames[message.ToolCallID]
-		if _, ok := caseExecutorBrowserReadTools[name]; !ok {
+		if _, ok := caseExecutorPrunableReadTools[name]; !ok {
 			continue
 		}
-		if kept < caseExecutorKeepRecentBrowserReads {
+		if kept < caseExecutorKeepRecentReads {
 			kept++
 			continue
 		}
-		message.Content = fmt.Sprintf(caseExecutorPrunedBrowserRead, name)
+		message.Content = fmt.Sprintf(caseExecutorPrunedRead, name)
 	}
 }
 
@@ -153,7 +159,7 @@ func caseExecutorSettlementInstruction(cause, pending string) string {
 	}
 	var builder strings.Builder
 	builder.WriteString(budget)
-	builder.WriteString("即将用尽，已停止新的浏览器/网络/数据库操作，也不能再调用 execution.case_finish；服务端会在运行结束后按已记录的步骤与断言聚合终态。你仍可调用以下记录工具，把已执行步骤的真实结果补记录完整：")
+	builder.WriteString("即将用尽，已停止新的被测系统操作（exec/shell/file/pty/http/db 等动作工具），也不能再调用 execution.case_finish；服务端会在运行结束后按已记录的步骤与断言聚合终态。你仍可调用以下记录工具，把已执行步骤的真实结果补记录完整：")
 	builder.WriteString("\n- execution.step_record：补记已执行步骤的 seq/status/observed；")
 	builder.WriteString("\n- execution.assertion_record：逐条补记已执行步骤的 verdict/actual/reason（expected 以服务端断言真值为准）；")
 	builder.WriteString("\n- execution.evidence：为失败/不确定的结果补交文本证据。")

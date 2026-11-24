@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
@@ -20,7 +22,8 @@ import (
 // delivery_report, delivery_report_revision and delivery_report_ref columns in
 // scan order. The lists are shared by every SELECT/RETURNING of the adapter.
 const reportColumns = `id, version_id, wave_id, kind, current_revision_id,
-	status, input_fingerprint, created_by_run_id, created_at, updated_at`
+	status, input_fingerprint, created_by_run_id, created_at, updated_at,
+	display_fingerprint`
 
 const reportRevisionColumns = `id, report_id, revision, status, html_ref, pdf_ref,
 	input_fingerprint, as_of, template_version, render_status,
@@ -34,9 +37,10 @@ const (
 	insertReportSQL = `
 		INSERT INTO delivery_report (
 			id, version_id, wave_id, kind, current_revision_id, status,
-			input_fingerprint, created_by_run_id, created_at, updated_at
+			input_fingerprint, created_by_run_id, created_at, updated_at,
+			display_fingerprint
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT DO NOTHING
 		RETURNING ` + reportColumns
 
@@ -69,6 +73,7 @@ type ReportRepository struct {
 }
 
 var _ deliveryapp.ReportRepository = (*ReportRepository)(nil)
+var _ deliveryapp.PublishedReportVersionLister = (*ReportRepository)(nil)
 
 // NewReportRepository wires the adapter over a pgx pool and the process-wide
 // snowflake generator. The caller MUST pass the generator seeded with this
@@ -110,7 +115,7 @@ func (r *ReportRepository) CreateReport(ctx context.Context, report delivery.Rep
 	created, err := scanReport(r.pool.QueryRow(ctx, insertReportSQL,
 		r.insertID(report.ID), report.VersionID, report.WaveID, string(report.Kind),
 		report.CurrentRevisionID, string(status), report.InputFingerprint,
-		report.CreatedByRunID, createdAt, updatedAt,
+		report.CreatedByRunID, createdAt, updatedAt, report.DisplayFingerprint,
 	))
 	if isNoRows(err) {
 		existing, err := r.findReportByScope(ctx, r.pool, report)
@@ -204,6 +209,46 @@ func (r *ReportRepository) ListReports(ctx context.Context, versionID int64, f d
 	return reports, nil
 }
 
+// ListVersionsWithPublishedReports is the complete stale sweep's scan source
+// (v0.2.4-G T11, SC-G8/R-G10): the distinct versions that own at least one report
+// with a published current revision — status published OR stale — ascending by
+// version_id, paginated by afterVersionID (exclusive). It deliberately does NOT
+// join the version status — the sweep covers completed versions too (the old
+// narrow polling only saw running ones). Stale reports are included (final fix
+// wave #5): a stale report still has a published current revision
+// (reportHasPublishedRevision accepts published OR stale), so the display healer
+// (RefreshDisplayIfChanged) must reach it to heal a lost judge event on a static
+// completed version; the canonical MarkStaleIfChanged no-ops on an already-stale
+// report, so including stale versions never mints duplicate stale events. Both
+// statuses are bound as domain constants (no inline literal).
+func (r *ReportRepository) ListVersionsWithPublishedReports(ctx context.Context, afterVersionID int64, limit int) ([]int64, error) {
+	ctx = contextOrBackground(ctx)
+	limit = effectiveLimit(limit)
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT version_id
+		FROM delivery_report
+		WHERE status = ANY($1) AND version_id > $2
+		ORDER BY version_id ASC
+		LIMIT $3
+	`, []string{string(delivery.ReportStatusPublished), string(delivery.ReportStatusStale)}, afterVersionID, limit)
+	if err != nil {
+		return nil, wrapReportDB("list published report versions", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, wrapReportDB("scan published report version", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapReportDB("list published report versions", err)
+	}
+	return ids, nil
+}
+
 // NextRevision returns max(revision)+1 under a FOR UPDATE lock of the report
 // row, serializing concurrent revision allocation. The row lock is held for
 // one statement only; CreateRevision re-checks the unique key so two racing
@@ -254,7 +299,7 @@ func (r *ReportRepository) CreateRevision(ctx context.Context, revision delivery
 	}
 	renderStatus := revision.RenderStatus
 	if renderStatus == "" {
-		renderStatus = "pending"
+		renderStatus = deliveryapp.ReportRenderPending
 	}
 	if !validRenderStatus(renderStatus) {
 		return delivery.ReportRevision{}, delivery.ErrInvalidArgument
@@ -323,7 +368,12 @@ func (r *ReportRepository) CreateRevision(ctx context.Context, revision delivery
 // Publishing never moves the report backwards: a revision lower than the
 // current or the highest published revision is a stale finalize and is
 // rejected without touching either row.
-func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string) error {
+//
+// displayFingerprint is optional (variadic so pre-T11 callers keep compiling):
+// when supplied it is stored on the report header in the SAME transaction as the
+// canonical fingerprint (v0.2.4-G T11, R-G10a) — the display-only digest the
+// complete sweep compares to heal lost judge events. Omitted leaves it unchanged.
+func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string, displayFingerprint ...string) error {
 	ctx = contextOrBackground(ctx)
 	if reportID <= 0 || revision <= 0 || htmlRef <= 0 || !validFingerprint(fingerprint) {
 		return delivery.ErrInvalidArgument
@@ -369,11 +419,11 @@ func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64
 			COALESCE((
 				SELECT MAX(pub.revision)
 				FROM delivery_report_revision pub
-				WHERE pub.report_id = r.id AND pub.status = 'published'
+				WHERE pub.report_id = r.id AND pub.status = $2
 			), 0)
 		FROM delivery_report r
 		WHERE r.id = $1
-	`, reportID).Scan(&currentRevision, &maxPublishedRevision); err != nil {
+	`, reportID, string(delivery.ReportStatusPublished)).Scan(&currentRevision, &maxPublishedRevision); err != nil {
 		return wrapReportDB("finalize report: load revision monotonicity", err)
 	}
 	if revision < currentRevision || revision < maxPublishedRevision {
@@ -382,23 +432,37 @@ func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64
 	now := nowUTC()
 	if _, err := tx.Exec(ctx, `
 		UPDATE delivery_report_revision
-		SET status = 'published',
-			render_status = 'done',
+		SET status = $6,
+			render_status = $7,
 			html_ref = $3,
 			input_fingerprint = $4,
 			updated_at = $5
 		WHERE id = $1 AND report_id = $2
-	`, revisionID, reportID, htmlRef, fingerprint, now); err != nil {
+	`, revisionID, reportID, htmlRef, fingerprint, now,
+		string(delivery.ReportStatusPublished), deliveryapp.ReportRenderDone); err != nil {
 		return wrapReportDB("finalize report: update revision", err)
 	}
-	if _, err := tx.Exec(ctx, `
+	if len(displayFingerprint) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE delivery_report
+			SET current_revision_id = $2,
+				status = $6,
+				input_fingerprint = $3,
+				display_fingerprint = $4,
+				updated_at = $5
+			WHERE id = $1
+		`, reportID, revisionID, fingerprint, displayFingerprint[0], now,
+			string(delivery.ReportStatusPublished)); err != nil {
+			return wrapReportDB("finalize report: update report", err)
+		}
+	} else if _, err := tx.Exec(ctx, `
 		UPDATE delivery_report
 		SET current_revision_id = $2,
-			status = 'published',
+			status = $5,
 			input_fingerprint = $3,
 			updated_at = $4
 		WHERE id = $1
-	`, reportID, revisionID, fingerprint, now); err != nil {
+	`, reportID, revisionID, fingerprint, now, string(delivery.ReportStatusPublished)); err != nil {
 		return wrapReportDB("finalize report: update report", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -421,8 +485,8 @@ func (r *ReportRepository) MarkRenderMetadata(ctx context.Context, revisionID in
 		UPDATE delivery_report_revision
 		SET render_status = $2,
 			updated_at = $3
-		WHERE id = $1 AND status <> 'published'
-	`, revisionID, status, nowUTC())
+		WHERE id = $1 AND status <> $4
+	`, revisionID, status, nowUTC(), string(delivery.ReportStatusPublished))
 	if err != nil {
 		return wrapReportDB("mark report render metadata", err)
 	}
@@ -447,10 +511,10 @@ func (r *ReportRepository) MarkStale(ctx context.Context, reportID int64) (bool,
 	ctx = contextOrBackground(ctx)
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_report
-		SET status = 'stale',
+		SET status = $3,
 			updated_at = $2
-		WHERE id = $1 AND status = 'published'
-	`, reportID, nowUTC())
+		WHERE id = $1 AND status = $4
+	`, reportID, nowUTC(), string(delivery.ReportStatusStale), string(delivery.ReportStatusPublished))
 	if err != nil {
 		return false, wrapReportDB("mark report stale", err)
 	}
@@ -539,15 +603,18 @@ func (r *ReportRepository) ListRenderableRevisions(ctx context.Context, limit, m
 		       rev.pdf_status, rev.pdf_attempts
 		FROM delivery_report_revision rev
 		JOIN delivery_report report ON report.id = rev.report_id
-		WHERE rev.status = 'published'
-		  AND rev.render_status = 'done'
+		WHERE rev.status = $3
+		  AND rev.render_status = $4
 		  AND rev.html_ref IS NOT NULL
-		  AND rev.pdf_status IN ('pending', 'failed')
+		  AND rev.pdf_status = ANY($5)
 		  AND rev.pdf_ref IS NULL
-		  AND (rev.pdf_status = 'pending' OR rev.pdf_attempts < $2)
+		  AND (rev.pdf_status = $6 OR rev.pdf_attempts < $2)
 		ORDER BY rev.id
 		LIMIT $1
-	`, limit, maxAttempts)
+	`, limit, maxAttempts,
+		string(delivery.ReportStatusPublished), deliveryapp.ReportRenderDone,
+		[]string{string(delivery.PDFStatusPending), string(delivery.PDFStatusFailed)},
+		string(delivery.PDFStatusPending))
 	if err != nil {
 		return nil, wrapReportDB("list renderable report revisions", err)
 	}
@@ -583,16 +650,18 @@ func (r *ReportRepository) MarkPDFRunning(ctx context.Context, revisionID int64)
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_report_revision
-		SET pdf_status = 'running',
+		SET pdf_status = $3,
 			pdf_attempts = pdf_attempts + 1,
 			pdf_error = NULL,
 			updated_at = $2
 		WHERE id = $1
-		  AND status = 'published'
-		  AND render_status = 'done'
-		  AND pdf_status IN ('pending', 'failed', 'running')
+		  AND status = $4
+		  AND render_status = $5
+		  AND pdf_status = ANY($6)
 		  AND pdf_ref IS NULL
-	`, revisionID, nowUTC())
+	`, revisionID, nowUTC(), string(delivery.PDFStatusRunning),
+		string(delivery.ReportStatusPublished), deliveryapp.ReportRenderDone,
+		pdfClaimableStatuses())
 	if err != nil {
 		return wrapReportDB("mark report PDF running", err)
 	}
@@ -621,17 +690,19 @@ func (r *ReportRepository) MarkPDFRendered(ctx context.Context, revisionID int64
 	at = at.UTC()
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_report_revision
-		SET pdf_status = 'done',
+		SET pdf_status = $5,
 			pdf_ref = $2,
 			pdf_error = NULL,
 			pdf_rendered_at = $3,
 			updated_at = $3
 		WHERE id = $1
-		  AND status = 'published'
-		  AND pdf_status = 'running'
+		  AND status = $6
+		  AND pdf_status = $7
 		  AND pdf_ref IS NULL
 		  AND pdf_attempts <= $4
-	`, revisionID, ref.RefID, at, attempts)
+	`, revisionID, ref.RefID, at, attempts,
+		string(delivery.PDFStatusDone), string(delivery.ReportStatusPublished),
+		string(delivery.PDFStatusRunning))
 	if err != nil {
 		return wrapReportDB("mark report PDF rendered", err)
 	}
@@ -660,16 +731,18 @@ func (r *ReportRepository) MarkPDFFailed(ctx context.Context, revisionID int64, 
 	message = clampPDFError(message)
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_report_revision
-		SET pdf_status = 'failed',
+		SET pdf_status = $5,
 			pdf_error = NULLIF($2, ''),
 			pdf_attempts = GREATEST(pdf_attempts, $3),
 			updated_at = $4
 		WHERE id = $1
-		  AND status = 'published'
-		  AND pdf_status IN ('pending', 'failed', 'running')
+		  AND status = $6
+		  AND pdf_status = ANY($7)
 		  AND pdf_ref IS NULL
 		  AND pdf_attempts <= $3
-	`, revisionID, message, attempts, at)
+	`, revisionID, message, attempts, at,
+		string(delivery.PDFStatusFailed), string(delivery.ReportStatusPublished),
+		pdfClaimableStatuses())
 	if err != nil {
 		return wrapReportDB("mark report PDF failed", err)
 	}
@@ -688,10 +761,10 @@ func (r *ReportRepository) MarkPDFDisabled(ctx context.Context, revisionID int64
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_report_revision
-		SET pdf_status = 'disabled',
+		SET pdf_status = $3,
 			updated_at = $2
-		WHERE id = $1 AND pdf_status = 'pending'
-	`, revisionID, nowUTC())
+		WHERE id = $1 AND pdf_status = $4
+	`, revisionID, nowUTC(), string(delivery.PDFStatusDisabled), string(delivery.PDFStatusPending))
 	if err != nil {
 		return wrapReportDB("mark report PDF disabled", err)
 	}
@@ -758,11 +831,11 @@ func (r *ReportRepository) EnsureRenderJob(ctx context.Context, revisionID, repo
 	_, err = r.pool.Exec(ctx, `
 		INSERT INTO work_item (id, version_id, team, type, status, priority,
 			dedupe_key, payload, max_attempts, available_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'open', 0,
+		VALUES ($1, $2, $3, $4, $8, 0,
 			$5, $6::jsonb, $7, now(), now(), now())
 		ON CONFLICT (version_id, type, dedupe_key) DO NOTHING
 	`, r.ids.Next(), versionID, string(deliveryapp.RenderTaskTeam), deliveryapp.RenderTaskType,
-		dedupeKey, string(payload), maxAttempts)
+		dedupeKey, string(payload), maxAttempts, string(agent.WorkItemOpen))
 	if err != nil {
 		return fmt.Errorf("ensure report.render_pdf work item: %w", err)
 	}
@@ -947,14 +1020,14 @@ func (r *ReportRepository) findReportByScope(ctx context.Context, exec interface
 		found, err = scanReport(exec.QueryRow(ctx, `
 			SELECT `+reportColumns+`
 			FROM delivery_report
-			WHERE version_id = $1 AND wave_id = $2 AND kind = 'wave'
-		`, report.VersionID, *report.WaveID))
+			WHERE version_id = $1 AND wave_id = $2 AND kind = $3
+		`, report.VersionID, *report.WaveID, string(delivery.ReportKindWave)))
 	} else {
 		found, err = scanReport(exec.QueryRow(ctx, `
 			SELECT `+reportColumns+`
 			FROM delivery_report
-			WHERE version_id = $1 AND kind = 'version'
-		`, report.VersionID))
+			WHERE version_id = $1 AND kind = $2
+		`, report.VersionID, string(delivery.ReportKindVersion)))
 	}
 	if isNoRows(err) {
 		return delivery.Report{}, deliveryapp.ErrReportNotFound
@@ -1010,10 +1083,13 @@ func validFingerprint(value string) bool {
 	return true
 }
 
-// validRenderStatus reports a persisted render_status value.
+// validRenderStatus reports a persisted render_status value. The vocabulary is
+// the application's exported render-status authority (single source, 五.1), whose
+// value set mirrors the delivery_0002 render_status CHECK.
 func validRenderStatus(value string) bool {
 	switch value {
-	case "pending", "running", "done", "failed":
+	case deliveryapp.ReportRenderPending, deliveryapp.ReportRenderRunning,
+		deliveryapp.ReportRenderDone, deliveryapp.ReportRenderFailed:
 		return true
 	default:
 		return false
@@ -1024,20 +1100,29 @@ func validRenderStatus(value string) bool {
 // P4 layout) and "2" (P7 layout with the optional appendix).
 func validTemplateVersion(value string) bool {
 	switch value {
-	case "1", "2":
+	case "1", "2", "3":
 		return true
 	default:
 		return false
 	}
 }
 
-// validReportRefKind reports a report_ref.kind allowed by the schema.
+// validReportRefKind reports a report_ref.kind allowed by the schema. The
+// vocabulary is delivery.ReportRefKinds() (single source, 五.1); the live DB CHECK
+// is pinned against it by TestReportRefKindMatchesSchema.
 func validReportRefKind(value string) bool {
-	switch value {
-	case "requirement", "scenario", "case_version", "wave", "case_run", "issue", "version_sut":
-		return true
-	default:
-		return false
+	return slices.Contains(delivery.ReportRefKinds(), value)
+}
+
+// pdfClaimableStatuses is the PDF status set a render worker may claim or fail:
+// pending/failed (a first or retried attempt) and running (a retry after a
+// transient failure whose lease expired). Derived from the domain constants so
+// the two SQL predicates that share it cannot drift apart.
+func pdfClaimableStatuses() []string {
+	return []string{
+		string(delivery.PDFStatusPending),
+		string(delivery.PDFStatusFailed),
+		string(delivery.PDFStatusRunning),
 	}
 }
 
@@ -1071,6 +1156,7 @@ func scanReport(row rowScanner) (delivery.Report, error) {
 		&report.ID, &report.VersionID, &report.WaveID, &kind,
 		&report.CurrentRevisionID, &status, &report.InputFingerprint,
 		&report.CreatedByRunID, &report.CreatedAt, &report.UpdatedAt,
+		&report.DisplayFingerprint,
 	); err != nil {
 		return delivery.Report{}, err
 	}

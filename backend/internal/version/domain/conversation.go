@@ -35,6 +35,56 @@ const (
 	MessageKindArtifact = "artifact"
 )
 
+// Conversation message stream_state enum (v0.2.4-D, R-D2/SC-D2). This is the ONE
+// authority for conversation_message.stream_state: the DB CHECK
+// (chk_conversation_message_stream_state) and the migration SQL are checked
+// projections of MessageStreamStates(), never a second hand-written truth.
+//
+//   - streaming: an incremental Host reply whose placeholder head exists and
+//     whose parts are still being updated in place by seq.
+//   - complete: the terminal state of a finished reply (and the default of every
+//     batch-path/legacy message, so existing rows stay compatible).
+//   - interrupted: the terminal state of a reply cut short after the first delta
+//     (error/cancel/lease loss); accumulated content is preserved, never deleted.
+const (
+	MessageStreamStateStreaming   = "streaming"
+	MessageStreamStateComplete    = "complete"
+	MessageStreamStateInterrupted = "interrupted"
+)
+
+// MessageStreamStates returns the conversation_message.stream_state enum in
+// contract order (OpenAPI stream_state). The DB CHECK and migration gates derive
+// their expected set from this list.
+func MessageStreamStates() []string {
+	return []string{
+		MessageStreamStateStreaming,
+		MessageStreamStateComplete,
+		MessageStreamStateInterrupted,
+	}
+}
+
+// ValidateMessageStreamState validates the stream_state enum. Empty is rejected
+// here; NormalizeMessageStreamState maps the legacy empty value to complete
+// before a write.
+func ValidateMessageStreamState(state string) error {
+	switch state {
+	case MessageStreamStateStreaming, MessageStreamStateComplete, MessageStreamStateInterrupted:
+		return nil
+	default:
+		return platform.Invalid("stream_state", "must be one of streaming, complete, interrupted")
+	}
+}
+
+// NormalizeMessageStreamState maps the empty legacy value to complete (existing
+// rows and batch-path messages are finished, never streaming) and leaves explicit
+// states untouched.
+func NormalizeMessageStreamState(state string) string {
+	if state == "" {
+		return MessageStreamStateComplete
+	}
+	return state
+}
+
 // ConversationWriterLeaseDuration is the single-writer lease of one
 // conversation (B §5.1): 90 seconds, renewed by the Host's heartbeat. A crashed
 // turn is recoverable once the lease expires.
@@ -121,9 +171,56 @@ var (
 	// overwrite the terminal cancel snapshot. Callers treat it as an ignored,
 	// best-effort write-back.
 	ErrJobCardCancelled = errors.New("job card is cancelled")
+	// ErrMessageStreamClosed reports that an in-place stream update targeted a
+	// message head whose stream_state is already terminal (complete/interrupted):
+	// a late delta must never resurrect a finished reply (typed 409 at the edge).
+	ErrMessageStreamClosed = errors.New("conversation message stream is closed")
 )
 
 var messageSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// OrphanSealFailure names one streaming head a recovery sweep could not seal,
+// with the concrete cause (a part-validation rejection, an undecodable stored
+// snapshot). The head keeps its stored content and its streaming state: the
+// sweep never fabricates a terminal seal and never drops what was already shown.
+type OrphanSealFailure struct {
+	MessageID int64
+	Err       error
+}
+
+// OrphanSealError is the partial-failure report of a PER-HEAD tolerant recovery
+// sweep (H-E2). One unsealable head must not block the recovery of the others, so
+// the sweep returns the heads it sealed alongside this error. It is a recovery
+// outcome, not a lease/fence rejection: the API's 403/409 mapping does not apply
+// to it, and the caller surfaces it (log/audit) instead of swallowing it
+// (constitution 七.6 — no silent degradation).
+type OrphanSealError struct {
+	Failures []OrphanSealFailure
+}
+
+func (e *OrphanSealError) Error() string {
+	if e == nil || len(e.Failures) == 0 {
+		return "no orphan stream head could be sealed"
+	}
+	parts := make([]string, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		parts = append(parts, fmt.Sprintf("message %d: %v", failure.MessageID, failure.Err))
+	}
+	return fmt.Sprintf("%d orphan stream head(s) left streaming: %s",
+		len(e.Failures), strings.Join(parts, "; "))
+}
+
+// MessageIDs lists the heads left streaming, in the order the sweep met them.
+func (e *OrphanSealError) MessageIDs() []int64 {
+	if e == nil {
+		return nil
+	}
+	ids := make([]int64, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		ids = append(ids, failure.MessageID)
+	}
+	return ids
+}
 
 // Conversation is one human/AI clarification thread.
 type Conversation struct {
@@ -149,6 +246,12 @@ type Conversation struct {
 	MessageCount  int
 	LastMessageAt *time.Time
 }
+
+// MessageRefKindRequirement is the MessageRef.Kind value marking a reference to a
+// version requirement. It is the single source for the clarification handoff/search
+// ref-kind predicate (both the SQL filter and the Go ref parser), so the two copies
+// cannot drift from each other or from the writers that stamp this kind.
+const MessageRefKindRequirement = "requirement"
 
 // MessageRef is one structured reference attached to a message.
 type MessageRef struct {
@@ -191,6 +294,11 @@ type Message struct {
 	// read from the linked agent_run. Empty for user messages and for
 	// assistant messages without a run (contracts `actual_model`).
 	ActualModel string
+	// StreamState is the conversation_message.stream_state enum (v0.2.4-D):
+	// streaming while an incremental Host reply is being written, complete or
+	// interrupted once terminal. Empty normalizes to complete for batch-path and
+	// legacy messages (NormalizeMessageStreamState).
+	StreamState string
 	CreatedAt   time.Time
 
 	// StreamParts is the append-only conversation_message_part aggregate written
@@ -676,6 +784,60 @@ type ConversationRepository interface {
 	// client_message_id returns the stored message with created=false instead of
 	// appending a duplicate (turn-level idempotency).
 	AppendAssistantMessageAsWriter(ctx context.Context, conversationID int64, message Message, turnID int64, agent string, now, leaseUntil time.Time) (*Message, bool, error)
+	// BeginAssistantStream inserts the placeholder head of one incremental Host
+	// reply iff (turnID, agent) owns the live lease (same fenced compare-and-set as
+	// AppendAssistantMessageAsWriter: idle is ErrNotConversationWriter, a different
+	// live turn is ErrConversationBusy, an expired non-NULL lease is taken over).
+	// The head is written with stream_state=streaming and empty parts; a repeated
+	// client_message_id returns the stored head with created=false (turn-level
+	// idempotency, no duplicate placeholder).
+	BeginAssistantStream(ctx context.Context, conversationID int64, message Message, turnID int64, agent string, now, leaseUntil time.Time) (*Message, bool, error)
+	// UpdateStreamPart rewrites the full snapshot of one streaming part (seq) in
+	// place: the conversation_message_part payload AND the matching part of the
+	// conversation_message.parts head snapshot, under FOR UPDATE. The first update
+	// for a seq inserts its row; later updates never grow rows (unique
+	// (message_id, seq)). It returns the previous part payload (nil when the seq
+	// had no row) so the application can derive the SSE increment. The live lease
+	// must belong to the message's owning Host turn (client_message_id ==
+	// HostTurnClientMessageID(active_turn_id), author_agent == active_agent): a
+	// foreign live turn is ErrConversationBusy, no live lease is
+	// ErrNotConversationWriter, and a terminal head is ErrMessageStreamClosed.
+	UpdateStreamPart(ctx context.Context, conversationID, messageID int64, seq int, part MessagePart, now time.Time) (json.RawMessage, error)
+	// FinishAssistantStream sets the terminal stream_state (complete or interrupted)
+	// of one streaming head and reconciles its conversation_message_part rows to
+	// finalParts (the authoritative final snapshot), under the same lease fence.
+	// It returns the stored head (for the terminal full-frame republish) and a bool
+	// reporting whether the head transitioned streaming->terminal; a head already
+	// terminal is an idempotent no-op (false, terminal sticky) so the application
+	// does not republish the terminal frame on a retry.
+	FinishAssistantStream(ctx context.Context, conversationID, messageID int64, finalParts []MessagePart, streamState string, now time.Time) (Message, bool, error)
+	// InterruptOrphanStreams seals every head of this conversation still marked
+	// streaming that belongs to a Host turn OTHER than (turnID, agent), which
+	// must own the live lease. It is the crash-recovery counterpart of
+	// FinishAssistantStream: a process that died mid-stream can never seal its
+	// own head, and the single-writer lease guarantees that once a new turn holds
+	// the lease every other streaming head is orphaned. Each orphan keeps its
+	// accumulated parts and gains errorPart appended (never deleted, never
+	// marked complete); the sealed heads are returned for the terminal frame
+	// republish. No live lease is ErrNotConversationWriter; a different live turn
+	// is ErrConversationBusy. A second call finds nothing and returns no heads.
+	//
+	// The sweep is PER-HEAD tolerant (H-E2): a head the validator refuses is left
+	// streaming and reported, never allowed to block the recovery of the other
+	// heads. It therefore returns the heads it sealed AND a *OrphanSealError
+	// naming the ones it could not — a partial recovery is never silent.
+	InterruptOrphanStreams(ctx context.Context, conversationID, turnID int64, agent string, errorPart MessagePart, now time.Time) ([]Message, error)
+	// InterruptRunOrphanStreams seals the streaming heads of ONE agent run in this
+	// conversation (H-E2). It is the recovery entry for a run the crash sweep has
+	// proven orphaned: the work item is settled (dead/failed/reopened) or its
+	// lease was taken over, so no live turn will ever seal these heads and the
+	// conversation may never get another turn to run the lease-fenced sweep.
+	//
+	// The fence is the run binding, not the lease: the agent context owns the
+	// run's terminal truth and is the only caller. Heads of other runs are never
+	// touched. Same content contract and same per-head tolerance as
+	// InterruptOrphanStreams; a run with no streaming head returns no heads.
+	InterruptRunOrphanStreams(ctx context.Context, conversationID, agentRunID int64, errorPart MessagePart, now time.Time) ([]Message, error)
 	Summary(ctx context.Context, conversationID int64) (*ConversationSummary, error)
 	// SaveSummary inserts a new summary version computed by the adapter.
 	SaveSummary(ctx context.Context, summary ConversationSummary) (ConversationSummary, error)
@@ -1004,18 +1166,46 @@ func IsValidJobCardKind(kind string) bool {
 	return ok
 }
 
-// conversationJobCardKinds are the P1/P2 conversation-writing work types that
-// run as background jobs for one conversation and therefore appear in the
-// thread as job cards. They are work item types, not frozen 0.2.1 contract job
-// kinds, so they stay out of IsValidJobCardKind: the contract enum sync for
-// them is owned by the contract task (Task 50).
+// DesignRoundJobCardKind is the historical design.round conversation job-card
+// kind. v0.2.4-H T18 (R-H6r) turned it into a PERMANENT historical read-only
+// value: it was removed from the writable set (conversationJobCardKinds below)
+// but is deliberately retained here as a named domain value so the value is not
+// lost. It has had zero producers since V-0004 removed the legacy design
+// pipeline (the planner pins byType("design.round")==0); historical conversation
+// cards render through the published OpenAPI JobKind enum member plus the
+// frontend KIND_LABEL/invalid_work_type rules. The 0.3 due-version ruling
+// (delete the published enum member or promote it if a producer is approved) is
+// recorded on conversationJobCardKinds.
+const DesignRoundJobCardKind = "design.round"
+
+// conversationJobCardKinds is the WRITE-side set of conversation-writing work
+// types that run as background jobs for one conversation and therefore may be
+// projected into the thread as job cards. ValidateJobCardMessage accepts these
+// kinds and the runner projects them through jobKindForCard. They are work item
+// types, not frozen 0.2.1 contract job kinds, so they stay out of
+// IsValidJobCardKind: the contract enum sync for them is owned by the contract
+// task (Task 50).
+//
+// design.round was REMOVED from this write set in v0.2.4-H T18 (R-H6r); it was
+// NOT deleted from the published contract. It remains only as the historical
+// read-only value DesignRoundJobCardKind. It has had zero producers since V-0004
+// removed the legacy design pipeline, so no run reaches this set with it; the
+// new design pipeline uses design.judge/design.rework. Historical conversation
+// job cards may still carry design.round, and their rendering is served by the
+// published OpenAPI JobKind enum member (docs/openapi/api.yaml, kept per R-H6r
+// so no contract-deletion notice period is triggered) plus the frontend
+// KIND_LABEL / invalid_work_type rules (JobCard.tsx). 0.3 due-version ruling
+// (constitution III.7 third path): delete the published enum member or promote
+// it if a producer is approved.
 var conversationJobCardKinds = map[string]struct{}{
-	"chat.turn": {}, "requirement.curate": {}, "design.round": {},
+	"chat.turn": {}, "requirement.curate": {},
 }
 
 // IsConversationJobCardKind reports whether kind is a conversation-writing work
-// type projected as a background job card (chat.turn/requirement.curate/
-// design.round).
+// type in the WRITE set projected as a background job card
+// (chat.turn/requirement.curate). design.round is intentionally absent: it is a
+// historical read-only value (DesignRoundJobCardKind) served by the published
+// enum plus the frontend labels (see conversationJobCardKinds).
 func IsConversationJobCardKind(kind string) bool {
 	_, ok := conversationJobCardKinds[kind]
 	return ok

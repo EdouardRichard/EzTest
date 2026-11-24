@@ -139,9 +139,9 @@ func (s *Service) TestConfig(ctx context.Context, id int64) (TestResult, error) 
 	}
 	result, err := s.client.Test(ctx, cfg)
 	if err != nil {
-		return TestResult{}, upstreamError(err, cfg.APIKey, "llm connectivity test failed")
+		return TestResult{}, upstreamError(err, "llm connectivity test failed")
 	}
-	result.Error = redact(result.Error, cfg.APIKey)
+	// GD-01 (Q05=B): the connectivity result message is kept verbatim.
 	return result, nil
 }
 
@@ -161,7 +161,7 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	}
 	remote, err := s.client.ListModels(ctx, cfg)
 	if err != nil {
-		return nil, upstreamError(err, cfg.APIKey, "failed to refresh llm models")
+		return nil, upstreamError(err, "failed to refresh llm models")
 	}
 	existing, err := s.repo.ListModelsByConfig(ctx, id)
 	if err != nil {
@@ -241,7 +241,7 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	if len(models) == 0 {
 		return nil, upstreamError(
 			errors.New("llm provider returned an empty model catalog; existing models were left unchanged"),
-			cfg.APIKey, "failed to refresh llm models")
+			"failed to refresh llm models")
 	}
 	// R-E2-2: a catalog refresh must not make the default-model vision
 	// invariant reversible by silently downgrading the configured default
@@ -1123,28 +1123,16 @@ func mapRepositoryError(err error) error {
 	}
 }
 
-// upstreamError keeps connectivity failures as retryable 503s and guarantees
-// the configured API key never appears in the message.
-func upstreamError(err error, secret, fallback string) error {
+// upstreamError keeps connectivity failures as retryable 503s. GD-01 (Q05=B):
+// the message is kept verbatim (credentials are plaintext by design).
+func upstreamError(err error, fallback string) error {
 	var apiErr *platform.Error
 	if errors.As(err, &apiErr) {
-		apiErr.Message = redact(apiErr.Message, secret)
 		return apiErr
 	}
 	message := strings.TrimSpace(err.Error())
 	if message == "" {
 		message = fallback
 	}
-	return platform.Unavailable(redact(message, secret))
-}
-
-// redact removes the configured secret from a message if it somehow leaked.
-func redact(message, secret string) string {
-	if secret == "" || message == "" {
-		return message
-	}
-	if !strings.Contains(message, secret) {
-		return message
-	}
-	return strings.ReplaceAll(message, secret, "[redacted]")
+	return platform.Unavailable(message)
 }

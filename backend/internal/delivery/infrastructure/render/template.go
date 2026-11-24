@@ -101,7 +101,7 @@ footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid #d0d7de; col
 <table>
 <thead><tr><th>波次</th><th>版本 SUT</th><th>总数</th><th>通过</th><th>失败</th><th>受阻</th><th>不确定</th></tr></thead>
 <tbody>
-{{range .SUTRows}}<tr data-sut-row="{{.WaveID}}-{{.VersionSUTID}}"><td class="num">{{.WaveID}}</td><td>{{.Label}}</td><td class="num">{{.Total}}</td><td class="num">{{.Passed}}</td><td class="num">{{.Failed}}</td><td class="num">{{.Blocked}}</td><td class="num">{{.Inconclusive}}</td></tr>
+{{range .SUTRows}}<tr data-sut-row="{{.WaveID}}-{{.SUTID}}"><td class="num">{{.WaveID}}</td><td>{{.Label}}</td><td class="num">{{.Total}}</td><td class="num">{{.Passed}}</td><td class="num">{{.Failed}}</td><td class="num">{{.Blocked}}</td><td class="num">{{.Inconclusive}}</td></tr>
 {{end}}
 </tbody>
 </table>
@@ -159,7 +159,7 @@ footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid #d0d7de; col
 <table>
 <thead><tr><th>ID</th><th>执行 ID</th><th>类型</th><th>版本 SUT</th><th>步骤</th><th>断言</th><th>SHA-256</th><th>大小（字节）</th></tr></thead>
 <tbody>
-{{range .EvidenceRows}}<tr data-evidence-id="{{.ID}}"><td class="num">{{.ID}}</td><td class="num">{{.CaseRunID}}</td><td>{{.Kind}}</td><td>{{int64ptr .VersionSUTID}}</td><td>{{intptr .StepSeq}}</td><td>{{intptr .AssertionSeq}}</td><td class="mono">{{.SHA256}}</td><td class="num">{{.SizeBytes}}</td></tr>
+{{range .EvidenceRows}}<tr data-evidence-id="{{.ID}}"><td class="num">{{.ID}}</td><td class="num">{{.CaseRunID}}</td><td>{{.Kind}}</td><td>{{int64ptr .SUTID}}</td><td>{{intptr .StepSeq}}</td><td>{{intptr .AssertionSeq}}</td><td class="mono">{{.SHA256}}</td><td class="num">{{.SizeBytes}}</td></tr>
 {{end}}
 </tbody>
 </table>

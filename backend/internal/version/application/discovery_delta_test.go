@@ -97,20 +97,20 @@ func deltaTemplateKey(value string) string {
 	return trimmed
 }
 
-func (f *fakeDeltaCatalog) FindPageByRouteTemplate(_ context.Context, environmentID int64, routeTemplate string) (resourceapp.PageView, bool, error) {
+func (f *fakeDeltaCatalog) FindPageByRouteTemplate(_ context.Context, sutID int64, routeTemplate string) (resourceapp.PageView, bool, error) {
 	key := deltaTemplateKey(routeTemplate)
 	for _, page := range f.pages {
-		if page.EnvironmentID == strconv.FormatInt(environmentID, 10) && deltaTemplateKey(page.RouteTemplate) == key {
+		if page.SUTID == strconv.FormatInt(sutID, 10) && deltaTemplateKey(page.RouteTemplate) == key {
 			return page, true, nil
 		}
 	}
 	return resourceapp.PageView{}, false, nil
 }
 
-func (f *fakeDeltaCatalog) FindAPIByTemplate(_ context.Context, environmentID int64, method, pathTemplate string) (resourceapp.APIView, bool, error) {
+func (f *fakeDeltaCatalog) FindAPIByTemplate(_ context.Context, sutID int64, method, pathTemplate string) (resourceapp.APIView, bool, error) {
 	key := deltaTemplateKey(pathTemplate)
 	for _, api := range f.apis {
-		if api.EnvironmentID == strconv.FormatInt(environmentID, 10) &&
+		if api.SUTID == strconv.FormatInt(sutID, 10) &&
 			strings.EqualFold(api.Method, method) && deltaTemplateKey(api.PathTemplate) == key {
 			return api, true, nil
 		}
@@ -124,7 +124,7 @@ func (f *fakeDeltaCatalog) CreateProposedPage(_ context.Context, input resourcea
 	}
 	f.nextID++
 	view := resourceapp.PageView{
-		ID: strconv.FormatInt(f.nextID, 10), EnvironmentID: strconv.FormatInt(input.EnvironmentID, 10),
+		ID: strconv.FormatInt(f.nextID, 10), SUTID: strconv.FormatInt(input.SUTID, 10),
 		Name: input.Name, URL: input.URL, RouteTemplate: input.RouteTemplate, PageType: input.PageType,
 		Status: "proposed", Source: input.Source,
 	}
@@ -139,7 +139,7 @@ func (f *fakeDeltaCatalog) CreateProposedAPI(_ context.Context, input resourceap
 	}
 	f.nextID++
 	view := resourceapp.APIView{
-		ID: strconv.FormatInt(f.nextID, 10), EnvironmentID: strconv.FormatInt(input.EnvironmentID, 10),
+		ID: strconv.FormatInt(f.nextID, 10), SUTID: strconv.FormatInt(input.SUTID, 10),
 		Name: input.Name, Method: input.Method, PathTemplate: input.PathTemplate,
 		Status: "proposed", Source: input.Source,
 	}
@@ -222,23 +222,23 @@ func (f *flakyDeltaFacts) Current(ctx context.Context, versionID int64, kind str
 
 func baseDeltaObservations() []deltaObservation {
 	return []deltaObservation{
-		{ObservationID: 11, VersionID: 7, WaveID: 3, CaseRunID: 3001, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 11, VersionID: 7, WaveID: 3, CaseRunID: 3001, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
-		{ObservationID: 12, VersionID: 7, WaveID: 3, CaseRunID: 3002, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 12, VersionID: 7, WaveID: 3, CaseRunID: 3002, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}", Decision: "new"},
-		{ObservationID: 13, VersionID: 7, WaveID: 3, CaseRunID: 3003, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 13, VersionID: 7, WaveID: 3, CaseRunID: 3003, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home", Decision: "new"},
-		{ObservationID: 14, VersionID: 7, WaveID: 3, CaseRunID: 3004, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 14, VersionID: 7, WaveID: 3, CaseRunID: 3004, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/legacy/{id}", Decision: "new"},
 	}
 }
 
 func seedRegisteredDeltaResources(catalog *fakeDeltaCatalog) {
 	catalog.pages = append(catalog.pages, resourceapp.PageView{
-		ID: "101", EnvironmentID: "9001", RouteTemplate: "/home", Status: "approved", Source: "admin",
+		ID: "101", SUTID: "5001", RouteTemplate: "/home", Status: "approved", Source: "admin",
 	})
 	catalog.apis = append(catalog.apis, resourceapp.APIView{
-		ID: "102", EnvironmentID: "9001", Method: "GET", PathTemplate: "/api/legacy/{id}", Status: "rejected", Source: "code",
+		ID: "102", SUTID: "5001", Method: "GET", PathTemplate: "/api/legacy/{id}", Status: "rejected", Source: "code",
 	})
 }
 
@@ -317,14 +317,14 @@ func TestDeltaClassifiesAndRecords(t *testing.T) {
 		}
 	}
 	pageFact, ok := kinds["page"]
-	if !ok || pageFact.Key != "page:env:9001:/orders/{id}" || pageFact.Payload["route_template"] != "/orders/{id}" {
+	if !ok || pageFact.Key != "page:sut:5001:/orders/{id}" || pageFact.Payload["route_template"] != "/orders/{id}" {
 		t.Fatalf("page fact = %+v", pageFact)
 	}
 	if provenance := factPayloadProvenance(t, pageFact); provenance["case_run_id"] != "3001" || provenance["observation_id"] != "11" {
 		t.Fatalf("page provenance = %#v", provenance)
 	}
 	apiFact, ok := kinds["api"]
-	if !ok || apiFact.Key != "api:env:9001:GET /api/orders/{id}" || apiFact.Payload["method"] != "GET" {
+	if !ok || apiFact.Key != "api:sut:5001:GET /api/orders/{id}" || apiFact.Payload["method"] != "GET" {
 		t.Fatalf("api fact = %+v", apiFact)
 	}
 
@@ -386,7 +386,7 @@ func TestDeltaClassifiesAndRecords(t *testing.T) {
 		len(result.New), len(result.Proposed), len(result.Approved), len(result.Rejected), len(result.OutOfScope))
 	for _, item := range append(append([]versionapp.DeltaItem{}, result.New...), result.OutOfScope...) {
 		t.Logf("item: kind=%s method=%s template=%s host=%s env=%d sut=%d observation=%d resource=%d fact=%d -> %s",
-			item.Kind, item.Method, item.ResourceTemplate, item.Host, item.EnvironmentID, item.VersionSUTID,
+			item.Kind, item.Method, item.ResourceTemplate, item.Host, item.EnvironmentID, item.SUTID,
 			item.ObservationID, item.ResourceID, item.FactID, item.Decision)
 	}
 	for _, fact := range facts {
@@ -475,14 +475,14 @@ func TestDeltaRejectedResourceIsNotReproposed(t *testing.T) {
 	}
 }
 
-// TestDeltaMultipleEnvironmentsStayIsolated: the same route template on two
-// environments is two resources and two facts (one per environment); a
-// registered page only suppresses its own environment.
-func TestDeltaMultipleEnvironmentsStayIsolated(t *testing.T) {
+// TestDeltaMultipleSUTsStayIsolated: the same route template on two SUTs is two
+// resources and two facts (one per SUT); a registered page only suppresses its
+// own SUT. v0.2.4-B moved page/API ownership from the environment to the SUT.
+func TestDeltaMultipleSUTsStayIsolated(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 21, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 21, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "a.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
-		{ObservationID: 22, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5002, EnvironmentID: 9002,
+		{ObservationID: 22, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5002, EnvironmentID: 9002,
 			Kind: "page", Host: "b.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
 	})
 	result, err := f.svc.Evaluate(context.Background(), 7, 3)
@@ -490,7 +490,7 @@ func TestDeltaMultipleEnvironmentsStayIsolated(t *testing.T) {
 		t.Fatalf("Evaluate: %v", err)
 	}
 	if len(result.New) != 2 {
-		t.Fatalf("new = %d, want one page per environment: %+v", len(result.New), result.New)
+		t.Fatalf("new = %d, want one page per SUT: %+v", len(result.New), result.New)
 	}
 	environments := map[int64]bool{}
 	for _, item := range result.New {
@@ -499,11 +499,11 @@ func TestDeltaMultipleEnvironmentsStayIsolated(t *testing.T) {
 	if !environments[9001] || !environments[9002] {
 		t.Fatalf("new environments = %v, want 9001 and 9002", environments)
 	}
-	if len(f.catalog.pages) != 2 || f.catalog.pages[0].EnvironmentID == f.catalog.pages[1].EnvironmentID {
-		t.Fatalf("catalog pages = %+v, want one per environment", f.catalog.pages)
+	if len(f.catalog.pages) != 2 || f.catalog.pages[0].SUTID == f.catalog.pages[1].SUTID {
+		t.Fatalf("catalog pages = %+v, want one per SUT", f.catalog.pages)
 	}
-	// The environment is part of the fact identity: two environments with the
-	// same template must not report a bogus fact conflict.
+	// The SUT is part of the fact identity: two SUTs with the same template must
+	// not report a bogus fact conflict.
 	facts, err := f.factSvc.Current(context.Background(), 7, "page")
 	if err != nil {
 		t.Fatalf("Current facts: %v", err)
@@ -515,8 +515,8 @@ func TestDeltaMultipleEnvironmentsStayIsolated(t *testing.T) {
 	for _, fact := range facts {
 		keys[fact.Key] = true
 	}
-	if !keys["page:env:9001:/orders/{id}"] || !keys["page:env:9002:/orders/{id}"] {
-		t.Fatalf("fact keys = %v, want the environment in the key", keys)
+	if !keys["page:sut:5001:/orders/{id}"] || !keys["page:sut:5002:/orders/{id}"] {
+		t.Fatalf("fact keys = %v, want the SUT in the key", keys)
 	}
 	if conflict := countDeltaEvents(f.publisher, "fact.conflict"); conflict != 0 {
 		t.Fatalf("fact.conflict events = %d, want none across environments", conflict)
@@ -535,26 +535,26 @@ func TestDeltaMultipleEnvironmentsStayIsolated(t *testing.T) {
 		f.catalog.created, f.catalog.pages, result.OutOfScope, result.Proposed)
 }
 
-// TestDeltaDoesNotDuplicateP9Fact: a current P9 page fact of the same
+// TestDeltaDoesNotDuplicateAnalysisFact: a current P9 page fact of the same
 // environment/template is reused (no second fact) while the newly proposed
 // resource still publishes one resource.delta carrying the P9 fact id.
-func TestDeltaDoesNotDuplicateP9Fact(t *testing.T) {
+func TestDeltaDoesNotDuplicateAnalysisFact(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 31, VersionID: 7, WaveID: 3, CaseRunID: 3001, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 31, VersionID: 7, WaveID: 3, CaseRunID: 3001, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
 	})
-	p9Payload := map[string]any{
+	analysisPayload := map[string]any{
 		"page_key":       "https://shop.example.com/orders/{id}",
 		"route_template": "/orders/{id}",
 		"environment_id": int64(9001),
 	}
-	hash, err := version.FactContentHash(p9Payload)
+	hash, err := version.FactContentHash(analysisPayload)
 	if err != nil {
 		t.Fatalf("FactContentHash: %v", err)
 	}
 	f.factRepo.facts[7001] = version.Fact{
 		ID: 7001, VersionID: 7, Kind: "page", Key: "page:env:9001:https://shop.example.com/orders/{id}",
-		Payload: p9Payload, Source: "p9", ContentHash: hash,
+		Payload: analysisPayload, Source: "p9", ContentHash: hash,
 	}
 	f.factRepo.order = append(f.factRepo.order, 7001)
 
@@ -584,11 +584,11 @@ func TestDeltaDoesNotDuplicateP9Fact(t *testing.T) {
 // /orders/{id}.
 func TestDeltaMatchesTrailingSlashTemplate(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 41, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 41, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}/", Decision: "new"},
 	})
 	f.catalog.pages = append(f.catalog.pages, resourceapp.PageView{
-		ID: "101", EnvironmentID: "9001", RouteTemplate: "/orders/{id}", Status: "approved",
+		ID: "101", SUTID: "5001", RouteTemplate: "/orders/{id}", Status: "approved",
 	})
 	result, err := f.svc.Evaluate(context.Background(), 7, 3)
 	if err != nil {
@@ -599,20 +599,21 @@ func TestDeltaMatchesTrailingSlashTemplate(t *testing.T) {
 	}
 }
 
-// TestDeltaFactKeySeparatesEnvironmentAndMethod pins the P9 fact-key convention:
-// the environment and the API method are part of fact identity, so two methods
-// on one path or two environments on one template never look contradictory.
-func TestDeltaFactKeySeparatesEnvironmentAndMethod(t *testing.T) {
+// TestDeltaFactKeySeparatesSUTAndMethod pins the fact-key convention after the
+// v0.2.4-B inversion: the owning SUT and the API method are part of fact
+// identity, so two methods on one path or two SUTs on one template never look
+// contradictory.
+func TestDeltaFactKeySeparatesSUTAndMethod(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 71, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 71, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
-		{ObservationID: 72, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5002, EnvironmentID: 9002,
+		{ObservationID: 72, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5002, EnvironmentID: 9002,
 			Kind: "page", Host: "other.example.com", ResourceTemplate: "/orders/{id}", Decision: "new"},
-		{ObservationID: 73, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 73, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}", Decision: "new"},
-		{ObservationID: 74, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 74, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "POST", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}", Decision: "new"},
-		{ObservationID: 75, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5002, EnvironmentID: 9002,
+		{ObservationID: 75, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5002, EnvironmentID: 9002,
 			Kind: "api", Method: "GET", Host: "other.example.com", ResourceTemplate: "/api/orders/{id}", Decision: "new"},
 	})
 	result, err := f.svc.Evaluate(context.Background(), 7, 3)
@@ -638,11 +639,11 @@ func TestDeltaFactKeySeparatesEnvironmentAndMethod(t *testing.T) {
 		keys[fact.Key] = true
 	}
 	for _, want := range []string{
-		"page:env:9001:/orders/{id}",
-		"page:env:9002:/orders/{id}",
-		"api:env:9001:GET /api/orders/{id}",
-		"api:env:9001:POST /api/orders/{id}",
-		"api:env:9002:GET /api/orders/{id}",
+		"page:sut:5001:/orders/{id}",
+		"page:sut:5002:/orders/{id}",
+		"api:sut:5001:GET /api/orders/{id}",
+		"api:sut:5001:POST /api/orders/{id}",
+		"api:sut:5002:GET /api/orders/{id}",
 	} {
 		if !keys[want] {
 			t.Fatalf("fact keys = %v, missing %q", keys, want)
@@ -660,7 +661,7 @@ func TestDeltaFactKeySeparatesEnvironmentAndMethod(t *testing.T) {
 func TestDeltaRepairsMissingFactOnRetry(t *testing.T) {
 	flaky := &flakyDeltaFacts{failNext: 1}
 	f := newDeltaFixtureWith([]deltaObservation{
-		{ObservationID: 61, VersionID: 7, WaveID: 3, CaseRunID: 3001, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 61, VersionID: 7, WaveID: 3, CaseRunID: 3001, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "POST", Host: "shop.example.com", ResourceTemplate: "/api/repair/{id}", Decision: "new"},
 	}, nil, func(inner versionapp.DiscoveryFactRecorder) versionapp.DiscoveryFactRecorder {
 		flaky.inner = inner
@@ -794,21 +795,21 @@ func TestDeltaEvaluateLockBusySkipsWave(t *testing.T) {
 // still become resources/facts/events; the skip is stable on re-runs.
 func TestDeltaSkipsUnprocessableObservationsAndContinues(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 51, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 51, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "TRACE", Host: "shop.example.com", ResourceTemplate: "/api/trace", Decision: "new"},
-		{ObservationID: 52, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 52, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "PROPFIND", Host: "shop.example.com", ResourceTemplate: "/api/propfind", Decision: "new"},
-		{ObservationID: 53, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 53, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "", Host: "shop.example.com", ResourceTemplate: "/api/no-method", Decision: "new"},
-		{ObservationID: 54, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 54, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "orders/{id}", Decision: "new"},
-		{ObservationID: 55, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 0,
-			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/no-environment", Decision: "new"},
-		{ObservationID: 56, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 55, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 0, EnvironmentID: 9001,
+			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/no-sut", Decision: "new"},
+		{ObservationID: 56, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "POST", Host: "shop.example.com", ResourceTemplate: "/api/broken", Decision: "new"},
-		{ObservationID: 57, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 57, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home", Decision: "new"},
-		{ObservationID: 58, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 58, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "api", Method: "POST", Host: "shop.example.com", ResourceTemplate: "/api/orders", Decision: "new"},
 	})
 	f.catalog.createErrs = map[string]error{
@@ -866,11 +867,11 @@ func TestDeltaSkipsUnprocessableObservationsAndContinues(t *testing.T) {
 // approval) is classified approved instead of out_of_scope.
 func TestDeltaApprovedObservationClassification(t *testing.T) {
 	f := newDeltaFixture([]deltaObservation{
-		{ObservationID: 81, VersionID: 7, WaveID: 3, CaseRunID: 1, VersionSUTID: 5001, EnvironmentID: 9001,
+		{ObservationID: 81, VersionID: 7, WaveID: 3, CaseRunID: 1, SUTID: 5001, EnvironmentID: 9001,
 			Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home", Decision: "approved"},
 	})
 	f.catalog.pages = append(f.catalog.pages, resourceapp.PageView{
-		ID: "101", EnvironmentID: "9001", RouteTemplate: "/home", Status: "approved", Source: "ai",
+		ID: "101", SUTID: "5001", RouteTemplate: "/home", Status: "approved", Source: "ai",
 	})
 
 	result, err := f.svc.Evaluate(context.Background(), 7, 3)

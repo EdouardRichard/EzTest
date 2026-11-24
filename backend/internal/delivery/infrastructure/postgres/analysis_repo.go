@@ -25,6 +25,21 @@ var analysisKinds = map[string]bool{
 	"triage":   true,
 }
 
+// insertAnalysisRunSQL stages one queued run.
+//
+// The ON CONFLICT index predicate below is the ONE delivery SQL site that cannot
+// bind its status values as query parameters (controller Ruling T11d-R4):
+// PostgreSQL matches a partial unique index by predicate IMPLICATION, and once
+// pgx's cached statement switches from a custom to a generic plan the implication
+// can no longer be proved. Real-DB measurement: the first four executions are
+// green and every execution from the fifth fails with SQLSTATE 42P10
+// ("no unique or exclusion constraint matching the ON CONFLICT specification")
+// — task-11d-report.md §6. Parameterizing it is therefore a born-green trap.
+//
+// The literals stay, under a fragment exemption in the delivery vocabulary gate,
+// and TestAnalysisConflictPredicateMatchesDomain pins them to
+// analysisActiveStatuses() (derived from the domain constants) AND to the live
+// partial index, so a domain-value drift still fails loud.
 const insertAnalysisRunSQL = `
 	INSERT INTO delivery_analysis_run (
 		id, version_id, kind, status, dedupe_key, input_ref, output,
@@ -33,6 +48,18 @@ const insertAnalysisRunSQL = `
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	ON CONFLICT (version_id, kind, dedupe_key) WHERE status IN ('queued', 'running') DO NOTHING
 	RETURNING ` + analysisColumns
+
+// analysisActiveStatuses is the delivery analysis "active" (non-terminal) status
+// set, derived from the domain constants. Every parameterized predicate binds it,
+// and the non-parameterizable ON CONFLICT predicate above is pinned against it.
+func analysisActiveStatuses() []string {
+	return []string{string(delivery.AnalysisStatusQueued), string(delivery.AnalysisStatusRunning)}
+}
+
+// analysisFinishedStatuses is the finished set the issue-detail triage projects.
+func analysisFinishedStatuses() []string {
+	return []string{string(delivery.AnalysisStatusDone), string(delivery.AnalysisStatusDegraded)}
+}
 
 // AnalysisRepository persists delivery_analysis_run rows. It implements
 // deliveryapp.AnalysisRepository and owns the database-enforced invariants of
@@ -104,12 +131,12 @@ func (r *AnalysisRepository) MarkRunning(ctx context.Context, id int64, agentRun
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE delivery_analysis_run
-		SET status = 'running',
+		SET status = $4,
 			agent_run_id = $2,
 			updated_at = $3
 		WHERE id = $1
-		  AND (status = 'queued' OR (status = 'running' AND agent_run_id IS NULL))
-	`, id, agentRunID, nowUTC())
+		  AND (status = $5 OR (status = $4 AND agent_run_id IS NULL))
+	`, id, agentRunID, nowUTC(), string(delivery.AnalysisStatusRunning), string(delivery.AnalysisStatusQueued))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return delivery.ErrStateConflict
@@ -157,8 +184,8 @@ func (r *AnalysisRepository) Complete(ctx context.Context, id int64, status deli
 			output = $3,
 			error = $4,
 			updated_at = $5
-		WHERE id = $1 AND status IN ('queued', 'running')
-	`, id, string(status), normalized, errMsg, nowUTC())
+		WHERE id = $1 AND status = ANY($6)
+	`, id, string(status), normalized, errMsg, nowUTC(), analysisActiveStatuses())
 	if err != nil {
 		return wrapDB("complete analysis run", err)
 	}
@@ -189,11 +216,11 @@ func (r *AnalysisRepository) LatestByIssue(ctx context.Context, issueID int64) (
 		SELECT `+analysisColumns+`
 		FROM delivery_analysis_run
 		WHERE kind = 'triage'
-		  AND status IN ('done', 'degraded')
+		  AND status = ANY($2)
 		  AND input_ref->>'issue_id' = $1
 		ORDER BY id DESC
 		LIMIT 1
-	`, fmt.Sprintf("%d", issueID)))
+	`, fmt.Sprintf("%d", issueID), analysisFinishedStatuses()))
 	if isNoRows(err) {
 		return delivery.AnalysisRun{}, false, nil
 	}
@@ -209,10 +236,10 @@ func (r *AnalysisRepository) findActive(ctx context.Context, run delivery.Analys
 		SELECT `+analysisColumns+`
 		FROM delivery_analysis_run
 		WHERE version_id = $1 AND kind = $2 AND dedupe_key = $3
-		  AND status IN ('queued', 'running')
+		  AND status = ANY($4)
 		ORDER BY id
 		LIMIT 1
-	`, run.VersionID, run.Kind, run.DedupeKey))
+	`, run.VersionID, run.Kind, run.DedupeKey, analysisActiveStatuses()))
 	if isNoRows(err) {
 		return delivery.AnalysisRun{}, false, nil
 	}

@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-// Resolver caches one HTTPClient per executor endpoint. P8 multi-executor
-// routing needs a client for each endpoint that owns a browser context; the
-// token/timeout are shared by every client. A missing/empty endpoint returns
-// nil so the caller can fail with a stable wiring error instead of dialing "".
+// Resolver caches one HTTPClient per executor endpoint. Multi-executor routing
+// needs a client for each endpoint that owns a session; the token/timeout are
+// shared by every client. A missing/empty endpoint returns nil so the caller can
+// fail with a stable wiring error instead of dialing "".
 type Resolver struct {
 	token   string
 	timeout time.Duration

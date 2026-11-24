@@ -30,16 +30,17 @@ type fakeService struct {
 	account    resourceapp.AccountView
 	repository resourceapp.CodeRepositoryView
 
-	suts         []resourceapp.SUTView
-	envs         []resourceapp.EnvironmentView
-	pages        []resourceapp.PageView
-	apis         []resourceapp.APIView
-	databases    []resourceapp.DatabaseView
-	accounts     []resourceapp.AccountView
-	repositories []resourceapp.CodeRepositoryView
-	sutRepos     []resourceapp.SUTRepositoryView
-	catalog      []resourceapp.SUTView
-	hasMore      bool
+	suts          []resourceapp.SUTView
+	envs          []resourceapp.EnvironmentView
+	pages         []resourceapp.PageView
+	apis          []resourceapp.APIView
+	databases     []resourceapp.DatabaseView
+	accounts      []resourceapp.AccountView
+	repositories  []resourceapp.CodeRepositoryView
+	sutRepos      []resourceapp.SUTRepositoryView
+	registrations []resourceapp.SUTRegistrationView
+	catalog       []resourceapp.EnvironmentView
+	hasMore       bool
 
 	sutRepository resourceapp.SUTRepositoryView
 
@@ -70,15 +71,15 @@ type fakeService struct {
 	lastAPIItems     []resourceapp.APIInput
 }
 
-func (f *fakeService) Catalog(context.Context) ([]resourceapp.SUTView, error) {
+func (f *fakeService) Catalog(context.Context) ([]resourceapp.EnvironmentView, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.catalog, nil
 }
 
-func (f *fakeService) CreateSUT(_ context.Context, input resourceapp.SUTInput, actorID int64) (resourceapp.SUTView, error) {
-	f.lastSUTInput, f.lastActor = input, actorID
+func (f *fakeService) CreateSUT(_ context.Context, environmentID int64, input resourceapp.SUTInput, actorID int64) (resourceapp.SUTView, error) {
+	f.lastParentID, f.lastSUTInput, f.lastActor = environmentID, input, actorID
 	return f.sut, f.err
 }
 
@@ -92,6 +93,11 @@ func (f *fakeService) DeleteSUT(_ context.Context, id int64, actorID int64) erro
 	return f.err
 }
 
+func (f *fakeService) RejectSUT(_ context.Context, id int64, actorID int64) (resourceapp.SUTView, error) {
+	f.lastID, f.lastActor = id, actorID
+	return f.sut, f.err
+}
+
 func (f *fakeService) ListSUTs(_ context.Context, limit int, beforeID *int64) ([]resourceapp.SUTView, bool, error) {
 	f.lastLimit, f.lastBefore = limit, beforeID
 	return f.suts, f.hasMore, f.err
@@ -102,8 +108,13 @@ func (f *fakeService) GetSUT(_ context.Context, id int64) (resourceapp.SUTView, 
 	return f.sut, f.err
 }
 
-func (f *fakeService) CreateEnvironment(_ context.Context, sutID int64, input resourceapp.EnvironmentInput, actorID int64) (resourceapp.EnvironmentView, error) {
-	f.lastParentID, f.lastEnvInput, f.lastActor = sutID, input, actorID
+func (f *fakeService) ListSUTRegistrations(_ context.Context, sutID int64) ([]resourceapp.SUTRegistrationView, error) {
+	f.lastID = sutID
+	return f.registrations, f.err
+}
+
+func (f *fakeService) CreateEnvironment(_ context.Context, input resourceapp.EnvironmentInput, actorID int64) (resourceapp.EnvironmentView, error) {
+	f.lastEnvInput, f.lastActor = input, actorID
 	return f.env, f.err
 }
 
@@ -117,13 +128,23 @@ func (f *fakeService) DeleteEnvironment(_ context.Context, id int64, actorID int
 	return f.err
 }
 
-func (f *fakeService) ListEnvironments(_ context.Context, sutID int64) ([]resourceapp.EnvironmentView, error) {
-	f.lastParentID = sutID
-	return f.envs, f.err
+func (f *fakeService) ListEnvironments(_ context.Context, limit int, beforeID *int64) ([]resourceapp.EnvironmentView, bool, error) {
+	f.lastLimit, f.lastBefore = limit, beforeID
+	return f.envs, f.hasMore, f.err
 }
 
-func (f *fakeService) CreatePage(_ context.Context, environmentID int64, input resourceapp.PageInput, actorID int64) (resourceapp.PageView, error) {
-	f.lastParentID, f.lastPageInput, f.lastActor = environmentID, input, actorID
+func (f *fakeService) GetEnvironment(_ context.Context, id int64) (resourceapp.EnvironmentView, error) {
+	f.lastID = id
+	return f.env, f.err
+}
+
+func (f *fakeService) ListSUTsByEnvironment(_ context.Context, environmentID int64) ([]resourceapp.SUTView, error) {
+	f.lastParentID = environmentID
+	return f.suts, f.err
+}
+
+func (f *fakeService) CreatePage(_ context.Context, sutID int64, input resourceapp.PageInput, actorID int64) (resourceapp.PageView, error) {
+	f.lastParentID, f.lastPageInput, f.lastActor = sutID, input, actorID
 	return f.page, f.err
 }
 
@@ -137,18 +158,18 @@ func (f *fakeService) DeletePage(_ context.Context, id int64, actorID int64) err
 	return f.err
 }
 
-func (f *fakeService) ListPages(_ context.Context, environmentID int64) ([]resourceapp.PageView, error) {
-	f.lastParentID = environmentID
+func (f *fakeService) ListPages(_ context.Context, sutID int64) ([]resourceapp.PageView, error) {
+	f.lastParentID = sutID
 	return f.pages, f.err
 }
 
-func (f *fakeService) ImportPages(_ context.Context, environmentID int64, items []resourceapp.PageInput, actorID int64) (resourceapp.ImportPagesResult, error) {
-	f.lastParentID, f.lastPageItems, f.lastActor = environmentID, items, actorID
+func (f *fakeService) ImportPages(_ context.Context, sutID int64, items []resourceapp.PageInput, actorID int64) (resourceapp.ImportPagesResult, error) {
+	f.lastParentID, f.lastPageItems, f.lastActor = sutID, items, actorID
 	return f.importPagesResult, f.err
 }
 
-func (f *fakeService) CreateAPI(_ context.Context, environmentID int64, input resourceapp.APIInput, actorID int64) (resourceapp.APIView, error) {
-	f.lastParentID, f.lastAPIInput, f.lastActor = environmentID, input, actorID
+func (f *fakeService) CreateAPI(_ context.Context, sutID int64, input resourceapp.APIInput, actorID int64) (resourceapp.APIView, error) {
+	f.lastParentID, f.lastAPIInput, f.lastActor = sutID, input, actorID
 	return f.api, f.err
 }
 
@@ -162,13 +183,13 @@ func (f *fakeService) DeleteAPI(_ context.Context, id int64, actorID int64) erro
 	return f.err
 }
 
-func (f *fakeService) ListAPIs(_ context.Context, environmentID int64) ([]resourceapp.APIView, error) {
-	f.lastParentID = environmentID
+func (f *fakeService) ListAPIs(_ context.Context, sutID int64) ([]resourceapp.APIView, error) {
+	f.lastParentID = sutID
 	return f.apis, f.err
 }
 
-func (f *fakeService) ImportAPIs(_ context.Context, environmentID int64, items []resourceapp.APIInput, actorID int64) (resourceapp.ImportAPIsResult, error) {
-	f.lastParentID, f.lastAPIItems, f.lastActor = environmentID, items, actorID
+func (f *fakeService) ImportAPIs(_ context.Context, sutID int64, items []resourceapp.APIInput, actorID int64) (resourceapp.ImportAPIsResult, error) {
+	f.lastParentID, f.lastAPIItems, f.lastActor = sutID, items, actorID
 	return f.importAPIsResult, f.err
 }
 
@@ -192,8 +213,8 @@ func (f *fakeService) ListDatabases(_ context.Context, sutID int64) ([]resourcea
 	return f.databases, f.err
 }
 
-func (f *fakeService) CreateAccount(_ context.Context, sutID int64, input resourceapp.AccountInput, actorID int64) (resourceapp.AccountView, error) {
-	f.lastParentID, f.lastAcctInput, f.lastActor = sutID, input, actorID
+func (f *fakeService) CreateAccount(_ context.Context, input resourceapp.AccountInput, actorID int64) (resourceapp.AccountView, error) {
+	f.lastAcctInput, f.lastActor = input, actorID
 	return f.account, f.err
 }
 
@@ -207,8 +228,7 @@ func (f *fakeService) DeleteAccount(_ context.Context, id int64, actorID int64) 
 	return f.err
 }
 
-func (f *fakeService) ListAccounts(_ context.Context, sutID int64) ([]resourceapp.AccountView, error) {
-	f.lastParentID = sutID
+func (f *fakeService) ListAccounts(_ context.Context) ([]resourceapp.AccountView, error) {
 	return f.accounts, f.err
 }
 
@@ -272,37 +292,38 @@ func (f *fakeService) RejectAPI(_ context.Context, apiID, actorID int64) (resour
 
 func sampleViews() (resourceapp.SUTView, resourceapp.EnvironmentView, resourceapp.PageView, resourceapp.APIView, resourceapp.DatabaseView, resourceapp.AccountView, resourceapp.CodeRepositoryView) {
 	page := resourceapp.PageView{
-		ID: "1003", SUTID: "1001", EnvironmentID: "1002", Name: "orders",
+		ID: "1003", SUTID: "1001", Name: "orders",
 		URL: "https://app.example.com/orders", RouteTemplate: "/orders", PageType: "page",
 		AuthRole: "user", Module: "orders", Status: resource.PageStatusApproved,
 		Source: resource.PageSourceAdmin, CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	api := resourceapp.APIView{
-		ID: "1004", SUTID: "1001", EnvironmentID: "1002", Method: "GET",
+		ID: "1004", SUTID: "1001", Method: "GET",
 		PathTemplate: "/api/orders", Name: "list", Source: resource.APISourceManual,
 		Status: resource.APIStatusApproved, CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	database := resourceapp.DatabaseView{
-		ID: "1005", SUTID: "1001", EnvironmentID: "1002", Name: "orders-db",
+		ID: "1005", SUTID: "1001", Name: "orders-db",
 		DSN: "postgres://db/orders", Username: "reader", PasswordSet: true,
 		ReadOnly: true, Status: resource.StatusActive, CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	account := resourceapp.AccountView{
-		ID: "1006", SUTID: "1001", EnvironmentID: "1002", Username: "admin",
+		ID: "1006", SUTID: "1001", Username: "admin",
 		Roles: []string{"admin"}, Notes: "seed", Status: resource.StatusActive,
 		PasswordSet: true, CreatedAt: testNow, UpdatedAt: testNow,
 	}
-	environment := resourceapp.EnvironmentView{
-		ID: "1002", SUTID: "1001", Name: "prod", BaseURL: "https://app.example.com",
-		IsDefault: true, Status: resource.StatusActive,
-		Pages: []resourceapp.PageView{page}, APIs: []resourceapp.APIView{api},
-		Databases: []resourceapp.DatabaseView{database}, Accounts: []resourceapp.AccountView{account},
+	sut := resourceapp.SUTView{
+		ID: "1001", EnvironmentID: "1000", Name: "Order Center", Intro: "orders",
+		BaseURL: "https://app.example.com", Family: familyPtr("payments"),
+		Pages:     []resourceapp.PageView{page},
+		APIs:      []resourceapp.APIView{api},
+		Databases: []resourceapp.DatabaseView{database},
 		CreatedAt: testNow, UpdatedAt: testNow,
 	}
-	sut := resourceapp.SUTView{
-		ID: "1001", Name: "Order Center", Intro: "orders", Family: familyPtr("payments"),
-		Environments: []resourceapp.EnvironmentView{environment},
-		CreatedAt:    testNow, UpdatedAt: testNow,
+	environment := resourceapp.EnvironmentView{
+		ID: "1000", Name: "prod", Description: "production", Status: resource.StatusActive,
+		SUTs:      []resourceapp.SUTView{sut},
+		CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	repository := resourceapp.CodeRepositoryView{
 		ID: "1007", Name: "orders", Path: "https://git.example.com/orders.git",
@@ -324,7 +345,7 @@ func newHandler() (*Handler, *fakeService) {
 		databases:    []resourceapp.DatabaseView{database},
 		accounts:     []resourceapp.AccountView{account},
 		repositories: []resourceapp.CodeRepositoryView{repository},
-		catalog:      []resourceapp.SUTView{sut},
+		catalog:      []resourceapp.EnvironmentView{env},
 	}
 	return New(svc), svc
 }
@@ -358,7 +379,9 @@ func decodeData(t *testing.T, rec *httptest.ResponseRecorder, target any) {
 
 func TestCreateSUTShape(t *testing.T) {
 	handler, svc := newHandler()
-	req := request(http.MethodPost, "/api/resources/suts", `{"name":"Order Center","intro":"orders"}`, admin)
+	req := request(http.MethodPost, "/api/resources/environments/1000/suts",
+		`{"name":"Order Center","intro":"orders","base_url":"https://app.example.com"}`, admin)
+	req.SetPathValue("id", "1000")
 	rec := httptest.NewRecorder()
 	handler.CreateSUT(rec, req)
 
@@ -367,18 +390,25 @@ func TestCreateSUTShape(t *testing.T) {
 	}
 	var dto sutDTO
 	decodeData(t, rec, &dto)
-	if dto.ID != "1001" || dto.Name != "Order Center" {
+	if dto.ID != "1001" || dto.Name != "Order Center" || dto.EnvironmentID != "1000" {
 		t.Fatalf("dto = %#v", dto)
 	}
 	if svc.lastActor != 42 || svc.lastSUTInput.Name != "Order Center" || svc.lastSUTInput.Intro != "orders" {
 		t.Fatalf("service call = %#v actor=%d", svc.lastSUTInput, svc.lastActor)
 	}
+	if svc.lastParentID != 1000 {
+		t.Fatalf("environment id = %d, want 1000", svc.lastParentID)
+	}
+	if svc.lastSUTInput.BaseURL != "https://app.example.com" {
+		t.Fatalf("base_url = %q", svc.lastSUTInput.BaseURL)
+	}
 }
 
 func TestCreateSUTFamilyPayload(t *testing.T) {
 	handler, svc := newHandler()
-	req := request(http.MethodPost, "/api/resources/suts",
-		`{"name":"Order Center","intro":"orders","family":"payments"}`, admin)
+	req := request(http.MethodPost, "/api/resources/environments/1000/suts",
+		`{"name":"Order Center","intro":"orders","family":"payments","base_url":"https://app.example.com"}`, admin)
+	req.SetPathValue("id", "1000")
 	rec := httptest.NewRecorder()
 	handler.CreateSUT(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -398,8 +428,10 @@ func TestCreateSUTOmittingFamilyLeavesItUnset(t *testing.T) {
 	handler, svc := newHandler()
 	svc.sut.Family = nil
 	svc.suts[0].Family = nil
-	svc.catalog[0].Family = nil
-	req := request(http.MethodPost, "/api/resources/suts", `{"name":"No Family"}`, admin)
+	svc.catalog[0].SUTs[0].Family = nil
+	req := request(http.MethodPost, "/api/resources/environments/1000/suts",
+		`{"name":"No Family","base_url":"https://nofamily.example.com"}`, admin)
+	req.SetPathValue("id", "1000")
 	rec := httptest.NewRecorder()
 	handler.CreateSUT(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -471,7 +503,8 @@ func TestGetSUTIncludesFamily(t *testing.T) {
 
 func TestWriteEndpointsRequireActor(t *testing.T) {
 	handler, _ := newHandler()
-	req := request(http.MethodPost, "/api/resources/suts", `{"name":"x"}`, nil)
+	req := request(http.MethodPost, "/api/resources/environments/1000/suts", `{"name":"x"}`, nil)
+	req.SetPathValue("id", "1000")
 	rec := httptest.NewRecorder()
 	handler.CreateSUT(rec, req)
 	if rec.Code != http.StatusUnauthorized {
@@ -489,7 +522,8 @@ func TestWriteEndpointsRequireActor(t *testing.T) {
 
 func TestCreateSUTRejectsInvalidBody(t *testing.T) {
 	handler, _ := newHandler()
-	req := request(http.MethodPost, "/api/resources/suts", `{"name":`, admin)
+	req := request(http.MethodPost, "/api/resources/environments/1000/suts", `{"name":`, admin)
+	req.SetPathValue("id", "1000")
 	rec := httptest.NewRecorder()
 	handler.CreateSUT(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -552,42 +586,39 @@ func TestGetSUTNestsResourcesAndHidesPasswords(t *testing.T) {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
 
+	// v0.2.4-B: a SUT nests its own assets directly (pages/APIs/databases);
+	// accounts are a global pool served from /api/resources/accounts.
 	var raw struct {
 		Data struct {
-			ID           string           `json:"id"`
-			CreatedAt    string           `json:"created_at"`
-			Environments []map[string]any `json:"environments"`
-			Accounts     []map[string]any `json:"accounts"`
-			Databases    []map[string]any `json:"databases"`
+			ID            string           `json:"id"`
+			EnvironmentID string           `json:"environment_id"`
+			BaseURL       string           `json:"base_url"`
+			CreatedAt     string           `json:"created_at"`
+			Pages         []map[string]any `json:"pages"`
+			APIs          []map[string]any `json:"apis"`
+			Databases     []map[string]any `json:"databases"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if raw.Data.ID != "1001" || len(raw.Data.Environments) != 1 {
+	if raw.Data.ID != "1001" || raw.Data.EnvironmentID != "1000" {
 		t.Fatalf("data = %#v", raw.Data)
+	}
+	if raw.Data.BaseURL != "https://app.example.com" {
+		t.Fatalf("base_url = %q", raw.Data.BaseURL)
 	}
 	if raw.Data.CreatedAt != "2026-10-31T12:00:00Z" {
 		t.Fatalf("created_at = %q", raw.Data.CreatedAt)
 	}
-	env := raw.Data.Environments[0]
-	pages, _ := env["pages"].([]any)
-	if len(pages) != 1 {
-		t.Fatalf("pages = %#v", env["pages"])
+	if len(raw.Data.Pages) != 1 || len(raw.Data.APIs) != 1 || len(raw.Data.Databases) != 1 {
+		t.Fatalf("nested assets = %#v", raw.Data)
 	}
-	accounts, _ := env["accounts"].([]any)
-	if len(accounts) != 1 {
-		t.Fatalf("accounts = %#v", env["accounts"])
+	page := raw.Data.Pages[0]
+	if _, ok := page["environment_id"]; ok {
+		t.Fatalf("page still exposes environment_id: %#v", page)
 	}
-	account := accounts[0].(map[string]any)
-	if _, ok := account["password"]; ok {
-		t.Fatalf("account exposes password: %#v", account)
-	}
-	if account["password_set"] != true {
-		t.Fatalf("account = %#v", account)
-	}
-	databases, _ := env["databases"].([]any)
-	database := databases[0].(map[string]any)
+	database := raw.Data.Databases[0]
 	if _, ok := database["password"]; ok {
 		t.Fatalf("database exposes password: %#v", database)
 	}
@@ -596,10 +627,55 @@ func TestGetSUTNestsResourcesAndHidesPasswords(t *testing.T) {
 	}
 }
 
+// TestGetEnvironmentNestsSUTs pins the inverted catalog read: the environment is
+// the root and nests its SUTs with their assets.
+func TestGetEnvironmentNestsSUTs(t *testing.T) {
+	handler, _ := newHandler()
+	req := request(http.MethodGet, "/api/resources/environments/1000", "", plainUser)
+	req.SetPathValue("id", "1000")
+	rec := httptest.NewRecorder()
+	handler.GetEnvironment(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var raw struct {
+		Data struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Status      string `json:"status"`
+			SUTs        []struct {
+				ID        string           `json:"id"`
+				BaseURL   string           `json:"base_url"`
+				Pages     []map[string]any `json:"pages"`
+				Databases []map[string]any `json:"databases"`
+			} `json:"suts"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if raw.Data.ID != "1000" || raw.Data.Description != "production" || raw.Data.Status != "active" {
+		t.Fatalf("environment = %#v", raw.Data)
+	}
+	if len(raw.Data.SUTs) != 1 || raw.Data.SUTs[0].ID != "1001" {
+		t.Fatalf("suts = %#v", raw.Data.SUTs)
+	}
+	if raw.Data.SUTs[0].BaseURL != "https://app.example.com" {
+		t.Fatalf("base_url must live on the SUT: %#v", raw.Data.SUTs[0])
+	}
+	if len(raw.Data.SUTs[0].Pages) != 1 || len(raw.Data.SUTs[0].Databases) != 1 {
+		t.Fatalf("nested assets = %#v", raw.Data.SUTs[0])
+	}
+	if strings.Contains(rec.Body.String(), `"base_url":"https://app.example.com","is_default"`) {
+		t.Fatalf("environment must not carry the old shape: %s", rec.Body.String())
+	}
+}
+
 func TestCreateAccountMasksPassword(t *testing.T) {
 	handler, svc := newHandler()
-	req := request(http.MethodPost, "/api/resources/suts/1001/accounts",
-		`{"environment_id":"1002","username":"admin","password":"s3cret","roles":["admin"]}`, admin)
+	req := request(http.MethodPost, "/api/resources/accounts",
+		`{"sut_id":"1001","username":"admin","password":"s3cret","roles":["admin"]}`, admin)
 	req.SetPathValue("id", "1001")
 	rec := httptest.NewRecorder()
 	handler.CreateAccount(rec, req)
@@ -614,18 +690,20 @@ func TestCreateAccountMasksPassword(t *testing.T) {
 	if !dto.PasswordSet || dto.Username != "admin" {
 		t.Fatalf("dto = %#v", dto)
 	}
-	if svc.lastAcctInput.Password != "s3cret" || svc.lastAcctInput.EnvironmentID != 1002 {
+	if svc.lastAcctInput.Password != "s3cret" || svc.lastAcctInput.SUTID == nil || *svc.lastAcctInput.SUTID != 1001 {
 		t.Fatalf("input = %#v", svc.lastAcctInput)
 	}
-	if svc.lastParentID != 1001 || svc.lastActor != 42 {
-		t.Fatalf("parent = %d actor = %d", svc.lastParentID, svc.lastActor)
+	// The account pool is global: the create route carries no SUT path segment,
+	// so the affinity travels in the body only.
+	if svc.lastActor != 42 {
+		t.Fatalf("actor = %d", svc.lastActor)
 	}
 }
 
 func TestCreateDatabaseMapsReadOnly(t *testing.T) {
 	handler, svc := newHandler()
 	req := request(http.MethodPost, "/api/resources/suts/1001/databases",
-		`{"environment_id":"1002","name":"orders","dsn":"postgres://db/orders","username":"reader","password":"pw"}`, admin)
+		`{"name":"orders","dsn":"postgres://db/orders","username":"reader","password":"pw"}`, admin)
 	req.SetPathValue("id", "1001")
 	rec := httptest.NewRecorder()
 	handler.CreateDatabase(rec, req)
@@ -636,7 +714,7 @@ func TestCreateDatabaseMapsReadOnly(t *testing.T) {
 		t.Fatalf("read_only = %v, want nil default", svc.lastDBInput.ReadOnly)
 	}
 	req = request(http.MethodPost, "/api/resources/suts/1001/databases",
-		`{"environment_id":"1002","name":"orders","dsn":"postgres://db/orders","username":"reader","read_only":false}`, admin)
+		`{"name":"orders","dsn":"postgres://db/orders","username":"reader","read_only":false}`, admin)
 	req.SetPathValue("id", "1001")
 	rec = httptest.NewRecorder()
 	handler.CreateDatabase(rec, req)
@@ -653,7 +731,7 @@ func TestImportPagesShape(t *testing.T) {
 	svc.importPagesResult = resourceapp.ImportPagesResult{
 		Created: 1, Skipped: 1, Items: []resourceapp.PageView{svc.page},
 	}
-	req := request(http.MethodPost, "/api/resources/environments/1002/pages/import",
+	req := request(http.MethodPost, "/api/resources/suts/1001/pages/import",
 		`{"items":[{"name":"orders","url":"https://app.example.com/orders"},{"name":"dup","url":"https://app.example.com/orders?x=1"}]}`, admin)
 	req.SetPathValue("id", "1002")
 	rec := httptest.NewRecorder()
@@ -688,7 +766,7 @@ func TestImportInvalidItemReturns400WithIndex(t *testing.T) {
 		Status: 400, Code: "invalid_argument", Message: "import item is invalid",
 		Details: map[string]any{"field": "items", "index": 1},
 	}
-	req := request(http.MethodPost, "/api/resources/environments/1002/apis/import",
+	req := request(http.MethodPost, "/api/resources/suts/1001/apis/import",
 		`{"items":[{"method":"GET","path_template":"/api/a","name":"a"}]}`, admin)
 	req.SetPathValue("id", "1002")
 	rec := httptest.NewRecorder()
@@ -715,7 +793,7 @@ func TestImportAPIsShape(t *testing.T) {
 	svc.importAPIsResult = resourceapp.ImportAPIsResult{
 		Created: 1, Skipped: 0, Items: []resourceapp.APIView{svc.api},
 	}
-	req := request(http.MethodPost, "/api/resources/environments/1002/apis/import",
+	req := request(http.MethodPost, "/api/resources/suts/1001/apis/import",
 		`{"items":[{"method":"POST","path_template":"/api/orders","name":"create"}]}`, admin)
 	req.SetPathValue("id", "1002")
 	rec := httptest.NewRecorder()
@@ -834,26 +912,26 @@ func TestUpdateSUTOnlyPatchesProvidedFields(t *testing.T) {
 func TestEnvironmentAndPageCRUDShapes(t *testing.T) {
 	handler, svc := newHandler()
 
-	req := request(http.MethodPost, "/api/resources/suts/1001/environments",
-		`{"name":"prod","base_url":"https://app.example.com","is_default":true}`, admin)
-	req.SetPathValue("id", "1001")
+	req := request(http.MethodPost, "/api/resources/environments",
+		`{"name":"prod","description":"production","status":"active"}`, admin)
 	rec := httptest.NewRecorder()
 	handler.CreateEnvironment(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("env status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if svc.lastEnvInput.Name != "prod" || !svc.lastEnvInput.IsDefault || svc.lastParentID != 1001 {
-		t.Fatalf("env input = %#v parent = %d", svc.lastEnvInput, svc.lastParentID)
+	if svc.lastEnvInput.Name != "prod" || svc.lastEnvInput.Description != "production" ||
+		svc.lastEnvInput.Status != "active" {
+		t.Fatalf("env input = %#v", svc.lastEnvInput)
 	}
 	var envDTO environmentDTO
 	decodeData(t, rec, &envDTO)
-	if envDTO.ID != "1002" || !envDTO.IsDefault {
+	if envDTO.ID != "1000" || len(envDTO.SUTs) != 1 || envDTO.SUTs[0].ID != "1001" {
 		t.Fatalf("env dto = %#v", envDTO)
 	}
 
-	req = request(http.MethodPost, "/api/resources/environments/1002/pages",
+	req = request(http.MethodPost, "/api/resources/suts/1001/pages",
 		`{"name":"orders","url":"https://app.example.com/orders"}`, admin)
-	req.SetPathValue("id", "1002")
+	req.SetPathValue("id", "1001")
 	rec = httptest.NewRecorder()
 	handler.CreatePage(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -875,7 +953,7 @@ func TestEnvironmentAndPageCRUDShapes(t *testing.T) {
 		t.Fatalf("page patch = %#v", svc.lastPagePatch)
 	}
 
-	req = request(http.MethodGet, "/api/resources/environments/1002/pages", "", plainUser)
+	req = request(http.MethodGet, "/api/resources/suts/1001/pages", "", plainUser)
 	req.SetPathValue("id", "1002")
 	rec = httptest.NewRecorder()
 	handler.ListPages(rec, req)
@@ -889,7 +967,7 @@ func TestEnvironmentAndPageCRUDShapes(t *testing.T) {
 
 func TestAPICRUDShapes(t *testing.T) {
 	handler, svc := newHandler()
-	req := request(http.MethodPost, "/api/resources/environments/1002/apis",
+	req := request(http.MethodPost, "/api/resources/suts/1001/apis",
 		`{"method":"GET","path_template":"/api/orders","name":"list"}`, admin)
 	req.SetPathValue("id", "1002")
 	rec := httptest.NewRecorder()
@@ -973,14 +1051,16 @@ func TestCatalogShape(t *testing.T) {
 	}
 	var envelope struct {
 		Data struct {
-			SUTs         []json.RawMessage `json:"suts"`
+			Environments []json.RawMessage `json:"environments"`
 			Repositories []json.RawMessage `json:"repositories"`
+			Accounts     []json.RawMessage `json:"accounts"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(envelope.Data.SUTs) != 1 {
+	if len(envelope.Data.Environments) != 1 || len(envelope.Data.Repositories) != 1 ||
+		len(envelope.Data.Accounts) != 1 {
 		t.Fatalf("catalog = %s", rec.Body.String())
 	}
 }

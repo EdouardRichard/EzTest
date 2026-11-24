@@ -13,6 +13,7 @@ import (
 
 	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
 // DefaultCommandTimeout is the read-only git command budget (spec §5.1).
@@ -87,12 +88,21 @@ func New(runner Runner, timeout time.Duration) *Git {
 	return &Git{runner: runner, timeout: timeout}
 }
 
-var (
-	commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	// Ref names accept branch/tag shapes but never an option-like leading dash,
-	// whitespace or control characters.
-	refPattern = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._/@{}~^+-]*$`)
-)
+// Ref names accept branch/tag shapes but never an option-like leading dash,
+// whitespace or control characters.
+var refPattern = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._/@{}~^+-]*$`)
+
+// validCommitSHA reports whether value is a present, well-formed 40-hex commit
+// SHA. The shape rule has one authority — platform/validation.GitCommitSHA, the
+// same validator behind the sut_repository.code_baseline_commit CHECK constraint
+// and codeintel/application.ValidCommitSHA — so gitx, the application and the
+// database cannot disagree (H-B5). GitCommitSHA accepts the empty string
+// ("not resolved yet", the nullable-column semantics); a resolved commit must be
+// present, so the empty string is rejected here BEFORE delegating. Without this
+// non-empty guard a bare GitCommitSHA("")==nil would let an empty SHA pass.
+func validCommitSHA(value string) bool {
+	return value != "" && validation.GitCommitSHA("commit", value) == nil
+}
 
 // ResolveCommit resolves a ref (branch, tag, short ref) or 40-hex SHA to the
 // full commit SHA. Nonexistent refs map to commit_not_found.
@@ -127,7 +137,7 @@ func (g *Git) HeadCommit(ctx context.Context, repoPath, branch string) (string, 
 // IsAncestor reports whether base is an ancestor of head (merge-base
 // --is-ancestor). It returns false with no error when the commits are unrelated.
 func (g *Git) IsAncestor(ctx context.Context, repoPath, base, head string) (bool, error) {
-	if !commitSHAPattern.MatchString(base) || !commitSHAPattern.MatchString(head) {
+	if !validCommitSHA(base) || !validCommitSHA(head) {
 		return false, apiError(http.StatusUnprocessableEntity, CodeCommitNotFound, "ancestor check requires 40-hex commit SHAs")
 	}
 	_, stderr, err := g.execute(ctx, repoPath, "merge-base", "--is-ancestor", base, head)
@@ -146,7 +156,7 @@ func (g *Git) IsAncestor(ctx context.Context, repoPath, base, head string) (bool
 // Commit loads commit metadata (never file content) for CodeCommitView.
 func (g *Git) Commit(ctx context.Context, repoPath, sha string, maxMessage int) (codeintel.CommitInfo, error) {
 	sha = strings.TrimSpace(sha)
-	if !commitSHAPattern.MatchString(sha) {
+	if !validCommitSHA(sha) {
 		return codeintel.CommitInfo{}, apiError(http.StatusUnprocessableEntity, CodeCommitNotFound, "commit SHA must be 40 lowercase hex characters")
 	}
 	resolved, err := g.resolveVerified(ctx, repoPath, sha)
@@ -193,7 +203,7 @@ func (g *Git) resolveVerified(ctx context.Context, repoPath, ref string) (string
 		return "", g.mapExecutionError(stderr, err)
 	}
 	sha := strings.TrimSpace(string(stdout))
-	if !commitSHAPattern.MatchString(sha) {
+	if !validCommitSHA(sha) {
 		return "", apiError(http.StatusUnprocessableEntity, CodeCommitNotFound, "git did not resolve the reference to a commit")
 	}
 	return sha, nil

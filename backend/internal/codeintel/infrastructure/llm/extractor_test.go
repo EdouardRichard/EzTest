@@ -29,6 +29,13 @@ func (f *fakeChat) Chat(_ context.Context, request llmapp.ChatRequest) (llmapp.C
 	return llmapp.ChatResponse{Content: f.content}, nil
 }
 
+// Stream satisfies the extended ChatGateway port. The extractor only uses the
+// non-streaming Chat path; a Stream call here means the consumer changed, so
+// fail loudly instead of supplying a fiat zero value.
+func (f *fakeChat) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	panic("fakeChat.Stream must not be called: the codeintel extractor uses non-streaming Chat")
+}
+
 func (f *fakeChat) ResolveModel(_ context.Context, _ int64, _ string, _ ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.modelCalls++
 	if f.modelErr != nil {

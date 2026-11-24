@@ -122,14 +122,28 @@ func requirementDetail(detail versionapp.RequirementDetail) tools.RequirementDet
 	if len(constraints) == 0 {
 		constraints = json.RawMessage(`{}`)
 	}
+	criteria := make([]tools.RequirementAcceptanceCriterion, 0, len(detail.CurrentVersion.AcceptanceCriteria))
+	for _, criterion := range detail.CurrentVersion.AcceptanceCriteria {
+		criteria = append(criteria, tools.RequirementAcceptanceCriterion{
+			ID:    criterion.ID,
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
+	}
 	return tools.RequirementDetail{
 		RequirementSummary: requirementSummary(detail.RequirementView),
-		Description:        detail.CurrentVersion.Description,
-		AcceptanceCriteria: detail.CurrentVersion.AcceptanceCriteria,
+		UserStory: tools.RequirementUserStory{
+			AsA:    detail.CurrentVersion.UserStory.AsA,
+			IWant:  detail.CurrentVersion.UserStory.IWant,
+			SoThat: detail.CurrentVersion.UserStory.SoThat,
+		},
+		Rules:              detail.CurrentVersion.Rules,
+		AcceptanceCriteria: criteria,
 		Constraints:        constraints,
-		TargetVersionSUTs:  detail.CurrentVersion.TargetVersionSUTs,
-		TargetPages:        detail.CurrentVersion.TargetPages,
-		TargetAPIs:         detail.CurrentVersion.TargetAPIs,
+		SutDescription:     detail.CurrentVersion.SutDescription,
+		ScopeOut:           detail.CurrentVersion.ScopeOut,
+		AccountRolesHint:   detail.CurrentVersion.AccountRolesHint,
 	}
 }
 
@@ -138,14 +152,27 @@ func versionDraft(draft tools.RequirementDraft) versionapp.RequirementDraft {
 	if len(constraints) == 0 {
 		constraints = json.RawMessage(`{}`)
 	}
+	criteria := make([]versionapp.RequirementAcceptanceCriterionInput, 0, len(draft.AcceptanceCriteria))
+	for _, criterion := range draft.AcceptanceCriteria {
+		criteria = append(criteria, versionapp.RequirementAcceptanceCriterionInput{
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
+	}
 	return versionapp.RequirementDraft{
-		Title:              draft.Title,
-		Description:        draft.Description,
-		AcceptanceCriteria: draft.AcceptanceCriteria,
+		Title: draft.Title,
+		UserStory: versionapp.RequirementUserStoryView{
+			AsA:    draft.UserStory.AsA,
+			IWant:  draft.UserStory.IWant,
+			SoThat: draft.UserStory.SoThat,
+		},
+		Rules:              draft.Rules,
+		AcceptanceCriteria: criteria,
 		Priority:           draft.Priority,
 		Constraints:        constraints,
-		TargetVersionSUTs:  draft.TargetVersionSUTs,
-		TargetPages:        draft.TargetPages,
-		TargetAPIs:         draft.TargetAPIs,
+		SutDescription:     draft.SutDescription,
+		ScopeOut:           draft.ScopeOut,
+		AccountRolesHint:   draft.AccountRolesHint,
 	}
 }

@@ -309,10 +309,10 @@ type RetestIssueView struct {
 
 // IssueRefView is one append-only issue reference (contract IssueRefView).
 type IssueRefView struct {
-	Kind         string  `json:"kind"`
-	RefID        string  `json:"ref_id"`
-	VersionSUTID *string `json:"version_sut_id"`
-	Role         string  `json:"role"`
+	Kind  string  `json:"kind"`
+	RefID string  `json:"ref_id"`
+	SUTID *string `json:"sut_id"`
+	Role  string  `json:"role"`
 }
 
 // IssueTriageView is the latest issue.triage analysis-run projection.
@@ -401,10 +401,10 @@ func toIssueRefView(ref delivery.IssueRef) IssueRefView {
 		role = delivery.IssueRefRoleSource
 	}
 	return IssueRefView{
-		Kind:         ref.Kind,
-		RefID:        platformid.Format(ref.RefID),
-		VersionSUTID: optionalIDString(ref.VersionSUTID),
-		Role:         role,
+		Kind:  ref.Kind,
+		RefID: platformid.Format(ref.RefID),
+		SUTID: optionalIDString(ref.SUTID),
+		Role:  role,
 	}
 }
 

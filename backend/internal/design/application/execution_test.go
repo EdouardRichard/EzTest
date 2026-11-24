@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
@@ -11,34 +12,37 @@ import (
 )
 
 func executableCaseFixture() design.ExecutableCase {
-	versionSUT := int64(9001)
-	pageID := int64(6001)
+	sutID := int64(9001)
 	return design.ExecutableCase{
 		CaseID:               7001,
 		RequirementID:        3001,
 		RequirementVersionID: 3002,
 		Version: design.CaseVersion{
-			ID:                  7002,
-			CaseID:              7001,
-			Revision:            1,
-			Title:               "跨系统退款",
-			Description:         "desc",
-			Preconditions:       "pre",
-			Priority:            design.PriorityP1,
-			DefaultVersionSUTID: &versionSUT,
-			VersionSUTIDs:       []int64{9001, 9002},
-			Status:              design.CaseStatusConfirmed,
+			ID:             7002,
+			CaseID:         7001,
+			Revision:       1,
+			Title:          "跨系统退款",
+			Description:    "desc",
+			SutDescription: "商城前台订单页、退款接口与订单库。",
+			Preconditions:  "pre",
+			CoveredACs:     []string{"AC-1", "AC-2"},
+			Priority:       design.PriorityP1,
+			Status:         design.CaseStatusConfirmed,
 			Steps: []design.CaseStep{
-				{ID: 1, Seq: 1, Action: "open", Expected: "visible", TargetVersionSUTID: &versionSUT, TargetPageID: &pageID, AccountRole: "admin", Data: json.RawMessage(`{}`)},
+				{ID: 1, Seq: 1, Action: "open", Expected: "visible", TargetDescription: "订单列表页", AccountRole: "admin", Data: json.RawMessage(`{}`)},
 			},
 			Assertions: []design.CaseAssertion{
-				{ID: 10, StepSeq: 1, AssertionSeq: 1, Kind: design.AssertionUI, Expected: "ok", TargetVersionSUTID: &versionSUT},
-				{ID: 11, StepSeq: 1, AssertionSeq: 2, Kind: design.AssertionDB, Expected: "paid", DatabaseID: &pageID},
+				{ID: 10, StepSeq: 1, AssertionSeq: 1, Kind: design.AssertionUI, Expected: "ok"},
+				{ID: 11, StepSeq: 1, AssertionSeq: 2, Kind: design.AssertionDB, Expected: "paid", SUTID: &sutID},
 			},
 		},
 	}
 }
 
+// TestGetCaseVersionMapsExecutableCase pins the design -> execution read contract
+// (§3.3): execution receives the natural-language case -- sut_description,
+// covered_acs, per-step target_description and the db assertion's sut_id -- and
+// no resource id list to resolve a target from. T11 owns the receiving adapter.
 func TestGetCaseVersionMapsExecutableCase(t *testing.T) {
 	repo := newFakeRepo()
 	repo.executableCaseErr = nil
@@ -52,15 +56,55 @@ func TestGetCaseVersionMapsExecutableCase(t *testing.T) {
 		t.Fatalf("GetCaseVersion: %v", err)
 	}
 	if executable.CaseID != 7001 || executable.CaseVersionID != 7002 || executable.RequirementID != 3001 ||
-		executable.RequirementVersionID != 3002 || executable.DefaultVersionSUTID != 9001 {
+		executable.RequirementVersionID != 3002 {
 		t.Fatalf("executable case = %+v", executable)
 	}
-	if len(executable.Steps) != 1 || executable.Steps[0].Action != "open" || executable.Steps[0].TargetVersionSUTID != 9001 {
+	if executable.SutDescription != "商城前台订单页、退款接口与订单库。" {
+		t.Fatalf("sut_description = %q", executable.SutDescription)
+	}
+	if len(executable.CoveredACs) != 2 || executable.CoveredACs[0] != "AC-1" || executable.CoveredACs[1] != "AC-2" {
+		t.Fatalf("covered_acs = %v", executable.CoveredACs)
+	}
+	if len(executable.Steps) != 1 || executable.Steps[0].Action != "open" ||
+		executable.Steps[0].TargetDescription != "订单列表页" {
 		t.Fatalf("steps = %+v", executable.Steps)
 	}
-	if len(executable.Assertions) != 2 || executable.Assertions[1].Kind != design.AssertionDB ||
-		executable.Assertions[1].AssertionSeq != 2 {
+	if len(executable.Assertions) != 2 {
 		t.Fatalf("assertions = %+v", executable.Assertions)
+	}
+	if executable.Assertions[0].SUTID != 0 {
+		t.Fatalf("a ui assertion must not carry a sut_id: %+v", executable.Assertions[0])
+	}
+	if executable.Assertions[1].Kind != design.AssertionDB || executable.Assertions[1].AssertionSeq != 2 ||
+		executable.Assertions[1].SUTID != 9001 {
+		t.Fatalf("db assertion = %+v", executable.Assertions[1])
+	}
+}
+
+// TestExecutableCaseViewCarriesNoResourceIDs pins the negative half of the
+// contract: the projection has no SUT/page/API id list left for execution to
+// resolve a target from, so a future edit cannot quietly re-introduce the
+// coupling v0.2.4-B removes. It is a compile-time assertion expressed as a test:
+// the field names below must not exist.
+func TestExecutableCaseViewCarriesNoResourceIDs(t *testing.T) {
+	view := executableCaseView(executableCaseFixture())
+	viewType := reflect.TypeOf(view)
+	for _, gone := range []string{"DefaultVersionSUTID", "VersionSUTIDs", "SUTIDs", "PageIDs", "APIIDs"} {
+		if _, found := viewType.FieldByName(gone); found {
+			t.Fatalf("ExecutableCaseView re-gained the retired field %q", gone)
+		}
+	}
+	stepType := reflect.TypeOf(view.Steps[0])
+	for _, gone := range []string{"TargetVersionSUTID", "PageID", "APIID"} {
+		if _, found := stepType.FieldByName(gone); found {
+			t.Fatalf("ExecutableStepView re-gained the retired field %q", gone)
+		}
+	}
+	assertionType := reflect.TypeOf(view.Assertions[0])
+	for _, gone := range []string{"TargetVersionSUTID", "DatabaseID", "APIID"} {
+		if _, found := assertionType.FieldByName(gone); found {
+			t.Fatalf("ExecutableAssertionView re-gained the retired field %q", gone)
+		}
 	}
 }
 

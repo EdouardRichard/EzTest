@@ -15,7 +15,6 @@ export type ApiSource = "code" | "openapi" | "ai" | "manual" | "import"
 export type SutPage = {
   id: string
   sut_id: string
-  environment_id: string
   name: string
   url: string
   route_template: string
@@ -31,7 +30,6 @@ export type SutPage = {
 export type SutApi = {
   id: string
   sut_id: string
-  environment_id: string
   method: ApiMethod
   path_template: string
   name: string
@@ -46,7 +44,6 @@ export type SutApi = {
 export type TargetDatabase = {
   id: string
   sut_id: string
-  environment_id: string
   name: string
   dsn: string
   username: string
@@ -59,8 +56,8 @@ export type TargetDatabase = {
 
 export type TestAccount = {
   id: string
-  sut_id: string
-  environment_id: string
+  /** Optional SUT affinity hint; omitted by the global account pool when absent. */
+  sut_id?: string
   username: string
   roles: string[]
   notes: string
@@ -70,28 +67,39 @@ export type TestAccount = {
   updated_at: string
 }
 
+/** SUT registration source (resource_0005, v0.2.4-B). */
+export type SutSource = "admin" | "ai" | "import"
+
+/** SUT registration status, separate from the active/disabled lifecycle. */
+export type SutRegistrationStatus = "proposed" | "approved" | "rejected"
+
+/**
+ * One top-level environment (v0.2.4-B hierarchy inversion). It owns SUTs; the
+ * old per-SUT environment carrying base_url/is_default/assets is gone.
+ */
 export type SutEnvironment = {
   id: string
-  sut_id: string
   name: string
-  base_url: string
-  is_default: boolean
+  description: string
   status: ResourceStatus
-  pages: SutPage[]
-  apis: SutApi[]
-  databases: TargetDatabase[]
-  accounts: TestAccount[]
+  suts: Sut[]
   created_at: string
   updated_at: string
 }
 
 export type Sut = {
   id: string
+  environment_id: string
   name: string
   intro: string
+  base_url: string
   /** Optional lowercase system family used by `knowledge.scope='system'` (P7). */
   family?: string | null
-  environments: SutEnvironment[]
+  source: SutSource
+  status: SutRegistrationStatus
+  pages: SutPage[]
+  apis: SutApi[]
+  databases: TargetDatabase[]
   created_at: string
   updated_at: string
 }
@@ -158,8 +166,7 @@ export type SutFormValues = {
 
 export type EnvironmentFormValues = {
   name: string
-  baseUrl: string
-  isDefault: boolean
+  description: string
   status: ResourceStatus
 }
 
@@ -181,7 +188,6 @@ export type ApiFormValues = {
 }
 
 export type DatabaseFormValues = {
-  environmentId: string
   name: string
   dsn: string
   username: string
@@ -190,7 +196,6 @@ export type DatabaseFormValues = {
 }
 
 export type AccountFormValues = {
-  environmentId: string
   username: string
   password: string
   roles: string
@@ -207,9 +212,11 @@ export type RepositoryFormValues = {
 
 export type FormErrors<T> = Partial<Record<keyof T, string>>
 
-/** Shared page-level resource scope (selected SUT + environment). */
+/** Shared page-level resource scope (selected SUT + its environment). */
 export type ResourceScope = {
   suts: Sut[]
+  /** Top-level environments (v0.2.4-B: environments own SUTs). */
+  environments: SutEnvironment[]
   sutId: string
   environmentId: string
   detail: Sut | null

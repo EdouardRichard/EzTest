@@ -106,13 +106,6 @@ type DesignSnapshotPort interface {
 	CountCaseConfirmation(ctx context.Context, versionID *int64) (int, int, error)
 }
 
-// VisualSnapshotPort is the visual context's diff-classification counter. The
-// adapter returns passed and failed visual diffs; inconclusive/blocked diffs are
-// not an opportunity and stay out of both counters.
-type VisualSnapshotPort interface {
-	VisualClassification(ctx context.Context, versionID *int64) (passed, failed int, err error)
-}
-
 // EventPublisher publishes the eval.* lifecycle events on the version channel
 // (W2-14, EV-20). Publish failures never roll back the eval run.
 type EventPublisher interface {

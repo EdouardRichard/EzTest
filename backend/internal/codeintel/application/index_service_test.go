@@ -40,7 +40,7 @@ func newIndexFixture(t *testing.T) *indexFixture {
 		runs:      newFakeIndexRepo(),
 		entities:  &fakeEntityRepo{},
 		git:       &fakeGit{resolveCommit: testCommitA, head: testCommitB, ancestor: true},
-		versions:  &fakeVersionReader{bindings: []VersionSUTBinding{{VersionSUTID: 11, VersionID: 1, RepoID: 10, Branch: "main"}}},
+		versions:  &fakeVersionReader{bindings: []SUTRepoBinding{{SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main"}}},
 		resources: &fakeResourceReader{repos: map[int64]RepoRef{10: {ID: 10, Name: "repo", Path: "/tmp/repo", Branch: "main"}}},
 		queue:     &fakeWorkQueue{},
 		events:    &fakeEvents{},
@@ -175,15 +175,15 @@ func TestIndexStartResolvesExplicitCommitAndHead(t *testing.T) {
 	}
 }
 
-// TestIndexStartUsesRepoHeadWhenSharedBaselineBelongsToAnotherRepo covers the
-// multi-repo entry from the CodeTab: a version_sut carries one baseline commit
-// that belongs to the first repository. Triggering an index for a second
-// repository must resolve that repository's own branch head instead of
-// reusing the shared commit.
-func TestIndexStartUsesRepoHeadWhenSharedBaselineBelongsToAnotherRepo(t *testing.T) {
+// TestIndexStartUsesRepoHeadWhenBaselineDoesNotResolve covers the multi-repo
+// entry from the CodeTab: every (SUT, repository) pair pins its own baseline,
+// but a pinned commit can be absent from the local clone. Triggering an index
+// for that repository must resolve its own branch head instead of failing on
+// the unresolvable commit.
+func TestIndexStartUsesRepoHeadWhenBaselineDoesNotResolve(t *testing.T) {
 	fixture := newIndexFixture(t)
-	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
-		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	fixture.versions.bindings = append(fixture.versions.bindings, SUTRepoBinding{
+		SUTID: 21, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
 	})
 	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
 	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}
@@ -201,13 +201,13 @@ func TestIndexStartUsesRepoHeadWhenSharedBaselineBelongsToAnotherRepo(t *testing
 	}
 }
 
-// TestRepoStatusUsesRepoSpecificBaseline pins the multi-repo read model: the
-// shared version_sut baseline must not be shown for a repository where that
-// commit does not resolve; its own done index commit is the baseline.
+// TestRepoStatusUsesRepoSpecificBaseline pins the multi-repo read model: a
+// pinned (SUT, repository) baseline that does not resolve in the local clone
+// must not be shown; the repository's own done index commit is the baseline.
 func TestRepoStatusUsesRepoSpecificBaseline(t *testing.T) {
 	fixture := newIndexFixture(t)
-	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
-		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	fixture.versions.bindings = append(fixture.versions.bindings, SUTRepoBinding{
+		SUTID: 21, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
 	})
 	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
 	fixture.runs.runs[5] = codeintel.IndexRun{
@@ -232,10 +232,39 @@ func TestRepoStatusUsesRepoSpecificBaseline(t *testing.T) {
 	}
 }
 
+// TestRepoStatusKeepsPerRepositoryBaselines pins the v0.2.4-B baseline model:
+// every (SUT, repository) pair of the environment code pool pins its own commit,
+// so two repositories of one version report two different baselines and neither
+// is treated as a conflict.
+func TestRepoStatusKeepsPerRepositoryBaselines(t *testing.T) {
+	fixture := newIndexFixture(t)
+	fixture.versions.bindings = []SUTRepoBinding{
+		{SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitA},
+		{SUTID: 22, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitB},
+	}
+	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
+
+	statuses, err := fixture.service.RepoStatus(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("RepoStatus: %v", err)
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("statuses = %+v", statuses)
+	}
+	byRepo := map[int64]RepoStatus{}
+	for _, status := range statuses {
+		byRepo[status.RepoID] = status
+	}
+	if byRepo[10].BaselineCommit != testCommitA || byRepo[20].BaselineCommit != testCommitB {
+		t.Fatalf("per-repo baselines = %q / %q, want %q / %q",
+			byRepo[10].BaselineCommit, byRepo[20].BaselineCommit, testCommitA, testCommitB)
+	}
+}
+
 // TestRepoStatusFallsBackToVersionScopedDoneRun pins the fallback scope: the
-// shared version_sut baseline is absent here, the newest run of this repository
-// failed, and another version sharing the repository owns the newest done run.
-// The read model must use this version's newest done run instead.
+// pinned baseline is absent here, the newest run of this repository failed, and
+// another version sharing the repository owns the newest done run. The read
+// model must use this version's newest done run instead.
 func TestRepoStatusFallsBackToVersionScopedDoneRun(t *testing.T) {
 	fixture := newIndexFixture(t)
 	fixture.versions.bindings[0].CodeBaselineCommit = ""
@@ -295,7 +324,7 @@ func TestIndexExecuteIndexesFilesAndBackfillsBaseline(t *testing.T) {
 		fixture.entities.fileCalls[0].runID != 7 || fixture.entities.fileCalls[0].unsupported != 1 {
 		t.Fatalf("entity calls = %+v", fixture.entities.fileCalls)
 	}
-	if len(fixture.versions.setCalls) != 1 || fixture.versions.setCalls[0] != (baselineSetCall{versionSUTID: 11, commit: testCommitA}) {
+	if len(fixture.versions.setCalls) != 1 || fixture.versions.setCalls[0] != (baselineSetCall{sutID: 21, repoID: 10, commit: testCommitA}) {
 		t.Fatalf("baseline calls = %+v", fixture.versions.setCalls)
 	}
 	types := fixture.events.types()

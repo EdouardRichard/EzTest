@@ -27,18 +27,21 @@ func TestDesignConvergesAfterCoverageRepairGeneration(t *testing.T) {
 	}
 
 	tests := []struct {
-		name  string
-		items []agent.WorkItem
-		want  string
+		name           string
+		items          []agent.WorkItem
+		want           string
+		wantExhausted  bool
+		wantGeneration int
 	}{
 		{
 			name: "no authoring generation yet keeps the base key",
 			want: baseKey,
 		},
 		{
-			name:  "terminal generation asks for the first repair generation",
-			items: []agent.WorkItem{workItem("3006", agent.WorkItemDone, 1, 3)},
-			want:  baseKey + ":repair:1",
+			name:           "terminal generation asks for the first repair generation",
+			items:          []agent.WorkItem{workItem("3006", agent.WorkItemDone, 1, 3)},
+			want:           baseKey + ":repair:1",
+			wantGeneration: 1,
 		},
 		{
 			name:  "open generation is not stampeded",
@@ -61,9 +64,10 @@ func TestDesignConvergesAfterCoverageRepairGeneration(t *testing.T) {
 			want:  "",
 		},
 		{
-			name:  "exhausted failure counts as a terminal generation",
-			items: []agent.WorkItem{workItem("3006", agent.WorkItemFailed, 3, 3)},
-			want:  baseKey + ":repair:1",
+			name:           "exhausted failure counts as a terminal generation",
+			items:          []agent.WorkItem{workItem("3006", agent.WorkItemFailed, 3, 3)},
+			want:           baseKey + ":repair:1",
+			wantGeneration: 1,
 		},
 		{
 			name: "terminal generations advance the bounded repair budget",
@@ -71,16 +75,40 @@ func TestDesignConvergesAfterCoverageRepairGeneration(t *testing.T) {
 				workItem("3006", agent.WorkItemDone, 1, 3),
 				workItem("3006", agent.WorkItemDone, 1, 3),
 			},
-			want: baseKey + ":repair:2",
+			want:           baseKey + ":repair:2",
+			wantGeneration: 2,
 		},
 		{
-			name: "exhausted repair budget stops generation",
+			name: "exhausted repair budget escalates instead of stranding (H-F5b)",
 			items: []agent.WorkItem{
 				workItem("3006", agent.WorkItemDone, 1, 3),
 				workItem("3006", agent.WorkItemDone, 1, 3),
 				workItem("3006", agent.WorkItemDone, 1, 3),
 			},
-			want: "",
+			want:           "",
+			wantExhausted:  true,
+			wantGeneration: 3,
+		},
+		{
+			name: "spent budget with an in-flight generation is a normal wait, not an escalation",
+			items: []agent.WorkItem{
+				workItem("3006", agent.WorkItemDone, 1, 3),
+				workItem("3006", agent.WorkItemDone, 1, 3),
+				workItem("3006", agent.WorkItemDone, 1, 3),
+				workItem("3006", agent.WorkItemOpen, 0, 3),
+			},
+			want:           "",
+			wantGeneration: 3,
+		},
+		{
+			name: "spent budget with a retry-backed failure still owes work",
+			items: []agent.WorkItem{
+				workItem("3006", agent.WorkItemDone, 1, 3),
+				workItem("3006", agent.WorkItemDone, 1, 3),
+				workItem("3006", agent.WorkItemFailed, 1, 3),
+			},
+			want:           "",
+			wantGeneration: 2,
 		},
 		{
 			name:  "another requirement version is ignored",
@@ -102,8 +130,10 @@ func TestDesignConvergesAfterCoverageRepairGeneration(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := coverageRepairDedupeKey(test.items, baseKey, 3006); got != test.want {
-				t.Fatalf("coverageRepairDedupeKey = %q, want %q", got, test.want)
+			got, exhausted, generation := coverageRepairDedupeKey(test.items, baseKey, 3006)
+			if got != test.want || exhausted != test.wantExhausted || generation != test.wantGeneration {
+				t.Fatalf("coverageRepairDedupeKey = (%q, %v, %d), want (%q, %v, %d)",
+					got, exhausted, generation, test.want, test.wantExhausted, test.wantGeneration)
 			}
 		})
 	}

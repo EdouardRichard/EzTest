@@ -35,14 +35,14 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		invalidator := &recordingKnowledgeInvalidator{}
 		h.svc.SetKnowledgeInvalidator(invalidator)
 
-		page, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		page, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Order list", URL: "https://app.example.com/orders", RouteTemplate: "/orders",
 		}, 42)
 		if err != nil {
 			t.Fatalf("CreatePage: %v", err)
 		}
 		route := "/orders/list"
-		if _, err := h.svc.UpdatePage(ctx, 1003, PagePatch{RouteTemplate: &route}, 42); err != nil {
+		if _, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &route}, 42); err != nil {
 			t.Fatalf("UpdatePage: %v", err)
 		}
 		if len(invalidator.changes) != 1 {
@@ -60,7 +60,7 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		}
 
 		// Re-applying the same route is not a change: no second invalidation.
-		if _, err := h.svc.UpdatePage(ctx, 1003, PagePatch{RouteTemplate: &route}, 42); err != nil {
+		if _, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &route}, 42); err != nil {
 			t.Fatalf("UpdatePage same route: %v", err)
 		}
 		if len(invalidator.changes) != 1 {
@@ -75,14 +75,14 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		invalidator := &recordingKnowledgeInvalidator{}
 		h.svc.SetKnowledgeInvalidator(invalidator)
 
-		if _, err := h.svc.CreateAccount(ctx, 1001, AccountInput{
-			EnvironmentID: 1002, Username: "order_admin", Password: "s3cret",
+		if _, err := h.svc.CreateAccount(ctx, AccountInput{
+			Username: "order_admin", Password: "s3cret",
 			Roles: []string{"order_admin", "auditor"},
 		}, 42); err != nil {
 			t.Fatalf("CreateAccount: %v", err)
 		}
 		roles := []string{"order_admin"}
-		if _, err := h.svc.UpdateAccount(ctx, 1003, AccountPatch{Roles: &roles}, 42); err != nil {
+		if _, err := h.svc.UpdateAccount(ctx, 1004, AccountPatch{Roles: &roles}, 42); err != nil {
 			t.Fatalf("UpdateAccount: %v", err)
 		}
 		if len(invalidator.changes) != 1 {
@@ -97,7 +97,7 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		}
 
 		notes := "unchanged roles"
-		if _, err := h.svc.UpdateAccount(ctx, 1003, AccountPatch{Notes: &notes}, 42); err != nil {
+		if _, err := h.svc.UpdateAccount(ctx, 1004, AccountPatch{Notes: &notes}, 42); err != nil {
 			t.Fatalf("UpdateAccount notes: %v", err)
 		}
 		if len(invalidator.changes) != 1 {
@@ -111,13 +111,13 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		invalidator := &recordingKnowledgeInvalidator{err: errors.New("knowledge unavailable")}
 		h.svc.SetKnowledgeInvalidator(invalidator)
 
-		if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		if _, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Cart", URL: "https://app.example.com/cart", RouteTemplate: "/cart",
 		}, 42); err != nil {
 			t.Fatalf("CreatePage: %v", err)
 		}
 		route := "/cart/items"
-		updated, err := h.svc.UpdatePage(ctx, 1003, PagePatch{RouteTemplate: &route}, 42)
+		updated, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &route}, 42)
 		if err != nil {
 			t.Fatalf("UpdatePage with a failing invalidator: %v", err)
 		}
@@ -134,7 +134,7 @@ func TestResourceChangeMarksStale(t *testing.T) {
 		}}
 		h.svc.SetKnowledgeInvalidator(failed)
 		route = "/cart/broken"
-		if _, err := h.svc.UpdatePage(ctx, 1003, PagePatch{RouteTemplate: &route}, 42); err != nil {
+		if _, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &route}, 42); err != nil {
 			t.Fatalf("UpdatePage with a partially failed invalidation: %v", err)
 		}
 		if len(failed.changes) != 1 {

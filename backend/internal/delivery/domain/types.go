@@ -31,6 +31,26 @@ func (s IssueStatus) Valid() bool {
 	}
 }
 
+// Issue severities (spec §5.1). The DB CHECK on delivery_issue.severity
+// (delivery_0001_issue_lifecycle.sql:16) carries the same three values; they are
+// untyped string constants because Issue.Severity is a plain string.
+//
+// This is the ISSUE severity vocabulary, NOT design.Severity* (the judge's
+// blocker/important/minor rubric): the two share the spelling "minor" but have
+// different value sets, so a report projection must source these, never those.
+const (
+	IssueSeverityMajor   = "major"
+	IssueSeverityMinor   = "minor"
+	IssueSeverityTrivial = "trivial"
+)
+
+// IssueSeverities lists the persisted issue severities in declaration order. It
+// is the authority the schema pin compares against the DB CHECK, so a new
+// severity cannot be added on one side only.
+func IssueSeverities() []string {
+	return []string{IssueSeverityMajor, IssueSeverityMinor, IssueSeverityTrivial}
+}
+
 // ReportKind is the delivery report scope (spec §3.3): one wave or the whole
 // version.
 type ReportKind string
@@ -120,10 +140,19 @@ func (s AnalysisStatus) Valid() bool {
 
 // Issue is one deduplicated delivery issue of a version (spec §3.2/§5).
 type Issue struct {
-	ID               int64
-	VersionID        int64
-	Title            string
-	Summary          string
+	ID        int64
+	VersionID int64
+	Title     string
+	Summary   string
+	// FailedExpected / FailedActual / FailedReason are the structured failure
+	// elements (v0.2.4-G SC-G3 / P21) taken from the representative run's
+	// assertion_result: the expected outcome, the observed outcome and the
+	// failure reason. They feed the five-element defect card; Summary stays the
+	// free-form narrative. They default to empty; the candidate-derivation fill
+	// (G T8) populates them.
+	FailedExpected   string
+	FailedActual     string
+	FailedReason     string
 	Status           IssueStatus
 	Category         string
 	Severity         string
@@ -164,14 +193,14 @@ const (
 // IssueRef is one append-only logical reference of an issue (spec §3.2). Kind
 // names the referenced entity; RefID is its intra-domain ID.
 type IssueRef struct {
-	ID           int64
-	IssueID      int64
-	Kind         string
-	RefID        int64
-	VersionSUTID *int64
-	Role         string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID        int64
+	IssueID   int64
+	Kind      string
+	RefID     int64
+	SUTID     *int64
+	Role      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // IssueStatusChange is one append-only issue status history row (spec §3.2).
@@ -197,9 +226,16 @@ type Report struct {
 	CurrentRevisionID *int64
 	Status            ReportStatus
 	InputFingerprint  string
-	CreatedByRunID    *int64
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	// DisplayFingerprint hashes the DISPLAY-ONLY state the current published
+	// revision shows (design judge review_state/verdict/findings/candidate
+	// matrix), independent of InputFingerprint (v0.2.4-G T11, R-G10a). The
+	// complete stale sweep compares it against the current source display state
+	// so a lost judge event on a static version still heals. Empty for drafts and
+	// pre-T11 rows (the sweep treats empty as divergent and republishes once).
+	DisplayFingerprint string
+	CreatedByRunID     *int64
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // ReportRevision is one append-only report content revision (spec §3.3). HTMLRef
@@ -247,6 +283,36 @@ type ReportRef struct {
 	RefID            int64
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// Report-ref kinds (H T11e-1, 五.1/五.4): the single authority for
+// delivery_report_ref.kind. The value set mirrors the frozen DB CHECK
+// (delivery_0002_report_revision.sql:66-68 as tightened by
+// delivery_0003_v024_rekey.sql:26-30, which relabelled 'version_sut' to 'sut');
+// TestReportRefKindMatchesSchema pins the equality against the live constraint.
+//
+// Four-site lockstep contract (delivery_0003_v024_rekey.sql:12-16): the delivery
+// emit path, the delivery validator (postgres.validReportRefKind), this DB CHECK
+// and the chain provider's report-ref aliases must all agree. Before this
+// constant block the validator was the only Go declaration of the vocabulary and
+// it was unexported inside the adapter, so every consumer re-wrote the literals.
+const (
+	ReportRefKindRequirement = "requirement"
+	ReportRefKindScenario    = "scenario"
+	ReportRefKindCaseVersion = "case_version"
+	ReportRefKindWave        = "wave"
+	ReportRefKindCaseRun     = "case_run"
+	ReportRefKindIssue       = "issue"
+	ReportRefKindSUT         = "sut"
+)
+
+// ReportRefKinds returns the report-ref kind vocabulary in declaration order so
+// a gate or a schema pin can derive the expected set instead of hand-copying it.
+func ReportRefKinds() []string {
+	return []string{
+		ReportRefKindRequirement, ReportRefKindScenario, ReportRefKindCaseVersion,
+		ReportRefKindWave, ReportRefKindCaseRun, ReportRefKindIssue, ReportRefKindSUT,
+	}
 }
 
 // AnalysisRun is one deterministic or agent-assisted analysis row (spec §3.4).

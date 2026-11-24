@@ -169,17 +169,22 @@ type WorkQueue interface {
 }
 
 // VersionReader is the codeintel view of the version context (spec §5.5).
+// v0.2.4-B (GD-03): a version binds one environment, and its effective code
+// scope is the environment code pool — the union of the sut_repository rows of
+// every SUT of that environment. SUTRepoBindings resolves that union; the
+// resolved baseline lives on sut_repository (one row per (SUT, repository)
+// pair), so the backfill write is keyed by that pair.
 type VersionReader interface {
-	VersionSUTBindings(ctx context.Context, versionID int64) ([]VersionSUTBinding, error)
-	SetCodeBaselineCommit(ctx context.Context, versionSUTID int64, commit string) error
+	SUTRepoBindings(ctx context.Context, versionID int64) ([]SUTRepoBinding, error)
+	SetSUTRepositoryBaselineCommit(ctx context.Context, sutID, repoID int64, commit string) error
 }
 
-// VersionSUTBinding is one version_sut binding with its code repository.
-// CodeBaselineCommit is empty when the baseline could not be resolved.
-type VersionSUTBinding struct {
-	VersionSUTID       int64
-	VersionID          int64
+// SUTRepoBinding is one (SUT, repository) pair of the version's environment code
+// pool. CodeBaselineCommit is the baseline pinned for that pair and is empty
+// when it has not been resolved yet.
+type SUTRepoBinding struct {
 	SUTID              int64
+	VersionID          int64
 	RepoID             int64
 	Branch             string
 	CodeBaselineCommit string
@@ -215,10 +220,11 @@ type CaseVersionRef struct {
 	Status        string
 }
 
-// ResourceReader is the codeintel view of the resource context.
+// ResourceReader is the codeintel view of the resource context. Pages and APIs
+// are SUT-owned (v0.2.4-B), so both asset reads are keyed by the SUT id.
 type ResourceReader interface {
-	SUTPages(ctx context.Context, versionSUTID int64) ([]PageRef, error)
-	SUTAPIs(ctx context.Context, versionSUTID int64) ([]APIRef, error)
+	SUTPages(ctx context.Context, sutID int64) ([]PageRef, error)
+	SUTAPIs(ctx context.Context, sutID int64) ([]APIRef, error)
 	CodeRepository(ctx context.Context, repoID int64) (RepoRef, error)
 }
 
@@ -238,7 +244,15 @@ type RepoRef struct {
 	UpdatedAt time.Time
 }
 
-// PageRef is one version SUT page.
+// AssetStatusRejected is the rejected status of a SUT page/API as carried through
+// the codeintel ResourceReader port (PageRef.Status / APIRef.Status). It mirrors the
+// resource catalog's rejected page/API status; the codeintel impact index excludes
+// rejected assets. It is a named constant rather than an inline literal so the value
+// the port consumes is not a hand-written second copy (constitution art.5; the
+// codeintel context owns its port vocabulary and does not import the resource domain).
+const AssetStatusRejected = "rejected"
+
+// PageRef is one SUT page.
 type PageRef struct {
 	ID            int64
 	Name          string
@@ -247,7 +261,7 @@ type PageRef struct {
 	Source        string
 }
 
-// APIRef is one version SUT API.
+// APIRef is one SUT API.
 type APIRef struct {
 	ID           int64
 	Name         string
@@ -264,14 +278,15 @@ type ExecutionReader interface {
 	EvidenceMeta(ctx context.Context, versionID, evidenceID int64) (EvidenceRef, error)
 }
 
-// NetworkRequest is one captured network evidence request.
+// NetworkRequest is one captured network evidence request. SUTID is the SUT the
+// request was captured against (nil when the executor did not scope it).
 type NetworkRequest struct {
-	ID           int64
-	CaseRunID    int64
-	VersionSUTID *int64
-	Method       string
-	URL          string
-	Status       int
+	ID        int64
+	CaseRunID int64
+	SUTID     *int64
+	Method    string
+	URL       string
+	Status    int
 }
 
 // EvidenceRef is one immutable evidence metadata row.
@@ -279,7 +294,7 @@ type EvidenceRef struct {
 	ID            int64
 	CaseRunID     int64
 	CaseVersionID int64
-	VersionSUTID  *int64
+	SUTID         *int64
 	Kind          string
 	MIME          string
 	SHA256        string
@@ -319,8 +334,9 @@ type AuditRecorder interface {
 	Record(ctx context.Context, entry AuditEntry) error
 }
 
-// SettingsReader is the codeintel view of the settings center (codeintel.* and
-// visual.* keys; settings may only lower the hard domain limits).
+// SettingsReader is the codeintel view of the settings center (codeintel.*
+// keys; settings may only lower the hard domain limits). The visual.* keys were
+// removed with the visual domain (GD-22); codeintel reads no visual settings.
 type SettingsReader interface {
 	String(ctx context.Context, key string) (string, error)
 	Int(ctx context.Context, key string) (int64, error)

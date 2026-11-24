@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
@@ -27,6 +28,10 @@ const (
 	ToolCaseGraphPropose     = "case.graph_propose"
 	ToolDesignReviewSubmit   = "design.review_submit"
 	ToolDesignDataPlanSubmit = "design.data_plan_submit"
+	// ToolDesignJudgmentSubmit is the independent judge's single write entry
+	// (v0.2.4-E quality gate, spec SC-E3). It submits per-case verdict candidates;
+	// the server settles the judgment facts and supplies the round.
+	ToolDesignJudgmentSubmit = "design.judgment_submit"
 )
 
 // Design proposal bounds (P2-D-18). The design application re-validates the
@@ -70,58 +75,60 @@ type GraphProposal struct {
 }
 
 // ScenarioProposal is one scenario node in a graph proposal.
+//
+// v0.2.4-B (design v1.3.1 §3.2): a scenario is a pure grouping node. Its
+// version_sut_ids/page_ids/api_ids are gone -- nothing selects resources any more.
 type ScenarioProposal struct {
-	Ref           string
-	ID            int64
-	Name          string
-	Description   string
-	VersionSUTIDs []int64
-	PageIDs       []int64
-	APIIDs        []int64
-	SortOrder     int
+	Ref         string
+	ID          int64
+	Name        string
+	Description string
+	SortOrder   int
 }
 
 // CaseProposal is one case node (with its immutable version content) in a
 // graph proposal.
+//
+// v0.2.4-B (§5.2): the case describes itself in natural language. SutDescription,
+// Preconditions and CoveredACs are REQUIRED; the resource target set
+// (default_version_sut_id/version_sut_ids/page_ids/api_ids) is gone.
 type CaseProposal struct {
-	Ref                 string
-	ID                  int64
-	ScenarioRef         string
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	DefaultVersionSUTID int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	Steps               []StepProposal
-	Assertions          []AssertionProposal
-	Sources             []SourceProposal
+	Ref            string
+	ID             int64
+	ScenarioRef    string
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Steps          []StepProposal
+	Assertions     []AssertionProposal
+	Sources        []SourceProposal
 }
 
-// StepProposal is one case step. Zero target IDs mean "inherit/null".
+// StepProposal is one case step. TargetDescription is the optional
+// natural-language locator that replaced target_version_sut_id/target_page_id/
+// target_api_id (§3.2).
 type StepProposal struct {
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID int64
-	TargetPageID       int64
-	TargetAPIID        int64
-	AccountRole        string
-	Data               json.RawMessage
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              json.RawMessage
 }
 
-// AssertionProposal is one assertion attached to a step sequence.
+// AssertionProposal is one assertion attached to a step sequence. SUTID is the
+// SUT a kind=db assertion reads (renamed from DatabaseID by M-B4); it is required
+// for db and ignored otherwise.
 type AssertionProposal struct {
-	StepSeq            int
-	Kind               string
-	Target             string
-	Expected           string
-	TargetVersionSUTID int64
-	TargetAPIID        int64
-	DatabaseID         int64
+	StepSeq  int
+	Kind     string
+	Target   string
+	Expected string
+	SUTID    int64
 }
 
 // SourceProposal is one provenance entry for a case version.
@@ -155,6 +162,29 @@ type DataPlanInput struct {
 	TestData      json.RawMessage
 }
 
+// JudgmentFindingInput is one judge finding parsed from design.judgment_submit.
+// CaseRef is empty for a requirement-level finding; a non-empty ref names a case
+// of the current requirement (the design service validates membership).
+type JudgmentFindingInput struct {
+	Dimension string
+	Severity  string
+	Message   string
+	CaseRef   string
+}
+
+// JudgmentInput is one parsed per-case judge verdict candidate. Round is
+// deliberately absent: it is server-supplied (the adapter injects it from the
+// scheduling scope), never model-supplied, so the model cannot pick a round.
+// ACCoverageMatrix is the optional AC×case coverage matrix the judge rubric
+// teaches (spec SC-E3 ①); the design service validates and stores it (SC-E5).
+type JudgmentInput struct {
+	CaseID           int64
+	CaseVersionID    int64
+	Verdict          string
+	Findings         []JudgmentFindingInput
+	ACCoverageMatrix map[string]any
+}
+
 // DesignPort is the design bounded context's application surface consumed by
 // the P2 tools. The adapter (agent/infrastructure/designadapter) enforces the
 // version scope and returns *tools.Error or *platform.Error for business
@@ -164,6 +194,10 @@ type DesignPort interface {
 	ProposeGraph(ctx context.Context, versionID int64, in GraphProposal, actorID, runID int64) (any, error)
 	SubmitReview(ctx context.Context, versionID, requirementID int64, runID int64, in ReviewInput) (any, error)
 	SubmitDataPlan(ctx context.Context, versionID, caseVersionID int64, runID int64, in DataPlanInput) (any, error)
+	// SubmitJudgment settles one per-case judge verdict candidate (T6
+	// JudgmentService.SubmitJudgment). The adapter injects the server-supplied
+	// round; the model never supplies it.
+	SubmitJudgment(ctx context.Context, versionID, requirementID, runID int64, in JudgmentInput) (any, error)
 }
 
 // --- payloads --------------------------------------------------------------
@@ -188,53 +222,44 @@ type graphProposalPayload struct {
 }
 
 type scenarioPayload struct {
-	Ref           string   `json:"ref"`
-	ID            *string  `json:"id"`
-	Name          string   `json:"name"`
-	Description   *string  `json:"description"`
-	VersionSUTIDs []string `json:"version_sut_ids"`
-	PageIDs       []string `json:"page_ids"`
-	APIIDs        []string `json:"api_ids"`
-	SortOrder     *int     `json:"sort_order"`
+	Ref         string  `json:"ref"`
+	ID          *string `json:"id"`
+	Name        string  `json:"name"`
+	Description *string `json:"description"`
+	SortOrder   *int    `json:"sort_order"`
 }
 
 type casePayload struct {
-	Ref                 string             `json:"ref"`
-	ID                  *string            `json:"id"`
-	ScenarioRef         string             `json:"scenario_ref"`
-	Title               string             `json:"title"`
-	Description         *string            `json:"description"`
-	Preconditions       *string            `json:"preconditions"`
-	TestData            json.RawMessage    `json:"test_data"`
-	Priority            *string            `json:"priority"`
-	DefaultVersionSUTID *string            `json:"default_version_sut_id"`
-	VersionSUTIDs       []string           `json:"version_sut_ids"`
-	PageIDs             []string           `json:"page_ids"`
-	APIIDs              []string           `json:"api_ids"`
-	Steps               []stepPayload      `json:"steps"`
-	Assertions          []assertionPayload `json:"assertions"`
-	Sources             []sourcePayload    `json:"sources"`
+	Ref            string             `json:"ref"`
+	ID             *string            `json:"id"`
+	ScenarioRef    string             `json:"scenario_ref"`
+	Title          string             `json:"title"`
+	Description    *string            `json:"description"`
+	SutDescription *string            `json:"sut_description"`
+	Preconditions  *string            `json:"preconditions"`
+	CoveredACs     []string           `json:"covered_acs"`
+	TestData       json.RawMessage    `json:"test_data"`
+	Priority       *string            `json:"priority"`
+	Steps          []stepPayload      `json:"steps"`
+	Assertions     []assertionPayload `json:"assertions"`
+	Sources        []sourcePayload    `json:"sources"`
 }
 
 type stepPayload struct {
-	Seq                int             `json:"seq"`
-	Action             string          `json:"action"`
-	Expected           *string         `json:"expected"`
-	TargetVersionSUTID *string         `json:"target_version_sut_id"`
-	TargetPageID       *string         `json:"target_page_id"`
-	TargetAPIID        *string         `json:"target_api_id"`
-	AccountRole        *string         `json:"account_role"`
-	Data               json.RawMessage `json:"data"`
+	Seq               int             `json:"seq"`
+	Action            string          `json:"action"`
+	Expected          *string         `json:"expected"`
+	TargetDescription *string         `json:"target_description"`
+	AccountRole       *string         `json:"account_role"`
+	Data              json.RawMessage `json:"data"`
 }
 
 type assertionPayload struct {
-	StepSeq            int     `json:"step_seq"`
-	Kind               string  `json:"kind"`
-	Target             string  `json:"target"`
-	Expected           *string `json:"expected"`
-	TargetVersionSUTID *string `json:"target_version_sut_id"`
-	TargetAPIID        *string `json:"target_api_id"`
-	DatabaseID         *string `json:"database_id"`
+	StepSeq  int     `json:"step_seq"`
+	Kind     string  `json:"kind"`
+	Target   string  `json:"target"`
+	Expected *string `json:"expected"`
+	SUTID    *string `json:"sut_id"`
 }
 
 type sourcePayload struct {
@@ -346,11 +371,12 @@ func (t *caseGraphPropose) Description() string {
 		"sources.kind=requirement 时 ref_id 必须是 requirement_version_id（当前需求版本 ID），不是 requirement_id。" +
 		"每条步骤与断言都必须有非空的 expected（可观察的成功判据）。" +
 		"未知字段（unknown fields）会被严格拒绝：不做别名映射；错误会给出最接近的合法字段名与合法字段清单。" +
-		"断言 kind=db 时必须传 database_id，且只能使用当前版本绑定环境中的数据库 id：先调用 sut.database_list（或读取 context.version_pack 的 databases 清单），禁止猜测或用库名/DSN 代替。" +
-		"ui 断言不接收 target_page_id：页面/接口目标写在对应的 steps[] 上（target_page_id/target_api_id），断言本身用 target/expected 描述检查点。" +
+		"用例契约是自然语言的（v0.2.4-B）：每个 case 必填 sut_description（被测系统，1..2000 字）、preconditions（前置条件；确实没有前置时显式写“无”，不能留空）、covered_acs（本用例覆盖的验收标准 id，至少 1 个且必须取自该需求当前版本的 acceptance_criteria，不在集合内会被 400 拒绝）。" +
+		"步骤目标写 target_description（自然语言定位，如“订单列表页的搜索框”），断言 kind=db 时必须传 sut_id（被断言数据所属 SUT 的十进制 ID，取自 sut.list，或 context.version_pack 数据库清单每行的 sut_id 字段；只校验存在，不校验归属）。" +
+		"default_version_sut_id / version_sut_ids / page_ids / api_ids / target_version_sut_id / target_page_id / target_api_id / database_id 已全部移除，不要再传。" +
 		"proposal_id 用于幂等：同一次提交的重试请复用同一个 proposal_id，重复提交返回首次结果、不会重复创建 case revision。" +
 		"base_revision 用于乐观并发：从 design.graph_read 读取需求 revision 后传入；过期会返回不可重试的 state_conflict（带 base_revision/current_revision），需重读后再提交。" +
-		"枚举取值：priority=P0/P1/P2/P3；assertion.kind=ui/api/db/text/visual；sources.kind=requirement/code/page/api/knowledge。"
+		"枚举取值：priority=P0/P1/P2/P3；assertion.kind=ui/api/db/text；sources.kind=requirement/code/page/api/knowledge。"
 }
 
 func (t *caseGraphPropose) Parameters() json.RawMessage {
@@ -365,10 +391,7 @@ func (t *caseGraphPropose) Execute(ctx context.Context, scope Scope, raw json.Ra
 	if err := decodeGraphProposalParams(raw, &payload); err != nil {
 		return nil, err
 	}
-	// The bound database inventory is only read when the proposal actually
-	// carries a db assertion; a db-less proposal never pays for the lookup.
-	allowedDatabaseIDs, databaseInventoryKnown := t.allowedDatabaseIDs(ctx, scope, payload)
-	proposal, err := parseGraphProposal(payload, scope, allowedDatabaseIDs, databaseInventoryKnown)
+	proposal, err := parseGraphProposal(payload, scope)
 	if err != nil {
 		return nil, retryableGraphFieldError(err)
 	}
@@ -459,44 +482,55 @@ func (t *caseGraphPropose) rememberProposal(versionID, requirementID int64, prop
 	}
 }
 
-// allowedDatabaseIDs resolves the bound environment database inventory for the
-// db assertions of one payload. known reports whether the inventory could be
-// read: a missing lister or a read failure returns known=false so the design
-// context remains the authority, while a successful read returns known=true even
-// when the list is empty. An empty known list means the environment binds no
-// databases, so any supplied database_id is unbound and must be rejected
-// locally as a retryable argument error instead of reaching the design domain.
-func (t *caseGraphPropose) allowedDatabaseIDs(ctx context.Context, scope Scope, payload graphProposalPayload) (ids []string, known bool) {
-	if !payloadHasDBAssertion(payload) {
-		return nil, false
-	}
-	lister, ok := t.deps.Resource.(DatabaseLister)
-	if !ok {
-		return nil, false
-	}
-	items, err := lister.ListDatabases(ctx, scope.VersionID, 0)
-	if err != nil {
-		return nil, false
-	}
-	ids = make([]string, 0, len(items))
-	for _, item := range items {
-		if id := strings.TrimSpace(item.ID); id != "" {
-			ids = append(ids, id)
+// allowedDatabaseIDs and payloadHasDBAssertion were removed with the db
+// assertion's database inventory check (v0.2.4-B, Lead ruling 6): a db assertion
+// now names a SUT and the rule is presence-only, so there is no bound-inventory
+// ownership lookup left to feed. The sut.database_list tool and its DatabaseLister
+// port are unchanged and still serve the resource tools.
+
+// maxSutDescriptionChars is the §5.2 bound on case_version.sut_description,
+// mirrored here so the model gets a precise tool-level field error instead of a
+// design 400 one hop later.
+const maxSutDescriptionChars = 2000
+
+// acIDPattern is the server-assigned acceptance-criterion id shape (§3.6: ids are
+// minted by the version context as AC-<n>). The tool checks the SHAPE only;
+// membership in the requirement's AC set is the design context's job, because
+// only design reads that set.
+var acIDPattern = regexp.MustCompile(`^AC-[1-9][0-9]*$`)
+
+// parseCoveredACs validates cases[].covered_acs: at least one id, each of the
+// server-assigned AC-<n> shape, de-duplicated. Duplicates are collapsed rather
+// than rejected -- covered_acs is a set, and design normalizes it sorted-unique
+// for the content hash, so a repeated id carries no meaning.
+func parseCoveredACs(field string, raw []string) ([]string, *Error) {
+	seen := make(map[string]struct{}, len(raw))
+	ids := make([]string, 0, len(raw))
+	for _, value := range raw {
+		acID := strings.TrimSpace(value)
+		if acID == "" {
+			continue
 		}
+		if !acIDPattern.MatchString(acID) {
+			return nil, InvalidWithAllowed(field,
+				fmt.Sprintf("%q is not an acceptance-criterion id", acID),
+				nil,
+				"copy the id verbatim from requirement.read (pass requirement_id) -- its ac_ids field is exactly the set covered_acs must be drawn from. Do not use design.graph_read for this: it carries no requirement AC ids, only each existing case's own covered_acs, which is empty for a requirement that has no cases yet. Ids are server-assigned as AC-1, AC-2, ... -- never invent, renumber or reuse a hole")
+		}
+		if _, duplicate := seen[acID]; duplicate {
+			continue
+		}
+		seen[acID] = struct{}{}
+		ids = append(ids, acID)
+	}
+	if len(ids) == 0 {
+		return nil, InvalidWithAllowed(field,
+			"covered_acs is required and must name at least one acceptance criterion this case implements",
+			nil,
+			"list the AC-<n> ids from the requirement's acceptance_criteria that this case proves; a case that covers none of them should not be proposed")
 	}
 	sort.Strings(ids)
-	return ids, true
-}
-
-func payloadHasDBAssertion(payload graphProposalPayload) bool {
-	for _, item := range payload.Cases {
-		for _, assertion := range item.Assertions {
-			if strings.TrimSpace(assertion.Kind) == "db" {
-				return true
-			}
-		}
-	}
-	return false
+	return ids, nil
 }
 
 // checkBaseRevision rejects a proposal composed against a stale requirement
@@ -754,7 +788,7 @@ func (t *designDataPlanSubmit) Execute(ctx context.Context, scope Scope, raw jso
 
 // --- validation helpers ----------------------------------------------------
 
-func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDatabaseIDs []string, databaseInventoryKnown bool) (GraphProposal, *Error) {
+func parseGraphProposal(payload graphProposalPayload, scope Scope) (GraphProposal, *Error) {
 	proposal := GraphProposal{}
 	requirementID, err := parseRequiredID("requirement_id", payload.RequirementID)
 	if err != nil {
@@ -829,18 +863,6 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 		if err != nil {
 			return GraphProposal{}, err
 		}
-		versionSUTs, err := parseIDList(field("version_sut_ids"), scenario.VersionSUTIDs)
-		if err != nil {
-			return GraphProposal{}, err
-		}
-		pageIDs, err := parseIDList(field("page_ids"), scenario.PageIDs)
-		if err != nil {
-			return GraphProposal{}, err
-		}
-		apiIDs, err := parseIDList(field("api_ids"), scenario.APIIDs)
-		if err != nil {
-			return GraphProposal{}, err
-		}
 		sortOrder := 0
 		if scenario.SortOrder != nil {
 			if *scenario.SortOrder < 0 {
@@ -849,8 +871,7 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 			sortOrder = *scenario.SortOrder
 		}
 		proposal.Scenarios = append(proposal.Scenarios, ScenarioProposal{
-			Ref: ref, ID: id, Name: scenario.Name, Description: description,
-			VersionSUTIDs: versionSUTs, PageIDs: pageIDs, APIIDs: apiIDs, SortOrder: sortOrder,
+			Ref: ref, ID: id, Name: scenario.Name, Description: description, SortOrder: sortOrder,
 		})
 	}
 
@@ -885,8 +906,26 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 		if err := validateText(field("description"), description, 0, 20000); err != nil {
 			return GraphProposal{}, err
 		}
-		preconditions := stringValueOr(item.Preconditions, "")
-		if err := validateText(field("preconditions"), preconditions, 0, 20000); err != nil {
+		// v0.2.4-B (§5.2) required contract elements. The tool checks shape and
+		// presence so the model gets a precise field error; the design context
+		// remains the authority for covered_acs set membership (it owns the
+		// requirement's AC set, which the tool layer cannot see).
+		sutDescription := strings.TrimSpace(stringValueOr(item.SutDescription, ""))
+		if err := validateText(field("sut_description"), sutDescription, 1, maxSutDescriptionChars); err != nil {
+			return GraphProposal{}, err
+		}
+		preconditions := strings.TrimSpace(stringValueOr(item.Preconditions, ""))
+		if preconditions == "" {
+			return GraphProposal{}, InvalidWithAllowed(field("preconditions"),
+				"preconditions is required; state the setup the case needs, or the literal 无 when it needs none",
+				nil,
+				"a blank precondition is not the same as no precondition: write 无 explicitly so the case states its Given")
+		}
+		if err := validateText(field("preconditions"), preconditions, 1, 20000); err != nil {
+			return GraphProposal{}, err
+		}
+		coveredACs, err := parseCoveredACs(field("covered_acs"), item.CoveredACs)
+		if err != nil {
 			return GraphProposal{}, err
 		}
 		testData := json.RawMessage(nil)
@@ -907,28 +946,6 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 			return GraphProposal{}, InvalidWithAllowed(field("priority"),
 				"must be one of P0, P1, P2, P3", []string{"P0", "P1", "P2", "P3"},
 				"use the exact enum value; case priority is P0/P1/P2/P3")
-		}
-		defaultSUT, err := parseRequiredID(field("default_version_sut_id"), stringValueOr(item.DefaultVersionSUTID, ""))
-		if err != nil {
-			return GraphProposal{}, err
-		}
-		versionSUTs, err := parseIDList(field("version_sut_ids"), item.VersionSUTIDs)
-		if err != nil {
-			return GraphProposal{}, err
-		}
-		if len(versionSUTs) == 0 {
-			return GraphProposal{}, Invalid(field("version_sut_ids"), "must contain at least one version SUT")
-		}
-		if !containsID(versionSUTs, defaultSUT) {
-			return GraphProposal{}, Invalid(field("default_version_sut_id"), "must be part of cases[].version_sut_ids")
-		}
-		pageIDs, err := parseIDList(field("page_ids"), item.PageIDs)
-		if err != nil {
-			return GraphProposal{}, err
-		}
-		apiIDs, err := parseIDList(field("api_ids"), item.APIIDs)
-		if err != nil {
-			return GraphProposal{}, err
 		}
 		id, err := parseOptionalID(field("id"), item.ID)
 		if err != nil {
@@ -954,23 +971,12 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 			if err := validateText(stepField("expected"), expected, 1, 20000); err != nil {
 				return GraphProposal{}, err
 			}
-			targetSUT, err := parseOptionalID(stepField("target_version_sut_id"), step.TargetVersionSUTID)
-			if err != nil {
-				return GraphProposal{}, err
-			}
-			if targetSUT > 0 && !containsID(versionSUTs, targetSUT) {
-				return GraphProposal{}, Invalid(stepField("target_version_sut_id"), "must be part of cases[].version_sut_ids")
-			}
-			targetPage, err := parseOptionalID(stepField("target_page_id"), step.TargetPageID)
-			if err != nil {
-				return GraphProposal{}, err
-			}
-			targetAPI, err := parseOptionalID(stepField("target_api_id"), step.TargetAPIID)
-			if err != nil {
+			targetDescription := strings.TrimSpace(stringValueOr(step.TargetDescription, ""))
+			if err := validateText(stepField("target_description"), targetDescription, 0, 2000); err != nil {
 				return GraphProposal{}, err
 			}
 			accountRole := stringValueOr(step.AccountRole, "")
-			if err := validateText(stepField("account_role"), accountRole, 0, 200); err != nil {
+			if err := validateText(stepField("account_role"), accountRole, 0, design.AccountRoleMax); err != nil {
 				return GraphProposal{}, err
 			}
 			stepData := json.RawMessage(nil)
@@ -983,8 +989,8 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 			}
 			steps = append(steps, StepProposal{
 				Seq: step.Seq, Action: step.Action, Expected: expected,
-				TargetVersionSUTID: targetSUT, TargetPageID: targetPage, TargetAPIID: targetAPI,
-				AccountRole: accountRole, Data: stepData,
+				TargetDescription: targetDescription,
+				AccountRole:       accountRole, Data: stepData,
 			})
 		}
 
@@ -1000,12 +1006,12 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 				return GraphProposal{}, Invalid(assertionField("step_seq"), "must reference an existing step sequence")
 			}
 			switch assertion.Kind {
-			case "ui", "api", "db", "text", "visual":
+			case "ui", "api", "db", "text":
 			default:
 				return GraphProposal{}, InvalidWithAllowed(assertionField("kind"),
 					fmt.Sprintf("%q is not a supported assertion kind", assertion.Kind),
-					[]string{"ui", "api", "db", "text", "visual"},
-					"use ui for page checks, api for endpoint checks, db for database checks, text for visible copy; visual requires an explicit baseline")
+					[]string{"ui", "api", "db", "text"},
+					"use ui for page checks, api for endpoint checks, db for database checks, text for visible copy")
 			}
 			if err := validateText(assertionField("target"), assertion.Target, 1, 2000); err != nil {
 				return GraphProposal{}, err
@@ -1014,38 +1020,24 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 			if err := validateText(assertionField("expected"), expected, 1, 2000); err != nil {
 				return GraphProposal{}, err
 			}
-			targetSUT, err := parseOptionalID(assertionField("target_version_sut_id"), assertion.TargetVersionSUTID)
+			// v0.2.4-B (M-B4 + Lead ruling 6): the db assertion names the SUT it
+			// reads, not a catalog database row, and the rule is PRESENCE only.
+			// The old inventory check (reject a database_id that is not bound to
+			// the version's environment) was an ownership rule and is retired with
+			// the rest of them: design has no resource scope to check against.
+			sutID, err := parseOptionalID(assertionField("sut_id"), assertion.SUTID)
 			if err != nil {
 				return GraphProposal{}, err
 			}
-			if targetSUT > 0 && !containsID(versionSUTs, targetSUT) {
-				return GraphProposal{}, Invalid(assertionField("target_version_sut_id"), "must be part of cases[].version_sut_ids")
-			}
-			targetAPI, err := parseOptionalID(assertionField("target_api_id"), assertion.TargetAPIID)
-			if err != nil {
-				return GraphProposal{}, err
-			}
-			databaseID, err := parseOptionalID(assertionField("database_id"), assertion.DatabaseID)
-			if err != nil {
-				return GraphProposal{}, err
-			}
-			if assertion.Kind == "db" {
-				if databaseID <= 0 {
-					return GraphProposal{}, InvalidWithAllowed(assertionField("database_id"),
-						"database_id is required for db assertions; call sut.database_list and reuse a bound database id",
-						allowedDatabaseIDs,
-						"call sut.database_list first (or read context.version_pack databases); never guess a database_id or use a database name/DSN")
-				}
-				if databaseInventoryKnown && !containsString(allowedDatabaseIDs, idString(databaseID)) {
-					return GraphProposal{}, InvalidWithAllowed(assertionField("database_id"),
-						fmt.Sprintf("database_id %q is not bound to this version's environment", idString(databaseID)),
-						allowedDatabaseIDs,
-						"choose one of the allowed database ids returned by sut.database_list; ids are not inferred from names")
-				}
+			if assertion.Kind == "db" && sutID <= 0 {
+				return GraphProposal{}, InvalidWithAllowed(assertionField("sut_id"),
+					"sut_id is required for db assertions: name the SUT whose data the assertion reads",
+					nil,
+					"take the decimal SUT id from sut.list, or from the sut_id field on each context.version_pack database row; never guess it, never pass a database name/DSN, and never reuse a database id -- a row's id and its sut_id are two different id spaces")
 			}
 			assertions = append(assertions, AssertionProposal{
 				StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target, Expected: expected,
-				TargetVersionSUTID: targetSUT, TargetAPIID: targetAPI, DatabaseID: databaseID,
+				SUTID: sutID,
 			})
 		}
 
@@ -1062,10 +1054,10 @@ func parseGraphProposal(payload graphProposalPayload, scope Scope, allowedDataba
 
 		proposal.Cases = append(proposal.Cases, CaseProposal{
 			Ref: ref, ID: id, ScenarioRef: item.ScenarioRef, Title: item.Title,
-			Description: description, Preconditions: preconditions, TestData: testData,
-			Priority: priority, DefaultVersionSUTID: defaultSUT,
-			VersionSUTIDs: versionSUTs, PageIDs: pageIDs, APIIDs: apiIDs,
-			Steps: steps, Assertions: assertions, Sources: caseSources,
+			Description: description, SutDescription: sutDescription,
+			Preconditions: preconditions, CoveredACs: coveredACs, TestData: testData,
+			Priority: priority,
+			Steps:    steps, Assertions: assertions, Sources: caseSources,
 		})
 	}
 	return proposal, nil
@@ -1206,7 +1198,7 @@ func graphProposalAllowedValues(path string) []string {
 	case strings.HasSuffix(path, ".priority"):
 		return []string{"P0", "P1", "P2", "P3"}
 	case strings.HasSuffix(path, ".kind") && strings.Contains(path, ".assertions["):
-		return []string{"ui", "api", "db", "text", "visual"}
+		return []string{"ui", "api", "db", "text"}
 	case strings.HasSuffix(path, ".kind") && strings.Contains(path, ".sources["):
 		return []string{"requirement", "code", "page", "api", "knowledge"}
 	default:
@@ -1445,26 +1437,6 @@ func parseOptionalID(field string, raw *string) (int64, *Error) {
 	return parsePositiveID(field, *raw)
 }
 
-func parseIDList(field string, raw []string) ([]int64, *Error) {
-	ids := make([]int64, 0, len(raw))
-	seen := make(map[int64]struct{}, len(raw))
-	for index, value := range raw {
-		if strings.TrimSpace(value) == "" {
-			return nil, Invalid(fmt.Sprintf("%s[%d]", field, index), "must be a positive decimal ID")
-		}
-		id, err := parsePositiveID(fmt.Sprintf("%s[%d]", field, index), value)
-		if err != nil {
-			return nil, err
-		}
-		if _, duplicate := seen[id]; duplicate {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
 func validateRef(field, raw string) (string, *Error) {
 	ref := strings.TrimSpace(raw)
 	if ref == "" {
@@ -1474,15 +1446,6 @@ func validateRef(field, raw string) (string, *Error) {
 		return "", invalidFromPlatform(err)
 	}
 	return ref, nil
-}
-
-func containsID(ids []int64, target int64) bool {
-	for _, id := range ids {
-		if id == target {
-			return true
-		}
-	}
-	return false
 }
 
 func stringValueOr(value *string, fallback string) string {
@@ -1498,24 +1461,15 @@ func idStringSchema() map[string]any {
 	return map[string]any{"type": "string", "pattern": `^[1-9][0-9]*$`}
 }
 
-func idArraySchema() map[string]any {
-	return map[string]any{"type": "array", "items": idStringSchema()}
-}
-
 // graphProposeSchema is the self-describing v0.22 E-1 contract (R-E1-1). Every
 // field documents its unit/values/when-required, enums are explicit, the
-// assertion branches are expressed with anyOf (db requires database_id), two
+// assertion branches are expressed with anyOf (db requires sut_id), two
 // complete examples (including a db assertion) show the whole shape, and the
 // root description names the legal top-level fields and the strict
 // unknown-field policy. additionalProperties stays false at every level.
 func graphProposeSchema() json.RawMessage {
 	id := func(description string) map[string]any {
 		schema := idStringSchema()
-		schema["description"] = description
-		return schema
-	}
-	ids := func(description string) map[string]any {
-		schema := idArraySchema()
 		schema["description"] = description
 		return schema
 	}
@@ -1532,12 +1486,19 @@ func graphProposeSchema() json.RawMessage {
 			"type": "string", "minLength": 1, "maxLength": 20000,
 			"description": "必填。可观察的成功结果；不能为空或只写“成功”。",
 		},
-		"target_version_sut_id": id("可选。步骤目标 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids；省略表示沿用用例默认 SUT。"),
-		"target_page_id":        id("可选。步骤目标页面的十进制 ID（来自 sut.page_list 的 kind=page 条目）；不是 path/URL。"),
-		"target_api_id":         id("可选。步骤目标 API 的十进制 ID（来自 sut.page_list 的 kind=api 条目）；不是 method+path。"),
+		"target_description": map[string]any{
+			"type": "string", "maxLength": 2000,
+			"description": "可选。本步骤操作对象的自然语言定位（如“订单列表页的搜索框”“POST /login 接口”）。" +
+				"执行团队据此在绑定环境的 SUT 目录中自行解析目标；不要传页面/接口/SUT 的数字 ID（target_page_id/target_api_id/target_version_sut_id 已移除）。",
+		},
 		"account_role": map[string]any{
-			"type": "string", "maxLength": 200,
-			"description": "可选。执行该步骤使用的账号角色（如 admin），对应绑定环境的测试账号角色。",
+			// The bound is imported, not copied: the design gate enforces
+			// design.AccountRoleMax (64), and a locally duplicated 200 here let a
+			// 70-character role clear the tool only to die one hop later as a
+			// design 400 -- losing the precise field error this early gate exists
+			// to give. Keep this and the parser call above on the same constant.
+			"type": "string", "maxLength": design.AccountRoleMax,
+			"description": "可选。执行该步骤使用的账号角色（如 admin），对应绑定环境的测试账号角色；最长 64 字符。",
 		},
 		"data": map[string]any{
 			"type": "object", "additionalProperties": true,
@@ -1551,27 +1512,27 @@ func graphProposeSchema() json.RawMessage {
 		},
 		"kind": map[string]any{
 			"type":        "string",
-			"enum":        []any{"ui", "api", "db", "text", "visual"},
-			"description": "必填。断言类型枚举：ui=页面元素/交互；api=接口响应；db=数据库（必须同时给 database_id）；text=页面可见文案；visual=截图/视觉基线（仅需求明确要求时使用）。",
+			"enum":        []any{"ui", "api", "db", "text"},
+			"description": "必填。断言类型枚举：ui=页面元素/交互；api=接口响应；db=数据库（必须同时给 sut_id）；text=页面可见文案。",
 		},
 		"target": map[string]any{
 			"type": "string", "minLength": 1, "maxLength": 2000,
-			"description": "必填。断言对象：ui 用元素/选择器描述，api 用 method+path，db 用表/查询，text/visual 用区域描述。",
+			"description": "必填。断言对象：ui 用元素/选择器描述，api 用 method+path，db 用表/查询，text 用区域描述。",
 		},
 		"expected": map[string]any{
 			"type": "string", "minLength": 1, "maxLength": 2000,
 			"description": "必填。可观察的成功判据（期望值），不能为空。",
 		},
-		"target_version_sut_id": id("可选。断言目标 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids。"),
-		"target_api_id":         id("可选。api 断言的目标 API 十进制 ID（来自 sut.page_list 的 kind=api 条目）。"),
-		"database_id":           id("kind=db 时必填。绑定环境目标数据库的十进制 ID：只能取 sut.database_list / context.version_pack.databases 返回的 id，禁止猜测或用库名/DSN 代替。"),
+		"sut_id": id("kind=db 时必填。被断言数据所属 SUT 的十进制 ID：取自 sut.list，或 context.version_pack 数据库清单每行的 sut_id 字段（注意同一行的 id 是 database id，供执行期 db.query 用，两者不可互换）；" +
+			"只校验存在，不校验归属。原 database_id 已按 M-B4 重键为 sut_id：db 断言指名 SUT，不再指名某个库。"),
 	}
 	assertionSchema := map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
 		"required":             []string{"step_seq", "kind", "target", "expected"},
 		"properties":           assertionProperties,
-		"description":          "断言对象。按 kind 分支（anyOf）：ui=步骤的 steps[].target_page_id + 步骤动作 + 断言 target/expected（断言对象本身不接收 target_page_id）；api=target_api_id/method+path+expected；db=database_id+查询/expected；text=可见文案；visual=基线/截图断言。",
+		"description": "断言对象。按 kind 分支（anyOf）：ui=步骤动作 + 断言 target/expected；api=method+path+expected；db=sut_id+查询/expected；text=可见文案。" +
+			" target_version_sut_id/target_api_id/database_id 已移除（v0.2.4-B）。",
 		"anyOf": []any{
 			map[string]any{
 				"description": "ui 断言分支：页面元素/交互结果",
@@ -1582,20 +1543,16 @@ func graphProposeSchema() json.RawMessage {
 				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"api"}}},
 			},
 			map[string]any{
-				"description": "db 断言分支：必须提供绑定环境的 database_id（来自 sut.database_list）",
+				"description": "db 断言分支：必须提供被断言数据所属 SUT 的 sut_id",
 				"properties": map[string]any{
-					"kind":        map[string]any{"enum": []any{"db"}},
-					"database_id": idStringSchema(),
+					"kind":   map[string]any{"enum": []any{"db"}},
+					"sut_id": idStringSchema(),
 				},
-				"required": []string{"database_id"},
+				"required": []string{"sut_id"},
 			},
 			map[string]any{
 				"description": "text 断言分支：页面可见文案",
 				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"text"}}},
-			},
-			map[string]any{
-				"description": "visual 断言分支：仅在需求/验收标准显式要求视觉基线时使用",
-				"properties":  map[string]any{"kind": map[string]any{"enum": []any{"visual"}}},
 			},
 		},
 	}
@@ -1639,9 +1596,25 @@ func graphProposeSchema() json.RawMessage {
 			"type": "string", "maxLength": 20000,
 			"description": "可选。用例说明。",
 		},
+		"sut_description": map[string]any{
+			"type": "string", "minLength": 1, "maxLength": maxSutDescriptionChars,
+			"description": "必填。被测系统的自然语言描述（1..2000 字），说明本用例操作/观察的是哪套系统" +
+				"（如“商城前台下单页与订单接口”）。执行团队据此在绑定环境的 SUT 目录中自行解析目标；" +
+				"不要写数字 ID。通常与需求的 sut_description 一致或更具体。",
+		},
 		"preconditions": map[string]any{
-			"type": "string", "maxLength": 20000,
-			"description": "可选。前置条件（账号、数据、环境状态）。",
+			"type": "string", "minLength": 1, "maxLength": 20000,
+			"description": "必填。前置条件（场景级 Given）：账号、数据、环境状态。确实没有前置时必须显式写“无”，不能留空。",
+		},
+		"covered_acs": map[string]any{
+			"type": "array", "minItems": 1, "maxItems": 200,
+			"items": map[string]any{
+				"type": "string", "pattern": `^AC-[1-9][0-9]*$`,
+				"description": "需求验收标准的服务端分配 id（AC-<n>）。",
+			},
+			"description": "必填，至少 1 项。本用例实现的验收标准 id 列表，必须取自该需求当前版本的 acceptance_criteria；" +
+				"不在集合内的 id 会被拒（400）。一个用例可覆盖多个 AC（多对多覆盖矩阵）；" +
+				"重复项会被去重，顺序不影响内容哈希。",
 		},
 		"test_data": map[string]any{
 			"type": "object", "additionalProperties": true,
@@ -1651,23 +1624,19 @@ func graphProposeSchema() json.RawMessage {
 			"type": "string", "enum": []any{"P0", "P1", "P2", "P3"},
 			"description": "可选，默认 P2。优先级枚举：P0 最高（核心阻断）→ P3 最低。只能取 P0/P1/P2/P3。",
 		},
-		"default_version_sut_id": id("必填。默认 version_sut 的十进制 ID，必须属于 cases[].version_sut_ids。"),
-		"version_sut_ids":        ids("必填。该用例可使用的 version_sut 十进制 ID 列表，至少一个。"),
-		"page_ids":               ids("可选。用例涉及的已绑定页面十进制 ID 列表（来自 sut.page_list 的 kind=page）。"),
-		"api_ids":                ids("可选。用例涉及的已绑定接口十进制 ID 列表（来自 sut.page_list 的 kind=api）。"),
 		"steps": map[string]any{
 			"type": "array", "minItems": 1, "maxItems": maxCaseSteps, "items": stepSchema,
 			"description": "必填。可执行步骤，seq 从 1 连续递增，至少一步。",
 		},
 		"assertions": map[string]any{
 			"type": "array", "maxItems": maxCaseAssertions, "items": assertionSchema,
-			"description": "可选。断言列表；kind=db 的项必须带 database_id。",
+			"description": "可选。断言列表；kind=db 的项必须带 sut_id。",
 		},
 		"sources": map[string]any{
 			"type": "array", "maxItems": maxCaseSources, "items": sourceSchema,
 			"description": "可选。该用例的来源；省略时继承顶层 sources。",
 		},
-	}, "ref", "scenario_ref", "title", "default_version_sut_id", "version_sut_ids", "steps")
+	}, "ref", "scenario_ref", "title", "sut_description", "preconditions", "covered_acs", "steps")
 	scenarioSchema := schemaObject(map[string]any{
 		"ref": map[string]any{
 			"type": "string", "minLength": 1, "maxLength": 64,
@@ -1682,9 +1651,6 @@ func graphProposeSchema() json.RawMessage {
 			"type": "string", "maxLength": 20000,
 			"description": "可选。场景说明。",
 		},
-		"version_sut_ids": ids("可选。场景使用的 version_sut 十进制 ID 列表。"),
-		"page_ids":        ids("可选。场景关联的已绑定页面十进制 ID 列表。"),
-		"api_ids":         ids("可选。场景关联的已绑定接口十进制 ID 列表。"),
 		"sort_order": map[string]any{
 			"type": "integer", "minimum": 0,
 			"description": "可选。场景排序（0 或正整数，越小越靠前）。",
@@ -1723,8 +1689,11 @@ func graphProposeSchema() json.RawMessage {
 		"properties":           properties,
 		"additionalProperties": false,
 		"required":             []string{"requirement_id", "requirement_version_id", "scenarios", "cases"},
-		"description": "提交场景/用例 draft 的自描述 schema。合法顶层字段：requirement_id、requirement_version_id、base_graph_hash、proposal_id、base_revision、scenarios、cases、sources。" +
-			" unknown fields are strictly rejected（未知字段会被拒绝，不做别名映射），错误会指出最接近的合法字段；db 断言必须带 database_id（来自 sut.database_list / context.version_pack.databases）。",
+		"description": "提交场景/用例 draft 的自描述 schema（v0.2.4-B 自然语言用例契约）。合法顶层字段：requirement_id、requirement_version_id、base_graph_hash、proposal_id、base_revision、scenarios、cases、sources。" +
+			" unknown fields are strictly rejected（未知字段会被拒绝，不做别名映射），错误会指出最接近的合法字段。" +
+			" 每个用例必须给 sut_description（被测系统，自然语言 1..2000 字）、preconditions（前置条件，必填，无前置时显式写“无”）、covered_acs（本用例覆盖的验收标准 id，>=1 且必须取自该需求当前 AC 集）。" +
+			" 步骤目标用 target_description 自然语言描述；db 断言必须带 sut_id（指名 SUT，只查存在不查归属）。" +
+			" default_version_sut_id / version_sut_ids / page_ids / api_ids / target_version_sut_id / target_page_id / target_api_id / database_id 已全部移除，传了会被拒。",
 		"examples": graphProposeExamples(),
 	}
 	raw, err := json.Marshal(document)
@@ -1734,9 +1703,10 @@ func graphProposeSchema() json.RawMessage {
 	return raw
 }
 
-// graphProposeExamples returns two complete, copyable proposals: one ordinary
-// ui/api update and one db assertion keyed by the bound database id. They are
-// part of the model-visible contract (R-E1-1), not test fixtures.
+// graphProposeExamples returns two complete, copyable proposals on the v0.2.4-B
+// natural-language case contract: one ordinary ui/api case and one db assertion
+// keyed by sut_id. They are part of the model-visible contract (R-E1-1), not test
+// fixtures, so they must parse against this file's own validator.
 func graphProposeExamples() []any {
 	return []any{
 		map[string]any{
@@ -1745,22 +1715,23 @@ func graphProposeExamples() []any {
 			"scenarios": []any{
 				map[string]any{
 					"ref": "s1", "name": "正常登录", "description": "手机号密码登录",
-					"version_sut_ids": []any{"9001"}, "page_ids": []any{"9101"}, "api_ids": []any{"9201"},
 				},
 			},
 			"cases": []any{
 				map[string]any{
 					"ref": "c1", "scenario_ref": "s1", "title": "账号密码登录成功", "priority": "P1",
-					"default_version_sut_id": "9001", "version_sut_ids": []any{"9001"},
+					"sut_description": "商城前台登录页与登录接口。",
+					"preconditions":   "已注册手机号 13800000000，账号未被锁定",
+					"covered_acs":     []any{"AC-1", "AC-2"},
 					"steps": []any{
 						map[string]any{"seq": 1, "action": "打开登录页", "expected": "显示登录表单",
-							"target_version_sut_id": "9001", "target_page_id": "9101"},
+							"target_description": "登录页的手机号输入框"},
 						map[string]any{"seq": 2, "action": "提交有效账号密码", "expected": "跳转到首页",
-							"target_version_sut_id": "9001", "target_api_id": "9201"},
+							"target_description": "POST /api/login 接口", "account_role": "buyer"},
 					},
 					"assertions": []any{
 						map[string]any{"step_seq": 1, "kind": "ui", "target": "登录表单", "expected": "表单可见"},
-						map[string]any{"step_seq": 2, "kind": "api", "target": "POST /login", "expected": "HTTP 200"},
+						map[string]any{"step_seq": 2, "kind": "api", "target": "POST /api/login", "expected": "HTTP 200"},
 					},
 					"sources": []any{
 						map[string]any{"kind": "requirement", "ref_id": "700"},
@@ -1775,21 +1746,23 @@ func graphProposeExamples() []any {
 			"base_revision":          3,
 			"scenarios": []any{
 				map[string]any{
-					"ref": "s1", "name": "正常登录", "version_sut_ids": []any{"9001"},
+					"ref": "s1", "name": "正常登录",
 				},
 			},
 			"cases": []any{
 				map[string]any{
 					"ref": "c1", "scenario_ref": "s1", "title": "登录成功后写入登录审计", "priority": "P1",
-					"default_version_sut_id": "9001", "version_sut_ids": []any{"9001"},
+					"sut_description": "商城登录接口及其订单库。",
+					"preconditions":   "无",
+					"covered_acs":     []any{"AC-10"},
 					"steps": []any{
 						map[string]any{"seq": 1, "action": "提交有效账号密码", "expected": "登录成功",
-							"target_version_sut_id": "9001", "target_api_id": "9201"},
+							"target_description": "POST /api/login 接口"},
 					},
 					"assertions": []any{
 						map[string]any{"step_seq": 1, "kind": "db",
 							"target":   "select count(*) from login_audit where user_id = 42",
-							"expected": "count = 1", "database_id": "1501"},
+							"expected": "count = 1", "sut_id": "9001"},
 					},
 					"sources": []any{
 						map[string]any{"kind": "requirement", "ref_id": "700"},

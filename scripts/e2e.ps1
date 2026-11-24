@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the EzTest Playwright E2E suite against the dedicated eztest_e2e database.
@@ -30,11 +30,20 @@ $frontendDir = Join-Path $repoRoot "frontend"
 $backendDir = Join-Path $repoRoot "backend"
 $tmpDir = Join-Path $repoRoot ".tmp"
 $e2eDbName = "eztest_e2e"
+# Ports default to the historical fixed values; override any of them with the
+# matching EZTEST_E2E_* environment variable when a default port is already owned
+# by another process (e.g. a developer web server on 6868). Env overrides keep
+# the positional Playwright filter argument (`scripts/e2e.ps1 versions`) intact.
 $apiPort = 13333
 $webPort = 6868
 $fakeLlmPort = 13334
 $fixturePort = 13335
 $executorPort = 13336
+if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_E2E_API_PORT)) { $apiPort = [int]$env:EZTEST_E2E_API_PORT }
+if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_E2E_WEB_PORT)) { $webPort = [int]$env:EZTEST_E2E_WEB_PORT }
+if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_E2E_FAKE_LLM_PORT)) { $fakeLlmPort = [int]$env:EZTEST_E2E_FAKE_LLM_PORT }
+if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_E2E_FIXTURE_PORT)) { $fixturePort = [int]$env:EZTEST_E2E_FIXTURE_PORT }
+if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_E2E_EXECUTOR_PORT)) { $executorPort = [int]$env:EZTEST_E2E_EXECUTOR_PORT }
 $apiBaseUrl = "http://localhost:$apiPort"
 $webBaseUrl = "http://localhost:$webPort"
 $fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
@@ -403,21 +412,23 @@ try {
     if ($executorProcess -and $executorBaseUrl) { $env:EZTEST_E2E_EXECUTOR_URL = $executorBaseUrl }
     Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
 
-    # P6 execution E2E state: the evidence file store and the executor endpoint
-    # the API and the browser tools use (design spec §5.6/§5.7).
+    # P6 execution E2E state: the executor endpoint the API/browser tools use
+    # (design spec §5.6/§5.7). $evidenceDir is a local-only artifact directory;
+    # the API no longer reads EZTEST_EVIDENCE_DIR (content root is the settings
+    # center's paths.data_root).
     if (Test-Path -LiteralPath $evidenceDir) {
         Remove-Item -LiteralPath $evidenceDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
-    $env:EZTEST_EVIDENCE_DIR = $evidenceDir
     $env:EZTEST_EXECUTOR_URL = $executorBaseUrl
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
-    # P7 report Markdown store (spec §6.5/D30). The API creates it on boot; a
-    # stale directory from an interrupted run is removed first.
+    # P7 report Markdown store (spec §6.5/D30). $reportDir is a local-only
+    # artifact directory; the API no longer reads EZTEST_REPORT_DIR (content
+    # root is the settings center's paths.data_root). A stale directory from an
+    # interrupted run is removed first.
     if (Test-Path -LiteralPath $reportDir) {
         Remove-Item -LiteralPath $reportDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    $env:EZTEST_REPORT_DIR = $reportDir
     # A bigger per-tick batch budget keeps the multi-batch autonomous chains of
     # the P7 specs from queueing behind each other (spec §6.2).
     if ([string]::IsNullOrWhiteSpace($env:EZTEST_AUTONOMY_BATCHES_PER_TICK)) {
@@ -436,8 +447,13 @@ try {
     # startup, before /api/health reports healthy.
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $e2eDatabaseUrl
-    $env:EZTEST_HTTP_ADDR = ":$apiPort"
-    $env:EZTEST_WEB_ORIGIN = $webBaseUrl
+    # config.go reads EZTEST_API_PORT / EZTEST_WEB_PORT / EZTEST_EXECUTOR_PORT
+    # (not EZTEST_HTTP_ADDR/EZTEST_WEB_ORIGIN), so the parametrized ports must be
+    # exported under these names for the API bind, CORS origins and the seeded
+    # executor URL to follow.
+    $env:EZTEST_API_PORT = "$apiPort"
+    $env:EZTEST_WEB_PORT = "$webPort"
+    $env:EZTEST_EXECUTOR_PORT = "$executorPort"
     $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
     # P3 attachments are isolated in a throwaway directory that is cleaned up
@@ -450,7 +466,7 @@ try {
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
     # The first-start seed reads EZTEST_INITIAL_ADMIN_PASSWORD; the e2e DB is fresh.
     $env:EZTEST_INITIAL_ADMIN_PASSWORD = $adminPassword
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+    foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
         if ($envValues.ContainsKey($key)) {
             Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
         }
@@ -478,13 +494,35 @@ try {
     $env:NEXT_TELEMETRY_DISABLED = "1"
     $nextBin = Join-Path $frontendDir "node_modules\next\dist\bin\next"
     Remove-Item -LiteralPath $webOut, $webErr -ErrorAction SilentlyContinue
-    $webProcess = Start-Process -FilePath $nodeExe `
-        -ArgumentList @("`"$nextBin`"", "dev", "-p", "$webPort") `
-        -WorkingDirectory $frontendDir `
-        -RedirectStandardOutput $webOut `
-        -RedirectStandardError $webErr `
-        -WindowStyle Hidden `
-        -PassThru
+    # Next.js 16's compiled @vercel/detect-agent keys off AI-agent env vars
+    # (AI_AGENT, CLAUDECODE, CLAUDE_CODE, CURSOR_*, ...); when it detects one,
+    # `next dev` stops to print a security/upgrade nudge (next/dist/lib/upgrade/
+    # nudge.js) that kills the dev server mid-run. The e2e web server must stay up
+    # deterministically, so the agent markers are cleared for this child only
+    # (restored right after Start-Process; the child already inherited the
+    # cleared environment). This changes no product behavior.
+    $agentEnvNames = @("AI_AGENT","ANTIGRAVITY_AGENT","AUGMENT_AGENT","CLAUDECODE","CLAUDE_CODE","CLAUDE_CODE_IS_COWORK","CODEX_CI","CODEX_SANDBOX","CODEX_THREAD_ID","COPILOT_ALLOW_ALL","COPILOT_GITHUB_TOKEN","COPILOT_MODEL","CURSOR_AGENT","CURSOR_EXTENSION_HOST_ROLE","CURSOR_TRACE_ID","GEMINI_CLI","OPENCODE_CLIENT","REPL_ID")
+    $savedAgentEnv = @{}
+    foreach ($agentEnvName in $agentEnvNames) {
+        $existing = Get-Item -Path "Env:$agentEnvName" -ErrorAction SilentlyContinue
+        if ($null -ne $existing) {
+            $savedAgentEnv[$agentEnvName] = $existing.Value
+            Remove-Item -Path "Env:$agentEnvName" -ErrorAction SilentlyContinue
+        }
+    }
+    try {
+        $webProcess = Start-Process -FilePath $nodeExe `
+            -ArgumentList @("`"$nextBin`"", "dev", "-p", "$webPort") `
+            -WorkingDirectory $frontendDir `
+            -RedirectStandardOutput $webOut `
+            -RedirectStandardError $webErr `
+            -WindowStyle Hidden `
+            -PassThru
+    } finally {
+        foreach ($agentEnvName in $savedAgentEnv.Keys) {
+            Set-Item -Path "Env:$agentEnvName" -Value $savedAgentEnv[$agentEnvName]
+        }
+    }
     Wait-ForHttp -Url "$webBaseUrl/login" -TimeoutSeconds 180 -Process $webProcess -Label "Web"
     Write-Host "Web is ready at $webBaseUrl"
 
@@ -506,8 +544,8 @@ try {
     # tools (design spec §10.5): same bearer token as the API, loopback address,
     # and its own health probe before Playwright starts.
     $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:$executorPort"
-    if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_MAX_CONTEXTS)) {
-        $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "8"
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_MAX_SESSIONS)) {
+        $env:EZTEST_EXECUTOR_MAX_SESSIONS = "8"
     }
     Remove-Item -LiteralPath $executorOut, $executorErr -ErrorAction SilentlyContinue
     $executorServer = Join-Path $executorDir "src\server.mjs"
@@ -578,21 +616,21 @@ try {
             # executor shutdown).
             $specFiles = @(Get-ChildItem -Path (Join-Path $frontendDir "e2e") -Filter "*.spec.ts" |
                 ForEach-Object { $_.Name })
-            $p8Specs = @($specFiles | Where-Object { $_ -like "p8-*.spec.ts" })
-            $p7Specs = @($specFiles | Where-Object { $_ -like "p7-*.spec.ts" })
+            $p8Specs = @($specFiles | Where-Object { $_ -like "full-journey*.spec.ts" })
+            $p7Specs = @($specFiles | Where-Object { $_ -like "knowledge-operations*.spec.ts" })
             $executionSpecs = @($specFiles | Where-Object { $_ -like "*execution.spec.ts" })
-            # p3/p4/p5 are real-LLM/dedicated-harness specs (scripts/p3-e2e.ps1,
-            # scripts/p4-e2e.ps1, scripts/p5-e2e.ps1); the fake-LLM runner must not
+            # p3/p4/p5 are real-LLM/dedicated-harness specs (scripts/execution-e2e.ps1,
+            # scripts/delivery-e2e.ps1, scripts/code-intelligence-e2e.ps1); the fake-LLM runner must not
             # include them. They run in their own harnesses.
             $bulkSpecs = @($specFiles | Where-Object {
-                $_ -ne "p3.spec.ts" -and $_ -ne "p4.spec.ts" -and $_ -ne "p5.spec.ts" -and
-                $_ -notlike "p8-*.spec.ts" -and $_ -notlike "p7-*.spec.ts" -and
+                $_ -ne "execution.spec.ts" -and $_ -ne "delivery.spec.ts" -and $_ -ne "code-intelligence.spec.ts" -and
+                $_ -notlike "full-journey*.spec.ts" -and $_ -notlike "knowledge-operations*.spec.ts" -and
                 $_ -notlike "*execution.spec.ts"
             })
             # The fake-LLM runner is self-contained: P0/P1/P2 only. P6 needs the P4
-            # dataset, P7 needs scripts/p7-acceptance.ps1 seed, P8 needs the S0-S6
+            # dataset, P7 needs scripts/knowledge-operations-acceptance.ps1 seed, P8 needs the S0-S6
             # dataset, and P3/P4/P5 are real-LLM specs; each runs in its own harness.
-            $coreSpecs = @($specFiles | Where-Object { $_ -in @("p0.spec.ts") })
+            $coreSpecs = @($specFiles | Where-Object { $_ -in @("platform-journey.spec.ts") })
             $phases = @(
                 @{ Label = "core fake-LLM suite (P0-P2)"; Files = $coreSpecs }
             )

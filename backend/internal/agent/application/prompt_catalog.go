@@ -87,8 +87,6 @@ func profileExampleTaskType(profileKey string) string {
 		return WorkTypeIssueTriage
 	case ProfileKeyReportWriter:
 		return WorkTypeReportWave
-	case ProfileKeyVersionSteward:
-		return WorkTypeVersionClose
 	default:
 		return WorkTypeChatTurn
 	}

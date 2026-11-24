@@ -2,26 +2,26 @@ import { describe, expect, it } from "vitest"
 
 import { findNavItem, isNavItemActive, NAV_ITEMS, NAV_SECTIONS, type NavItem } from "./nav-items"
 
-const labels = ["版本", "问题", "报告", "知识", "资源", "质量", "Agent 中心", "设置"]
+const labels = ["版本", "问题", "报告", "知识", "资源", "质量", "Agent 中心", "技能库", "设置"]
 
 describe("NAV_ITEMS", () => {
-  it("has exactly the eight P0 navigation entries in product order", () => {
-    expect(NAV_ITEMS).toHaveLength(8)
+  it("has exactly the nine global navigation entries in product order", () => {
+    expect(NAV_ITEMS).toHaveLength(9)
     expect(NAV_ITEMS.map((item) => item.label)).toEqual(labels)
   })
 
   it("uses unique keys, hrefs and icons", () => {
-    expect(new Set(NAV_ITEMS.map((item) => item.key)).size).toBe(8)
-    expect(new Set(NAV_ITEMS.map((item) => item.href)).size).toBe(8)
-    expect(new Set(NAV_ITEMS.map((item) => item.icon)).size).toBe(8)
+    expect(new Set(NAV_ITEMS.map((item) => item.key)).size).toBe(9)
+    expect(new Set(NAV_ITEMS.map((item) => item.href)).size).toBe(9)
+    expect(new Set(NAV_ITEMS.map((item) => item.icon)).size).toBe(9)
   })
 
-  it("splits the five workspace entries from the three platform entries", () => {
+  it("splits the five workspace entries from the four platform entries", () => {
     expect(NAV_SECTIONS.map((section) => section.label)).toEqual(["工作区", "平台"])
     const workspace = NAV_ITEMS.filter((item) => item.section === "workspace")
     const platform = NAV_ITEMS.filter((item) => item.section === "platform")
     expect(workspace.map((item) => item.label)).toEqual(["版本", "问题", "报告", "知识", "资源"])
-    expect(platform.map((item) => item.label)).toEqual(["质量", "Agent 中心", "设置"])
+    expect(platform.map((item) => item.label)).toEqual(["质量", "Agent 中心", "技能库", "设置"])
   })
 
   it("marks no entry as a placeholder", () => {
@@ -38,6 +38,7 @@ describe("NAV_ITEMS", () => {
       "/resources",
       "/quality",
       "/agents",
+      "/skills",
       "/settings",
     ])
   })

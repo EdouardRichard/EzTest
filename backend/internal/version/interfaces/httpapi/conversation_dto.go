@@ -40,7 +40,12 @@ type conversationMessageDTO struct {
 	Parts          []version.MessagePart `json:"parts"`
 	Refs           []version.MessageRef  `json:"refs"`
 	ActualModel    *string               `json:"actual_model"`
-	CreatedAt      string                `json:"created_at"`
+	// StreamState is the incremental reply lifecycle (v0.2.4-D, additive). The
+	// SSE full frame already carried it; the HTTP snapshot carries it too so a
+	// thread reloaded mid-reply resumes rendering instead of reading as a
+	// finished message with no text.
+	StreamState string `json:"stream_state"`
+	CreatedAt   string `json:"created_at"`
 }
 
 // ---------- 0.2.1 streaming parts ----------
@@ -185,6 +190,7 @@ func toConversationMessageDTO(view versionapp.MessageView) conversationMessageDT
 		Parts:          parts,
 		Refs:           refs,
 		ActualModel:    view.ActualModel,
+		StreamState:    version.NormalizeMessageStreamState(view.StreamState),
 		CreatedAt:      formatTime(view.CreatedAt),
 	}
 }

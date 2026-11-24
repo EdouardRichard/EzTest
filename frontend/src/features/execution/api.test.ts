@@ -185,14 +185,14 @@ describe("execution api", () => {
     await expect(
       listEvidence("2001", {
         caseRunId: "9302",
-        versionSutId: "1002",
+        sutId: "1002",
         kind: "screenshot",
         before: "9401",
         limit: 50,
       }),
     ).resolves.toEqual([evidenceScreenshotFixture])
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "http://localhost:13333/api/versions/2001/evidence?case_run_id=9302&version_sut_id=1002&kind=screenshot&before=9401&limit=50",
+      "http://localhost:13333/api/versions/2001/evidence?case_run_id=9302&sut_id=1002&kind=screenshot&before=9401&limit=50",
     )
 
     fetchMock.mockResolvedValueOnce(jsonResponse({ data: evidenceScreenshotFixture }))

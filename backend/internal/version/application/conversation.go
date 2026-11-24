@@ -1154,6 +1154,11 @@ func (s *ConversationService) publishMessageEvent(ctx context.Context, versionID
 		"parts":           parts,
 		"refs":            refs,
 		"created_at":      message.CreatedAt.UTC().Format(time.RFC3339),
+		// stream_state marks an incremental reply's lifecycle (v0.2.4-D): the
+		// placeholder frame is streaming, the terminal frame complete/interrupted.
+		// Batch-path messages normalize to complete, so existing consumers see a
+		// finished message unchanged.
+		"stream_state": version.NormalizeMessageStreamState(message.StreamState),
 	}
 	_ = s.events.Publish(ctx, eventingapp.Event{
 		Channel: "version:" + platformid.Format(versionID),

@@ -33,11 +33,13 @@ const (
 )
 
 // designAuthoringWorkTypes are the background design work types whose context
-// is scoped by Task 79.
+// is scoped by Task 79. design.rework joined in v0.2.4-E T19 fix round 1: the
+// rework author works from its scoped case + the judge findings in the task
+// block (SC-E4), not from the shared design thread — replaying previous
+// authors' projections would flood it exactly like the per-requirement author.
 func isDesignAuthoringWorkType(workType string) bool {
 	switch workType {
-	case WorkTypeDesignRequirement, WorkTypeDesignGap, WorkTypeDesignRound,
-		WorkTypeDesignCritic, WorkTypeDesignDataPlan:
+	case WorkTypeDesignRequirement, WorkTypeDesignGap, WorkTypeDesignCritic, WorkTypeDesignRework:
 		return true
 	default:
 		return false

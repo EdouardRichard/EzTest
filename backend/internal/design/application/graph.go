@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // CaseRunStatusReader is the execution read port consumed by the design graph
@@ -45,10 +45,10 @@ type GraphService struct {
 	// revisionStore is the W2-11 cross-context provenance read port for the
 	// additive discovery case revision service.
 	revisionStore DiscoveryRevisionStore
-	// visual resolves the active visual_assertion configurations of a case
-	// version so confirmation can require a resolvable visual_assertion_id
-	// before a kind=visual assertion reaches execution (Task 115).
-	visual VisualAssertionResolver
+	// judgment is the confirmation judgment gate (spec SC-E5). Confirm reads
+	// the review state of every draft it is about to freeze through this port;
+	// an unwired gate fails closed rather than confirming unreviewed cases.
+	judgment JudgmentGate
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are
@@ -96,14 +96,24 @@ func (s *GraphService) SetCaseRunStatusReader(reader CaseRunStatusReader) *Graph
 	return s
 }
 
-// SetVisualAssertionResolver attaches the visual context read port used by
-// confirmation to require a resolvable visual_assertion_id for every
-// kind=visual assertion (Task 115). It returns the service for fluent wiring.
-func (s *GraphService) SetVisualAssertionResolver(resolver VisualAssertionResolver) *GraphService {
-	if s != nil {
-		s.visual = resolver
+// caseReviewState projects one case version's review state through the
+// confirmation judgment gate (spec SC-E5, T16): the SAME ReviewStateFor
+// authority Confirm and the shared review gate consume, never a second
+// derivation. Like latestCaseRunStatuses, this is a best-effort read
+// projection: an unwired gate, a case with no current version, or a gate read
+// failure leaves the field empty rather than failing the whole graph/case
+// read or fabricating a verdict. Confirm itself still fails closed on an
+// unwired gate (validateJudgmentForConfirm) -- this projection is for display,
+// not a confirmation decision.
+func (s *GraphService) caseReviewState(ctx context.Context, versionID, caseID, currentVersionID int64) design.ReviewState {
+	if s == nil || s.judgment == nil || currentVersionID <= 0 {
+		return ""
 	}
-	return s
+	state, err := s.judgment.ReviewStateFor(ctx, versionID, caseID, currentVersionID)
+	if err != nil {
+		return ""
+	}
+	return state
 }
 
 // latestCaseRunStatuses loads the newest case_run status per current case
@@ -165,7 +175,6 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 			Title:                requirement.Requirement.Title,
 			Status:               requirement.Requirement.Status,
 			DesignStatus:         requirement.DesignStatus,
-			TargetVersionSUTIDs:  requirement.Requirement.TargetVersionSUTIDs,
 			Scenarios:            make([]ScenarioGraphView, 0, len(requirement.Scenarios)),
 		}
 		for _, scenario := range requirement.Scenarios {
@@ -174,9 +183,6 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 				RequirementVersionID: scenario.Scenario.RequirementVersionID,
 				Name:                 scenario.Scenario.Name,
 				Description:          scenario.Scenario.Description,
-				VersionSUTIDs:        scenario.Scenario.VersionSUTIDs,
-				PageIDs:              scenario.Scenario.PageIDs,
-				APIIDs:               scenario.Scenario.APIIDs,
 				SortOrder:            scenario.Scenario.SortOrder,
 				Cases:                make([]CaseCardView, 0, len(scenario.Cases)),
 			}
@@ -186,20 +192,19 @@ func (s *GraphService) ReadGraph(ctx context.Context, versionID int64) (GraphVie
 					verdict = design.CaseRunVerdictFromStatus(status)
 				}
 				scenarioView.Cases = append(scenarioView.Cases, CaseCardView{
-					CaseID:              item.Case.ID,
-					CurrentVersionID:    derefInt64(item.Case.CurrentVersionID),
-					Revision:            item.Current.Revision,
-					Title:               item.Current.Title,
-					Priority:            item.Current.Priority,
-					Status:              item.Current.Status,
-					DefaultVersionSUTID: item.Current.DefaultVersionSUTID,
-					VersionSUTIDs:       item.Current.VersionSUTIDs,
-					PageIDs:             item.Current.PageIDs,
-					APIIDs:              item.Current.APIIDs,
-					StepCount:           item.StepCount,
-					AssertionCount:      item.AssertionCount,
-					ExecutionVerdict:    string(verdict),
-					CreatedAt:           utcNow(item.Current.CreatedAt),
+					CaseID:           item.Case.ID,
+					CurrentVersionID: derefInt64(item.Case.CurrentVersionID),
+					Revision:         item.Current.Revision,
+					Title:            item.Current.Title,
+					Priority:         item.Current.Priority,
+					Status:           item.Current.Status,
+					SutDescription:   item.Current.SutDescription,
+					CoveredACs:       append([]string(nil), item.Current.CoveredACs...),
+					StepCount:        item.StepCount,
+					AssertionCount:   item.AssertionCount,
+					ExecutionVerdict: string(verdict),
+					ReviewState:      s.caseReviewState(ctx, versionID, item.Case.ID, item.Current.ID),
+					CreatedAt:        utcNow(item.Current.CreatedAt),
 				})
 			}
 			requirementView.Scenarios = append(requirementView.Scenarios, scenarioView)
@@ -243,6 +248,7 @@ func (s *GraphService) GetCase(ctx context.Context, versionID, caseID int64, cas
 			data.Selected.Status == design.CaseStatusDraft &&
 			data.Case.Status == design.CaseStatusDraft &&
 			data.Scenario.RequirementVersionID == data.Requirement.CurrentVersionID,
+		ReviewState: s.caseReviewState(ctx, versionID, caseID, derefInt64(data.Case.CurrentVersionID)),
 	}
 	for _, version := range data.Versions {
 		summary := CaseVersionSummaryView{
@@ -302,26 +308,25 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 	if err := requirePositiveID("requirement_version_id", in.RequirementVersionID); err != nil {
 		return ProposeResult{}, err
 	}
-	versionContext, err := s.repo.VersionContext(ctx, versionID)
-	if err != nil {
+	// v0.2.4-B: VersionContext no longer feeds proposal validation -- the four
+	// resource maps it carried served the retired ownership group (§5.2), and
+	// the AC id set that replaced them comes from RequirementContext below. The
+	// read stays as the version-existence gate so a proposal into a missing
+	// version still reports 404 "version" rather than falling through to the
+	// requirement read and reporting 404 "requirement".
+	if _, err := s.repo.VersionContext(ctx, versionID); err != nil {
 		return ProposeResult{}, mapDesignError(err, "version")
 	}
 	requirement, err := s.repo.RequirementContext(ctx, versionID, in.RequirementID)
 	if err != nil {
 		return ProposeResult{}, mapDesignError(err, "requirement")
 	}
-	if requirement.Status != "clarified" {
+	if requirement.Status != string(version.RequirementClarified) {
 		return ProposeResult{}, platform.StateConflict("the requirement must be clarified before it can be designed")
 	}
 	if requirement.CurrentVersionID == 0 || requirement.CurrentVersionID != in.RequirementVersionID {
 		return ProposeResult{}, platform.StateConflict("the requirement version is stale; re-read the graph and retry")
 	}
-
-	// Task 120: ordinary functional ACs must generate non-visual assertions.
-	// Apply the default before validation and persistence so both the stored
-	// case version and its content hash reflect the assertion that will run;
-	// an explicit visual-baseline requirement keeps kind=visual untouched.
-	normalizeProposalAssertionKinds(&in, requirement)
 
 	graph, err := s.repo.ReadGraph(ctx, versionID)
 	if err != nil {
@@ -333,15 +338,17 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 	}
 
 	proposal := toDomainProposal(in)
+	// v0.2.4-B (§5.2): the requirement's AC id set is the only thing a case's
+	// covered_acs is validated against. It arrives on the RequirementRef already
+	// loaded above for the clarified/current-revision gates, so the linkage rule
+	// needs no extra port or query. The retired resource maps (AllowedVersionSUTs
+	// /PageToSUT/APIToSUT/DBTOSUT) are gone with the ownership group they served.
 	validationContext := design.ProposalContext{
 		VersionID:            versionID,
 		RequirementID:        in.RequirementID,
 		RequirementVersionID: in.RequirementVersionID,
 		CurrentHash:          currentHash,
-		AllowedVersionSUTs:   versionContext.AllowedVersionSUTs,
-		PageToSUT:            versionContext.PageToSUT,
-		APIToSUT:             versionContext.APIToSUT,
-		DBTOSUT:              versionContext.DBTOSUT,
+		RequirementACIDs:     requirement.ACIDs,
 	}
 	if err := design.ValidateProposal(proposal, validationContext); err != nil {
 		return ProposeResult{}, err
@@ -400,9 +407,6 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 				updated := existing
 				updated.Name = strings.TrimSpace(scenarioInput.Name)
 				updated.Description = scenarioInput.Description
-				updated.VersionSUTIDs = scenarioInput.VersionSUTIDs
-				updated.PageIDs = scenarioInput.PageIDs
-				updated.APIIDs = scenarioInput.APIIDs
 				updated.SortOrder = scenarioInput.SortOrder
 				updated.UpdatedAt = now
 				if !sameScenarioContent(existing, updated) {
@@ -422,9 +426,6 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 				RequirementVersionID: in.RequirementVersionID,
 				Name:                 strings.TrimSpace(scenarioInput.Name),
 				Description:          scenarioInput.Description,
-				VersionSUTIDs:        scenarioInput.VersionSUTIDs,
-				PageIDs:              scenarioInput.PageIDs,
-				APIIDs:               scenarioInput.APIIDs,
 				SortOrder:            scenarioInput.SortOrder,
 				CreatedAt:            now,
 				UpdatedAt:            now,
@@ -585,18 +586,20 @@ func (s *GraphService) buildCaseVersion(in CaseInput, caseID int64, current *des
 		revision = current.Revision + 1
 	}
 	version := design.CaseVersion{
-		ID:                  s.ids.Next(),
-		CaseID:              caseID,
-		Revision:            revision,
-		Title:               strings.TrimSpace(in.Title),
-		Description:         in.Description,
+		ID:          s.ids.Next(),
+		CaseID:      caseID,
+		Revision:    revision,
+		Title:       strings.TrimSpace(in.Title),
+		Description: in.Description,
+		// The stored contract values are the canonical ones: sut_description
+		// trimmed and covered_acs normalized (trimmed, de-duplicated, sorted),
+		// exactly as ComputeCaseContentHash projects them. Storing anything else
+		// would let the row and its own content hash disagree about order.
+		SutDescription:      strings.TrimSpace(in.SutDescription),
 		Preconditions:       in.Preconditions,
+		CoveredACs:          design.NormalizeACIDSet(in.CoveredACs),
 		TestData:            in.TestData,
 		Priority:            in.Priority,
-		DefaultVersionSUTID: in.DefaultVersionSUTID,
-		VersionSUTIDs:       in.VersionSUTIDs,
-		PageIDs:             in.PageIDs,
-		APIIDs:              in.APIIDs,
 		Status:              design.CaseStatusDraft,
 		Trigger:             in.Trigger,
 		SourceObservationID: in.SourceObservationID,
@@ -617,17 +620,15 @@ func (s *GraphService) buildCaseVersion(in CaseInput, caseID int64, current *des
 	for _, step := range in.Steps {
 		version.Steps = append(version.Steps, design.CaseStep{
 			ID: s.ids.Next(), Seq: step.Seq, Action: step.Action, Expected: step.Expected,
-			TargetVersionSUTID: step.TargetVersionSUTID, TargetPageID: step.TargetPageID,
-			TargetAPIID: step.TargetAPIID, AccountRole: step.AccountRole, Data: step.Data,
-			CreatedAt: now,
+			TargetDescription: step.TargetDescription, AccountRole: step.AccountRole,
+			Data: step.Data, CreatedAt: now,
 		})
 	}
 	for _, assertion := range in.Assertions {
 		version.Assertions = append(version.Assertions, design.CaseAssertion{
 			ID: s.ids.Next(), StepSeq: assertion.StepSeq, Kind: assertion.Kind,
 			Target: assertion.Target, Expected: assertion.Expected,
-			TargetVersionSUTID: assertion.TargetVersionSUTID, TargetAPIID: assertion.TargetAPIID,
-			DatabaseID: assertion.DatabaseID, CreatedAt: now,
+			SUTID: assertion.SUTID, CreatedAt: now,
 		})
 	}
 	for _, source := range in.Sources {
@@ -647,29 +648,14 @@ func (s *GraphService) buildCaseVersion(in CaseInput, caseID int64, current *des
 	return version, true, nil
 }
 
+// sameScenarioContent reports whether an update would change anything. With the
+// v0.2.4-B resource arrays gone a scenario is just its name, description and
+// sort order, so the equalInt64Sets helper this used to call is dead and was
+// removed with it.
 func sameScenarioContent(left, right design.Scenario) bool {
 	return left.Name == right.Name &&
 		left.Description == right.Description &&
-		left.SortOrder == right.SortOrder &&
-		equalInt64Sets(left.VersionSUTIDs, right.VersionSUTIDs) &&
-		equalInt64Sets(left.PageIDs, right.PageIDs) &&
-		equalInt64Sets(left.APIIDs, right.APIIDs)
-}
-
-func equalInt64Sets(left, right []int64) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	leftCopy := append([]int64(nil), left...)
-	rightCopy := append([]int64(nil), right...)
-	sort.Slice(leftCopy, func(i, j int) bool { return leftCopy[i] < leftCopy[j] })
-	sort.Slice(rightCopy, func(i, j int) bool { return rightCopy[i] < rightCopy[j] })
-	for index := range leftCopy {
-		if leftCopy[index] != rightCopy[index] {
-			return false
-		}
-	}
-	return true
+		left.SortOrder == right.SortOrder
 }
 
 func withActorAudit(scenario design.Scenario, actorID, runID int64) design.Scenario {
@@ -684,36 +670,33 @@ func withActorAudit(scenario design.Scenario, actorID, runID int64) design.Scena
 
 func caseVersionDetailView(version design.CaseVersion) CaseVersionDetailView {
 	view := CaseVersionDetailView{
-		CaseVersionID:       version.ID,
-		Revision:            version.Revision,
-		Title:               version.Title,
-		Description:         version.Description,
-		Preconditions:       version.Preconditions,
-		TestData:            version.TestData,
-		Priority:            version.Priority,
-		DefaultVersionSUTID: version.DefaultVersionSUTID,
-		VersionSUTIDs:       version.VersionSUTIDs,
-		PageIDs:             version.PageIDs,
-		APIIDs:              version.APIIDs,
-		Status:              version.Status,
-		ContentHash:         version.ContentHash,
-		CreatedAt:           utcNow(version.CreatedAt),
-		Steps:               make([]CaseStepView, 0, len(version.Steps)),
-		Assertions:          make([]CaseAssertionView, 0, len(version.Assertions)),
-		Sources:             make([]CaseSourceView, 0, len(version.Sources)),
+		CaseVersionID:  version.ID,
+		Revision:       version.Revision,
+		Title:          version.Title,
+		Description:    version.Description,
+		SutDescription: version.SutDescription,
+		Preconditions:  version.Preconditions,
+		CoveredACs:     append([]string(nil), version.CoveredACs...),
+		TestData:       version.TestData,
+		Priority:       version.Priority,
+		Status:         version.Status,
+		ContentHash:    version.ContentHash,
+		CreatedAt:      utcNow(version.CreatedAt),
+		Steps:          make([]CaseStepView, 0, len(version.Steps)),
+		Assertions:     make([]CaseAssertionView, 0, len(version.Assertions)),
+		Sources:        make([]CaseSourceView, 0, len(version.Sources)),
 	}
 	for _, step := range version.Steps {
 		view.Steps = append(view.Steps, CaseStepView{
 			Seq: step.Seq, Action: step.Action, Expected: step.Expected,
-			TargetVersionSUTID: step.TargetVersionSUTID, TargetPageID: step.TargetPageID,
-			TargetAPIID: step.TargetAPIID, AccountRole: step.AccountRole, Data: step.Data,
+			TargetDescription: step.TargetDescription, AccountRole: step.AccountRole,
+			Data: step.Data,
 		})
 	}
 	for _, assertion := range version.Assertions {
 		view.Assertions = append(view.Assertions, CaseAssertionView{
-			ID: assertion.ID, StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
-			Expected: assertion.Expected, TargetVersionSUTID: assertion.TargetVersionSUTID,
-			TargetAPIID: assertion.TargetAPIID, DatabaseID: assertion.DatabaseID,
+			ID: assertion.ID, StepSeq: assertion.StepSeq, Kind: assertion.Kind,
+			Target: assertion.Target, Expected: assertion.Expected, SUTID: assertion.SUTID,
 		})
 	}
 	for _, source := range version.Sources {
@@ -754,25 +737,7 @@ func (s *GraphService) publishCaseVersionCreated(ctx context.Context, versionID,
 }
 
 func (s *GraphService) publishEvent(ctx context.Context, versionID int64, eventType string, requirementID int64, payload map[string]any, actorID int64) {
-	if s.events == nil {
-		return
-	}
-	scope := map[string]any{
-		"version_id":     platformid.Format(versionID),
-		"requirement_id": platformid.Format(requirementID),
-	}
-	event := eventingapp.Event{
-		Channel:   "version:" + platformid.Format(versionID),
-		Type:      eventType,
-		Scope:     scope,
-		Payload:   payload,
-		RequestID: requestid.From(ctx),
-	}
-	if actorID > 0 {
-		actor := actorID
-		event.ActorID = &actor
-	}
-	_ = s.events.Publish(ctx, event)
+	publishDesignEvent(ctx, s.events, versionID, eventType, requirementID, payload, actorID)
 }
 
 func (s *GraphService) recordAudit(ctx context.Context, requirementID int64, caseIDs []int64, created []createdCaseVersion, actorID int64) {
@@ -871,47 +836,55 @@ func checkAccumulatedLimits(
 // ExecutableCaseView is the P3 execution read projection of one
 // current+confirmed case version. It is the only design surface the execution
 // context consumes; no P2 write semantics change.
+//
+// v0.2.4-B (§3.3): this is a natural-language contract. default_version_sut_id
+// and version_sut_ids are gone; execution resolves where to run from
+// SutDescription plus the environment SUT catalog it already reads through
+// versionapp.EnvironmentSUTCatalog.EffectiveSUTs() (name/intro/base_url, no
+// credentials). CoveredACs travels along so a run can report which acceptance
+// criteria it exercised. The execution adapter (T11) owns the receiving side.
 type ExecutableCaseView struct {
 	CaseID               int64
 	CaseVersionID        int64
 	RequirementID        int64
 	RequirementVersionID int64
-	DefaultVersionSUTID  int64
 	Title                string
 	Description          string
+	SutDescription       string
 	Preconditions        string
+	CoveredACs           []string
 	Priority             string
-	VersionSUTIDs        []int64
 	Steps                []ExecutableStepView
 	Assertions           []ExecutableAssertionView
 }
 
-// ExecutableStepView is one P3 case step projection.
+// ExecutableStepView is one P3 case step projection. TargetDescription replaces
+// target_version_sut_id/target_page_id/target_api_id: the step says what it acts
+// on in prose and the execution team locates it (§3.2).
 type ExecutableStepView struct {
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID int64
-	AccountRole        string
-	PageID             *int64
-	APIID              *int64
-	Data               []byte
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              []byte
 }
 
 // ExecutableAssertionView is one P3 case assertion projection. AssertionSeq is
 // derived server-side by ascending case_assertion ID (P3-D-06).
+//
+// SUTID replaces target_version_sut_id/target_api_id/database_id (M-B4:
+// database_id was re-keyed to the SUT). It is only meaningful for kind=db, where
+// the domain gate requires it; 0 means unset.
 type ExecutableAssertionView struct {
-	// CaseAssertionID is the design case_assertion.id. Execution uses it to
-	// join the visual assertion configuration to the exact design assertion
-	// (Task 115), not just to a derived position.
-	CaseAssertionID    int64
-	StepSeq            int
-	AssertionSeq       int
-	Kind               string
-	Expected           string
-	TargetVersionSUTID int64
-	DatabaseID         *int64
-	APIID              *int64
+	// CaseAssertionID is the design case_assertion.id, the stable join key
+	// execution uses to map a projected assertion back to its design row.
+	CaseAssertionID int64
+	StepSeq         int
+	AssertionSeq    int
+	Kind            string
+	Expected        string
+	SUTID           int64
 }
 
 // GetCaseVersion returns one current+confirmed case version for execution. It
@@ -988,37 +961,23 @@ func executableCaseView(data design.ExecutableCase) ExecutableCaseView {
 		CaseVersionID:        version.ID,
 		RequirementID:        data.RequirementID,
 		RequirementVersionID: data.RequirementVersionID,
-		DefaultVersionSUTID:  derefInt64(version.DefaultVersionSUTID),
 		Title:                version.Title,
 		Description:          version.Description,
+		SutDescription:       version.SutDescription,
 		Preconditions:        version.Preconditions,
+		CoveredACs:           append([]string(nil), version.CoveredACs...),
 		Priority:             version.Priority,
-		VersionSUTIDs:        append([]int64(nil), version.VersionSUTIDs...),
-		Steps:                make([]ExecutableStepView, 0, len(version.Steps)),
+		Steps:                executableStepViews(version.Steps),
 		Assertions:           make([]ExecutableAssertionView, 0, len(version.Assertions)),
-	}
-	for _, step := range version.Steps {
-		view.Steps = append(view.Steps, ExecutableStepView{
-			Seq:                step.Seq,
-			Action:             step.Action,
-			Expected:           step.Expected,
-			TargetVersionSUTID: derefInt64(step.TargetVersionSUTID),
-			AccountRole:        step.AccountRole,
-			PageID:             step.TargetPageID,
-			APIID:              step.TargetAPIID,
-			Data:               append([]byte(nil), step.Data...),
-		})
 	}
 	for _, assertion := range version.Assertions {
 		view.Assertions = append(view.Assertions, ExecutableAssertionView{
-			CaseAssertionID:    assertion.ID,
-			StepSeq:            assertion.StepSeq,
-			AssertionSeq:       assertion.AssertionSeq,
-			Kind:               assertion.Kind,
-			Expected:           assertion.Expected,
-			TargetVersionSUTID: derefInt64(assertion.TargetVersionSUTID),
-			DatabaseID:         assertion.DatabaseID,
-			APIID:              assertion.TargetAPIID,
+			CaseAssertionID: assertion.ID,
+			StepSeq:         assertion.StepSeq,
+			AssertionSeq:    assertion.AssertionSeq,
+			Kind:            assertion.Kind,
+			Expected:        assertion.Expected,
+			SUTID:           derefInt64(assertion.SUTID),
 		})
 	}
 	return view

@@ -30,6 +30,7 @@ import {
   nextActionLabel,
   STEP_STATUS_LABEL,
   terminalCauseLabel,
+  terminalCauseRemedy,
 } from "./labels"
 import type { AssertionResult, CaseRun, CaseRunDetail, Evidence, StepResult } from "./types"
 
@@ -109,8 +110,8 @@ function StepRow({
         >
           {STEP_STATUS_LABEL[step.status]}
         </Badge>
-        {step.target_version_sut_id !== null ? (
-          <span className="text-muted-foreground">SUT {step.target_version_sut_id}</span>
+        {step.target_sut_id !== null ? (
+          <span className="text-muted-foreground">SUT {step.target_sut_id}</span>
         ) : null}
         <span className="ml-auto text-muted-foreground">
           {spanDuration(step.started_at, step.finished_at)}
@@ -376,6 +377,7 @@ export function CaseRunDetailView({
   const verdictReason = causeTextLabel(run.summary.verdict_reason) ?? ""
   const lastError = causeTextLabel(run.summary.last_error) ?? ""
   const nextAction =
+    terminalCauseRemedy(run.summary.terminal_cause) ??
     nextActionLabel(run.summary.next_action) ??
     (run.status === "blocked" ? "先解决阻塞条件（账号/环境/数据），再重跑用例" : null)
   // `usage` is nullable on the wire (v0.22 audit §2.5-2): a terminal row settled

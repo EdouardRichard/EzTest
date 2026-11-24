@@ -27,6 +27,9 @@ func (f *analysisFixture) addBlockedMissingFeatureRun(runID int64) execution.Cas
 	run := f.addRun(runID, 1, 901, execution.CaseRunBlocked, execution.FailureClassBlocked)
 	run.Summary = execution.CaseRunSummary{EvidenceCount: 14}
 	f.runs.byID[runID] = run
+	// The trap stored 14 evidence rows; seed them so the evidence gate sees the
+	// persisted count (the gate reads the repository, never the projection).
+	f.addEvidenceRows(runID, 14)
 	f.results.steps[runID] = []execution.StepResult{
 		{CaseRunID: runID, Seq: 1, Status: execution.StepPassed, Observed: map[string]any{"summary": "已登录并打开文章详情页"}},
 		{CaseRunID: runID, Seq: 2, Status: execution.StepPassed, Observed: map[string]any{"summary": "文章已发布并可通过 /posts/{id} 访问"}},
@@ -106,6 +109,9 @@ func TestMissingFeatureCreatesIssue(t *testing.T) {
 	run := f.addRun(caseRunID, 2, 902, execution.CaseRunBlocked, execution.FailureClassBlocked)
 	run.Summary = execution.CaseRunSummary{EvidenceCount: 10}
 	f.runs.byID[caseRunID] = run
+	// The trap stored 10 evidence rows; seed them so the evidence gate sees the
+	// persisted count (it reads the repository, never the projection).
+	f.addEvidenceRows(caseRunID, 10)
 	f.results.steps[caseRunID] = []execution.StepResult{
 		{CaseRunID: caseRunID, Seq: 1, Status: execution.StepPassed},
 		{

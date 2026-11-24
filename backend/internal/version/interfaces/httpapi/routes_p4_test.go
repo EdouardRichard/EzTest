@@ -8,11 +8,11 @@ import (
 	versionapi "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 )
 
-// TestP4ReopenRoutesAreRegistered exercises the local mux registration used by
-// the server assembly: RegisterP4 must mount both P4 reopen routes with the
+// TestReopenRoutesAreRegistered exercises the local mux registration used by
+// the server assembly: RegisterReopenRoutes must mount both P4 reopen routes with the
 // contract path parameter names, and both handlers must reach application
 // services only.
-func TestP4ReopenRoutesAreRegistered(t *testing.T) {
+func TestReopenRoutesAreRegistered(t *testing.T) {
 	versionStub := &stubService{}
 	versionReopen := &stubVersionReopenService{}
 	requirementStub := &stubRequirementService{}
@@ -45,7 +45,7 @@ func TestP4ReopenRoutesAreRegistered(t *testing.T) {
 		versionapi.WithRequirementClosures(closures),
 	)
 	mux := http.NewServeMux()
-	versionapi.RegisterP4(mux, versionHandler, requirementHandler)
+	versionapi.RegisterReopenRoutes(mux, versionHandler, requirementHandler)
 
 	versionRecorder := call(t, mux, http.MethodPost, "/api/versions/101/reopen", `{"reason":"manual"}`, actor())
 	if versionRecorder.Code != http.StatusOK {

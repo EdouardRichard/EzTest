@@ -32,6 +32,9 @@ type ConversationView struct {
 // assistant messages from the linked agent_run (`actual_model`). Kind is the
 // DB-3 conversation_message kind (text/question/answer); question/answer cards
 // use it to render the structured batch, and empty keeps the legacy text row.
+// StreamState is the incremental reply lifecycle (v0.2.4-D): the HTTP snapshot
+// carries it too, so a thread loaded mid-reply is legible as still streaming
+// instead of looking like a finished (empty) message.
 type MessageView struct {
 	ID             int64
 	ConversationID int64
@@ -40,6 +43,7 @@ type MessageView struct {
 	Parts          []version.MessagePart
 	Refs           []version.MessageRef
 	ActualModel    *string
+	StreamState    string
 	CreatedAt      time.Time
 }
 
@@ -94,6 +98,7 @@ func toMessageView(message version.Message) MessageView {
 		Kind:           message.Kind,
 		Parts:          nonNilParts(message.Parts),
 		Refs:           nonNilRefs(message.Refs),
+		StreamState:    version.NormalizeMessageStreamState(message.StreamState),
 		CreatedAt:      message.CreatedAt,
 	}
 	if message.ActualModel != "" {

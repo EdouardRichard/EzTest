@@ -34,12 +34,12 @@ describe("Sidebar", () => {
 
   afterEach(cleanup)
 
-  it("renders the eight navigation entries grouped into workspace and platform", () => {
+  it("renders the nine navigation entries grouped into workspace and platform", () => {
     render(<Sidebar />)
 
     const nav = screen.getByRole("navigation", { name: "主导航" })
     const links = within(nav).getAllByRole("link")
-    expect(links).toHaveLength(8)
+    expect(links).toHaveLength(9)
     expect(links.map((link) => link.textContent?.replace(/P1/g, "").trim())).toEqual([
       "版本",
       "问题",
@@ -48,6 +48,7 @@ describe("Sidebar", () => {
       "资源",
       "质量",
       "Agent 中心",
+      "技能库",
       "设置",
     ])
     expect(screen.getByText("工作区")).toBeInTheDocument()
@@ -82,7 +83,7 @@ describe("Sidebar", () => {
     render(<Sidebar />)
 
     const nav = screen.getByRole("navigation", { name: "主导航" })
-    expect(within(nav).getAllByRole("link")).toHaveLength(8)
+    expect(within(nav).getAllByRole("link")).toHaveLength(9)
     expect(screen.getByRole("link", { name: /^质量/ })).toBeInTheDocument()
     expect(screen.getByRole("link", { name: /^Agent 中心/ })).toBeInTheDocument()
     expect(screen.getByRole("link", { name: /^设置/ })).toBeInTheDocument()
@@ -121,10 +122,10 @@ describe("Sidebar", () => {
     expect(html).not.toContain("平台")
   })
 
-  it("shows the controlled-environment notice at the bottom", () => {
+  it("shows the self-hosted environment notice at the bottom", () => {
     render(<Sidebar />)
 
-    expect(screen.getByText(/开发测试环境 · 受控网络/)).toBeInTheDocument()
+    expect(screen.getByText(/自托管测试环境/)).toBeInTheDocument()
     expect(screen.getByText(/AI 可读取测试账号凭据/)).toBeInTheDocument()
   })
 })

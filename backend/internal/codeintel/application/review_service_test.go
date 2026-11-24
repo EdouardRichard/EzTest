@@ -127,7 +127,7 @@ func newReviewHarness() *reviewHarness {
 	reviews.factVersion[fact.ID] = fact.Version
 	events := &fakeEvents{}
 	audit := &fakeAudit{}
-	versions := &fakeVersionReader{bindings: []VersionSUTBinding{{VersionSUTID: 11, VersionID: 1, RepoID: 10}}}
+	versions := &fakeVersionReader{bindings: []SUTRepoBinding{{SUTID: 21, VersionID: 1, RepoID: 10}}}
 	service := NewReviewService(ReviewDeps{
 		Reviews:  reviews,
 		Facts:    facts,

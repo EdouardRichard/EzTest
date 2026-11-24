@@ -250,19 +250,23 @@ describe("DesignMindmap status colours", () => {
   it("refreshes rendered scenario data after a same-hash graph refresh", async () => {
     const { rerender } = renderMindmap()
     await screen.findByTestId("scenario-node-5001")
-    expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent("SUT 1 个 · 页面 1 个")
+    // v0.2.4-B: the scenario node summarizes its prose description (the deleted
+    // SUT/page counts are gone). The description is the observable that proves a
+    // same-hash refresh rebuilds node data instead of reusing a stale cache.
+    expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent("审核通过后原路退回")
+    expect(screen.getByTestId("scenario-node-5001")).not.toHaveTextContent("（更新）")
 
     const refreshedGraph = sameHashRefreshedGraph()
     const scenario = refreshedGraph.requirements[0]?.scenarios[0]
     if (scenario === undefined) throw new Error("fixture is missing the scenario")
-    scenario.version_sut_ids = ["1001", "1002"]
-    scenario.page_ids = ["2301", "2302"]
     scenario.description = "审核通过后原路退回（更新）"
 
     rerender({ graph: refreshedGraph })
 
     await waitFor(() =>
-      expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent("SUT 2 个 · 页面 2 个"),
+      expect(screen.getByTestId("scenario-node-5001")).toHaveTextContent(
+        "审核通过后原路退回（更新）",
+      ),
     )
   })
 

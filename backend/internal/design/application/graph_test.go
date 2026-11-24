@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
-	"time"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -27,20 +27,20 @@ func validProposeInput() ProposeInput {
 		RequirementVersionID: 3002,
 		Scenarios: []ScenarioInput{{
 			Ref: "s1", Name: "正常登录", Description: "正常路径",
-			VersionSUTIDs: []int64{9001, 9002}, PageIDs: []int64{6001}, APIIDs: []int64{4001},
 		}},
 		Cases: []CaseInput{{
 			Ref: "c1", ScenarioRef: "s1", Title: "账号密码登录成功", Description: "使用有效账号登录",
-			Preconditions: "已有账号", TestData: json.RawMessage(`{"username":"admin"}`),
-			Priority: "P1", DefaultVersionSUTID: int64Ptr(9001),
-			VersionSUTIDs: []int64{9001, 9002}, PageIDs: []int64{6001, 6002},
+			SutDescription: "商城前台登录页与登录接口。",
+			Preconditions:  "已有账号", CoveredACs: []string{"AC-1", "AC-2"},
+			TestData: json.RawMessage(`{"username":"admin"}`),
+			Priority: "P1",
 			Steps: []StepInput{
-				{Seq: 1, Action: "打开登录页", Expected: "显示表单", TargetPageID: int64Ptr(6001), AccountRole: "admin", Data: json.RawMessage(`{}`)},
-				{Seq: 2, Action: "提交登录", Expected: "登录成功", TargetVersionSUTID: int64Ptr(9002), TargetAPIID: int64Ptr(4002), Data: json.RawMessage(`{"username":"admin"}`)},
+				{Seq: 1, Action: "打开登录页", Expected: "显示表单", TargetDescription: "登录页账号输入框", AccountRole: "admin", Data: json.RawMessage(`{}`)},
+				{Seq: 2, Action: "提交登录", Expected: "登录成功", TargetDescription: "POST /login 接口", Data: json.RawMessage(`{"username":"admin"}`)},
 			},
 			Assertions: []AssertionInput{
-				{StepSeq: 1, Kind: "ui", Target: "欢迎文案", Expected: "欢迎回来", TargetVersionSUTID: int64Ptr(9001)},
-				{StepSeq: 2, Kind: "api", Target: "POST /login", Expected: "200", TargetVersionSUTID: int64Ptr(9002)},
+				{StepSeq: 1, Kind: "ui", Target: "欢迎文案", Expected: "欢迎回来"},
+				{StepSeq: 2, Kind: "api", Target: "POST /login", Expected: "200"},
 			},
 			Sources: []SourceInput{{Kind: "requirement", RefID: "3002"}},
 		}},
@@ -196,7 +196,7 @@ func TestCaseModificationCreatesVersion(t *testing.T) {
 	modified.Cases[0].ID = int64Ptr(caseID)
 	modified.Cases[0].Steps[0].Action = "打开墨栈博客首页"
 	modified.Cases[0].Steps[0].Expected = "首页加载成功"
-	modified.Cases[0].Steps[0].TargetVersionSUTID = int64Ptr(9001)
+	modified.Cases[0].Steps[0].TargetDescription = "登录页的记住我勾选框"
 	second, err := service.Propose(context.Background(), 1001, modified, 1, 1)
 	if err != nil {
 		t.Fatalf("modification Propose: %v", err)
@@ -214,8 +214,8 @@ func TestCaseModificationCreatesVersion(t *testing.T) {
 	if current.Steps[0].Action != "打开墨栈博客首页" || current.Steps[0].Expected != "首页加载成功" {
 		t.Fatalf("modified step = %+v", current.Steps[0])
 	}
-	if current.Steps[0].TargetVersionSUTID == nil || *current.Steps[0].TargetVersionSUTID != 9001 {
-		t.Fatalf("modified step target = %+v", current.Steps[0].TargetVersionSUTID)
+	if current.Steps[0].TargetDescription != "登录页的记住我勾选框" {
+		t.Fatalf("modified step target = %+v", current.Steps[0].TargetDescription)
 	}
 	history := repo.versions(caseID)
 	if len(history) != 2 || history[0].Revision != 1 || history[1].Revision != 2 {
@@ -345,7 +345,7 @@ func TestReadGraphIncludesStaleAndCounts(t *testing.T) {
 	service, repo, _, _ := newGraphFixture(t)
 	repo.scenarios = []design.Scenario{{
 		ID: 5001, VersionID: 1001, RequirementID: 3001, RequirementVersionID: 3002,
-		Name: "正常登录", VersionSUTIDs: []int64{9001}, PageIDs: []int64{6001}, APIIDs: []int64{},
+		Name: "正常登录", Description: "正常路径",
 	}}
 	confirmed := design.CaseVersion{ID: 7002, CaseID: 7001, Revision: 1, Title: "登录成功", Status: design.CaseStatusConfirmed, ContentHash: "a"}
 	repo.cases[7001] = &fakeCase{
@@ -483,15 +483,114 @@ func TestGetCaseConfirmableRequiresCurrentRequirementVersion(t *testing.T) {
 	}
 }
 
-func TestProposeCrossSUTStepsAllowed(t *testing.T) {
-	service, _, _, _ := newGraphFixture(t)
+// TestProposeEnforcesCoveredACLinkage pins the T8 -> T9 handoff end to end: the
+// requirement's AC id set reaches ProposalContext through the existing
+// RequirementContext read (no new port), and a case whose covered_acs names an id
+// outside that set is rejected. This replaces the retired
+// TestProposeCrossSUTStepsAllowed -- "cross-SUT steps" is not a concept any more,
+// because a case no longer selects resources at all.
+func TestProposeEnforcesCoveredACLinkage(t *testing.T) {
+	service, repo, _, _ := newGraphFixture(t)
+
+	// The fixture requirement carries AC-1/AC-2/AC-10.
+	if got := repo.requirement.ACIDs; len(got) != 3 {
+		t.Fatalf("fixture requirement ACIDs = %v", got)
+	}
+
 	in := validProposeInput()
+	in.Cases[0].CoveredACs = []string{"AC-10"}
+	if _, err := service.Propose(context.Background(), 1001, in, 1, 1); err != nil {
+		t.Fatalf("Propose with an in-set AC: %v", err)
+	}
+
+	in = validProposeInput()
+	in.Cases[0].CoveredACs = []string{"AC-1", "AC-7"}
+	_, err := service.Propose(context.Background(), 1001, in, 1, 1)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+		t.Fatalf("out-of-set covered_acs err = %v, want invalid_argument", err)
+	}
+	if field, _ := apiErr.Details["field"].(string); field != "cases[0].covered_acs" {
+		t.Fatalf("error field = %q, want cases[0].covered_acs", field)
+	}
+	if len(repo.cases) != 1 {
+		t.Fatalf("the rejected proposal must not have written a second case: %d", len(repo.cases))
+	}
+}
+
+// TestProposePersistsNormalizedContractFields pins that what is stored is the
+// canonical contract value: sut_description trimmed and covered_acs normalized
+// sorted-unique, matching what ComputeCaseContentHash projects. Without this the
+// row and its own content hash could disagree about order.
+func TestProposePersistsNormalizedContractFields(t *testing.T) {
+	service, repo, _, _ := newGraphFixture(t)
+	in := validProposeInput()
+	in.Cases[0].SutDescription = "  商城前台登录页与登录接口。  "
+	in.Cases[0].CoveredACs = []string{" AC-10 ", "AC-1", "AC-10"}
+
 	result, err := service.Propose(context.Background(), 1001, in, 1, 1)
 	if err != nil {
-		t.Fatalf("cross-SUT Propose: %v", err)
+		t.Fatalf("Propose: %v", err)
 	}
-	if len(result.CaseVersionIDs) != 1 {
-		t.Fatalf("result = %+v", result)
+	current := repo.cases[result.CaseIDs[0]].current
+	if current.SutDescription != "商城前台登录页与登录接口。" {
+		t.Fatalf("sut_description = %q, want it trimmed", current.SutDescription)
+	}
+	if got := strings.Join(current.CoveredACs, ","); got != "AC-1,AC-10" {
+		t.Fatalf("covered_acs = %v, want [AC-1 AC-10] sorted unique", current.CoveredACs)
+	}
+	if current.Steps[0].TargetDescription != "登录页账号输入框" {
+		t.Fatalf("step target_description = %q", current.Steps[0].TargetDescription)
+	}
+}
+
+// TestProposeRejectsMissingContractFields pins the three new required elements at
+// the service boundary, not just inside the domain gate.
+func TestProposeRejectsMissingContractFields(t *testing.T) {
+	mutations := map[string]func(*ProposeInput){
+		"sut_description": func(in *ProposeInput) { in.Cases[0].SutDescription = "" },
+		"preconditions":   func(in *ProposeInput) { in.Cases[0].Preconditions = "  " },
+		"covered_acs":     func(in *ProposeInput) { in.Cases[0].CoveredACs = nil },
+	}
+	for name, mutate := range mutations {
+		service, repo, _, _ := newGraphFixture(t)
+		in := validProposeInput()
+		mutate(&in)
+		_, err := service.Propose(context.Background(), 1001, in, 1, 1)
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+			t.Fatalf("%s: err = %v, want invalid_argument", name, err)
+		}
+		if field, _ := apiErr.Details["field"].(string); !strings.HasSuffix(field, name) {
+			t.Fatalf("%s: error field = %q", name, field)
+		}
+		if len(repo.cases) != 0 {
+			t.Fatalf("%s: the rejected proposal wrote a case", name)
+		}
+	}
+}
+
+// TestProposeAcceptsExplicitNoPreconditions pins the §5.2 escape hatch through the
+// service: "无" is a stated precondition and must not be rejected.
+func TestProposeAcceptsExplicitNoPreconditions(t *testing.T) {
+	service, _, _, _ := newGraphFixture(t)
+	in := validProposeInput()
+	in.Cases[0].Preconditions = "无"
+	if _, err := service.Propose(context.Background(), 1001, in, 1, 1); err != nil {
+		t.Fatalf(`preconditions "无" should be accepted: %v`, err)
+	}
+}
+
+// TestProposeRetainsGraphHashCAS pins that the retired ownership group did not
+// take the optimistic-concurrency gate with it.
+func TestProposeRetainsGraphHashCAS(t *testing.T) {
+	service, _, _, _ := newGraphFixture(t)
+	in := validProposeInput()
+	in.BaseGraphHash = strings.Repeat("b", 64)
+	_, err := service.Propose(context.Background(), 1001, in, 1, 1)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "state_conflict" {
+		t.Fatalf("stale base_graph_hash err = %v, want state_conflict", err)
 	}
 }
 
@@ -714,4 +813,141 @@ func TestDesignGraphCarriesLatestVerdict(t *testing.T) {
 	})
 }
 
-var _ = time.Now
+// reviewStatesByCaseID projects the graph's per-card review_state the same way
+// verdictsByCaseID projects execution_verdict, for the T16 assertions below.
+func reviewStatesByCaseID(view GraphView) map[int64]design.ReviewState {
+	states := make(map[int64]design.ReviewState)
+	for _, requirement := range view.Requirements {
+		for _, scenario := range requirement.Scenarios {
+			for _, card := range scenario.Cases {
+				states[card.CaseID] = card.ReviewState
+			}
+		}
+	}
+	return states
+}
+
+// TestDesignGraphCarriesReviewState pins T16: every case card's review_state
+// is the JudgmentGate's ReviewStateFor projection (spec SC-E5), derived per
+// current case version -- never a second, independently computed truth.
+func TestDesignGraphCarriesReviewState(t *testing.T) {
+	t.Run("wired gate populates every card", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, nil)
+		service.SetJudgmentGate(fakeReviewStateGate{states: map[int64]design.ReviewState{
+			7001: design.ReviewStatePass,
+			7003: design.ReviewStateEscalatedFail,
+			7005: design.ReviewStateJudgeUnavailable,
+			7009: design.ReviewStateReworking,
+		}})
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph: %v", err)
+		}
+		states := reviewStatesByCaseID(view)
+		want := map[int64]design.ReviewState{
+			7001: design.ReviewStatePass, 7003: design.ReviewStateEscalatedFail,
+			7005: design.ReviewStateJudgeUnavailable, 7009: design.ReviewStateReworking,
+		}
+		for caseID, wantState := range want {
+			if states[caseID] != wantState {
+				t.Fatalf("case %d review_state = %q, want %q", caseID, states[caseID], wantState)
+			}
+		}
+	})
+
+	t.Run("unwired gate leaves review_state empty, graph still readable", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, nil)
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph must not fail on an unwired judgment gate: %v", err)
+		}
+		for caseID, state := range reviewStatesByCaseID(view) {
+			if state != "" {
+				t.Fatalf("case %d review_state = %q, want empty (unwired gate)", caseID, state)
+			}
+		}
+	})
+
+	t.Run("gate read failure does not fail the graph read", func(t *testing.T) {
+		service := newVerdictGraphFixture(t, nil)
+		service.SetJudgmentGate(fakeReviewStateGate{err: errors.New("judgment read unavailable")})
+		view, err := service.ReadGraph(context.Background(), 1001)
+		if err != nil {
+			t.Fatalf("ReadGraph must not fail on a judgment projection error: %v", err)
+		}
+		for caseID, state := range reviewStatesByCaseID(view) {
+			if state != "" {
+				t.Fatalf("case %d review_state = %q, want empty on read failure", caseID, state)
+			}
+		}
+	})
+}
+
+// TestGetCaseCarriesReviewState pins T16: the case detail's review_state is
+// always derived from the CURRENT version, even when a historical version is
+// selected for viewing -- review_state answers "what state is this case in
+// now", not "what state was the selected historical revision in".
+func TestGetCaseCarriesReviewState(t *testing.T) {
+	repo := newFakeRepo()
+	repo.caseData = design.CaseData{
+		Case:        design.CaseEntity{ID: 7001, ScenarioID: 5001, CurrentVersionID: int64Ptr(7002), Status: design.CaseStatusDraft},
+		Scenario:    design.Scenario{ID: 5001, Name: "正常登录", RequirementVersionID: repo.requirement.CurrentVersionID},
+		Requirement: repo.requirement,
+		Versions: []design.CaseVersionSummary{
+			{ID: 7000, Revision: 1, Status: design.CaseStatusStale, Title: "旧草案"},
+			{ID: 7002, Revision: 2, Status: design.CaseStatusDraft, Title: "登录成功"},
+		},
+		Selected: design.CaseVersion{ID: 7000, CaseID: 7001, Revision: 1, Status: design.CaseStatusStale, Title: "旧草案"},
+	}
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), nil, nil, &fakeTeamRoom{})
+	gate := &recordingReviewStateGate{state: design.ReviewStateJudgeUnavailable}
+	service.SetJudgmentGate(gate)
+
+	detail, err := service.GetCase(context.Background(), 1001, 7001, int64Ptr(7000))
+	if err != nil {
+		t.Fatalf("GetCase: %v", err)
+	}
+	if detail.ReviewState != design.ReviewStateJudgeUnavailable {
+		t.Fatalf("review_state = %q, want judge_unavailable", detail.ReviewState)
+	}
+	if gate.lastCurrentVersionID != 7002 {
+		t.Fatalf("review state derived against version %d, want the CURRENT version 7002 (not the selected historical 7000)", gate.lastCurrentVersionID)
+	}
+}
+
+// fakeReviewStateGate answers ReviewStateFor from a fixed per-case map; the
+// override/judgment-fact reads are never exercised by the graph/detail read
+// path, so they panic if reached (method discipline, mirroring
+// alwaysPassJudgmentGate).
+type fakeReviewStateGate struct {
+	states map[int64]design.ReviewState
+	err    error
+}
+
+func (g fakeReviewStateGate) ReviewStateFor(_ context.Context, _, caseID, _ int64) (design.ReviewState, error) {
+	if g.err != nil {
+		return "", g.err
+	}
+	return g.states[caseID], nil
+}
+
+func (g fakeReviewStateGate) LatestOverride(context.Context, int64, int64) (*design.Override, error) {
+	panic("the design graph/detail read path must not ask for an override")
+}
+
+func (g fakeReviewStateGate) LatestJudgment(context.Context, int64) (*design.Judgment, error) {
+	panic("the design graph/detail read path must not ask for a judgment fact")
+}
+
+// recordingReviewStateGate captures the currentVersionID argument so a test
+// can pin WHICH version the projection was derived against.
+type recordingReviewStateGate struct {
+	fakeReviewStateGate
+	state                design.ReviewState
+	lastCurrentVersionID int64
+}
+
+func (g *recordingReviewStateGate) ReviewStateFor(_ context.Context, _, _, currentVersionID int64) (design.ReviewState, error) {
+	g.lastCurrentVersionID = currentVersionID
+	return g.state, nil
+}

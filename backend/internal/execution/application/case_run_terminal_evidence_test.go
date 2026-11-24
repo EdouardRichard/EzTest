@@ -2,7 +2,9 @@ package executionapp_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"testing"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
@@ -11,28 +13,36 @@ import (
 
 // TestFailedCaseRunCapturesTerminalScreenshot pins the P3 §6.4 automatic
 // evidence rule: a case_run entering failed/blocked/inconclusive with a live
-// browser context captures one screenshot, so a real failure is never a
-// zero-evidence row (QA-F1). Best effort: it must not change the verdict.
+// session captures one screenshot through the official playwright CLI (over the
+// general exec channel, T15) and settles it as screenshot evidence, so a real
+// failure is never a zero-evidence row (QA-F1). Best effort: it must not change
+// the verdict. The retained browser bridge is NOT used for this capture anymore.
 func TestFailedCaseRunCapturesTerminalScreenshot(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 
 	fixture.sutContext.mu.Lock()
 	fixture.sutContext.rows[9101] = execution.CaseRunSUTContext{
-		ID: 9101, CaseRunID: 3001, VersionSUTID: 7, AccountRole: "admin",
-		BrowserContextID: "ctx_active", Status: execution.SUTContextActive,
+		ID: 9101, CaseRunID: 3001, SUTID: 7, AccountRole: "admin",
+		SessionID: "ctx_active", Status: execution.SUTContextActive,
 	}
 	fixture.sutContext.mu.Unlock()
 
-	png := base64.StdEncoding.EncodeToString([]byte("png"))
-	fixture.browser.result = executionapp.BrowserActionResult{
-		OK: true,
-		Artifacts: []executionapp.BrowserArtifact{{
-			Kind: "screenshot", Base64: png, Filename: "failure.png", Bytes: 3, MIME: "image/png",
+	// The executor settles the CLI screenshot as a recording-layer artifact; the
+	// terminal capture drains the ledger into evidence.
+	pngBytes := []byte("png")
+	png := base64.StdEncoding.EncodeToString(pngBytes)
+	sum := sha256.Sum256(pngBytes)
+	fixture.execution.artifactPages = []executionapp.ArtifactPage{{
+		Artifacts: []executionapp.ExecutionArtifact{{
+			Kind: "screenshot", Base64: png, SHA256: hex.EncodeToString(sum[:]),
+			Path: ".playwright-cli/page-terminal.png", Filename: "page-terminal.png",
+			Size: int64(len(pngBytes)), MIME: "image/png",
 		}},
-	}
+		NextCursor: 1,
+	}}
 
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 		Verdict: execution.CaseRunFailed, FailureClass: execution.FailureClassAutomation,
 	})
 	if err != nil {
@@ -51,19 +61,20 @@ func TestFailedCaseRunCapturesTerminalScreenshot(t *testing.T) {
 	if evidence[0].Kind != execution.EvidenceScreenshot {
 		t.Fatalf("evidence kind = %q, want screenshot", evidence[0].Kind)
 	}
-	if evidence[0].VersionSUTID == nil || *evidence[0].VersionSUTID != 7 {
-		t.Fatalf("evidence version_sut = %v, want 7", evidence[0].VersionSUTID)
+	if evidence[0].SUTID == nil || *evidence[0].SUTID != 7 {
+		t.Fatalf("evidence sut id = %v, want 7", evidence[0].SUTID)
 	}
-	fixture.browser.mu.Lock()
-	defer fixture.browser.mu.Unlock()
-	found := false
-	for _, action := range fixture.browser.actions {
-		if action == "screenshot" {
-			found = true
+	fixture.execution.mu.Lock()
+	defer fixture.execution.mu.Unlock()
+	// The capture ran the CLI screenshot over exec, not the browser bridge.
+	foundCmd := false
+	for _, command := range fixture.execution.commands {
+		if len(command.Argv) >= 2 && command.Argv[0] == "playwright-cli" && command.Argv[1] == "screenshot" {
+			foundCmd = true
 			break
 		}
 	}
-	if !found {
-		t.Fatalf("the terminal capture did not call the executor screenshot action: %v", fixture.browser.actions)
+	if !foundCmd {
+		t.Fatalf("the terminal capture did not run the CLI screenshot over exec: %+v", fixture.execution.commands)
 	}
 }

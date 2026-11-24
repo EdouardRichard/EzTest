@@ -14,6 +14,11 @@ import (
 // coverage repairs).
 const fakeCoverageRepairLimit = 3
 
+// fakeJudgeGenerationLimit mirrors the production adapter's bounded judge
+// generations per current-draft case-version set (T8). A changed set resets the
+// budget.
+const fakeJudgeGenerationLimit = 3
+
 // fakeEnqueuer dedupes tasks by dedupe key like the work queue does. statuses
 // models the work-item lifecycle so the coverage-repair check can tell an
 // in-flight task from a terminal one; a task created through Ensure is open.
@@ -21,6 +26,47 @@ type fakeEnqueuer struct {
 	tasks          []TaskInput
 	statuses       map[string]string
 	repairRequests []coverageRepairRequest
+	// attempts models the work item's attempt counter so the fake can tell a
+	// RETRYABLE failure (the queue still owes the generation its work) from one
+	// that died at its cap. Production makes exactly that distinction
+	// (designWorkItemTerminal); a fake that treats every failure as in-flight
+	// diverges from it (H-F10 T8).
+	attempts map[string]int
+	// judgeExhausted records the judge_exhausted escalation facts the judge
+	// generation mechanism writes when a case version's budget is spent (T8).
+	judgeExhausted map[[2]int64]bool
+}
+
+// fakeMaxAttempts mirrors the queue's default attempt cap
+// (agent.DefaultMaxAttempts). A failed task below it is retry-backed.
+const fakeMaxAttempts = 3
+
+// seedFailedAtCap stores a generation that failed with its attempts at the cap:
+// terminal, so it counts as a spent generation instead of blocking forever.
+func (f *fakeEnqueuer) seedFailedAtCap(in TaskInput) {
+	if f.statuses == nil {
+		f.statuses = map[string]string{}
+	}
+	if f.attempts == nil {
+		f.attempts = map[string]int{}
+	}
+	f.tasks = append(f.tasks, in)
+	f.statuses[in.DedupeKey] = "failed"
+	f.attempts[in.DedupeKey] = fakeMaxAttempts
+}
+
+// inFlight mirrors the production terminal predicate for the fake's lifecycle:
+// open/claimed/running/waiting_human always owe work, and a failure owes work
+// while its attempts are below the cap.
+func (f *fakeEnqueuer) inFlight(dedupeKey string) bool {
+	switch f.statuses[dedupeKey] {
+	case "open", "claimed", "running", "waiting_human":
+		return true
+	case "failed":
+		return f.attempts[dedupeKey] < fakeMaxAttempts
+	default:
+		return false
+	}
 }
 
 // coverageRepairRequest records one EnsureCoverageRepair call so a test can
@@ -73,12 +119,7 @@ func (f *fakeEnqueuer) EnsureCoverageRepair(ctx context.Context, in TaskInput, r
 		if taskPayloadString(task, "requirement_version_id") != fmt.Sprint(requirementVersionID) {
 			continue
 		}
-		switch f.statuses[task.DedupeKey] {
-		case "open", "claimed", "running", "waiting_human":
-			return false, nil
-		case "failed":
-			// A failed item below its attempt cap is retried by the queue; a
-			// fresh generation would duplicate the in-flight retry.
+		if f.inFlight(task.DedupeKey) {
 			return false, nil
 		}
 		generation++
@@ -88,6 +129,53 @@ func (f *fakeEnqueuer) EnsureCoverageRepair(ctx context.Context, in TaskInput, r
 	}
 	if generation > 0 {
 		in.DedupeKey = fmt.Sprintf("%s:repair:%d", in.DedupeKey, generation)
+	}
+	return f.Ensure(ctx, in)
+}
+
+// EnsureJudgeGeneration models the production adapter (T8, review fix round 1):
+// it serializes per requirement version (an in-flight judge run blocks a new
+// one), advances a monotonic dedupe sequence across all terminal judge
+// generations of the requirement version, and bounds the generation budget per
+// current-draft case-version set. On exhaustion it writes a judge_exhausted
+// escalation fact for EVERY pending case version. A changed draft set starts a
+// fresh budget without reusing an occupied dedupe key.
+func (f *fakeEnqueuer) EnsureJudgeGeneration(ctx context.Context, in TaskInput, drafts, pending []JudgeCaseRef) (bool, error) {
+	if f.statuses == nil {
+		f.statuses = map[string]string{}
+	}
+	setKey := JudgeDraftSetKey(drafts)
+	if setKey == "" {
+		return false, nil
+	}
+	reqVersion := taskPayloadString(in, "requirement_version_id")
+	sequence, budget := 0, 0
+	for _, task := range f.tasks {
+		if task.Type != TaskTypeDesignJudge {
+			continue
+		}
+		if taskPayloadString(task, "requirement_version_id") != reqVersion {
+			continue
+		}
+		if f.inFlight(task.DedupeKey) {
+			return false, nil
+		}
+		sequence++
+		if taskPayloadString(task, "draft_case_version_ids") == setKey {
+			budget++
+		}
+	}
+	if budget >= fakeJudgeGenerationLimit {
+		if f.judgeExhausted == nil {
+			f.judgeExhausted = map[[2]int64]bool{}
+		}
+		for _, ref := range pending {
+			f.judgeExhausted[[2]int64{ref.CaseID, ref.CaseVersionID}] = true
+		}
+		return false, nil
+	}
+	if sequence > 0 {
+		in.DedupeKey = fmt.Sprintf("%s:judge:%d", in.DedupeKey, sequence)
 	}
 	return f.Ensure(ctx, in)
 }
@@ -159,6 +247,17 @@ func (f *fakeDesignConverger) ConvergeDesign(_ context.Context, versionID int64)
 	f.versionIDs = append(f.versionIDs, versionID)
 	return f.err
 }
+
+// fakeReviewGate is the T9 shared review-gate stand-in for the legacy planner
+// tests that pin the coverage convergence trigger (NeedsRedesign). The zero
+// value passes, so those tests keep their original assertions; the real gate
+// predicate is pinned in review_gate_test.go. An unwired gate fails closed, so
+// every test that expects convergence injects this pass gate.
+type fakeReviewGate struct {
+	err error
+}
+
+func (f fakeReviewGate) ReviewGate(context.Context, int64) error { return f.err }
 
 func newPlannerFixture() (*Planner, *fakeRepo, *fakeEnqueuer, *fakeTeamRoom, *fakeConversationCreator, *fakeVersionStarter, *fakeStaler) {
 	repo := newFakeRepo()

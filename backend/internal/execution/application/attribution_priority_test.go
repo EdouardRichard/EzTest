@@ -25,7 +25,7 @@ func TestResultReadAttributionSeverityMatchesCasePriority(t *testing.T) {
 		Verdict: execution.AssertionFailed, Expected: "201", Actual: "500", Reason: "publish API missing",
 	}
 
-	value, err := fixture.runner.ResultRead(context.Background(), p3Scope(), tools.ResultReadInput{})
+	value, err := fixture.runner.ResultRead(context.Background(), executionScope(), tools.ResultReadInput{})
 	if err != nil {
 		t.Fatalf("ResultRead: %v", err)
 	}

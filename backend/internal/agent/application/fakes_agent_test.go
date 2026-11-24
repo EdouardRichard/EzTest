@@ -3,6 +3,7 @@ package agentapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"time"
@@ -30,9 +31,40 @@ type fakeRuntimeRepo struct {
 	messages  []agent.AgentMessage
 	packets   []agent.ContextPacket
 	packetIDs map[int64]agent.ContextPacket
+	// updates records every in-place transcript rewrite (v0.2.4-D T8), in call
+	// order, so "one row per turn, updated in place" is observable.
+	updates []agent.AgentMessage
+	// updateFailures makes the next N in-place writes fail, mirroring a
+	// transient store failure the runner must log and reconcile at the seal.
+	updateFailures int
+	// sealFailures makes the next N *sealing* writes (a write carrying a terminal
+	// stream state) fail, while per-delta streaming writes keep succeeding. That
+	// isolates "the turn's own seal was lost" from "every write failed", which is
+	// what the run-terminal backstop has to recover.
+	sealFailures int
 	// packetCacheUpdates counts the provider cache-stat overwrites persisted
 	// through UpdateContextPacketCacheStats.
 	packetCacheUpdates int
+	// activities is the agent_activity fact ledger (v0.2.4-D T10, Q04): one row
+	// per (run_id, seq), upserted with the production ON CONFLICT semantics.
+	activities []agent.Activity
+	// activityErr makes every fact write fail, so "the event is derived only
+	// after the fact succeeded" is observable.
+	activityErr error
+	// activityWrites records every write attempt in call order (start and end
+	// of one call are two writes of the SAME row).
+	activityWrites []agent.Activity
+	// activityEventCounts snapshots how many agent.activity events had been
+	// published at each fact write. It is only filled when events is set, and
+	// it is what makes "fact BEFORE event" a real ordering assertion.
+	activityEventCounts []int
+	events              *fakePublisher
+	// priorPacket is the version's previously persisted context packet, the
+	// stage-boundary trigger's only prior-stage source (H-E3). Nil means the
+	// version has no packet yet.
+	priorPacket      *agent.ContextPacket
+	priorPacketErr   error
+	priorPacketReads []int64
 }
 
 func newFakeRuntimeRepo() *fakeRuntimeRepo {
@@ -103,13 +135,154 @@ func (f *fakeRuntimeRepo) FinishRun(_ context.Context, run agent.AgentRun) error
 	return nil
 }
 
-func (f *fakeRuntimeRepo) AppendMessage(_ context.Context, message agent.AgentMessage) (agent.AgentMessage, error) {
+func (f *fakeRuntimeRepo) AppendMessage(ctx context.Context, message agent.AgentMessage) (agent.AgentMessage, error) {
+	// A real pgx write on a cancelled context fails. Honouring ctx here is what
+	// makes the "partial content survives cancellation" assertions discriminating
+	// (v0.2.4-D T6, carried T3 review #4).
+	if err := ctx.Err(); err != nil {
+		return agent.AgentMessage{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	message.ID = f.next()
 	message.CreatedAt = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	// The column default is complete: a row appended without an explicit state
+	// is a finished (batch/legacy) message, exactly like the production DB.
+	message.StreamState = agent.NormalizeMessageStreamState(message.StreamState)
 	f.messages = append(f.messages, message)
 	return message, nil
+}
+
+// UpdateMessage mirrors the production in-place rewrite AND its terminal freeze:
+// only a row that is still streaming may be rewritten, and a sealed row refuses
+// every later write (agent.ErrMessageStreamClosed). A permissive fake here would
+// make the freeze assertions non-discriminating.
+func (f *fakeRuntimeRepo) UpdateMessage(ctx context.Context, message agent.AgentMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateFailures > 0 {
+		f.updateFailures--
+		return errors.New("transcript store is unavailable")
+	}
+	if f.sealFailures > 0 && agent.NormalizeMessageStreamState(message.StreamState) != agent.MessageStreamStateStreaming {
+		f.sealFailures--
+		return errors.New("transcript seal write failed")
+	}
+	for index := range f.messages {
+		if f.messages[index].ID != message.ID {
+			continue
+		}
+		if agent.NormalizeMessageStreamState(f.messages[index].StreamState) != agent.MessageStreamStateStreaming {
+			return agent.ErrMessageStreamClosed
+		}
+		f.messages[index].Parts = message.Parts
+		f.messages[index].ToolCalls = message.ToolCalls
+		f.messages[index].Usage = message.Usage
+		f.messages[index].StreamState = agent.NormalizeMessageStreamState(message.StreamState)
+		f.updates = append(f.updates, f.messages[index])
+		return nil
+	}
+	return agent.ErrNotFound
+}
+
+// InsertActivity mirrors the production (run_id, seq) UPSERT of the fact ledger:
+// the first write of a seq inserts the row, a later write of the SAME seq folds
+// into it (the end of a call adds ended_at/error and payload keys), the recorded
+// start and outcome are never erased by a replayed start, and a different seq is
+// a different fact. A permissive "append every write" fake would make the
+// idempotency assertions non-discriminating.
+func (f *fakeRuntimeRepo) InsertActivity(ctx context.Context, activity agent.Activity) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activityWrites = append(f.activityWrites, activity)
+	if f.events != nil {
+		count := 0
+		for _, event := range f.events.events {
+			// Only the TOOL activity event is derived from a tool fact; the
+			// per-turn "thinking" heartbeat is an unrelated projection.
+			if event.Type == "agent.activity" && event.Payload["status"] == "tool" {
+				count++
+			}
+		}
+		f.activityEventCounts = append(f.activityEventCounts, count)
+	}
+	if f.activityErr != nil {
+		return f.activityErr
+	}
+	if err := activity.Validate(); err != nil {
+		return err
+	}
+	for index := range f.activities {
+		stored := &f.activities[index]
+		if stored.RunID != activity.RunID || stored.Seq != activity.Seq {
+			continue
+		}
+		stored.Type = activity.Type
+		stored.Title = activity.Title
+		if activity.EndedAt != nil {
+			stored.EndedAt = activity.EndedAt
+		}
+		if activity.Error != "" {
+			stored.Error = activity.Error
+		}
+		merged := map[string]any{}
+		for key, value := range stored.Payload {
+			merged[key] = value
+		}
+		for key, value := range activity.Payload {
+			merged[key] = value
+		}
+		stored.Payload = merged
+		stored.UpdatedAt = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+		return nil
+	}
+	activity.ID = f.next()
+	activity.CreatedAt = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	activity.UpdatedAt = activity.CreatedAt
+	f.activities = append(f.activities, activity)
+	return nil
+}
+
+// activityRows returns a copy of the fact ledger in write order.
+func (f *fakeRuntimeRepo) activityRows() []agent.Activity {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.Activity(nil), f.activities...)
+}
+
+// transcript returns a copy of every persisted transcript row.
+func (f *fakeRuntimeRepo) transcript() []agent.AgentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.AgentMessage(nil), f.messages...)
+}
+
+// transcriptUpdates returns a copy of the in-place rewrite log.
+func (f *fakeRuntimeRepo) transcriptUpdates() []agent.AgentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.AgentMessage(nil), f.updates...)
+}
+
+// failNextUpdates makes the next n in-place transcript writes fail.
+func (f *fakeRuntimeRepo) failNextUpdates(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.updateFailures = n
+}
+
+// failNextSeals makes the next n sealing transcript writes fail (streaming
+// per-delta writes still succeed).
+func (f *fakeRuntimeRepo) failNextSeals(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sealFailures = n
 }
 
 func (f *fakeRuntimeRepo) ListRunMessages(_ context.Context, runID int64, limit int) ([]agent.AgentMessage, error) {
@@ -145,6 +318,24 @@ func (f *fakeRuntimeRepo) GetContextPacket(_ context.Context, id int64) (agent.C
 		return agent.ContextPacket{}, agent.ErrNotFound
 	}
 	return packet, nil
+}
+
+// LatestVersionContextPacket mirrors the production version-scoped read the
+// stage-boundary trigger uses (H-E3). It answers from priorPacket ONLY: a fixture
+// that does not seed a previous chain has no prior packet, exactly like a version
+// whose first run is starting, so every existing assembly test keeps its
+// behaviour. priorPacketErr exercises the read-failure branch.
+func (f *fakeRuntimeRepo) LatestVersionContextPacket(_ context.Context, versionID int64) (agent.ContextPacket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.priorPacketReads = append(f.priorPacketReads, versionID)
+	if f.priorPacketErr != nil {
+		return agent.ContextPacket{}, f.priorPacketErr
+	}
+	if f.priorPacket == nil {
+		return agent.ContextPacket{}, agent.ErrNotFound
+	}
+	return *f.priorPacket, nil
 }
 
 // UpdateContextPacketCacheStats mirrors the production token_counts rewrite:
@@ -188,12 +379,17 @@ func (f *fakeRuntimeRepo) lastFinished(t interface{ Fatalf(string, ...any) }) ag
 }
 
 // scriptedChat is a deterministic ChatGateway: the Nth Chat call returns
-// errors[N] if set, otherwise responses[min(N,last)].
+// errors[N] if set, otherwise responses[min(N,last)]. Stream shares the same
+// request/error scripting; streams[N] (when non-nil) scripts the Nth Stream
+// call's delta sequence, otherwise the deltas are derived from responses[N] so
+// Chat-scripted tests exercise the streaming consumption path unchanged.
 type scriptedChat struct {
 	mu        sync.Mutex
 	responses []llmapp.ChatResponse
 	errors    []error
+	streams   [][]llmapp.Delta
 	requests  []llmapp.ChatRequest
+	chatCalls int
 	models    []llmapp.ModelInfo
 	modelErr  error
 	resolves  []string
@@ -202,12 +398,21 @@ type scriptedChat struct {
 	supportsVision bool
 	requirements   []llmapp.ModelRequirements
 	onChat         func(index int, req llmapp.ChatRequest)
+	// onDelta runs after each emitted delta of a Stream call (call index,
+	// 0-based emitted count). It lets a test cancel or deadline the run context
+	// mid-stream, exactly where a real SSE reader would notice.
+	onDelta func(index int, emitted int)
+	// onStreamCtx, when set, receives the context each Stream call runs under
+	// (the runner's derived run context). It lets a fake-clock test wait
+	// deterministically for a deadline to propagate to that context (H-E14).
+	onStreamCtx func(ctx context.Context)
 }
 
 func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
 	f.mu.Lock()
 	index := len(f.requests)
 	f.requests = append(f.requests, req)
+	f.chatCalls++
 	onChat := f.onChat
 	var scriptedErr error
 	if index < len(f.errors) {
@@ -226,6 +431,98 @@ func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.C
 		onChat(index, req)
 	}
 	return response, scriptedErr
+}
+
+// Stream emits the scripted delta sequence of the Nth call and then returns
+// errors[N]. A non-nil streams[N] entry is emitted verbatim (even when an error
+// is scripted, so a partial-then-failed turn can be scripted); otherwise the
+// deltas are derived from the scripted ChatResponse. A scripted error with no
+// streams entry fails before any delta, mirroring a pre-first-delta rejection.
+func (f *scriptedChat) Stream(ctx context.Context, req llmapp.ChatRequest, onDelta func(llmapp.Delta)) error {
+	f.mu.Lock()
+	index := len(f.requests)
+	f.requests = append(f.requests, req)
+	onChat := f.onChat
+	deltaHook := f.onDelta
+	streamCtxHook := f.onStreamCtx
+	var scriptedErr error
+	if index < len(f.errors) {
+		scriptedErr = f.errors[index]
+	}
+	var deltas []llmapp.Delta
+	if index < len(f.streams) && f.streams[index] != nil {
+		deltas = f.streams[index]
+	} else if scriptedErr == nil {
+		var response llmapp.ChatResponse
+		if len(f.responses) > 0 {
+			if index < len(f.responses) {
+				response = f.responses[index]
+			} else {
+				response = f.responses[len(f.responses)-1]
+			}
+		}
+		deltas = chatResponseDeltas(response)
+	}
+	f.mu.Unlock()
+	if onChat != nil {
+		onChat(index, req)
+	}
+	if streamCtxHook != nil {
+		streamCtxHook(ctx)
+	}
+	for emitted, delta := range deltas {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		onDelta(delta)
+		if deltaHook != nil {
+			deltaHook(index, emitted)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return scriptedErr
+}
+
+// chatResponseDeltas renders one scripted ChatResponse as the delta sequence a
+// protocol adapter would emit for it: reasoning text, per-index tool-call
+// fragments (identity first, arguments split in two), content split in two,
+// then the terminal finish/usage/reasoning-items delta.
+func chatResponseDeltas(response llmapp.ChatResponse) []llmapp.Delta {
+	var deltas []llmapp.Delta
+	if response.ReasoningContent != "" {
+		deltas = append(deltas, llmapp.Delta{ReasoningContent: response.ReasoningContent})
+	}
+	for index, call := range response.ToolCalls {
+		deltas = append(deltas, llmapp.Delta{ToolCall: &llmapp.ToolCallDelta{
+			Index: index, ID: call.ID, Name: call.Name,
+		}})
+		mid := len(call.Arguments) / 2
+		deltas = append(deltas,
+			llmapp.Delta{ToolCall: &llmapp.ToolCallDelta{Index: index, Arguments: call.Arguments[:mid]}},
+			llmapp.Delta{ToolCall: &llmapp.ToolCallDelta{Index: index, Arguments: call.Arguments[mid:]}},
+		)
+	}
+	if response.Content != "" {
+		mid := len(response.Content) / 2
+		deltas = append(deltas,
+			llmapp.Delta{Content: response.Content[:mid]},
+			llmapp.Delta{Content: response.Content[mid:]},
+		)
+	}
+	deltas = append(deltas, llmapp.Delta{
+		FinishReason:   response.FinishReason,
+		Usage:          response.Usage,
+		ReasoningItems: response.ReasoningItems,
+	})
+	return deltas
+}
+
+func (f *scriptedChat) chatCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.chatCalls
 }
 
 func (f *scriptedChat) ResolveModel(_ context.Context, _ int64, model string, required ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
@@ -541,6 +838,14 @@ type fakeDesignPort struct {
 	dataPlanInput         tools.DataPlanInput
 	dataPlanResult        any
 	dataPlanErr           error
+
+	judgmentCalls         int
+	judgmentVersionID     int64
+	judgmentRequirementID int64
+	judgmentRunID         int64
+	judgmentInput         tools.JudgmentInput
+	judgmentResult        any
+	judgmentErr           error
 }
 
 func (f *fakeDesignPort) ReadGraph(_ context.Context, versionID, requirementID, caseID int64) (any, error) {
@@ -576,6 +881,15 @@ func (f *fakeDesignPort) SubmitDataPlan(_ context.Context, versionID, caseVersio
 	f.dataPlanRunID = runID
 	f.dataPlanInput = in
 	return f.dataPlanResult, f.dataPlanErr
+}
+
+func (f *fakeDesignPort) SubmitJudgment(_ context.Context, versionID, requirementID, runID int64, in tools.JudgmentInput) (any, error) {
+	f.judgmentCalls++
+	f.judgmentVersionID = versionID
+	f.judgmentRequirementID = requirementID
+	f.judgmentRunID = runID
+	f.judgmentInput = in
+	return f.judgmentResult, f.judgmentErr
 }
 
 // fakeDesignRoundStarter records the design.cases stage-entry port calls.
@@ -661,9 +975,6 @@ func fakeWorkItem(workType string, payload agentapp.WorkItemPayload) agent.WorkI
 		"issue_id":               idStringOrZero(payload.IssueID),
 		"report_id":              idStringOrZero(payload.ReportID),
 		"report_revision":        idStringOrZero(int64(payload.ReportRevision)),
-		"close_round":            idStringOrZero(int64(payload.CloseRound)),
-		"report_revision_id":     idStringOrZero(payload.ReportRevisionID),
-		"predicate_fingerprint":  payload.PredicateFingerprint,
 		"repo_id":                idStringOrZero(payload.RepoID),
 		"index_run_id":           idStringOrZero(payload.IndexRunID),
 		"analysis_id":            idStringOrZero(payload.AnalysisID),
@@ -698,12 +1009,21 @@ func idStringOrZero(value int64) string {
 type manualClock struct {
 	mu  sync.Mutex
 	now time.Time
+	// step, when positive, makes every read advance the clock by that amount. It
+	// is how a boundary that runs entirely between two model calls (the prepare
+	// assembly's stage boundary, H-E3) still has a MEASURED duration instead of
+	// the frozen clock's legitimate zero. Zero keeps the clock frozen.
+	step time.Duration
 }
 
 func (c *manualClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.now
+	current := c.now
+	if c.step > 0 {
+		c.now = c.now.Add(c.step)
+	}
+	return current
 }
 
 func (c *manualClock) Advance(delta time.Duration) {

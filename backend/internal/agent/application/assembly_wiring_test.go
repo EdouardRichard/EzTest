@@ -732,7 +732,7 @@ func TestTaskContextInUserSuffix(t *testing.T) {
 		provider := &fakeTaskProvider{task: executionTaskFixture()}
 		fixture := newRunnerFixtureWithTaskProvider(t, provider)
 		fixture.chat.responses = []llmapp.ChatResponse{{Content: "用例执行完成"}}
-		if _, err := mustRun(t, fixture, p3CaseItem()); err != nil {
+		if _, err := mustRun(t, fixture, executionCaseItem()); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		request := fixture.chat.request(0)

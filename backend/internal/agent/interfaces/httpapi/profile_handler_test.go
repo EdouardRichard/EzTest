@@ -30,15 +30,15 @@ type stubProfileService struct {
 	tools     []agentapp.AgentToolView
 	err       error
 
-	listCalls   int
-	getCalls    int
-	patchCalls  int
-	saveCalls   int
-	resetCalls  int
+	listCalls    int
+	getCalls     int
+	patchCalls   int
+	saveCalls    int
+	resetCalls   int
 	restoreCalls int
-	revCalls    int
+	revCalls     int
 	previewCalls int
-	toolsCalls  int
+	toolsCalls   int
 
 	lastActor    platform.Actor
 	lastKey      string

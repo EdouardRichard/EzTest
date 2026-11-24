@@ -569,20 +569,20 @@ func copyMeta(meta map[string]any) map[string]any {
 	return out
 }
 
-// nodeSUTIDs returns every version SUT ID a node is associated with. Providers
-// put cross-SUT targets in Meta["version_sut_ids"] (case/scenario/run) or
-// Meta["target_version_sut_ids"] (requirement).
+// nodeSUTIDs returns every SUT ID a node is associated with. Providers put
+// cross-SUT targets in Meta["sut_ids"] (case/scenario/run) or
+// Meta["target_sut_ids"] (requirement).
 func nodeSUTIDs(node Node) []int64 {
 	ids := map[int64]bool{}
-	if node.VersionSUTID != nil && *node.VersionSUTID > 0 {
-		ids[*node.VersionSUTID] = true
+	if node.SUTID != nil && *node.SUTID > 0 {
+		ids[*node.SUTID] = true
 	}
-	for _, id := range node.VersionSUTIDs {
+	for _, id := range node.SUTIDs {
 		if id > 0 {
 			ids[id] = true
 		}
 	}
-	for _, id := range metaIDList(node.Meta, "version_sut_ids", "target_version_sut_ids", "sut_ids") {
+	for _, id := range metaIDList(node.Meta, "sut_ids", "target_sut_ids") {
 		ids[id] = true
 	}
 	return sortedIDs(ids)
@@ -912,7 +912,7 @@ func (g *chainGraph) filter(f ChainFilter) map[string]bool {
 }
 
 func nodeMatchesFilter(node Node, f ChainFilter) bool {
-	if f.VersionSUTID != nil && !containsID(nodeSUTIDs(node), *f.VersionSUTID) {
+	if f.SUTID != nil && !containsID(nodeSUTIDs(node), *f.SUTID) {
 		return false
 	}
 	if f.PageID != nil && !containsID(nodePageIDs(node), *f.PageID) {

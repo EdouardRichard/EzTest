@@ -1,5 +1,5 @@
 // Package adapters wires the quality context's outbound ports onto the shared
-// eventing and visual contexts. It keeps the quality application layer free of
+// eventing context. It keeps the quality application layer free of
 // infrastructure imports.
 package adapters
 

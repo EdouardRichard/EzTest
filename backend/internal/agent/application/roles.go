@@ -18,31 +18,35 @@ import (
 // role was removed with the explore work item kinds.
 type RoleKey string
 
-// The six role keys after the v0.22 D-B1 convergence.
+// The seven role keys: the six converged v0.22 D-B1 roles plus the independent
+// design judge role (v0.2.4-E quality gate, spec SC-E3).
 const (
 	RoleAssistant        RoleKey = "assistant"
 	RoleCaseAuthor       RoleKey = "case_author"
 	RoleCaseReviewer     RoleKey = "case_reviewer"
+	RoleCaseJudge        RoleKey = "case_judge"
 	RoleFailureAnalyst   RoleKey = "failure_analyst"
 	RoleReportWriter     RoleKey = "report_writer"
 	RoleKnowledgeCurator RoleKey = "knowledge_curator"
 )
 
 // roleKeys is the frozen catalog order: the assistant (two Hosts) first, then
-// the five background roles.
+// the design background roles (author/reviewer/judge) and the remaining
+// background roles.
 var roleKeys = []RoleKey{
 	RoleAssistant,
 	RoleCaseAuthor,
 	RoleCaseReviewer,
+	RoleCaseJudge,
 	RoleFailureAnalyst,
 	RoleReportWriter,
 	RoleKnowledgeCurator,
 }
 
-// RoleKeys returns a copy of the six catalog keys in catalog order.
+// RoleKeys returns a copy of the seven catalog keys in catalog order.
 func RoleKeys() []RoleKey { return append([]RoleKey(nil), roleKeys...) }
 
-// Valid reports whether the key is one of the six catalog roles.
+// Valid reports whether the key is one of the seven catalog roles.
 func (r RoleKey) Valid() bool {
 	for _, key := range roleKeys {
 		if key == r {
@@ -85,17 +89,30 @@ const assistantRolePrompt = `你是 EzTest 的测试助手（assistant，2 个�
 const caseAuthorRolePrompt = `你是 EzTest 的设计 Author（case_author，后台作业角色）。
 角色边界：
 - 只生成/修改用例草稿（case.graph_propose）；不能确认、执行或修改需求。
-- 需求确认后按 design.cases 范围生成用例，步骤、断言、来源与目标 SUT 必须完整可执行。
-- 断言 kind 默认用 ui/text/api（需要数据库校验时 db）；只有需求/验收标准明确要求视觉基线或像素级截图比对时才用 visual。
-- 不调用 browser.* / execution.* / case.confirm；确认只能由用户完成。
+- 需求确认后按 design.cases 范围生成用例：步骤、断言、来源必须完整可执行，并写明自然语言用例契约——sut_description（被测系统，1..2000 字）、preconditions（前置条件，必填，确实没有前置时显式写“无”）、covered_acs（本用例覆盖的验收标准 id，至少 1 个且必须取自该需求当前的 AC 集）。
+- 步骤目标用 target_description 自然语言描述，断言 kind=db 时给 sut_id；不再传 version_sut/page/api/database 的数字 ID（已移除，传了会被拒）。
+- 断言 kind 用 ui/text/api（需要数据库校验时 db，且必须带 sut_id）。
+- 不调用通用执行与执行记录类工具（exec.* / shell.* / file.* / pty.* / http.request / db.query / execution.*）与 case.confirm；确认只能由用户完成。
+- 提交后由独立设计裁判按覆盖率/可执行标准/关联系统三维逐用例审查草稿；blocker/important finding 会使该用例被判 fail 并打回重设计，仅 minor 时 verdict=pass 附注记。裁判 pass 不等于确认，确认仍由人工完成；提交前先按这三维自查。
+- 版本环境有已索引代码仓时，设计前必须先查 code（code.facts / code.routes / code.apis 等只读工具）核对代码现状；代码衍生用例必带 sources kind=code（用 path/line/sha 定位代码位置）并对照 code.anchors 返回的 status/commit_sha 核对定位有效（该工具只列出锚点，不替你校验）；无对应锚点时在 finding 说明；无已索引仓库时按需求纯需求设计，不编造代码事实。
+- Gherkin 映射语义：用例 preconditions 是场景级 Given，须建立所覆盖 AC 的 given 前提；步骤 expected 写步骤级观察，断言写断言级 Then（分工不冗余）；断言用 step_seq 绑定步骤，场景终态 Then 由末步断言承载。
 [role:case_author]`
 
 const caseReviewerRolePrompt = `你是 EzTest 的设计 Critic（case_reviewer，后台作业角色）。
 角色边界：
 - 只通过 design.review_submit 提交评审发现（blocker/important/minor），可读取设计图。
 - 不能修改用例、不能确认、不能执行；内部评审不构成人工关卡。
-- 检查覆盖遗漏、步骤不可执行、断言缺失、目标 SUT 错误与重复用例。
+- 检查覆盖遗漏（covered_acs 是否真的覆盖对应验收标准、是否有 AC 无用例）、步骤不可执行、断言缺失、sut_description 与被测系统/环境目录不一致与重复用例。
+- 内部评审与独立裁判互补、不替代：独立设计裁判另行按覆盖率/可执行标准/关联系统逐用例审查，blocker/important finding 会把用例打回重设计；评审 finding 不构成裁判结论，也不替代裁判门禁。
 [role:case_reviewer]`
+
+const caseJudgeRolePrompt = `你是 EzTest 的设计裁判（case_judge，后台作业角色，独立用例质量裁判）。
+角色边界：
+- 只读审查：读取需求、用例图、代码事实与版本环境目录，按覆盖率/可执行标准/关联系统三维 rubric 逐用例审查。
+- 唯一写入口是 design.judgment_submit：逐用例提交 verdict（pass|fail）与 findings（dimension/severity/message/case_ref）；blocker/important → fail，仅 minor → pass 带注记。
+- 不修改用例、不确认用例或需求、不执行测试；裁判结论只是候选，确认永远由人工完成。
+- 独立于作者：不读取作者对话、交接包摘要或团队频道发现；只写裁判事实与作业卡，不写 assistant 消息。
+[role:case_judge]`
 
 const failureAnalystRolePrompt = `你是 EzTest 的失败分析师（failure_analyst）。
 角色边界：
@@ -237,6 +254,28 @@ var roleSpecs = []RoleSpec{
 		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
 	},
 	{
+		Key:   RoleCaseJudge,
+		Name:  "用例裁判",
+		Model: llmapp.ModelRequirements{Tools: true, Reasoning: true},
+		// The judge consumes the 0.2.1 TYPE-path design.judge/design.rework
+		// work (same family as design.requirement/design.critic); it owns no
+		// kind-path work item kinds and never enters the kind-path stage-entry
+		// matrix (E spec SC-E4 registers this deviation from design §5.4).
+		WorkItemKinds: nil,
+		// The role whitelist derives from the judge seed whitelist (single
+		// authority, profiles.go): the role is the outer boundary and the
+		// profile is inside it by construction. design.judgment_submit is the
+		// only write entry; the author-leaking context tools and the case
+		// writing surfaces are deliberately absent (I-B4 independence).
+		Tools: append([]string(nil), designJudgeTools...),
+		Profiles: []string{
+			ProfileKeyDesignJudge,
+		},
+		SystemPrompt: caseJudgeRolePrompt,
+		RunSeconds:   roleDefaultRunSeconds,
+		MaxTurnsFuse: roleDefaultMaxTurnsFuse,
+	},
+	{
 		Key:   RoleFailureAnalyst,
 		Name:  "失败分析师",
 		Model: llmapp.ModelRequirements{Tools: true, Reasoning: true},
@@ -313,7 +352,7 @@ var roleSpecs = []RoleSpec{
 			"knowledge.search",
 			"knowledge.read",
 		},
-		// The knowledge_curator profile seed (p7_profiles.go) executes this
+		// The knowledge_curator profile seed (knowledge_profiles.go) executes this
 		// role, so the structured retrieval tools (knowledge.search/read,
 		// registered by the retrieval task) are model-visible while the runtime
 		// RoleToolGuard keeps the surface closed.
@@ -324,7 +363,7 @@ var roleSpecs = []RoleSpec{
 	},
 }
 
-// RoleCatalog returns a deep copy of the six role specs in catalog order.
+// RoleCatalog returns a deep copy of the seven role specs in catalog order.
 func RoleCatalog() []RoleSpec {
 	specs := make([]RoleSpec, 0, len(roleSpecs))
 	for _, spec := range roleSpecs {
@@ -353,7 +392,7 @@ func cloneRoleSpec(spec RoleSpec) RoleSpec {
 // RoleForProfile returns the catalog role that executes a stored profile key.
 // ProfileAdminService uses it to apply the role whitelist to administrator
 // edits, and ValidateRoleProfiles uses the same mapping at startup. Profiles
-// outside the six roles (case_executor, coverage_analyst, version_steward,
+// outside the seven roles (case_executor, coverage_analyst, knowledge_curator,
 // ...) report false: they keep their own frozen contract whitelist.
 func RoleForProfile(profileKey string) (RoleSpec, bool) {
 	for _, spec := range roleSpecs {
@@ -411,8 +450,8 @@ func RoleAllowsWorkItemKind(role RoleKey, kind string) bool {
 // ValidateRoleProfiles fails closed when a seeded agent_profile that executes a
 // catalog role allows a tool outside that role's whitelist. It is called by
 // EnsureProfiles so a profile edit cannot silently widen a role's permissions
-// (review focus 5). Profiles outside the six roles (for example
-// case_executor or version_steward) are not constrained by this catalog.
+// (review focus 5). Profiles outside the seven roles (for example
+// case_executor or knowledge_curator) are not constrained by this catalog.
 func ValidateRoleProfiles(profiles []agent.AgentProfile) error {
 	roleByProfile := make(map[string]RoleKey)
 	for _, spec := range roleSpecs {
@@ -450,8 +489,8 @@ func ValidateRoleProfiles(profiles []agent.AgentProfile) error {
 const ActionRoleToolDenied = "agent.role.tool_denied"
 
 // RoleToolGuard enforces one role's whitelist before registry execution and
-// audits every denial. It is the runtime seam for the six roles; the frozen
-// 14 agent_profile seeds keep their own allowed_tools (validated as a subset by
+// audits every denial. It is the runtime seam for the seven roles; the frozen
+// agent_profile seeds keep their own allowed_tools (validated as a subset by
 // ValidateRoleProfiles). The guard is safe for concurrent use: the ToolSet is
 // immutable and the audit recorder owns its synchronization.
 type RoleToolGuard struct {

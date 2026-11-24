@@ -11,6 +11,7 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
 // agentProfileKeyPattern is the frozen ProfileKey schema used by the runs
@@ -23,10 +24,15 @@ type AgentCenterService interface {
 	Catalog(ctx context.Context) (agentapp.Catalog, error)
 	Runs(ctx context.Context, filter agentapp.RunFilter) ([]agentapp.RunView, bool, error)
 	Quality(ctx context.Context) (agentapp.QualityView, error)
+	// RunTranscript is the admin-only live transcript read (v0.2.4-D T8).
+	RunTranscript(ctx context.Context, runID int64) ([]agent.AgentMessage, error)
+	// RunActivity is the admin-only activity fact read (v0.2.4-D T10).
+	RunActivity(ctx context.Context, runID int64) ([]agent.Activity, error)
 }
 
-// AgentCenterHandler serves the P6 logged-in Agent center read API. It only
-// renders projections; prompts/transcripts are never part of the read model.
+// AgentCenterHandler serves the logged-in Agent center read API. The catalog,
+// run list and quality projections carry no prompts or transcripts; the run
+// transcript route is a separate admin-only surface (v0.2.4-D T8, SC-D3).
 type AgentCenterHandler struct {
 	service AgentCenterService
 }
@@ -100,6 +106,72 @@ func (h *AgentCenterHandler) Quality(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusOK, toAgentCenterQualityDTO(view))
+}
+
+// RunTranscript GET /api/agent-center/runs/{id}/transcript (admin only,
+// v0.2.4-D T8/SC-D3). It returns the run's current transcript snapshot including
+// rows still streaming; the live increments arrive on the run:{id} event
+// channel, which is gated for admins on both generic event endpoints as well.
+// The admin gate mirrors ContextPacketHandler.Latest: the payload is the model
+// transcript, so it belongs to the management surface, not the ordinary run
+// metadata view (constitution Constraints A.1, Q08=C).
+func (h *AgentCenterHandler) RunTranscript(w http.ResponseWriter, r *http.Request) {
+	if _, err := requireAdminActor(r); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	runID, err := validation.NonEmptyID("id", r.PathValue("id"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h == nil || h.service == nil {
+		httpx.Error(w, r, platform.Unavailable("agent center service is not configured"))
+		return
+	}
+	messages, err := h.service.RunTranscript(r.Context(), runID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]agentapp.TranscriptMessage, 0, len(messages))
+	for _, message := range messages {
+		items = append(items, agentapp.NewTranscriptMessage(message))
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
+// RunActivity GET /api/agent-center/runs/{id}/activity (admin only,
+// v0.2.4-D T10/SC-D5). It returns the run's coarse fact ledger — one row per tool
+// call and per compaction boundary, keyed (run_id, seq) — which is the internal
+// audit/debug read of agent_activity and deliberately separate from the
+// transcript (R-D6). The admin gate mirrors RunTranscript: the ledger is a
+// management surface, not part of the ordinary run metadata view (constitution
+// Constraints A.1, Q08=C).
+func (h *AgentCenterHandler) RunActivity(w http.ResponseWriter, r *http.Request) {
+	if _, err := requireAdminActor(r); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	runID, err := validation.NonEmptyID("id", r.PathValue("id"))
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if h == nil || h.service == nil {
+		httpx.Error(w, r, platform.Unavailable("agent center service is not configured"))
+		return
+	}
+	activities, err := h.service.RunActivity(r.Context(), runID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]agentActivityDTO, 0, len(activities))
+	for _, activity := range activities {
+		items = append(items, toAgentActivityDTO(activity))
+	}
+	httpx.JSON(w, http.StatusOK, items)
 }
 
 /* -------------------------------- parsing -------------------------------- */

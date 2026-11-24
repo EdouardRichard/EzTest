@@ -5,6 +5,19 @@
 // server is spawned on an ephemeral loopback port so the suite never depends on
 // a fixed port.
 //
+// Expectations are derived from the v0.2.4-B design contract (the agent tool
+// validator in backend/internal/agent/application/tools/design.go and the task
+// prompts in runner.go), NOT from the double's observed output:
+//   * case_author / design_host read design.graph_read, then requirement.read
+//     (the AC-id set is NOT in graph_read), then case.graph_propose.
+//   * A proposed case carries the natural-language contract: sut_description,
+//     preconditions, covered_acs (a non-empty subset of the requirement AC set),
+//     executable steps with prose target_description, and requirement sources
+//     keyed by requirement_version_id.
+//   * The deleted resource-id fields (default_version_sut_id / version_sut_ids /
+//     page_ids / api_ids on cases/scenarios, target_*_id on steps, database_id on
+//     assertions) must NEVER appear: the decoder hard-rejects them.
+//
 // Run: node --test scripts/fake-llm-p2.test.cjs
 
 const { after, before, test } = require("node:test");
@@ -63,6 +76,45 @@ async function postChat(body) {
   return { status: response.status, json };
 }
 
+// postChatStream reads the raw SSE body (not JSON) so a stream:true request can
+// be asserted against the OpenAI chat-completions streaming contract.
+async function postChatStream(body) {
+  const response = await fetch(baseUrl + "/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type") || "",
+    text,
+  };
+}
+
+// parseSseFrames returns the ordered data payloads of an SSE body. Each event is
+// a single "data: <payload>" line (JSON.stringify never emits newlines), so the
+// payloads are recovered by prefix, preserving order incl. the [DONE] sentinel.
+function parseSseFrames(text) {
+  const frames = [];
+  for (const line of text.split("\n")) {
+    if (line.startsWith("data: ")) frames.push(line.slice("data: ".length));
+  }
+  return frames;
+}
+
+// toolCallFragments collects the streamed tool-call deltas in emission order.
+function toolCallFragments(chunks) {
+  const fragments = [];
+  for (const chunk of chunks) {
+    const delta = chunk.choices[0].delta;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const call of delta.tool_calls) fragments.push(call);
+    }
+  }
+  return fragments;
+}
+
 function systemMarked(profile, extra) {
   return { role: "system", content: "[profile:" + profile + "] 角色提示词" + (extra || "") };
 }
@@ -90,6 +142,99 @@ function assistantToolCall(message) {
   return { name: call.function.name, args };
 }
 
+// --- contract assertion helpers (expectations from design.go, not the double) --
+
+const AC_ID_PATTERN = /^AC-[1-9][0-9]*$/;
+const DELETED_CASE_FIELDS = ["default_version_sut_id", "version_sut_ids", "page_ids", "api_ids"];
+const DELETED_SCENARIO_FIELDS = ["version_sut_ids", "page_ids", "api_ids"];
+const DELETED_STEP_FIELDS = ["target_page_id", "target_api_id", "target_version_sut_id"];
+const DELETED_ASSERTION_FIELDS = ["target_version_sut_id", "target_api_id", "database_id"];
+
+function assertNoFields(obj, fields, label) {
+  for (const field of fields) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(obj, field),
+      false,
+      label + " carries deleted field " + field + ": " + JSON.stringify(obj),
+    );
+  }
+}
+
+// assertScenarioContract pins the scenario schema: ref/name required, optional
+// description/sort_order, and none of the deleted resource-id fields.
+function assertScenarioContract(scenario) {
+  assertNoFields(scenario, DELETED_SCENARIO_FIELDS, "scenario");
+  assert.equal(typeof scenario.ref, "string");
+  assert.ok(scenario.ref.length >= 1);
+  assert.equal(typeof scenario.name, "string");
+  assert.ok(scenario.name.length >= 1);
+}
+
+// assertCaseContract pins the v0.2.4-B natural-language case contract from the
+// design validator (design.go caseSchema): required sut_description/preconditions/
+// covered_acs/steps, prose step targets, valid assertion kinds, requirement
+// sources keyed by requirement_version_id, and the absence of every deleted
+// resource-id field. coveredACs is the requirement AC set (requirement.read.ac_ids),
+// the contract source covered_acs must be drawn from.
+function assertCaseContract(item, coveredACs, requirementVersionID) {
+  assertNoFields(item, DELETED_CASE_FIELDS, "case");
+  // sut_description: required prose, 1..2000 chars (design.go maxSutDescriptionChars).
+  assert.equal(typeof item.sut_description, "string");
+  assert.ok(
+    item.sut_description.length >= 1 && item.sut_description.length <= 2000,
+    "sut_description must be 1..2000 chars: " + JSON.stringify(item.sut_description),
+  );
+  // preconditions: required, non-empty (the contract requires "无" when none).
+  assert.equal(typeof item.preconditions, "string");
+  assert.ok(item.preconditions.length >= 1, "preconditions must be non-empty");
+  // covered_acs: required non-empty subset of the requirement AC set.
+  assert.ok(
+    Array.isArray(item.covered_acs) && item.covered_acs.length >= 1,
+    "covered_acs must be a non-empty array",
+  );
+  for (const ac of item.covered_acs) {
+    assert.match(ac, AC_ID_PATTERN, "covered_acs id must be AC-<n>: " + ac);
+    assert.ok(
+      coveredACs.includes(ac),
+      "covered_acs id " + ac + " is not in the requirement AC set " + JSON.stringify(coveredACs),
+    );
+  }
+  // steps: required, each with seq/action/expected and a prose target_description.
+  assert.ok(Array.isArray(item.steps) && item.steps.length >= 1);
+  for (const step of item.steps) {
+    assert.equal(typeof step.seq, "number");
+    assert.ok(typeof step.action === "string" && step.action.length >= 1);
+    assert.ok(typeof step.expected === "string" && step.expected.length >= 1);
+    assert.ok(
+      typeof step.target_description === "string" && step.target_description.length >= 1,
+      "step must carry a prose target_description",
+    );
+    assertNoFields(step, DELETED_STEP_FIELDS, "step");
+  }
+  // assertions: each with step_seq/kind/target/expected; kind=db requires sut_id.
+  assert.ok(Array.isArray(item.assertions));
+  for (const assertion of item.assertions) {
+    assert.equal(typeof assertion.step_seq, "number");
+    assert.ok(["ui", "api", "db", "text"].includes(assertion.kind), "bad assertion kind: " + assertion.kind);
+    assert.ok(typeof assertion.target === "string" && assertion.target.length >= 1);
+    assert.ok(typeof assertion.expected === "string" && assertion.expected.length >= 1);
+    if (assertion.kind === "db") {
+      assert.ok(
+        typeof assertion.sut_id === "string" && assertion.sut_id.length >= 1,
+        "db assertion must carry sut_id",
+      );
+    }
+    assertNoFields(assertion, DELETED_ASSERTION_FIELDS, "assertion");
+  }
+  // sources: requirement source keyed by requirement_version_id (not requirement_id).
+  assert.ok(Array.isArray(item.sources) && item.sources.length >= 1);
+  assert.equal(item.sources[0].kind, "requirement");
+  assert.equal(item.sources[0].ref_id, requirementVersionID);
+}
+
+// --- graph_read fixtures (v0.2.4-B shape: no target_version_sut_ids; case cards
+// carry sut_description/covered_acs, not resource ids) -------------------------
+
 const GRAPH = {
   version_id: "1001",
   graph_hash: "a".repeat(64),
@@ -100,7 +245,6 @@ const GRAPH = {
       revision: 1,
       title: "登录",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [
         {
           id: "5001",
@@ -113,14 +257,29 @@ const GRAPH = {
               revision: 1,
               title: "账号密码登录成功",
               status: "draft",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "登录页与登录接口。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
       ],
     },
   ],
+};
+
+// REQUIREMENT_READ is the requirement.read result: it carries the AC-id set
+// (ac_ids) that graph_read does not, plus the requirement's prose sut_description.
+const REQUIREMENT_READ = {
+  requirement_id: "3001",
+  requirement_version_id: "3002",
+  revision: 1,
+  status: "clarified",
+  title: "登录",
+  sut_description: "登录页与登录接口的被测系统描述。",
+  acceptance_criteria: [
+    { id: "AC-1", given: "已注册账号", when: "用户执行登录", then: "登录成功" },
+  ],
+  ac_ids: ["AC-1"],
 };
 
 const GRAPH_EMPTY = {
@@ -132,7 +291,6 @@ const GRAPH_EMPTY = {
       requirement_version_id: "3002",
       title: "登录",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [],
     },
   ],
@@ -150,7 +308,6 @@ const GRAPH_MIXED = {
       revision: 2,
       title: "被回退的需求",
       status: "draft",
-      target_version_sut_ids: ["9001"],
       scenarios: [],
     },
     {
@@ -159,7 +316,6 @@ const GRAPH_MIXED = {
       revision: 1,
       title: "登录",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [],
     },
   ],
@@ -177,7 +333,6 @@ const GRAPH_REDESIGN = {
       revision: 2,
       title: "登录（新版）",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [
         {
           id: "5001",
@@ -190,8 +345,8 @@ const GRAPH_REDESIGN = {
               revision: 1,
               title: "旧版用例",
               status: "stale",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "旧版登录页。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
@@ -213,7 +368,6 @@ const GRAPH_MIXED_VERSIONS = {
       revision: 2,
       title: "登录（新版）",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [
         {
           id: "5001",
@@ -226,8 +380,8 @@ const GRAPH_MIXED_VERSIONS = {
               revision: 1,
               title: "旧版用例",
               status: "stale",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "旧版登录页。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
@@ -242,8 +396,8 @@ const GRAPH_MIXED_VERSIONS = {
               revision: 1,
               title: "新版用例",
               status: "draft",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "新版登录页。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
@@ -264,7 +418,6 @@ const GRAPH_CONFIRMED_FIRST = {
       revision: 1,
       title: "登录",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [
         {
           id: "5101",
@@ -277,8 +430,8 @@ const GRAPH_CONFIRMED_FIRST = {
               revision: 1,
               title: "已确认用例",
               status: "confirmed",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "登录页。",
+              covered_acs: ["AC-1"],
             },
             {
               case_id: "7201",
@@ -286,8 +439,8 @@ const GRAPH_CONFIRMED_FIRST = {
               revision: 1,
               title: "草稿用例",
               status: "draft",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "登录页。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
@@ -305,7 +458,6 @@ const GRAPH_ALL_CONFIRMED = {
       requirement_version_id: "3002",
       title: "登录",
       status: "clarified",
-      target_version_sut_ids: ["9001"],
       scenarios: [
         {
           id: "5101",
@@ -318,8 +470,8 @@ const GRAPH_ALL_CONFIRMED = {
               revision: 1,
               title: "已确认用例",
               status: "confirmed",
-              default_version_sut_id: "9001",
-              version_sut_ids: ["9001"],
+              sut_description: "登录页。",
+              covered_acs: ["AC-1"],
             },
           ],
         },
@@ -361,7 +513,7 @@ test("design_host answers design chat without tools or confirmation", async () =
   assert.ok(!/confirm/i.test(message.content));
 });
 
-test("design_host reads the graph then proposes a draft when asked to modify", async () => {
+test("design_host reads graph, reads requirement ACs, then proposes a draft when asked to modify", async () => {
   const first = await postChat({
     model: "fake-llm",
     messages: [systemMarked("design_host"), userText("请新增一条异常登录用例")],
@@ -370,26 +522,38 @@ test("design_host reads the graph then proposes a draft when asked to modify", a
   assert.equal(read.name, "design.graph_read");
   assert.deepEqual(read.args, {});
 
+  // graph_read does not carry the requirement AC set, so the next read is
+  // requirement.read for the scoped requirement (design v1.3.1 §5.2).
   const second = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("请新增一条异常登录用例"), toolResult(GRAPH)],
+  });
+  const reqRead = assistantToolCall(second.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const third = await postChat({
     model: "fake-llm",
     messages: [
       systemMarked("design_host"),
       userText("请新增一条异常登录用例"),
-      { role: "assistant", content: null, tool_calls: [{ id: "call-1", type: "function", function: { name: "design.graph_read", arguments: "{}" } }] },
       toolResult(GRAPH),
+      toolResult(REQUIREMENT_READ),
     ],
   });
-  const propose = assistantToolCall(second.json.choices[0].message);
+  const propose = assistantToolCall(third.json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
   assert.equal(propose.args.requirement_id, "3001");
   assert.equal(propose.args.requirement_version_id, "3002");
   assert.equal(propose.args.scenarios.length, 1);
   assert.equal(propose.args.scenarios[0].id, "5001");
+  assertScenarioContract(propose.args.scenarios[0]);
   assert.equal(propose.args.cases.length, 1);
   assert.equal(propose.args.cases[0].id, "7001");
   assert.equal(propose.args.cases[0].ref, "c1");
+  assertCaseContract(propose.args.cases[0], REQUIREMENT_READ.ac_ids, "3002");
 
-  const third = await postChat({
+  const fourth = await postChat({
     model: "fake-llm",
     messages: [
       systemMarked("design_host"),
@@ -397,20 +561,31 @@ test("design_host reads the graph then proposes a draft when asked to modify", a
       toolResult({ graph_hash: "c".repeat(64), scenario_ids: ["5001"], case_ids: ["7001"], case_version_ids: ["7002"] }),
     ],
   });
-  assert.equal(third.json.choices[0].message.tool_calls, undefined);
-  assert.ok(third.json.choices[0].message.content.length > 0);
+  assert.equal(fourth.json.choices[0].message.tool_calls, undefined);
+  assert.ok(fourth.json.choices[0].message.content.length > 0);
 });
 
 test("design_host creates a scenario and case when the graph has none", async () => {
-  const { json } = await postChat({
+  // graph_read -> requirement.read -> propose, even with an empty graph.
+  const readStep = await postChat({
     model: "fake-llm",
     messages: [systemMarked("design_host"), userText("新增用例"), toolResult(GRAPH_EMPTY)],
+  });
+  const reqRead = assistantToolCall(readStep.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const { json } = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("新增用例"), toolResult(GRAPH_EMPTY), toolResult(REQUIREMENT_READ)],
   });
   const propose = assistantToolCall(json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
   assert.equal(propose.args.scenarios[0].id, undefined);
   assert.equal(propose.args.cases[0].id, undefined);
-  assert.equal(propose.args.cases[0].steps.length >= 1, true);
+  assert.ok(propose.args.cases[0].steps.length >= 1);
+  assertScenarioContract(propose.args.scenarios[0]);
+  assertCaseContract(propose.args.cases[0], REQUIREMENT_READ.ac_ids, "3002");
 });
 
 test("design_host does not propose on the opening turn or without a modify request", async () => {
@@ -440,10 +615,18 @@ test("design_host does not propose on the opening turn or without a modify reque
   assert.equal(question.json.choices[0].message.tool_calls, undefined, "question turn proposed a case");
 });
 
-test("design_host proposes against the first clarified requirement when a draft row is first", async () => {
-  const { json } = await postChat({
+test("design_host targets the first clarified requirement when a draft row is first", async () => {
+  const readStep = await postChat({
     model: "fake-llm",
     messages: [systemMarked("design_host"), userText("新增用例"), toolResult(GRAPH_MIXED)],
+  });
+  const reqRead = assistantToolCall(readStep.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const { json } = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("新增用例"), toolResult(GRAPH_MIXED), toolResult(REQUIREMENT_READ)],
   });
   const propose = assistantToolCall(json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
@@ -462,7 +645,7 @@ test("design_planner returns a scope-only text without tools", async () => {
   assert.ok(message.content.includes("范围"), message.content);
 });
 
-test("case_author reads the graph then proposes one scenario and two cases", async () => {
+test("case_author reads graph, reads requirement ACs, then proposes one scenario and two cases", async () => {
   const first = await postChat({
     model: "fake-llm",
     messages: [systemMarked("case_author"), userText("设计需求 3001")],
@@ -474,7 +657,15 @@ test("case_author reads the graph then proposes one scenario and two cases", asy
     model: "fake-llm",
     messages: [systemMarked("case_author"), userText("设计需求 3001"), toolResult(GRAPH)],
   });
-  const propose = assistantToolCall(second.json.choices[0].message);
+  const reqRead = assistantToolCall(second.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const third = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("case_author"), userText("设计需求 3001"), toolResult(GRAPH), toolResult(REQUIREMENT_READ)],
+  });
+  const propose = assistantToolCall(third.json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
   assert.equal(propose.args.requirement_id, "3001");
   assert.equal(propose.args.requirement_version_id, "3002");
@@ -488,19 +679,18 @@ test("case_author reads the graph then proposes one scenario and two cases", asy
   assert.deepEqual(caseRefs, ["c1", "c2"]);
   const scenarioRefs = propose.args.scenarios.map((item) => item.ref);
   assert.equal(new Set(scenarioRefs).size, scenarioRefs.length, "duplicate scenario refs: " + JSON.stringify(scenarioRefs));
+  assertScenarioContract(propose.args.scenarios[0]);
   for (const item of propose.args.cases) {
     assert.ok(item.title.length > 0);
     assert.ok(scenarioRefs.includes(item.scenario_ref), "unknown scenario_ref: " + item.scenario_ref);
-    assert.equal(item.default_version_sut_id, "9001");
-    assert.ok(Array.isArray(item.version_sut_ids) && item.version_sut_ids.length > 0);
-    assert.ok(item.steps.length >= 1);
-    assert.ok(item.assertions.length >= 1);
-    assert.ok(item.sources.length >= 1);
-    assert.equal(item.sources[0].kind, "requirement");
-    assert.equal(item.sources[0].ref_id, "3002");
+    // The natural-language case contract, derived from design.go (not the double):
+    // covered_acs drawn from the requirement AC set, prose sut_description,
+    // preconditions, executable steps with prose targets, and no deleted id fields.
+    assertCaseContract(item, REQUIREMENT_READ.ac_ids, "3002");
+    assert.deepEqual(item.covered_acs, REQUIREMENT_READ.ac_ids);
   }
 
-  const third = await postChat({
+  const fourth = await postChat({
     model: "fake-llm",
     messages: [
       systemMarked("case_author"),
@@ -508,8 +698,8 @@ test("case_author reads the graph then proposes one scenario and two cases", asy
       toolResult({ graph_hash: "d".repeat(64), case_ids: ["7001", "7003"], case_version_ids: ["7002", "7004"] }),
     ],
   });
-  assert.equal(third.json.choices[0].message.tool_calls, undefined);
-  assert.ok(third.json.choices[0].message.content.length > 0);
+  assert.equal(fourth.json.choices[0].message.tool_calls, undefined);
+  assert.ok(fourth.json.choices[0].message.content.length > 0);
 });
 
 test("case_author selects the scoped clarified requirement", async () => {
@@ -517,7 +707,20 @@ test("case_author selects the scoped clarified requirement", async () => {
     model: "fake-llm",
     messages: [systemMarked("case_author", taskScope("3001")), userText("设计需求 3001"), toolResult(GRAPH_MIXED)],
   });
-  const propose = assistantToolCall(scoped.json.choices[0].message);
+  const scopedRead = assistantToolCall(scoped.json.choices[0].message);
+  assert.equal(scopedRead.name, "requirement.read");
+  assert.equal(scopedRead.args.requirement_id, "3001");
+
+  const scopedPropose = await postChat({
+    model: "fake-llm",
+    messages: [
+      systemMarked("case_author", taskScope("3001")),
+      userText("设计需求 3001"),
+      toolResult(GRAPH_MIXED),
+      toolResult(REQUIREMENT_READ),
+    ],
+  });
+  const propose = assistantToolCall(scopedPropose.json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
   assert.equal(propose.args.requirement_id, "3001");
   assert.equal(propose.args.requirement_version_id, "3002");
@@ -528,15 +731,28 @@ test("case_author selects the scoped clarified requirement", async () => {
     model: "fake-llm",
     messages: [systemMarked("case_author"), userText("设计需求"), toolResult(GRAPH_MIXED)],
   });
-  const fallbackProposal = assistantToolCall(fallback.json.choices[0].message);
-  assert.equal(fallbackProposal.args.requirement_id, "3001");
-  assert.equal(fallbackProposal.args.requirement_version_id, "3002");
+  const fallbackRead = assistantToolCall(fallback.json.choices[0].message);
+  assert.equal(fallbackRead.name, "requirement.read");
+  assert.equal(fallbackRead.args.requirement_id, "3001");
 });
 
 test("case_author on a new requirement version ignores old-version scenarios", async () => {
-  const response = await postChat({
+  const readStep = await postChat({
     model: "fake-llm",
     messages: [systemMarked("case_author", taskScope("3001")), userText("重新设计需求 3001"), toolResult(GRAPH_REDESIGN)],
+  });
+  const reqRead = assistantToolCall(readStep.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const response = await postChat({
+    model: "fake-llm",
+    messages: [
+      systemMarked("case_author", taskScope("3001")),
+      userText("重新设计需求 3001"),
+      toolResult(GRAPH_REDESIGN),
+      toolResult(REQUIREMENT_READ),
+    ],
   });
   const propose = assistantToolCall(response.json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
@@ -550,13 +766,27 @@ test("case_author on a new requirement version ignores old-version scenarios", a
   for (const item of propose.args.cases) {
     assert.equal(item.id, undefined);
     assert.equal(item.scenario_ref, "s1");
+    assertCaseContract(item, REQUIREMENT_READ.ac_ids, "3002");
   }
 });
 
 test("design_host updates only cases under the requirement's current version", async () => {
-  const response = await postChat({
+  const readStep = await postChat({
     model: "fake-llm",
     messages: [systemMarked("design_host"), userText("修改用例"), toolResult(GRAPH_MIXED_VERSIONS)],
+  });
+  const reqRead = assistantToolCall(readStep.json.choices[0].message);
+  assert.equal(reqRead.name, "requirement.read");
+  assert.equal(reqRead.args.requirement_id, "3001");
+
+  const response = await postChat({
+    model: "fake-llm",
+    messages: [
+      systemMarked("design_host"),
+      userText("修改用例"),
+      toolResult(GRAPH_MIXED_VERSIONS),
+      toolResult(REQUIREMENT_READ),
+    ],
   });
   const propose = assistantToolCall(response.json.choices[0].message);
   assert.equal(propose.name, "case.graph_propose");
@@ -564,6 +794,7 @@ test("design_host updates only cases under the requirement's current version", a
   assert.equal(propose.args.scenarios.length, 1);
   assert.equal(propose.args.scenarios[0].id, "5101");
   assert.equal(propose.args.cases[0].id, "7001");
+  assertCaseContract(propose.args.cases[0], REQUIREMENT_READ.ac_ids, "3002");
 });
 
 test("design_critic submits one minor finding before the final text", async () => {
@@ -639,7 +870,9 @@ test("no design profile ever emits case.confirm or granular design write tools",
   const bodies = [
     { messages: [systemMarked("design_host"), userText("请修改用例")] },
     { messages: [systemMarked("design_host"), userText("请修改用例"), toolResult(GRAPH)] },
+    { messages: [systemMarked("design_host"), userText("请修改用例"), toolResult(GRAPH), toolResult(REQUIREMENT_READ)] },
     { messages: [systemMarked("case_author"), userText("设计需求 3001"), toolResult(GRAPH)] },
+    { messages: [systemMarked("case_author"), userText("设计需求 3001"), toolResult(GRAPH), toolResult(REQUIREMENT_READ)] },
     { messages: [systemMarked("design_critic"), userText("自审")] },
     { messages: [systemMarked("data_planner"), userText("数据")] },
   ];
@@ -656,4 +889,116 @@ test("no design profile ever emits case.confirm or granular design write tools",
       assert.equal(forbidden.has(call.function.name), false, "forbidden tool call: " + call.function.name);
     }
   }
+});
+
+// --- stream:true tool-call contract (v0.2.4-D) -------------------------------
+// Expectations are derived from the OpenAI chat-completions streaming contract
+// (incremental tool_calls deltas: first fragment carries id/type/function.name,
+// later fragments carry only function.arguments at the same index; a terminal
+// finish_reason:"tool_calls" chunk; usage when stream_options.include_usage is
+// set; a trailing [DONE] sentinel), NOT from the double's observed output. The
+// tool name and propose args come from the design contract (design.go), the
+// same source the non-stream case_author test above pins.
+
+test("case_author tool call streams as OpenAI SSE fragments when stream:true", async () => {
+  const { status, contentType, text } = await postChatStream({
+    model: "fake-llm",
+    stream: true,
+    stream_options: { include_usage: true },
+    messages: [
+      systemMarked("case_author"),
+      userText("设计需求 3001"),
+      toolResult(GRAPH),
+      toolResult(REQUIREMENT_READ),
+    ],
+  });
+  assert.equal(status, 200);
+  assert.match(contentType, /text\/event-stream/);
+
+  const frames = parseSseFrames(text);
+  // Contract: the stream terminates with the [DONE] sentinel.
+  assert.equal(frames[frames.length - 1], "[DONE]");
+
+  const chunks = frames.slice(0, -1).map((payload) => JSON.parse(payload));
+  for (const chunk of chunks) {
+    assert.equal(chunk.object, "chat.completion.chunk");
+    assert.ok(chunk.choices.length >= 1);
+    assert.equal(chunk.choices[0].index, 0);
+  }
+
+  const fragments = toolCallFragments(chunks);
+  // The propose arguments are a long JSON string, so the contract's incremental
+  // delta stream carries more than one argument fragment.
+  assert.ok(fragments.length >= 2, "expected fragmented tool-call arguments, got " + fragments.length);
+
+  // First fragment carries id/type/function.name at index 0.
+  const first = fragments[0];
+  assert.equal(first.index, 0);
+  assert.equal(first.type, "function");
+  assert.equal(typeof first.id, "string");
+  assert.ok(first.id.length >= 1);
+  assert.equal(first.function.name, "case.graph_propose");
+  assert.equal(typeof first.function.arguments, "string");
+
+  // Later fragments carry only function.arguments at the same index (no id/type/name).
+  for (const frag of fragments.slice(1)) {
+    assert.equal(frag.index, 0);
+    assert.equal(frag.id, undefined);
+    assert.equal(frag.type, undefined);
+    assert.equal(frag.function.name, undefined);
+    assert.equal(typeof frag.function.arguments, "string");
+  }
+
+  // Reassembled arguments are valid JSON matching the design propose contract.
+  const args = JSON.parse(fragments.map((frag) => frag.function.arguments).join(""));
+  assert.equal(args.requirement_id, "3001");
+  assert.equal(args.requirement_version_id, "3002");
+  assert.equal(args.scenarios.length, 1);
+  assert.equal(args.cases.length, 2);
+
+  // Terminal chunk carries finish_reason "tool_calls".
+  const terminal = chunks[chunks.length - 1];
+  assert.equal(terminal.choices[0].finish_reason, "tool_calls");
+
+  // stream_options.include_usage: the TERMINAL chunk carries the usage snapshot
+  // (OpenAI puts usage on the final chunk; the Go adapter reads it from the
+  // trailing chunks). Pinning terminal.usage — not "any frame has usage" — is
+  // what guards SC-D1 telemetry parity: a usage frame emitted mid-stream would
+  // satisfy a loose `some` assertion while the terminal snapshot the runner
+  // merges could be missing.
+  assert.ok(terminal.usage, "expected usage on the terminal chunk for stream_options.include_usage");
+  assert.equal(typeof terminal.usage.prompt_tokens, "number");
+  assert.equal(typeof terminal.usage.completion_tokens, "number");
+  assert.equal(typeof terminal.usage.total_tokens, "number");
+});
+
+test("case_author graph_read tool call streams a single-fragment SSE turn when stream:true", async () => {
+  const { status, contentType, text } = await postChatStream({
+    model: "fake-llm",
+    stream: true,
+    stream_options: { include_usage: true },
+    messages: [systemMarked("case_author"), userText("设计需求 3001")],
+  });
+  assert.equal(status, 200);
+  assert.match(contentType, /text\/event-stream/);
+
+  const frames = parseSseFrames(text);
+  assert.equal(frames[frames.length - 1], "[DONE]");
+  const chunks = frames.slice(0, -1).map((payload) => JSON.parse(payload));
+
+  const fragments = toolCallFragments(chunks);
+  // graph_read has empty arguments ("{}"), so the first (and only) fragment
+  // still carries id/type/function.name.
+  assert.ok(fragments.length >= 1);
+  const first = fragments[0];
+  assert.equal(first.index, 0);
+  assert.equal(first.type, "function");
+  assert.equal(typeof first.id, "string");
+  assert.equal(first.function.name, "design.graph_read");
+  const args = JSON.parse(fragments.map((frag) => frag.function.arguments).join(""));
+  assert.deepEqual(args, {});
+
+  const terminal = chunks[chunks.length - 1];
+  assert.equal(terminal.choices[0].finish_reason, "tool_calls");
+  assert.ok(terminal.usage, "expected usage on the terminal chunk");
 });

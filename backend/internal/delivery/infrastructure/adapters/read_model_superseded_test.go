@@ -20,7 +20,7 @@ func cancelledWaveSupersedingResults(deps Deps) {
 	waves := deps.Waves.(*fakeWaves)
 	waves.waves = append(waves.waves, execution.RunWave{
 		ID: 13, VersionID: 7, Status: execution.WaveCancelled, Trigger: execution.WaveTriggerManual,
-		Counts:    execution.WaveCounts{Total: 2, Superseded: 2, ByVersionSUT: map[string]execution.SUTCounts{}},
+		Counts:    execution.WaveCounts{Total: 2, Superseded: 2, BySUT: map[string]execution.SUTCounts{}},
 		StartedAt: &fixtureTime, FinishedAt: &fixtureAfter, CreatedAt: fixtureTime, UpdatedAt: fixtureAfter,
 	})
 	runs := deps.CaseRuns.(*fakeCaseRuns)

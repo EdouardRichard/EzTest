@@ -33,14 +33,11 @@ import (
 const (
 	itVersionID = 9001
 
-	itSUT1        = 9101
-	itSUT2        = 9102
-	itEnv1        = 9201
-	itEnv2        = 9202
-	itPage1       = 9301
-	itPage2       = 9302
-	itVersionSUT1 = 9401
-	itVersionSUT2 = 9402
+	itSUT1  = 9101
+	itSUT2  = 9102
+	itEnv1  = 9201
+	itPage1 = 9301
+	itPage2 = 9302
 
 	itRequirement1  = 9501
 	itRequirementV1 = 9511
@@ -95,7 +92,7 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, itClock, nil, nil, nil)
 	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc := versionapp.NewRequirementService(
-		requirementRepo, nil, nil, nil, nil, nil, ids, itClock,
+		requirementRepo, nil, nil, nil, nil, ids, itClock,
 	)
 	designSvc := designapp.NewGraphService(designpg.New(pool), ids, itClock, nil, nil, nil)
 	executionRepos := executionpg.NewRepository(pool, ids)
@@ -158,55 +155,64 @@ func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) map[int64]time.Time {
 		sql  string
 		args []any
 	}{
-		{`INSERT INTO sut (id, name, intro, created_by) VALUES ($1, 'Payments', '', 1), ($2, 'Checkout', '', 1)`,
-			[]any{itSUT1, itSUT2}},
-		{`INSERT INTO sut_environment (id, sut_id, name, base_url, is_default, status)
-		  VALUES ($1, $2, 'Payments staging', 'https://pay.example.test', true, 'active'),
-		         ($3, $4, 'Checkout staging', 'https://checkout.example.test', true, 'active')`,
-			[]any{itEnv1, itSUT1, itEnv2, itSUT2}},
-		{`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template)
-		  VALUES ($1, $2, $3, 'Checkout page', 'https://pay.example.test/checkout', '/checkout'),
-		         ($4, $5, $6, 'Refund page', 'https://checkout.example.test/refund', '/refund')`,
-			[]any{itPage1, itSUT1, itEnv1, itPage2, itSUT2, itEnv2}},
-		{`INSERT INTO version (id, title, status, auto_design_new_requirements, created_by, created_at, updated_at)
-		  VALUES ($1, 'P4 chain integration', 'running', false, 1, now(), now())`,
-			[]any{itVersionID}},
-		{`INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
-		  VALUES ($1, $3, $4, $5, 'active'),
-		         ($2, $3, $6, $7, 'active')`,
-			[]any{itVersionSUT1, itVersionSUT2, itVersionID, itSUT1, itEnv1, itSUT2, itEnv2}},
-		{`INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
+		// v0.2.4-B: environment is top-level; the version binds one environment
+		// whose SUTs own the pages. There is no version_sut binding row anymore,
+		// so the SUT id is the key the design/execution/delivery rows reference.
+		{`INSERT INTO environment (id, name, status) VALUES ($1, 'P4 chain env', 'active')`,
+			[]any{itEnv1}},
+		{`INSERT INTO sut (id, environment_id, name, intro, base_url, created_by)
+		  VALUES ($1, $3, 'Payments', '', 'https://pay.example.test', 1),
+		         ($2, $3, 'Checkout', '', 'https://checkout.example.test', 1)`,
+			[]any{itSUT1, itSUT2, itEnv1}},
+		{`INSERT INTO sut_page (id, sut_id, name, url, route_template)
+		  VALUES ($1, $2, 'Checkout page', 'https://pay.example.test/checkout', '/checkout'),
+		         ($3, $4, 'Refund page', 'https://checkout.example.test/refund', '/refund')`,
+			[]any{itPage1, itSUT1, itPage2, itSUT2}},
+		{`INSERT INTO version (id, title, status, auto_design_new_requirements, created_by, environment_id, created_at, updated_at)
+		  VALUES ($1, 'P4 chain integration', 'running', false, 1, $2, now(), now())`,
+			[]any{itVersionID, itEnv1}},
+		{`INSERT INTO requirement (id, version_id, current_version_id, status,
 		                          closed_at, created_at, updated_at)
-		  VALUES ($1, $4, $2, 'clarified', '["9401"]'::jsonb, NULL, now(), now()),
-		         ($3, $4, $5, 'closed', '[]'::jsonb, now(), now(), now())`,
+		  VALUES ($1, $4, $2, 'clarified', NULL, now(), now()),
+		         ($3, $4, $5, 'closed', now(), now(), now())`,
 			[]any{itRequirement1, itRequirementV1, itRequirement2, itVersionID, itRequirementV2}},
-		{`INSERT INTO requirement_version (id, requirement_id, revision, title, description, priority,
-		                                   content_hash, target_version_suts, created_at)
-		  VALUES ($1, $2, 1, 'Pay flow', '', 'P1', $3, '["9401"]'::jsonb, now()),
-		         ($4, $5, 1, 'Refund flow', '', 'P2', $6, '[]'::jsonb, now())`,
+		{`INSERT INTO requirement_version (id, requirement_id, revision, title, priority,
+		                                   content_hash, created_at)
+		  VALUES ($1, $2, 1, 'Pay flow', 'P1', $3, now()),
+		         ($4, $5, 1, 'Refund flow', 'P2', $6, now())`,
 			[]any{itRequirementV1, itRequirement1, itHash("a"), itRequirementV2, itRequirement2, itHash("b")}},
 		{`INSERT INTO case_scenario (id, version_id, requirement_id, requirement_version_id, name,
-		                             description, version_sut_ids, page_ids, api_ids, sort_order)
-		  VALUES ($1, $3, $4, $5, 'Pay scenario', '', '["9401","9402"]'::jsonb, '["9301"]'::jsonb, '[]'::jsonb, 0),
-		         ($2, $3, $6, $7, 'Refund scenario', '', '["9402"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 0)`,
+		                             description, sort_order)
+		  VALUES ($1, $3, $4, $5, 'Pay scenario', '', 0),
+		         ($2, $3, $6, $7, 'Refund scenario', '', 0)`,
 			[]any{itScenario1, itScenario2, itVersionID, itRequirement1, itRequirementV1, itRequirement2, itRequirementV2}},
 		{`INSERT INTO case_entity (id, scenario_id, current_version_id, status)
 		  VALUES ($1, $3, $5, 'confirmed'), ($2, $4, $6, 'confirmed')`,
 			[]any{itCase1, itCase2, itScenario1, itScenario2, itCaseV1, itCaseV2}},
 		{`INSERT INTO case_version (id, case_id, revision, title, description, priority,
-		                            default_version_sut_id, version_sut_ids, page_ids, api_ids,
+		                            sut_description, covered_acs,
 		                            status, content_hash, created_at, updated_at)
-		  VALUES ($1, $4, 1, 'Pay with card', '', 'P1', 9401, '["9401","9402"]'::jsonb,
-		          '["9301"]'::jsonb, '[]'::jsonb, 'confirmed', $6, now(), now()),
-		         ($2, $5, 1, 'Refund order', '', 'P2', 9402, '["9402"]'::jsonb,
-		          '[]'::jsonb, '[]'::jsonb, 'confirmed', $7, now(), now()),
-		         ($3, $4, 2, 'Superseded pay title', '', 'P1', 9401, '["9402"]'::jsonb,
-		          '["9301"]'::jsonb, '[]'::jsonb, 'superseded', $8, now(), now())`,
+		  VALUES ($1, $4, 1, 'Pay with card', '', 'P1',
+		          'Payments checkout page and the pricing API.', '["AC-1","AC-2"]'::jsonb,
+		          'confirmed', $6, now(), now()),
+		         ($2, $5, 1, 'Refund order', '', 'P2',
+		          'Checkout refund flow.', '["AC-1"]'::jsonb,
+		          'confirmed', $7, now(), now()),
+		         ($3, $4, 2, 'Superseded pay title', '', 'P1',
+		          'Payments checkout page.', '["AC-1"]'::jsonb,
+		          'superseded', $8, now(), now())`,
 			[]any{itCaseV1, itCaseV2, itCaseVSuperseded, itCase1, itCase2, itHash("c"), itHash("d"), itHash("e")}},
-		{`INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids,
+		// v0.2.4-B (T27 fixture follow-up): case_scenario / case_version no longer
+		// carry version_sut_ids / page_ids / api_ids / default_version_sut_id --
+		// design_0004_v024_case_contract.sql dropped them and the natural-language
+		// case contract (sut_description + covered_acs) replaced them. The seeds
+		// above now match the current schema; the chain case node projects those
+		// two typed fields (T27/U8). execution_intent.sut_ids /
+		// case_run_sut_context.sut_id were renamed by execution_0008_v024_rekey (T11).
+		{`INSERT INTO execution_intent (id, version_id, case_version_id, sut_ids,
 		                                environment_fingerprint, purpose, status, dedupe_key)
-		  VALUES ($1, $3, $4, '["9401"]'::jsonb, $5, 'initial', 'done', 'chain-intent-1'),
-		         ($2, $3, $6, '["9402"]'::jsonb, $7, 'initial', 'done', 'chain-intent-2')`,
+		  VALUES ($1, $3, $4, '["9101"]'::jsonb, $5, 'initial', 'done', 'chain-intent-1'),
+		         ($2, $3, $6, '["9102"]'::jsonb, $7, 'initial', 'done', 'chain-intent-2')`,
 			[]any{itIntent1, itIntent2, itVersionID, itCaseV1, itHash("f"), itCaseVSuperseded, itHash("1")}},
 		{`INSERT INTO run_wave (id, version_id, status, trigger, counts, finished_at, created_at, updated_at)
 		  VALUES ($1, $3, 'done', 'auto',
@@ -223,19 +229,19 @@ func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) map[int64]time.Time {
 		          '{"step_total":3,"step_failed":1,"assertion_total":2,"assertion_failed":1,"evidence_count":2,"verdict_reason":"amount mismatch"}'::jsonb,
 		          now(), now())`,
 			[]any{itRun1, itRun2, itWave1, itWave2, itIntent1, itIntent2, itCaseV1, itCaseVSuperseded}},
-		{`INSERT INTO case_run_sut_context (id, case_run_id, version_sut_id, account_role, status)
+		{`INSERT INTO case_run_sut_context (id, case_run_id, sut_id, account_role, status)
 		  VALUES ($1, $2, $3, 'admin', 'closed')`,
-			[]any{itSUTRun2, itRun2, itVersionSUT2}},
+			[]any{itSUTRun2, itRun2, itSUT2}},
 		{`INSERT INTO delivery_issue (id, version_id, title, summary, status, category, severity,
 		                              dedupe_key, source, expected_revision, created_at, updated_at)
 		  VALUES ($1, $2, 'Amount mismatch', 'expected 10 got 20', 'open', 'api', 'major',
 		          $3, 'failure_candidate', 1, now(), now())`,
 			[]any{itIssueID, itVersionID, itDedupeKey()}},
-		{`INSERT INTO delivery_issue_ref (id, issue_id, kind, ref_id, version_sut_id, role)
+		{`INSERT INTO delivery_issue_ref (id, issue_id, kind, ref_id, sut_id, role)
 		  VALUES (901, $1, 'case_run', $2, $3, 'source'),
 		         (902, $1, 'wave', $4, NULL, 'source'),
 		         (903, $1, 'requirement', $5, NULL, 'source')`,
-			[]any{itIssueID, itRun2, itVersionSUT2, itWave2, itRequirement1}},
+			[]any{itIssueID, itRun2, itSUT2, itWave2, itRequirement1}},
 		{`INSERT INTO delivery_report (id, version_id, wave_id, kind, current_revision_id, status, input_fingerprint)
 		  VALUES ($1, $2, $4, 'wave', $3, 'published', $5)`,
 			[]any{itReportID, itVersionID, itReportRevID, itWave2, itHash("2")}},
@@ -245,9 +251,9 @@ func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) map[int64]time.Time {
 			[]any{itReportRevID, itReportID, itHash("2")}},
 		{`INSERT INTO delivery_report_ref (id, report_id, report_revision_id, kind, ref_id)
 		  VALUES (911, $1, $2, 'issue', $3), (912, $1, $2, 'case_run', $4),
-		         (913, $1, $2, 'wave', $5), (914, $1, $2, 'version_sut', $6),
+		         (913, $1, $2, 'wave', $5), (914, $1, $2, 'sut', $6),
 		         (915, $1, $2, 'requirement', $7)`,
-			[]any{itReportID, itReportRevID, itIssueID, itRun2, itWave2, itVersionSUT1, itRequirement1}},
+			[]any{itReportID, itReportRevID, itIssueID, itRun2, itWave2, itSUT1, itRequirement1}},
 		{`INSERT INTO requirement_closure (id, requirement_id, requirement_version_id, close_round,
 		                                   check_result, evidence_refs, closed_at, reopen_count)
 		  VALUES ($1, $2, $3, 1,
@@ -351,8 +357,8 @@ func TestProvidersChainIntegration(t *testing.T) {
 	if node := nodes["case_run:9822"]; node.Status != "failed" {
 		t.Errorf("case run status = %q, want failed", node.Status)
 	}
-	if node := nodes["case_run:9822"]; !slices.Equal(node.VersionSUTIDs, []int64{itVersionSUT2}) {
-		t.Errorf("case run version SUT ids = %v, want [%d]", node.VersionSUTIDs, itVersionSUT2)
+	if node := nodes["case_run:9822"]; !slices.Equal(node.SUTIDs, []int64{itSUT2}) {
+		t.Errorf("case run SUT ids = %v, want [%d]", node.SUTIDs, itSUT2)
 	}
 	if node := nodes["closure:9951"]; node.Status != versionapp.ClosureSummaryStatusReopened {
 		t.Errorf("closure status = %q, want reopened for the incremented reopen_count", node.Status)
@@ -366,16 +372,28 @@ func TestProvidersChainIntegration(t *testing.T) {
 		t.Errorf("issue refs were not projected: %+v", node)
 	}
 
-	// Cross-SUT labels: the case uses both version SUTs, so both SUT names must
-	// be attached after the resource provider resolves the labels.
+	// v0.2.4-B (T27 fixture follow-up): a case version no longer binds SUT/page
+	// ids -- design_0004 deleted that capability and the natural-language case
+	// contract replaced it. The pre-inversion assertions here checked cross-SUT
+	// labels (Payments + Checkout) and page labels (Checkout page) resolved from
+	// the case's version_sut_ids/page_ids; those columns no longer exist, so a
+	// case node carries no sut_labels/page_labels. They are replaced by assertions
+	// on the typed sut_description/covered_acs fields the chain now projects
+	// (T27/U8 promoted them out of the untyped Meta map). SUT/page labels still
+	// attach to the execution/delivery nodes that reference a SUT (see the filter
+	// test and TestProvidersDirectReads).
 	caseNode := nodes["case_version:9711"]
-	labels, _ := caseNode.Meta["sut_labels"].([]string)
-	if !slices.Contains(labels, "Payments") || !slices.Contains(labels, "Checkout") {
-		t.Errorf("cross-SUT labels = %v, want Payments and Checkout", caseNode.Meta["sut_labels"])
+	if caseNode.SutDescription != "Payments checkout page and the pricing API." {
+		t.Errorf("case sut_description = %q, want the seeded natural-language description", caseNode.SutDescription)
 	}
-	pageLabels, _ := caseNode.Meta["page_labels"].([]string)
-	if !slices.Contains(pageLabels, "Checkout page") {
-		t.Errorf("page labels = %v, want Checkout page", caseNode.Meta["page_labels"])
+	if !slices.Equal(caseNode.CoveredACs, []string{"AC-1", "AC-2"}) {
+		t.Errorf("case covered_acs = %v, want [AC-1 AC-2]", caseNode.CoveredACs)
+	}
+	if _, found := caseNode.Meta["sut_labels"]; found {
+		t.Errorf("case node still carries pre-inversion sut_labels: %v", caseNode.Meta["sut_labels"])
+	}
+	if _, found := caseNode.Meta["page_labels"]; found {
+		t.Errorf("case node still carries pre-inversion page_labels: %v", caseNode.Meta["page_labels"])
 	}
 
 	edges := edgeSet(view.Edges)
@@ -407,17 +425,17 @@ func TestProvidersChainIntegrationRequirementBudget(t *testing.T) {
 
 	const extraRoots = chain.DefaultMaxRequirements + 5
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
+		INSERT INTO requirement (id, version_id, current_version_id, status,
 		                          created_at, updated_at)
-		SELECT 10000 + g, $1::bigint, 20000 + g, 'clarified', '[]'::jsonb, now(), now()
+		SELECT 10000 + g, $1::bigint, 20000 + g, 'clarified', now(), now()
 		FROM generate_series(1, $2::int) AS g`,
 		itVersionID, extraRoots); err != nil {
 		t.Fatalf("insert bulk requirements: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement_version (id, requirement_id, revision, title, description, priority,
-		                                 content_hash, target_version_suts, created_at)
-		SELECT 20000 + g, 10000 + g, 1, 'Bulk requirement', '', 'P2', repeat('a', 64), '[]'::jsonb, now()
+		INSERT INTO requirement_version (id, requirement_id, revision, title, priority,
+		                                 content_hash, created_at)
+		SELECT 20000 + g, 10000 + g, 1, 'Bulk requirement', 'P2', repeat('a', 64), now()
 		FROM generate_series(1, $1::int) AS g`, extraRoots); err != nil {
 		t.Fatalf("insert bulk requirement versions: %v", err)
 	}
@@ -562,6 +580,24 @@ func TestProvidersDirectReads(t *testing.T) {
 	if refs, _ := reports[0].Meta["issue_ids"].([]int64); !slices.Contains(refs, int64(itIssueID)) {
 		t.Errorf("report issue refs = %v", reports[0].Meta)
 	}
+	// v0.2.4-B regression guard for the kept cross-context report-ref kind. The
+	// 'sut' delivery_report_ref seed (ref_id=itSUT1) must reach the report
+	// node's SUTIDs through the delivery.ReportRefKindSUT switch (T11e-4 deleted the
+	// local alias group; the provider now reads the delivery domain constant).
+	// T14 renamed delivery's emitted kind to 'sut' and updated that switch in
+	// lockstep; if a future edit drifts, the SUT ids silently vanish. The filter
+	// test cannot catch this (it filters by itSUT2 while the report carries
+	// itSUT1), so assert the report SUT ids directly here.
+	if !slices.Equal(reports[0].SUTIDs, []int64{itSUT1}) {
+		t.Errorf("report SUT ids = %v, want [%d] from the 'sut' report ref", reports[0].SUTIDs, itSUT1)
+	}
+	if reports[0].SUTID == nil || *reports[0].SUTID != itSUT1 {
+		t.Errorf("report SUT id = %v, want %d", reports[0].SUTID, itSUT1)
+	}
+	// The issue's sut_id ref column (itSUT2) must reach the issue node.
+	if !slices.Equal(issues[0].SUTIDs, []int64{itSUT2}) {
+		t.Errorf("issue SUT ids = %v, want [%d] from the issue ref sut_id", issues[0].SUTIDs, itSUT2)
+	}
 	if closures[0].RequirementID == nil || *closures[0].RequirementID != itRequirement2 {
 		t.Errorf("closure node requirement = %v", closures[0].RequirementID)
 	}
@@ -570,7 +606,7 @@ func TestProvidersDirectReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SUTNames: %v", err)
 	}
-	if sutNames[itVersionSUT1] != "Payments" || sutNames[itVersionSUT2] != "Checkout" {
+	if sutNames[itSUT1] != "Payments" || sutNames[itSUT2] != "Checkout" {
 		t.Errorf("SUT names = %v", sutNames)
 	}
 	pageNames, err := bundle.Resource.PageNames(ctx, itVersionID)
@@ -635,16 +671,16 @@ func TestProvidersChainIntegrationEventRange(t *testing.T) {
 	}
 	for _, requirement := range requirements {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
+			INSERT INTO requirement (id, version_id, current_version_id, status,
 			                          created_at, updated_at)
-			VALUES ($1, $2, $3, 'clarified', '[]'::jsonb, $4, $4)`,
+			VALUES ($1, $2, $3, 'clarified', $4, $4)`,
 			requirement.id, itVersionID, requirement.versionID, requirement.at); err != nil {
 			t.Fatalf("insert range requirement %d: %v", requirement.id, err)
 		}
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO requirement_version (id, requirement_id, revision, title, description, priority,
-			                                 content_hash, target_version_suts, created_at)
-			VALUES ($1, $2, 1, 'Range requirement', '', 'P2', $3, '[]'::jsonb, $4)`,
+			INSERT INTO requirement_version (id, requirement_id, revision, title, priority,
+			                                 content_hash, created_at)
+			VALUES ($1, $2, 1, 'Range requirement', 'P2', $3, $4)`,
 			requirement.versionID, requirement.id, requirement.contentHash, requirement.at); err != nil {
 			t.Fatalf("insert range requirement version %d: %v", requirement.versionID, err)
 		}
@@ -694,14 +730,14 @@ func TestProvidersChainIntegrationFilters(t *testing.T) {
 	_, bundle := newChainProviders(t)
 	ctx := context.Background()
 
-	sutID := int64(itVersionSUT2)
-	view, err := bundle.Service.Read(ctx, itVersionID, chain.ChainFilter{VersionSUTID: &sutID})
+	sutID := int64(itSUT2)
+	view, err := bundle.Service.Read(ctx, itVersionID, chain.ChainFilter{SUTID: &sutID})
 	if err != nil {
 		t.Fatalf("filtered Read: %v", err)
 	}
 	for _, node := range view.Nodes {
-		matches := node.VersionSUTID != nil && *node.VersionSUTID == sutID
-		for _, id := range node.VersionSUTIDs {
+		matches := node.SUTID != nil && *node.SUTID == sutID
+		for _, id := range node.SUTIDs {
 			matches = matches || id == sutID
 		}
 		if !matches {
@@ -709,10 +745,22 @@ func TestProvidersChainIntegrationFilters(t *testing.T) {
 		}
 	}
 	nodes := nodeIndex(view.Nodes)
-	if _, ok := nodes["case_version:9712"]; !ok {
-		t.Errorf("SUT-scoped filter lost the case node: %v", view.Nodes)
-	}
+	// v0.2.4-B (T27 fixture follow-up): a SUT-scoped filter keeps the nodes that
+	// actually reference the SUT -- the case run that executed against it
+	// (case_run_sut_context.sut_id = itSUT2) and the issue raised on it
+	// (delivery_issue_ref.sut_id = itSUT2). Case versions no longer bind SUT ids
+	// (design_0004 deleted that capability), so the pre-inversion assertion that
+	// case_version:9712 survives a SUT filter is replaced: no case_version node is
+	// SUT-scoped any more, and the run/issue nodes that carry itSUT2 are kept.
 	if _, ok := nodes["case_run:9822"]; !ok {
-		t.Errorf("SUT-scoped filter lost the cross-SUT run node: %v", view.Nodes)
+		t.Errorf("SUT-scoped filter lost the run node that executed against itSUT2: %v", view.Nodes)
+	}
+	if _, ok := nodes["issue:9901"]; !ok {
+		t.Errorf("SUT-scoped filter lost the issue node referencing itSUT2: %v", view.Nodes)
+	}
+	for id := range nodes {
+		if strings.HasPrefix(id, "case_version:") {
+			t.Errorf("case_version node %q survived a SUT filter; case versions no longer bind SUT ids", id)
+		}
 	}
 }

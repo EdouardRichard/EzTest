@@ -33,6 +33,11 @@ const executionApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/execution/api", () => executionApi)
 
+// The report full-text/waiver surface is self-contained and covered by its own
+// tests (features/reports); stub it here so this tab's tests stay focused on the
+// list/detail/revision/export behaviour.
+vi.mock("@/features/reports/ReportInsights", () => ({ ReportInsights: () => null }))
+
 const navigation = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
@@ -190,7 +195,7 @@ const createdArtifact: ReportArtifactView = {
 const screenshotEvidence: Evidence = {
   id: "9401",
   case_run_id: "9301",
-  version_sut_id: "1001",
+  sut_id: "1001",
   step_seq: 1,
   assertion_seq: null,
   kind: "screenshot",

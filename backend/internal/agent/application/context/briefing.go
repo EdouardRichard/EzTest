@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // BriefingTokenBudget is the total render envelope from spec R-A8-5 (≤3k
@@ -129,6 +130,13 @@ type Briefing struct {
 	mandatoryPlan     string
 	mandatoryFindings string
 	mandatoryHandoff  string
+
+	// findings is the source fact set the findings group and its protected
+	// prefix were derived from. It is kept so a consumer that must exclude a
+	// fact family (the independent judge excludes agent narrative) can RE-DERIVE
+	// the group through the same render functions instead of hand-editing the
+	// rendered text. It never affects Render's bytes.
+	findings []FactSnapshot
 }
 
 // BriefingBuilder builds version briefings from a Reader.
@@ -139,6 +147,60 @@ type BriefingBuilder struct {
 // NewBriefingBuilder wires the briefing builder to its read port.
 func NewBriefingBuilder(reader Reader) *BriefingBuilder {
 	return &BriefingBuilder{reader: reader}
+}
+
+// WithoutHandoff returns a copy of b with the clarification→design handoff
+// group removed. The independent design judge (v0.2.4-E quality gate, I-B4)
+// must not read the handoff document — it is a collaboration artifact carrying
+// the clarification Host's and design author's discussion, not a version fact
+// the judge needs (requirement.read/design.graph_read give it the current
+// requirement and case content directly). Every other group (goal/stage,
+// confirmed requirements, case counts, findings, execution, knowledge, open
+// questions) is version-level fact, not author chat/reasoning, and stays.
+// The receiver is a value, so the original Briefing is never mutated.
+func (b Briefing) WithoutHandoff() Briefing {
+	b.Handoff = nil
+	b.mandatoryHandoff = ""
+	return b
+}
+
+// WithoutAgentNarrative returns a copy of b whose findings group excludes the
+// agent's own narrative conclusions (v0.2.4-E quality gate, I-B4; whole-branch
+// review Important #3). The findings group renders EVERY current version_fact,
+// and task.complete / the run settlement write kind=progress whose
+// payload.summary IS the author's own conclusion — so stripping only the handoff
+// still handed the independent judge the author's verdict on its own work,
+// anchoring the judgement the gate exists to keep independent.
+//
+// The group and its PROTECTED top-3 prefix are re-derived from the filtered fact
+// set through the same render functions (single derivation, no hand-edited text
+// and no stale mandatory prefix). Objective version facts — approved resources,
+// stage transitions, clarification decisions — stay: they are version truth, not
+// author reasoning. The receiver is a value, so the original is never mutated.
+// A Briefing that was not derived by newBriefing carries no source facts, so the
+// group re-derives to noneText: fail closed rather than showing findings whose
+// provenance cannot be checked (only BuildBriefing feeds the judge path).
+func (b Briefing) WithoutAgentNarrative() Briefing {
+	kept := make([]FactSnapshot, 0, len(b.findings))
+	for _, fact := range b.findings {
+		if agentNarrativeFactKind(fact.Kind) {
+			continue
+		}
+		kept = append(kept, fact)
+	}
+	b.findings = kept
+	b.Findings = briefingSection(SectionFindings, sectionTitleFindings, findingsBody(kept))
+	b.mandatoryFindings = findingsMandatoryBody(kept)
+	return b
+}
+
+// agentNarrativeFactKind reports whether a version_fact kind carries an agent's
+// own narrative conclusion rather than version-level objective fact. The kind
+// vocabulary's single authority is the version domain (version.FactKind*); the
+// completion producer aliases the same constant, so the exclusion cannot drift
+// from what task.complete actually writes.
+func agentNarrativeFactKind(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(kind), version.FactKindProgress)
 }
 
 // BuildBriefing derives the briefing of one version. It validates the version
@@ -185,6 +247,7 @@ func newBriefing(source Source) Briefing {
 		mandatoryPlan:     planMandatoryBody(source.Plan),
 		mandatoryFindings: findingsMandatoryBody(source.Findings),
 		mandatoryHandoff:  handoffMandatory,
+		findings:          source.Findings,
 	}
 	return briefing
 }
@@ -590,21 +653,6 @@ func casesBody(in CasesSnapshot) string {
 	return strings.Join(parts, "\n")
 }
 
-// planTerminalStatuses are the statuses that mean a plan item no longer needs
-// work (spec R-A8-5). The set mirrors the production read port filter
-// (done/completed/cancelled/skipped/failed/closed) and also accepts the
-// cancelled spelling alias. Current and next are always chosen among the other
-// items.
-var planTerminalStatuses = map[string]bool{
-	"done":      true,
-	"completed": true,
-	"skipped":   true,
-	"cancelled": true,
-	"canceled":  true,
-	"failed":    true,
-	"closed":    true,
-}
-
 // planItemView is one renderable plan item: its normalized status and its
 // already-rendered label.
 type planItemView struct {
@@ -612,10 +660,14 @@ type planItemView struct {
 	label  string
 }
 
-// planItemTerminal reports whether a plan status is terminal. An empty or
-// unknown status counts as open, so a malformed row still shows up as work.
+// planItemTerminal reports whether a plan status is terminal. It DERIVES from
+// the version domain authority (version.PlanItemTerminal / the
+// PlanItemTerminalStatuses set, spec R-A8-5) — the hand-written map this
+// replaced was a second truth (invariant 15②, closed by v0.2.4-C T22). An empty
+// or unknown status counts as open, so a malformed row still shows up as work.
+// Current and next are always chosen among the other items.
 func planItemTerminal(status string) bool {
-	return planTerminalStatuses[strings.ToLower(oneLine(status))]
+	return version.PlanItemTerminal(status)
 }
 
 // planViews returns the renderable plan items in plan order. Items without a

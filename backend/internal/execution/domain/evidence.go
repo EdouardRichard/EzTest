@@ -2,7 +2,10 @@ package execution
 
 import "time"
 
-// EvidenceKind is the frozen evidence kind enum (P3-D-21, extended by P5 §3.6).
+// EvidenceKind is the persisted evidence kind enum. The kind set is the single
+// registry of what the evidence settlement path accepts: every execution
+// channel declares its evidence kind here, and an artifact kind outside this
+// registry fails closed (constitution art.4.5).
 type EvidenceKind string
 
 const (
@@ -14,39 +17,47 @@ const (
 	EvidenceDB         EvidenceKind = "db"
 	EvidenceDownload   EvidenceKind = "download"
 	EvidenceText       EvidenceKind = "text"
-	// P5 visual evidence kinds: the live capture and the pixel-diff image of
-	// one visual assertion comparison (executor visual.compare).
-	EvidenceVisualActual EvidenceKind = "visual_actual"
-	EvidenceVisualDiff   EvidenceKind = "visual_diff"
+	// Recording-layer kinds (v0.2.4-C): command execution records, workspace
+	// file snapshots and browser/execution traces. Producers are the executor
+	// v2 recording layer; the settlement path accepts them through this
+	// registry like every other kind.
+	EvidenceCommand EvidenceKind = "command"
+	EvidenceFile    EvidenceKind = "file"
+	EvidenceTrace   EvidenceKind = "trace"
 )
 
-// EvidenceMaxPerCaseRun caps the evidence rows of one case_run. Overflow is
-// dropped and counted, never failed.
-const EvidenceMaxPerCaseRun = 100
-
-// Valid reports whether kind is one of the ten persisted evidence kinds.
-func (k EvidenceKind) Valid() bool {
-	switch k {
-	case EvidenceScreenshot, EvidenceSnapshot, EvidenceConsole, EvidenceNetwork,
+// EvidenceKinds is the authoritative evidence-kind registry. API enums, the
+// artifact settlement gate and contract tests derive from it; do not maintain
+// a second hand-written kind list.
+func EvidenceKinds() []EvidenceKind {
+	return []EvidenceKind{
+		EvidenceScreenshot, EvidenceSnapshot, EvidenceConsole, EvidenceNetwork,
 		EvidenceHTTP, EvidenceDB, EvidenceDownload, EvidenceText,
-		EvidenceVisualActual, EvidenceVisualDiff:
-		return true
-	default:
-		return false
+		EvidenceCommand, EvidenceFile, EvidenceTrace,
 	}
+}
+
+// Valid reports whether kind is one of the persisted evidence kinds.
+func (k EvidenceKind) Valid() bool {
+	for _, kind := range EvidenceKinds() {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // MIME returns the default MIME type for a kind when the uploaded artifact does
 // not carry one.
 func (k EvidenceKind) MIME() string {
 	switch k {
-	case EvidenceScreenshot, EvidenceVisualActual, EvidenceVisualDiff:
+	case EvidenceScreenshot:
 		return "image/png"
 	case EvidenceSnapshot, EvidenceText, EvidenceDB:
 		return "text/plain; charset=utf-8"
 	case EvidenceConsole, EvidenceNetwork, EvidenceHTTP:
 		return "application/json"
-	case EvidenceDownload:
+	case EvidenceDownload, EvidenceCommand, EvidenceFile, EvidenceTrace:
 		return "application/octet-stream"
 	default:
 		return "application/octet-stream"
@@ -58,7 +69,7 @@ func (k EvidenceKind) MIME() string {
 type Evidence struct {
 	ID             int64
 	CaseRunID      int64
-	VersionSUTID   *int64
+	SUTID          *int64
 	StepSeq        *int
 	AssertionSeq   *int
 	Kind           EvidenceKind
@@ -103,11 +114,11 @@ type EvidenceRef struct {
 // EvidenceFilter narrows one evidence page. Limit and BeforeID implement the
 // shared descending-ID cursor convention.
 type EvidenceFilter struct {
-	CaseRunID    *int64
-	VersionSUTID *int64
-	Kind         EvidenceKind
-	BeforeID     *int64
-	Limit        int
+	CaseRunID *int64
+	SUTID     *int64
+	Kind      EvidenceKind
+	BeforeID  *int64
+	Limit     int
 }
 
 // EvidenceFilenameMax / EvidenceMIMEMax bound evidence metadata strings.

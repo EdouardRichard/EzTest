@@ -62,13 +62,13 @@ func derefID(value *int64) int64 {
 	return *value
 }
 
-// uniqueSortedIDs normalizes a version_sut ID set: positive, unique, ascending.
+// uniqueSortedIDs normalizes a SUT id set: positive, unique, ascending.
 func uniqueSortedIDs(ids []int64) ([]int64, error) {
 	seen := make(map[int64]struct{}, len(ids))
 	result := make([]int64, 0, len(ids))
 	for _, id := range ids {
 		if id <= 0 {
-			return nil, platform.Invalid("version_sut_ids", "must contain positive decimal IDs")
+			return nil, platform.Invalid("sut_ids", "must contain positive decimal IDs")
 		}
 		if _, ok := seen[id]; ok {
 			continue

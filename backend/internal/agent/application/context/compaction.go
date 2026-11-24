@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -208,20 +209,37 @@ const (
 // String returns the stable payload spelling of the trigger.
 func (t CompactionTrigger) String() string { return string(t) }
 
+// CompactionTriggers returns the v0.22 trigger vocabulary in stable order. It is
+// the ONE enumerable authority of the set: Valid, Validate and every consumer
+// that must cover "all triggers" (for example the activity fact hook's test)
+// derive from it, so adding a trigger cannot leave a hand-written list behind
+// (constitution 五.1/五.3).
+func CompactionTriggers() []CompactionTrigger {
+	return []CompactionTrigger{
+		CompactionTriggerPressure,
+		CompactionTriggerOverflow,
+		CompactionTriggerStageBoundary,
+	}
+}
+
 // Valid reports whether the trigger belongs to the v0.22 set.
 func (t CompactionTrigger) Valid() bool {
-	switch t {
-	case CompactionTriggerPressure, CompactionTriggerOverflow, CompactionTriggerStageBoundary:
-		return true
-	default:
-		return false
+	for _, trigger := range CompactionTriggers() {
+		if t == trigger {
+			return true
+		}
 	}
+	return false
 }
 
 // Validate returns a typed invalid-argument error for an unknown trigger.
 func (t CompactionTrigger) Validate() error {
 	if !t.Valid() {
-		return platform.Invalid("trigger", "must be one of pressure, overflow, stage_boundary")
+		names := make([]string, 0, len(CompactionTriggers()))
+		for _, trigger := range CompactionTriggers() {
+			names = append(names, string(trigger))
+		}
+		return platform.Invalid("trigger", "must be one of "+strings.Join(names, ", "))
 	}
 	return nil
 }

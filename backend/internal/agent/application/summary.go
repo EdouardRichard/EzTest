@@ -15,6 +15,7 @@ import (
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 const (
@@ -741,20 +742,12 @@ func summaryConfidence(confidence *float64) string {
 	return strconv.FormatFloat(*confidence, 'f', 2, 64)
 }
 
-// summaryTerminalStatuses mirrors the briefing plan-terminal set: an unknown or
-// empty status is open (never silently hidden).
-var summaryTerminalStatuses = map[string]bool{
-	"done":      true,
-	"completed": true,
-	"skipped":   true,
-	"cancelled": true,
-	"canceled":  true,
-	"failed":    true,
-	"closed":    true,
-}
-
+// summaryPlanTerminal DERIVES from the version domain authority
+// (version.PlanItemTerminal) — the hand-written map this replaced was a second
+// truth (invariant 15③, closed by v0.2.4-C T22). An unknown or empty status is
+// open (never silently hidden).
 func summaryPlanTerminal(status string) bool {
-	return summaryTerminalStatuses[strings.ToLower(strings.TrimSpace(status))]
+	return version.PlanItemTerminal(status)
 }
 
 func summaryPlanStatus(status string) string {

@@ -15,6 +15,78 @@ import (
 // freeze an enum, so any non-empty value is accepted.
 const PlanItemStatusPending = "pending"
 
+// PlanItemStatusInProgress is the open (non-terminal) plan-item status for work
+// underway. The runtime Host-turn plan builder writes it and reads it back
+// (cmd/eztest/v022_runtime_tools.go), so THAT read/write pair cannot drift apart.
+// The extraction milestone's open-run projection (application.ExtractionPlanStatusRunning)
+// currently shares the same value but is a SEPARATE constant, not derived from this
+// one. The AST writer-link test (plan_item_test.go) enumerates that constant and
+// requires its value to classify terminal or known-open, so a drift to an unclassified
+// value (e.g. "running") fails; a drift to another known-open value (e.g. "pending")
+// would pass classification yet break value equality. Deriving ExtractionPlanStatusRunning
+// from this constant is registered as a named debt (task-18-report.md R4).
+const PlanItemStatusInProgress = "in_progress"
+
+// planItemTerminalStatuses is the single authoritative set of FINISHED plan-item
+// statuses (lower-case). Both PlanItemTerminal (the Go predicate the handoff
+// reader calls) and PlanItemTerminalStatuses (the text[] the briefing reader binds
+// into SQL) derive from this one list, so THESE TWO readers (handoff + briefing)
+// cannot disagree about "is this item finished?". The three former backend reader
+// copies (agent context/briefing, agent summary, tools/task_complete) now DERIVE from
+// this authority via version.PlanItemTerminal — v0.2.4-C T22 closed the live
+// task_complete two-value divergence (regression pin
+// TestPlanItemCompletionAcceptsAllTerminalStatuses). The only remaining mirror is the
+// frontend plan-status.ts (consumed by PlanPanel), a guarded cross-language copy pinned
+// both ways: Go TestEnumAuthorityFrontendPlanStatus reads that file, and
+// plan-status.test.ts pins its set equal to this authority.
+//
+// The set is derived from the writers, not from either legacy reader copy
+// (v0.2.4-B fix round 2: the briefing and handoff carried divergent hand-written
+// sets, so a failed/closed item was finished in one reader and open in the other):
+//   - done, failed: the extraction milestone writes these as the FINAL states of a
+//     run (application.ExtractionPlanStatusDone / ExtractionPlanStatusFailed,
+//     mapped from ExtractionRunDone / ExtractionRunFailed); the agent completion
+//     path writes done (application.CompletionPlanStatusDone);
+//   - in_progress: the milestone's open-run state, the runtime plan tools'
+//     in-progress state, and the settlement writeback (application.SettlementPlanStatus
+//     = "in_progress": a run that settled without a verified completion did NOT
+//     finish its item, so the next run can continue it) — NON-terminal;
+//   - completed, cancelled, canceled, skipped, closed: completion / abandonment /
+//     skip / closure states the model may write through the free-form plan.update
+//     tool — each denotes an item that will not progress further. Both cancelled
+//     spellings are accepted because the tool does not constrain the status string.
+//
+// pending (the planner's initial status and Normalize's default) and in_progress
+// (the milestone's open-run status) are NON-terminal, as is any other ongoing-work
+// value. This predicate CLASSIFIES values for readers; it does not freeze what the
+// DB/contracts accept (the enum above stays open).
+var planItemTerminalStatuses = []string{
+	"done", "completed", "cancelled", "canceled", "skipped", "failed", "closed",
+}
+
+// PlanItemTerminal reports whether a plan-item status denotes a finished item —
+// one that must not be presented as open work. Normalization (trim + lower-case)
+// matches the legacy handoff classifier so a stored " Done " or "FAILED"
+// classifies identically. It is the single classification authority shared by the
+// agent briefing and the design handoff readers.
+func PlanItemTerminal(status string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	for _, terminal := range planItemTerminalStatuses {
+		if normalized == terminal {
+			return true
+		}
+	}
+	return false
+}
+
+// PlanItemTerminalStatuses returns a copy of the authoritative terminal set for
+// readers that filter in SQL. Bind it as a text[] parameter and compare against
+// lower(btrim(status)) so the SQL classification matches PlanItemTerminal's
+// trim + lower-case normalization. The copy keeps the authority unmodifiable.
+func PlanItemTerminalStatuses() []string {
+	return append([]string(nil), planItemTerminalStatuses...)
+}
+
 // PlanItem persistence errors.
 var (
 	// ErrPlanNotFound reports a missing version_plan_item row.

@@ -9,6 +9,7 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Spinner } from "@/components/ui/Spinner"
 
 import { listPlanItems, type PlanItem, planConflictDetails, updatePlanItem } from "./api"
+import { planItemTerminal } from "./plan-status"
 
 const STATUS_LABEL: Record<string, string> = {
   pending: "待办",
@@ -17,7 +18,10 @@ const STATUS_LABEL: Record<string, string> = {
   done: "已完成",
   completed: "已完成",
   cancelled: "已取消",
+  canceled: "已取消",
   skipped: "已跳过",
+  failed: "失败",
+  closed: "已关闭",
 }
 
 /** Display order of the status groups: open work first, closed work last. */
@@ -28,19 +32,34 @@ const STATUS_ORDER = [
   "done",
   "completed",
   "cancelled",
+  "canceled",
   "skipped",
+  "failed",
+  "closed",
 ]
 
-const TERMINAL_STATUSES = new Set(["done", "completed", "cancelled", "skipped"])
+// T20 product decisions (NOT the terminal set):
+// COMPLETED_STATUSES = the "successfully done" states that show a checked box and
+// can be toggled back to pending. failed/closed/cancelled are terminal but did not
+// succeed, so they are NOT "completed".
 const COMPLETED_STATUSES = new Set(["done", "completed"])
-const NON_TOGGLEABLE_STATUSES = new Set(["cancelled", "skipped"])
+// NON_TOGGLEABLE_STATUSES = every terminal state except done/completed. A finished
+// item that did not succeed (cancelled/canceled/skipped/failed/closed) must not be
+// flipped by the simple "complete" checkbox; only done/completed are toggleable.
+const NON_TOGGLEABLE_STATUSES = new Set(["cancelled", "canceled", "skipped", "failed", "closed"])
+
+/** Trim + lower-case mirrors Go PlanItemTerminal so " Done "/"FAILED" classify
+ * identically across the terminal, completed and non-toggleable vocabularies. */
+function normalizeStatus(status: string): string {
+  return status.trim().toLowerCase()
+}
 
 function isTerminal(status: string): boolean {
-  return TERMINAL_STATUSES.has(status)
+  return planItemTerminal(status)
 }
 
 function isCompleted(status: string): boolean {
-  return COMPLETED_STATUSES.has(status)
+  return COMPLETED_STATUSES.has(normalizeStatus(status))
 }
 
 function statusLabel(status: string): string {
@@ -134,7 +153,8 @@ export function PlanPanel({ versionId, onChanged, refreshKey = 0 }: PlanPanelPro
   }
 
   async function toggle(item: PlanItem): Promise<void> {
-    if (toggling[item.id] === true || NON_TOGGLEABLE_STATUSES.has(item.status)) return
+    if (toggling[item.id] === true || NON_TOGGLEABLE_STATUSES.has(normalizeStatus(item.status)))
+      return
     const nextStatus = isCompleted(item.status) ? "pending" : "done"
     const previousItems = items
     const baseItems = items ?? []
@@ -252,7 +272,7 @@ export function PlanPanel({ versionId, onChanged, refreshKey = 0 }: PlanPanelPro
               <ul className="space-y-1">
                 {group.items.map((item) => {
                   const checked = isCompleted(item.status)
-                  const toggleable = !NON_TOGGLEABLE_STATUSES.has(item.status)
+                  const toggleable = !NON_TOGGLEABLE_STATUSES.has(normalizeStatus(item.status))
                   return (
                     <li
                       key={item.id}

@@ -127,8 +127,8 @@ func waveNode(wave execution.RunWave) chain.Node {
 			"evidence_count": wave.Counts.Evidence,
 		},
 	}
-	if len(wave.Counts.ByVersionSUT) > 0 {
-		node.Meta["by_version_sut"] = wave.Counts.ByVersionSUT
+	if len(wave.Counts.BySUT) > 0 {
+		node.Meta["by_sut"] = wave.Counts.BySUT
 	}
 	if wave.StartedAt != nil {
 		node.Meta["started_at"] = *wave.StartedAt
@@ -158,7 +158,7 @@ func waveCountsMap(counts execution.WaveCounts) map[string]int {
 }
 
 // caseRunNode maps one case run. Step/assertion/evidence counts come from the
-// persisted run summary; version SUT ids come from the run's SUT contexts so
+// persisted run summary; SUT ids come from the run's SUT contexts so
 // cross-SUT labels and the sut_id filter work without reading case tables.
 func (p *ExecutionProvider) caseRunNode(ctx context.Context, run execution.CaseRun) (chain.Node, error) {
 	node := chain.Node{
@@ -200,11 +200,11 @@ func (p *ExecutionProvider) caseRunNode(ctx context.Context, run execution.CaseR
 		}
 		ids := make([]int64, 0, len(contexts))
 		for _, sutContext := range contexts {
-			ids = append(ids, sutContext.VersionSUTID)
+			ids = append(ids, sutContext.SUTID)
 		}
-		node.VersionSUTIDs = sortUniqueIDs(ids)
-		if len(node.VersionSUTIDs) == 1 {
-			node.VersionSUTID = int64Ptr(node.VersionSUTIDs[0])
+		node.SUTIDs = sortUniqueIDs(ids)
+		if len(node.SUTIDs) == 1 {
+			node.SUTID = int64Ptr(node.SUTIDs[0])
 		}
 	}
 	return node, nil
@@ -215,17 +215,17 @@ func (p *ExecutionProvider) caseRunNode(ctx context.Context, run execution.CaseR
 func caseRunResult(status execution.CaseRunStatus) string {
 	switch status {
 	case execution.CaseRunPassed:
-		return "passed"
+		return string(execution.CaseRunPassed)
 	case execution.CaseRunFailed:
-		return "failed"
+		return string(execution.CaseRunFailed)
 	case execution.CaseRunBlocked:
-		return "blocked"
+		return string(execution.CaseRunBlocked)
 	case execution.CaseRunInconclusive:
-		return "inconclusive"
+		return string(execution.CaseRunInconclusive)
 	case execution.CaseRunSkipped:
-		return "skipped"
+		return string(execution.CaseRunSkipped)
 	case execution.CaseRunInterrupted:
-		return "interrupted"
+		return string(execution.CaseRunInterrupted)
 	default:
 		return ""
 	}

@@ -26,16 +26,6 @@ func (p *pinTaskEnsurer) EnsureReportTask(_ context.Context, reportID int64, rev
 	return nil
 }
 
-func (p *pinTaskEnsurer) EnsureRequirementClose(_ context.Context, requirementID, requirementVersionID int64, closeRound int32) error {
-	p.calls = append(p.calls, fmt.Sprintf("requirement:%d:%d:%d", requirementID, requirementVersionID, closeRound))
-	return nil
-}
-
-func (p *pinTaskEnsurer) EnsureVersionClose(_ context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error {
-	p.calls = append(p.calls, fmt.Sprintf("version:%d:%d:%s", versionID, reportRevisionID, predicateFingerprint))
-	return nil
-}
-
 var _ TaskEnsurer = (*pinTaskEnsurer)(nil)
 
 func TestTaskEnsurerRevisionAwareContract(t *testing.T) {
@@ -45,8 +35,6 @@ func TestTaskEnsurerRevisionAwareContract(t *testing.T) {
 	ctx := context.Background()
 	issueID, issueVersionID := int64(101), int64(202)
 	reportID, revision := int64(303), int32(4)
-	requirementID, requirementVersionID, closeRound := int64(404), int64(707), int32(2)
-	versionID, reportRevisionID := int64(505), int64(606)
 
 	if err := ensurer.EnsureIssueTriage(ctx, issueID, issueVersionID); err != nil {
 		t.Fatalf("EnsureIssueTriage() error = %v", err)
@@ -54,18 +42,10 @@ func TestTaskEnsurerRevisionAwareContract(t *testing.T) {
 	if err := ensurer.EnsureReportTask(ctx, reportID, revision); err != nil {
 		t.Fatalf("EnsureReportTask() error = %v", err)
 	}
-	if err := ensurer.EnsureRequirementClose(ctx, requirementID, requirementVersionID, closeRound); err != nil {
-		t.Fatalf("EnsureRequirementClose() error = %v", err)
-	}
-	if err := ensurer.EnsureVersionClose(ctx, versionID, reportRevisionID, "f00d"); err != nil {
-		t.Fatalf("EnsureVersionClose() error = %v", err)
-	}
 
 	want := []string{
 		"triage:101:202",
 		"report:303:4",
-		"requirement:404:707:2",
-		"version:505:606:f00d",
 	}
 	if len(recorder.calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", recorder.calls, want)

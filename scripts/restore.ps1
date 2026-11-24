@@ -37,10 +37,10 @@
     restore. Content directories are overwritten file-by-file and extra files
     are reported as unexpected warnings, not deleted.
 
-    Secrets: EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE and the .env file are
-    not backed up. The operator must supply them separately; without the same
-    keyring the encrypted LLM configuration (llm_configs.api_key / headers)
-    cannot be decrypted.
+    Secrets: the .env file is not backed up; the operator must supply it
+    separately for connection settings. LLM and resource credentials are stored
+    plaintext in the database by design (GD-01 / Q05=B) and are included in the
+    database dump; there is no encryption keyring.
 
     Database URL query parameters (sslmode, connect_timeout, application_name,
     ...) are passed to the client tools through the corresponding PG*
@@ -626,8 +626,8 @@ try {
             warnings        = @($warnings)
             secrets         = [ordered]@{
                 included     = $false
-                requiredKeys = @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE")
-                note         = "Secrets are not part of the backup. Supply the same EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE separately; encrypted LLM configuration is unrecoverable without them."
+                requiredKeys = @()
+                note         = "The .env file is not archived; supply it separately for connection settings. LLM and resource credentials are plaintext in the database by design (GD-01 / Q05=B) and included in the database dump; no encryption keyring."
             }
             passed          = [bool]$passed
         }
@@ -782,8 +782,8 @@ try {
         warnings        = @($warnings)
         secrets         = [ordered]@{
             included     = $false
-            requiredKeys = @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE")
-            note         = "Secrets are not part of the backup. Supply the same EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE separately; encrypted LLM configuration is unrecoverable without them."
+            requiredKeys = @()
+            note         = "The .env file is not archived; supply it separately for connection settings. LLM and resource credentials are plaintext in the database by design (GD-01 / Q05=B) and included in the database dump; no encryption keyring."
         }
         passed          = [bool]$passed
     }
@@ -801,7 +801,7 @@ try {
     }
     Write-Note "files       $($fileResult.Verified)/$($fileResult.Expected) verified, $($fileResult.Missing.Count) missing, $($fileResult.Mismatches.Count) sha256 mismatch(es)"
     Write-Note "report      $reportFull"
-    Write-Note "secrets     not included; supply EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE separately (encrypted LLM keys are unrecoverable without them)"
+    Write-Note "secrets     .env not included (supply separately); LLM/resource credentials are plaintext in the database dump by design (GD-01/Q05=B), no keyring"
     if ($warnings.Count -gt 0) {
         foreach ($warning in $warnings) { Write-Note "warning: $warning" }
     }

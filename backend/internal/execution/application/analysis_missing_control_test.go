@@ -50,6 +50,9 @@ func addFR10602Run(f *analysisFixture, caseRunID, caseVersionID int64, blockedFi
 	run := f.addRun(caseRunID, 2, caseVersionID, execution.CaseRunBlocked, execution.FailureClassBlocked)
 	run.Summary = execution.CaseRunSummary{EvidenceCount: 16, LastError: fr10602LastError}
 	f.runs.byID[caseRunID] = run
+	// The trap stored 16 evidence rows; seed them so the evidence gate sees the
+	// persisted count (the gate reads the repository, never the projection).
+	f.addEvidenceRows(caseRunID, 16)
 
 	steps := []execution.StepResult{
 		{CaseRunID: caseRunID, Seq: 1, Status: execution.StepFailed, Observed: map[string]any{"summary": fr10602Observed}, Error: fr10602LastError},

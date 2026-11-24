@@ -237,7 +237,7 @@ func TestKnowledgeCuratorProfileTools(t *testing.T) {
 
 	// The tools are model-visible only when the role ToolSet can render their
 	// definitions from the live registry (the registry is what the model sees).
-	registry := tools.NewP7Registry(tools.Deps{})
+	registry := tools.NewKnowledgeRegistry(tools.Deps{})
 	visible := set.Names(registry)
 	for _, name := range required {
 		if !hasToolName(visible, name) {

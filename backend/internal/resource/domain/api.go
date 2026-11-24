@@ -21,20 +21,19 @@ const (
 	APISourceAI      = "ai"
 )
 
-// API is one HTTP endpoint of a SUT environment.
+// API is one HTTP endpoint of a SUT.
 type API struct {
-	ID            int64
-	SUTID         int64
-	EnvironmentID int64
-	Method        string
-	PathTemplate  string
-	Name          string
-	AuthRole      string
-	Source        string
-	Status        string
-	SchemaRef     string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID           int64
+	SUTID        int64
+	Method       string
+	PathTemplate string
+	Name         string
+	AuthRole     string
+	Source       string
+	Status       string
+	SchemaRef    string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Validate checks API fields.

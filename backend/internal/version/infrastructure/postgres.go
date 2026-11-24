@@ -1,34 +1,40 @@
-// Package versionpg is the PostgreSQL adapter for versions, SUT bindings and
-// the bound database/account rows.
+// Package versionpg is the PostgreSQL adapter for versions, their direct
+// environment binding and the version account subset.
 package versionpg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	resource "github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// versionColumns is the version row projection, shared by the INSERT and every
+// read. environment_id is the direct binding of v0.2.4-B: NOT NULL, but still a
+// logical cross-context BIGINT with no physical foreign key (Agent.md §6.9.7, cf.
+// version_0010 which keeps sut_id/repo_id/account_id logical for the same
+// reason). The resource delete guard EnvironmentInUse is the protection against
+// deleting a bound environment.
 const versionColumns = `id, title, description, goal, status, auto_design_new_requirements,
-	closed_at, close_reason, close_run_id, created_by, created_at, updated_at`
+	environment_id, closed_at, close_reason, close_run_id, created_by, created_at,
+	updated_at, closure_kind, unverified`
 
-// Repository stores versions, version_sut bindings, the version-level
-// repository overrides and the version account subset.
+// Repository stores versions and the account subset each version executes with.
 type Repository struct {
 	pool *pgxpool.Pool
 	ids  platformid.Generator
 }
 
-// New wraps a pgx pool. The generator supplies primary keys for the binding
-// override/account rows; business entity IDs are assigned by the application
-// service.
+// New wraps a pgx pool. The generator supplies primary keys for the version
+// account rows; business entity IDs are assigned by the application service.
 func New(pool *pgxpool.Pool, ids platformid.Generator) *Repository {
 	return &Repository{pool: pool, ids: ids}
 }
@@ -56,42 +62,31 @@ func wrapDB(op string, err error) error {
 	return fmt.Errorf("%s: %w", op, err)
 }
 
-// Create inserts the version, its environment-only binding, the initial
-// repository overrides and the version account subset in one transaction. A
-// uniqueness failure rolls the whole aggregate back.
-func (r *Repository) Create(ctx context.Context, v version.Version, bindings []version.Binding) error {
+// Create inserts the version with its direct environment binding and the version
+// account subset in one transaction. A uniqueness failure rolls the whole
+// aggregate back.
+func (r *Repository) Create(ctx context.Context, v version.Version, accounts []version.AccountBinding) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("create version: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// A fresh version closes normally; normalize the empty Go default to the
+	// domain constant so the closure_kind CHECK never sees an empty string.
+	if v.ClosureKind == "" {
+		v.ClosureKind = version.ClosureKindNormal
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO version (`+versionColumns+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`, v.ID, v.Title, v.Description, v.Goal, v.Status, v.AutoDesignNewRequirements,
-		v.ClosedAt, v.CloseReason, v.CloseRunID, v.CreatedBy, v.CreatedAt, v.UpdatedAt); err != nil {
+		v.EnvironmentID, v.ClosedAt, v.CloseReason, v.CloseRunID, v.CreatedBy,
+		v.CreatedAt, v.UpdatedAt, v.ClosureKind, v.Unverified); err != nil {
 		return wrapDB("insert version", err)
 	}
-
-	for _, binding := range bindings {
-		scopeExclude, err := encodeScopeExclude(binding.ScopeExclude)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO version_sut (id, version_id, sut_id, environment_id, code_baseline_commit, scope_exclude)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-		`, binding.ID, v.ID, binding.SUTID, binding.EnvironmentID,
-			nullableCommit(binding.CodeBaselineCommit), scopeExclude); err != nil {
-			return wrapDB("insert version_sut", err)
-		}
-		if err := insertBindingRepositories(ctx, tx, r.ids, v.ID, binding.RepositoryOverrides); err != nil {
-			return err
-		}
-		if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, binding.Accounts); err != nil {
-			return err
-		}
+	if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, accounts); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -100,14 +95,12 @@ func (r *Repository) Create(ctx context.Context, v version.Version, bindings []v
 	return nil
 }
 
-// UpdateBinding rewrites the v0.22 binding projection of one existing version
-// in one transaction: version_sut (environment/scope_exclude/code baseline),
-// the version_repository_override rows and the version_account rows. The
-// version row is locked first and the write only proceeds while its
-// updated_at still equals expectedUpdatedAt, so concurrent binding or stage
-// writers settle deterministically (ErrBindingConflict) instead of silently
-// losing an update.
-func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, binding version.Binding, expectedUpdatedAt time.Time) error {
+// UpdateBinding rewrites the editable binding projection of one existing version
+// in one transaction: version.environment_id and the version_account rows. The
+// version row is locked first and the write only proceeds while its updated_at
+// still equals expectedUpdatedAt, so concurrent binding or stage writers settle
+// deterministically (ErrBindingConflict) instead of silently losing an update.
+func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, accounts []version.AccountBinding, expectedUpdatedAt time.Time) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("update version binding: begin: %w", err)
@@ -126,59 +119,23 @@ func (r *Repository) UpdateBinding(ctx context.Context, v version.Version, bindi
 		return version.ErrBindingConflict
 	}
 
-	scopeExclude, err := encodeScopeExclude(binding.ScopeExclude)
-	if err != nil {
-		return err
-	}
 	tag, err := tx.Exec(ctx, `
-		UPDATE version_sut
-		SET environment_id = $3, scope_exclude = $4::jsonb,
-			code_baseline_commit = $5, updated_at = $6
-		WHERE id = $1 AND version_id = $2
-	`, binding.ID, v.ID, binding.EnvironmentID, scopeExclude,
-		nullableCommit(binding.CodeBaselineCommit), v.UpdatedAt)
+		UPDATE version SET environment_id = $2, updated_at = $3 WHERE id = $1
+	`, v.ID, v.EnvironmentID, v.UpdatedAt)
 	if err != nil {
-		return wrapDB("update version_sut", err)
+		return wrapDB("update version binding", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return version.ErrNotFound
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM version_repository_override WHERE version_id = $1`, v.ID); err != nil {
-		return wrapDB("delete version repository overrides", err)
-	}
-	if err := insertBindingRepositories(ctx, tx, r.ids, v.ID, binding.RepositoryOverrides); err != nil {
-		return err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM version_account WHERE version_id = $1`, v.ID); err != nil {
 		return wrapDB("delete version accounts", err)
 	}
-	if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, binding.Accounts); err != nil {
+	if err := insertBindingAccounts(ctx, tx, r.ids, v.ID, accounts); err != nil {
 		return err
-	}
-	tag, err = tx.Exec(ctx, `UPDATE version SET updated_at = $2 WHERE id = $1`, v.ID, v.UpdatedAt)
-	if err != nil {
-		return wrapDB("update version timestamp", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return version.ErrNotFound
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("update version binding: commit: %w", err)
-	}
-	return nil
-}
-
-func insertBindingRepositories(
-	ctx context.Context, tx pgx.Tx, ids platformid.Generator, versionID int64,
-	overrides []version.RepositoryOverride,
-) error {
-	for _, override := range overrides {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO version_repository_override (id, version_id, repo_id, included)
-			VALUES ($1, $2, $3, $4)
-		`, ids.Next(), versionID, override.RepoID, override.Included); err != nil {
-			return wrapDB("insert version repository override", err)
-		}
 	}
 	return nil
 }
@@ -198,73 +155,11 @@ func insertBindingAccounts(
 	return nil
 }
 
-// Get loads one version and its environment-only bindings with the version
-// repository overrides and account subset.
-func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []version.Binding, error) {
+// Get loads one version with its direct environment binding and account subset.
+func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []version.AccountBinding, error) {
 	v, err := scanVersion(r.pool.QueryRow(ctx, `SELECT `+versionColumns+` FROM version WHERE id = $1`, id))
 	if err != nil {
 		return version.Version{}, nil, wrapDB("get version", err)
-	}
-
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, version_id, sut_id, environment_id,
-			COALESCE(code_baseline_commit, ''), scope_exclude
-		FROM version_sut WHERE version_id = $1 ORDER BY id
-	`, id)
-	if err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version bindings: %w", err)
-	}
-	defer rows.Close()
-
-	bindings := make([]version.Binding, 0)
-	for rows.Next() {
-		var binding version.Binding
-		var scopeRaw []byte
-		if err := rows.Scan(&binding.ID, &binding.VersionID, &binding.SUTID, &binding.EnvironmentID,
-			&binding.CodeBaselineCommit, &scopeRaw); err != nil {
-			return version.Version{}, nil, fmt.Errorf("scan version binding: %w", err)
-		}
-		if len(scopeRaw) > 0 {
-			if err := json.Unmarshal(scopeRaw, &binding.ScopeExclude); err != nil {
-				return version.Version{}, nil, fmt.Errorf("decode version scope_exclude: %w", err)
-			}
-		}
-		binding.ScopeExclude = version.NewScopeExclude(
-			binding.ScopeExclude.Pages, binding.ScopeExclude.APIs, binding.ScopeExclude.Databases,
-		)
-		binding.RepositoryOverrides = []version.RepositoryOverride{}
-		binding.Accounts = []version.AccountBinding{}
-		bindings = append(bindings, binding)
-	}
-	if err := rows.Err(); err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version bindings: %w", err)
-	}
-	if len(bindings) == 0 {
-		return v, bindings, nil
-	}
-
-	overrideRows, err := r.pool.Query(ctx, `
-		SELECT repo_id, included
-		FROM version_repository_override
-		WHERE version_id = $1
-		ORDER BY repo_id
-	`, id)
-	if err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version repository overrides: %w", err)
-	}
-	defer overrideRows.Close()
-	for overrideRows.Next() {
-		var repoID int64
-		var included bool
-		if err := overrideRows.Scan(&repoID, &included); err != nil {
-			return version.Version{}, nil, fmt.Errorf("scan version repository override: %w", err)
-		}
-		// The environment-only model has one binding per version.
-		bindings[0].RepositoryOverrides = append(bindings[0].RepositoryOverrides,
-			version.RepositoryOverride{RepoID: repoID, Included: included})
-	}
-	if err := overrideRows.Err(); err != nil {
-		return version.Version{}, nil, fmt.Errorf("get version repository overrides: %w", err)
 	}
 
 	accountRows, err := r.pool.Query(ctx, `
@@ -277,27 +172,30 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 		return version.Version{}, nil, fmt.Errorf("get version accounts: %w", err)
 	}
 	defer accountRows.Close()
+
+	accounts := make([]version.AccountBinding, 0)
 	for accountRows.Next() {
 		var accountID int64
 		if err := accountRows.Scan(&accountID); err != nil {
 			return version.Version{}, nil, fmt.Errorf("scan version account: %w", err)
 		}
-		bindings[0].Accounts = append(bindings[0].Accounts, version.AccountBinding{AccountID: accountID})
+		accounts = append(accounts, version.AccountBinding{AccountID: accountID})
 	}
 	if err := accountRows.Err(); err != nil {
 		return version.Version{}, nil, fmt.Errorf("get version accounts: %w", err)
 	}
-	return v, bindings, nil
+	return v, accounts, nil
 }
 
-// List returns version summaries ordered by ID descending, counting bindings.
+// List returns version summaries ordered by ID descending. SUTCount is the
+// number of SUTs in the environment each version binds (v0.2.4-B): it is derived
+// from the resource catalog, never stored.
 func (r *Repository) List(ctx context.Context, limit int, beforeID *int64) ([]version.Summary, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT v.id, v.title, v.status, v.created_at, v.updated_at, count(b.id)
+		SELECT v.id, v.title, v.status, v.created_at, v.updated_at,
+			(SELECT count(*) FROM sut s WHERE s.environment_id = v.environment_id)
 		FROM version v
-		LEFT JOIN version_sut b ON b.version_id = v.id
 		WHERE ($1::BIGINT IS NULL OR v.id < $1)
-		GROUP BY v.id, v.title, v.status, v.created_at, v.updated_at
 		ORDER BY v.id DESC
 		LIMIT $2
 	`, beforeID, limit)
@@ -321,8 +219,8 @@ func (r *Repository) List(ctx context.Context, limit int, beforeID *int64) ([]ve
 	return summaries, nil
 }
 
-// Update rewrites the editable version fields. Status and ownership columns
-// are never touched by the P0 API.
+// Update rewrites the editable version fields. Status, the environment binding
+// and the ownership columns are never touched by this API.
 func (r *Repository) Update(ctx context.Context, v version.Version) (version.Version, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE version SET title = $2, description = $3, goal = $4,
@@ -342,44 +240,13 @@ func (r *Repository) Update(ctx context.Context, v version.Version) (version.Ver
 // no-ops and reports whether this call changed the row.
 func (r *Repository) MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE version SET status = 'running', updated_at = $2
-		WHERE id = $1 AND status = 'initial'
-	`, id, updatedAt)
+		UPDATE version SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = $4
+	`, id, updatedAt, version.StatusRunning, version.StatusInitial)
 	if err != nil {
 		return false, wrapDB("mark version running", err)
 	}
 	return tag.RowsAffected() > 0, nil
-}
-
-// Reopen flips completed -> running and clears the close fields (P3 §5.9).
-// The WHERE guard makes repeated calls no-ops.
-func (r *Repository) Reopen(ctx context.Context, id int64, updatedAt time.Time) (bool, error) {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE version SET status = 'running', closed_at = NULL, close_reason = '',
-			close_run_id = NULL, updated_at = $2
-		WHERE id = $1 AND status = 'completed'
-	`, id, updatedAt)
-	if err != nil {
-		return false, wrapDB("reopen version", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut row
-// (P5 §5.5). An empty commit clears the column to NULL so the binding is
-// treated as unresolved again.
-func (r *Repository) SetCodeBaselineCommit(ctx context.Context, versionSUTID int64, commitSHA string) error {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE version_sut SET code_baseline_commit = NULLIF($2, ''), updated_at = now()
-		WHERE id = $1
-	`, versionSUTID, commitSHA)
-	if err != nil {
-		return wrapDB("set version code baseline commit", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return version.ErrNotFound
-	}
-	return nil
 }
 
 // Close completes one running version (P4 spec §7.3/§7.4). It first takes the
@@ -388,7 +255,13 @@ func (r *Repository) SetCodeBaselineCommit(ctx context.Context, versionSUTID int
 // is held and only then applies the conditional running -> completed UPDATE. A
 // recheck error rolls the transaction back untouched; a version that is no
 // longer running is a state conflict.
-func (r *Repository) Close(ctx context.Context, id int64, close version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
+func (r *Repository) Close(ctx context.Context, id int64, close *version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
+	// nil close fields are a caller contract violation, not a silent default:
+	// fail loud with a typed field error instead of dereferencing nil (H-G4
+	// fix-wave Close pointer nil guard). All production callers pass non-nil.
+	if close == nil {
+		return version.Version{}, platform.Invalid("close", "version close fields are required")
+	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return version.Version{}, fmt.Errorf("close version: begin: %w", err)
@@ -418,16 +291,23 @@ func (r *Repository) Close(ctx context.Context, id int64, close version.VersionC
 	if closedAt.IsZero() {
 		closedAt = time.Now().UTC()
 	}
+	closureKind := close.ClosureKind
+	if closureKind == "" {
+		closureKind = version.ClosureKindNormal
+	}
 	current.Status = version.StatusCompleted
 	current.ClosedAt = &closedAt
 	current.CloseReason = close.CloseReason
 	current.CloseRunID = cloneCloseRunID(close.CloseRunID)
+	current.ClosureKind = closureKind
+	current.Unverified = close.Unverified
 	current.UpdatedAt = closedAt
 	tag, err := tx.Exec(ctx, `
-		UPDATE version SET status = 'completed', closed_at = $2, close_reason = $3,
-			close_run_id = $4, updated_at = $5
-		WHERE id = $1 AND status = 'running'
-	`, id, closedAt, close.CloseReason, close.CloseRunID, closedAt)
+		UPDATE version SET status = $6, closed_at = $2, close_reason = $3,
+			close_run_id = $4, updated_at = $5, closure_kind = $7, unverified = $8
+		WHERE id = $1 AND status = $9
+	`, id, closedAt, close.CloseReason, close.CloseRunID, closedAt,
+		version.StatusCompleted, closureKind, close.Unverified, version.StatusRunning)
 	if err != nil {
 		return version.Version{}, wrapDB("close version", err)
 	}
@@ -440,25 +320,60 @@ func (r *Repository) Close(ctx context.Context, id int64, close version.VersionC
 	return current, nil
 }
 
-// ReopenIfCompleted flips completed -> running, clears the close projection and
-// returns the updated version. A version in any other status is returned
-// unchanged with changed=false; a missing version yields ErrNotFound. The
-// single-statement conditional UPDATE is the guard, so concurrent reopens and
-// close/reopen races settle on one row version.
+// ReopenIfCompleted flips completed -> running, clears the close projection
+// (including the waiver: closure_kind back to normal, unverified false) AND
+// undoes the waiver's requirement-level effects in the same transaction, then
+// returns the updated version.
+//
+// R-G8a lifecycle (reopen means re-verification, not laundering): a requirement
+// whose LATEST closure round was waived (check_result.waived=true) is reopened
+// closed -> clarified with its waiver flag cleared, so it must earn closure
+// again through the normal predicates or a fresh waiver. Requirements closed
+// NORMALLY stay closed — their closure was legitimate. Any remaining waived
+// flag (a clarified requirement marked but not yet closed) is cleared too.
+// Without the undo, a waived closure would survive the version reopen and the
+// reconciler would re-close the version as normal/unverified=false, laundering
+// the waiver into a fully-verified-looking close.
+//
+// A version in any other status is returned unchanged with changed=false; a
+// missing version yields ErrNotFound. The single-statement conditional UPDATE
+// is the guard, so concurrent reopens and close/reopen races settle on one row
+// version.
 func (r *Repository) ReopenIfCompleted(ctx context.Context, id int64, reopenedAt time.Time) (version.Version, bool, error) {
-	reopened, err := scanVersion(r.pool.QueryRow(ctx, `
-		UPDATE version SET status = 'running', closed_at = NULL, close_reason = '',
-			close_run_id = NULL, updated_at = $2
-		WHERE id = $1 AND status = 'completed'
-		RETURNING `+versionColumns, id, reopenedAt))
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return version.Version{}, false, fmt.Errorf("reopen version: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	reopened, err := scanVersion(tx.QueryRow(ctx, `
+		UPDATE version SET status = $3, closed_at = NULL, close_reason = '',
+			close_run_id = NULL, updated_at = $2, closure_kind = $4, unverified = false
+		WHERE id = $1 AND status = $5
+		RETURNING `+versionColumns, id, reopenedAt, version.StatusRunning, version.ClosureKindNormal, version.StatusCompleted))
 	if err == nil {
+		if err := undoWaivedRequirementClosures(ctx, tx, id, reopenedAt); err != nil {
+			return version.Version{}, false, err
+		}
+		// Clear any remaining waiver flags (clarified requirements marked but not
+		// yet closed) atomically with the version reopen so the reconciler can
+		// never observe a running version with stale waived requirements.
+		if _, err := tx.Exec(ctx, `
+			UPDATE requirement SET waived = false, updated_at = $2
+			WHERE version_id = $1 AND waived
+		`, id, reopenedAt); err != nil {
+			return version.Version{}, false, wrapDB("reopen version: clear requirement waivers", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return version.Version{}, false, fmt.Errorf("reopen version: commit: %w", err)
+		}
 		return reopened, true, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return version.Version{}, false, wrapDB("reopen version", err)
 	}
 	// No row was updated: distinguish "not completed" (no-op) from "missing".
-	current, err := scanVersion(r.pool.QueryRow(ctx, `
+	current, err := scanVersion(tx.QueryRow(ctx, `
 		SELECT `+versionColumns+` FROM version WHERE id = $1
 	`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -468,6 +383,94 @@ func (r *Repository) ReopenIfCompleted(ctx context.Context, id int64, reopenedAt
 		return version.Version{}, false, wrapDB("reopen version", err)
 	}
 	return current, false, nil
+}
+
+// undoWaivedRequirementClosures reopens the version's waiver-closed requirements
+// (R-G8a): closed requirements whose LATEST closure round carries
+// check_result.waived=true go back to clarified with the waiver flag cleared and
+// the round's reopen_count incremented (the same bookkeeping the requirement
+// reopen path does). Normally-closed requirements are untouched. The closure
+// round is the authoritative fact — the requirement.waived flag alone is not
+// consulted for the undo decision. Status values are domain-constant query
+// parameters (no inline status literal). The candidate SELECT takes FOR UPDATE
+// OF r so the waiver-closed set is stable under concurrent requirement writes
+// (H-G4 T6: the prior plain SELECT left a READ COMMITTED race window that only
+// the guarded UPDATE backstopped).
+func undoWaivedRequirementClosures(ctx context.Context, tx pgx.Tx, versionID int64, reopenedAt time.Time) error {
+	rows, err := tx.Query(ctx, `
+		SELECT r.id FROM requirement r
+		WHERE r.version_id = $1 AND r.status = $2
+		  AND COALESCE((
+		    SELECT (rc.check_result->>'waived')::boolean
+		    FROM requirement_closure rc
+		    WHERE rc.requirement_id = r.id
+		    ORDER BY rc.close_round DESC, rc.id DESC
+		    LIMIT 1
+		  ), false)
+		ORDER BY r.id
+		FOR UPDATE OF r
+	`, versionID, string(version.RequirementClosed))
+	if err != nil {
+		return wrapDB("reopen version: find waiver-closed requirements", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var requirementID int64
+		if err := rows.Scan(&requirementID); err != nil {
+			rows.Close()
+			return wrapDB("reopen version: scan waiver-closed requirement", err)
+		}
+		ids = append(ids, requirementID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return wrapDB("reopen version: read waiver-closed requirements", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	// The status guard re-checks closed under the row lock: a concurrent
+	// requirement reopen (closed -> draft) wins and is never overwritten.
+	// RETURNING captures exactly the rows the guard hit, so the reopen_count
+	// bookkeeping below bumps only those rounds — never a row a concurrent
+	// reopen already moved (H-G4 T6 reopen_count bookkeeping).
+	updatedRows, err := tx.Query(ctx, `
+		UPDATE requirement
+		SET status = $3, closed_at = NULL, closed_by_run_id = NULL, waived = false, updated_at = $2
+		WHERE id = ANY($1) AND status = $4
+		RETURNING id
+	`, ids, reopenedAt, string(version.RequirementClarified), string(version.RequirementClosed))
+	if err != nil {
+		return wrapDB("reopen version: undo waived requirement closures", err)
+	}
+	var updatedIDs []int64
+	for updatedRows.Next() {
+		var requirementID int64
+		if err := updatedRows.Scan(&requirementID); err != nil {
+			updatedRows.Close()
+			return wrapDB("reopen version: scan reopened requirement", err)
+		}
+		updatedIDs = append(updatedIDs, requirementID)
+	}
+	updatedRows.Close()
+	if err := updatedRows.Err(); err != nil {
+		return wrapDB("reopen version: read reopened requirements", err)
+	}
+	if len(updatedIDs) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE requirement_closure
+		SET reopen_count = reopen_count + 1, updated_at = $2
+		WHERE id IN (
+		  SELECT DISTINCT ON (requirement_id) id FROM requirement_closure
+		  WHERE requirement_id = ANY($1)
+		  ORDER BY requirement_id, close_round DESC, id DESC
+		)
+	`, updatedIDs, reopenedAt); err != nil {
+		return wrapDB("reopen version: bump waived closure reopen count", err)
+	}
+	return nil
 }
 
 func cloneCloseRunID(value *int64) *int64 {
@@ -522,7 +525,7 @@ func (r *Repository) Stats(ctx context.Context, id int64) (version.VersionStats,
 func (r *Repository) ListInitialVersionsWithContent(ctx context.Context, limit int) ([]int64, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT v.id FROM version v
-		WHERE v.status = 'initial'
+		WHERE v.status = $2
 		  AND (
 			EXISTS (
 				SELECT 1 FROM conversation c
@@ -533,7 +536,7 @@ func (r *Repository) ListInitialVersionsWithContent(ctx context.Context, limit i
 		  )
 		ORDER BY v.id
 		LIMIT $1
-	`, limit)
+	`, limit, version.StatusInitial)
 	if err != nil {
 		return nil, fmt.Errorf("list initial versions with content: %w", err)
 	}
@@ -552,57 +555,89 @@ func (r *Repository) ListInitialVersionsWithContent(ctx context.Context, limit i
 	return ids, nil
 }
 
-// SUTInUse reports whether any version binding references the SUT.
+// The usage guards and ReferencingVersions below resolve a resource reference
+// through the inverted hierarchy (v0.2.4-B): a version binds an environment, an
+// environment owns SUTs and a SUT owns the assets. The joins read resource-context
+// tables directly, which is the established pattern for these guard predicates
+// (cf. the v0.22 version_sut joins they replace); no cross-context foreign key is
+// implied.
+//
+// H-B14: the asset-status predicates are the resource domain constants bound as
+// query parameters (never SQL-inline literals), and every guard that joins a SUT
+// also mirrors resourceapp.SUTView.IsApproved -- (s.status = approved OR s.status
+// = '') -- so a proposed/rejected SUT contributes nothing to effective scope and
+// its assets are not "in use" (the delete guard must not over-block on resources
+// the version can never execute against). The empty-status branch is UNREACHABLE
+// from the database (sut.status is NOT NULL DEFAULT 'approved' with a CHECK,
+// resource_0005); it is kept only to mirror IsApproved exactly. The status
+// constants are pure cross-context vocabulary (single source in resource/domain),
+// the reuse R-H9 recognizes; the predicate authority stays
+// resourceapp.SUTView.IsApproved.
+//
+// H-B1 (v0.2.4-H): these SQL mirrors are the REMAINING ones. The handoff adapter's
+// mirrors are gone (its resources block is assembled from
+// resourceapp.HandoffResourceReader) and so is the resource code-pool mirror
+// (Service.ListEnvironmentRepositories now gates in Go). What is left here is
+// pinned per status against the authority by
+// TestVersionSUTGateMirrorsIsApproved (internal/version/infrastructure, real DB):
+// a rule-shape drift, not just a value drift, fails that pin.
+
+// SUTInUse reports whether any version binds an environment that contains the
+// SUT in effective scope (the SUT itself must be approved, IsApproved mirror).
 func (r *Repository) SUTInUse(ctx context.Context, id int64) (bool, error) {
-	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE sut_id = $1)`, id)
+	return r.exists(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM version v
+			JOIN sut s ON s.environment_id = v.environment_id
+			WHERE s.id = $1 AND (s.status = $2 OR s.status = '')
+		)`, id, resource.SUTStatusApproved)
 }
 
-// EnvironmentInUse reports whether any version binding references the
-// environment.
+// EnvironmentInUse reports whether any version binds the environment.
 func (r *Repository) EnvironmentInUse(ctx context.Context, id int64) (bool, error) {
-	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE environment_id = $1)`, id)
+	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version WHERE environment_id = $1)`, id)
 }
 
 // PageInUse reports whether the page is inside the effective scope of a version
-// binding: it belongs to a bound environment and is not excluded. A resource
-// that is explicitly excluded is not part of the version range, so deleting it
-// is not blocked by this guard.
+// binding: it is an approved page of an APPROVED SUT of a bound environment.
+// Exclusions no longer exist, so every approved page of an approved SUT of the
+// environment is in range.
 func (r *Repository) PageInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
 			SELECT 1
-			FROM version_sut vs
-			JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
-			WHERE p.id = $1 AND p.status = 'approved'
-			  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
-		)`, id)
+			FROM version v
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN sut_page p ON p.sut_id = s.id
+			WHERE p.id = $1 AND p.status = $2 AND (s.status = $3 OR s.status = '')
+		)`, id, resource.PageStatusApproved, resource.SUTStatusApproved)
 }
 
 // APIInUse reports whether the API is inside the effective scope of a version
-// binding: it belongs to a bound environment and is not excluded.
+// binding (approved API of an approved SUT of a bound environment).
 func (r *Repository) APIInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
 			SELECT 1
-			FROM version_sut vs
-			JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
-			WHERE a.id = $1 AND a.status = 'approved'
-			  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
-		)`, id)
+			FROM version v
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN sut_api a ON a.sut_id = s.id
+			WHERE a.id = $1 AND a.status = $2 AND (s.status = $3 OR s.status = '')
+		)`, id, resource.APIStatusApproved, resource.SUTStatusApproved)
 }
 
 // DatabaseInUse reports whether the target database is inside the effective
-// scope of a version binding: it belongs to a bound environment, is active and
-// is not excluded.
+// scope of a version binding: it is active and owned by an approved SUT of a
+// bound environment.
 func (r *Repository) DatabaseInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
 		SELECT EXISTS (
 			SELECT 1
-			FROM version_sut vs
-			JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
-			WHERE d.id = $1 AND d.status = 'active'
-			  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
-		)`, id)
+			FROM version v
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN target_database d ON d.sut_id = s.id
+			WHERE d.id = $1 AND d.status = $2 AND (s.status = $3 OR s.status = '')
+		)`, id, resource.StatusActive, resource.SUTStatusApproved)
 }
 
 // AccountInUse reports whether any version enables the test account.
@@ -613,12 +648,17 @@ func (r *Repository) AccountInUse(ctx context.Context, id int64) (bool, error) {
 		)`, id)
 }
 
-// RepositoryInUse reports whether any SUT association or version override
-// references the code repository.
+// RepositoryInUse reports whether any APPROVED SUT association references the
+// code repository (IsApproved mirror: a proposed/rejected SUT contributes nothing
+// to the code pool). The version-level overrides of v0.22 are gone, so the SUT
+// associations are the only reference.
 func (r *Repository) RepositoryInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `
-		SELECT EXISTS (SELECT 1 FROM sut_repository WHERE repo_id = $1)
-			OR EXISTS (SELECT 1 FROM version_repository_override WHERE repo_id = $1)`, id)
+		SELECT EXISTS (
+			SELECT 1 FROM sut_repository sr
+			JOIN sut s ON s.id = sr.sut_id
+			WHERE sr.repo_id = $1 AND (s.status = $2 OR s.status = '')
+		)`, id, resource.SUTStatusApproved)
 }
 
 // ReferencingVersions lists the versions whose binding references a resource of
@@ -628,48 +668,49 @@ func (r *Repository) RepositoryInUse(ctx context.Context, id int64) (bool, error
 // the versions it returns.
 func (r *Repository) ReferencingVersions(ctx context.Context, kind string, id int64) ([]version.ReferencingVersion, error) {
 	var query string
+	args := []any{id}
 	switch kind {
 	case "sut":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			JOIN version_sut vs ON vs.version_id = v.id
-			WHERE vs.sut_id = $1
+			JOIN sut s ON s.environment_id = v.environment_id
+			WHERE s.id = $1 AND (s.status = $2 OR s.status = '')
 			ORDER BY v.id`
+		args = append(args, resource.SUTStatusApproved)
 	case "environment":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			JOIN version_sut vs ON vs.version_id = v.id
-			WHERE vs.environment_id = $1
+			WHERE v.environment_id = $1
 			ORDER BY v.id`
 	case "page":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			JOIN version_sut vs ON vs.version_id = v.id
-			JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
-			WHERE p.id = $1 AND p.status = 'approved'
-			  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN sut_page p ON p.sut_id = s.id
+			WHERE p.id = $1 AND p.status = $2 AND (s.status = $3 OR s.status = '')
 			ORDER BY v.id`
+		args = append(args, resource.PageStatusApproved, resource.SUTStatusApproved)
 	case "api":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			JOIN version_sut vs ON vs.version_id = v.id
-			JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
-			WHERE a.id = $1 AND a.status = 'approved'
-			  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN sut_api a ON a.sut_id = s.id
+			WHERE a.id = $1 AND a.status = $2 AND (s.status = $3 OR s.status = '')
 			ORDER BY v.id`
+		args = append(args, resource.APIStatusApproved, resource.SUTStatusApproved)
 	case "database":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			JOIN version_sut vs ON vs.version_id = v.id
-			JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
-			WHERE d.id = $1 AND d.status = 'active'
-			  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
+			JOIN sut s ON s.environment_id = v.environment_id
+			JOIN target_database d ON d.sut_id = s.id
+			WHERE d.id = $1 AND d.status = $2 AND (s.status = $3 OR s.status = '')
 			ORDER BY v.id`
+		args = append(args, resource.StatusActive, resource.SUTStatusApproved)
 	case "account":
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
@@ -681,17 +722,15 @@ func (r *Repository) ReferencingVersions(ctx context.Context, kind string, id in
 		query = `
 			SELECT DISTINCT v.id, v.title, v.status, v.stage, v.suspended_from
 			FROM version v
-			LEFT JOIN version_sut vs ON vs.version_id = v.id
-			WHERE vs.sut_id IN (SELECT sut_id FROM sut_repository WHERE repo_id = $1)
-			   OR EXISTS (
-				SELECT 1 FROM version_repository_override vro
-				WHERE vro.version_id = v.id AND vro.repo_id = $1
-			   )
+			JOIN sut s ON s.environment_id = v.environment_id
+			WHERE s.id IN (SELECT sut_id FROM sut_repository WHERE repo_id = $1)
+			  AND (s.status = $2 OR s.status = '')
 			ORDER BY v.id`
+		args = append(args, resource.SUTStatusApproved)
 	default:
 		return nil, fmt.Errorf("referencing versions: unknown resource kind %q", kind)
 	}
-	rows, err := r.pool.Query(ctx, query, id)
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("referencing versions: %w", err)
 	}
@@ -717,9 +756,9 @@ func (r *Repository) ReferencingVersions(ctx context.Context, kind string, id in
 	return refs, nil
 }
 
-func (r *Repository) exists(ctx context.Context, query string, id int64) (bool, error) {
+func (r *Repository) exists(ctx context.Context, query string, args ...any) (bool, error) {
 	var used bool
-	if err := r.pool.QueryRow(ctx, query, id).Scan(&used); err != nil {
+	if err := r.pool.QueryRow(ctx, query, args...).Scan(&used); err != nil {
 		return false, fmt.Errorf("version usage query: %w", err)
 	}
 	return used, nil
@@ -728,29 +767,11 @@ func (r *Repository) exists(ctx context.Context, query string, id int64) (bool, 
 func scanVersion(row rowScanner) (version.Version, error) {
 	var v version.Version
 	if err := row.Scan(&v.ID, &v.Title, &v.Description, &v.Goal, &v.Status,
-		&v.AutoDesignNewRequirements, &v.ClosedAt, &v.CloseReason, &v.CloseRunID,
-		&v.CreatedBy, &v.CreatedAt, &v.UpdatedAt); err != nil {
+		&v.AutoDesignNewRequirements, &v.EnvironmentID, &v.ClosedAt, &v.CloseReason,
+		&v.CloseRunID, &v.CreatedBy, &v.CreatedAt, &v.UpdatedAt, &v.ClosureKind, &v.Unverified); err != nil {
 		return version.Version{}, err
 	}
 	return v, nil
-}
-
-func encodeScopeExclude(scope version.ScopeExclude) (string, error) {
-	normalized := version.NewScopeExclude(scope.Pages, scope.APIs, scope.Databases)
-	raw, err := json.Marshal(normalized)
-	if err != nil {
-		return "", fmt.Errorf("encode version scope_exclude: %w", err)
-	}
-	return string(raw), nil
-}
-
-// nullableCommit stores an unresolved baseline as SQL NULL so the column CHECK
-// only ever sees a full commit SHA.
-func nullableCommit(commit string) any {
-	if commit == "" {
-		return nil
-	}
-	return commit
 }
 
 var (

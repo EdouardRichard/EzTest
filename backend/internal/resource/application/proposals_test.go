@@ -8,17 +8,23 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
+// proposalSUTID is the SUT the proposal tests file their candidates under. It is
+// seeded straight into the fake repository so it consumes no generator ID and
+// the proposed rows keep predictable IDs (the harness environment is 1001, so
+// the first proposal is 1002).
+const proposalSUTID = int64(700001)
+
 func seedProposalEnvironment(h *harness) {
-	h.repo.suts = append(h.repo.suts, resource.SUT{ID: 1001, Name: "Order Center", Intro: "orders", CreatedBy: 42, CreatedAt: testNow, UpdatedAt: testNow})
-	h.repo.environments = append(h.repo.environments, resource.Environment{
-		ID: 1002, SUTID: 1001, Name: "staging", BaseURL: "https://staging.example.test",
-		IsDefault: true, Status: resource.StatusActive, CreatedAt: testNow, UpdatedAt: testNow,
+	h.repo.suts = append(h.repo.suts, resource.SUT{
+		ID: proposalSUTID, EnvironmentID: testEnvironmentID, Name: "Order Center",
+		Intro: "orders", BaseURL: "https://staging.example.test",
+		CreatedBy: 42, CreatedAt: testNow, UpdatedAt: testNow,
 	})
 }
 
 func proposedPageInput() ProposedPageInput {
 	return ProposedPageInput{
-		EnvironmentID: 1002,
+		SUTID:         proposalSUTID,
 		Name:          "Orders list",
 		URL:           "https://staging.example.test/orders",
 		RouteTemplate: "/orders",
@@ -37,7 +43,7 @@ func TestCreateProposedPage(t *testing.T) {
 	if view.Status != resource.PageStatusProposed || view.Source != resource.PageSourceAI || view.RouteTemplate != "/orders" {
 		t.Fatalf("page = %+v", view)
 	}
-	if view.SUTID != "1001" || view.EnvironmentID != "1002" || view.PageType != "page" {
+	if view.SUTID != "700001" || view.PageType != "page" {
 		t.Fatalf("page parents = %+v", view)
 	}
 	if len(h.repo.pages) != 1 || h.repo.pages[0].Status != resource.PageStatusProposed {
@@ -87,7 +93,7 @@ func TestCreateProposedPageValidates(t *testing.T) {
 	seedProposalEnvironment(h)
 
 	missing := proposedPageInput()
-	missing.EnvironmentID = 9999
+	missing.SUTID = 9999
 	_, err := h.svc.CreateProposedPage(context.Background(), missing)
 	assertAPIError(t, err, 404, "not_found")
 
@@ -116,8 +122,8 @@ func TestConfirmAndRejectProposedPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	id := int64(1001) // seqIDs assigned 1001 to the first page
-	if created.ID != "1001" {
+	id := int64(1002) // seqIDs assigned 1002 to the first proposed page
+	if created.ID != "1002" {
 		t.Fatalf("page id = %q", created.ID)
 	}
 
@@ -141,8 +147,8 @@ func TestConfirmAndRejectProposedPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create second: %v", err)
 	}
-	pendingID := int64(1002)
-	if pending.ID != "1002" {
+	pendingID := int64(1003)
+	if pending.ID != "1003" {
 		t.Fatalf("second id = %q", pending.ID)
 	}
 	rejected, err := h.svc.RejectPage(context.Background(), pendingID, 42)
@@ -182,11 +188,11 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	h := newHarness()
 	seedProposalEnvironment(h)
 	view, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
-		EnvironmentID: 1002,
-		Method:        "POST",
-		PathTemplate:  "/api/refund",
-		Name:          "Refund",
-		Source:        resource.APISourceCode,
+		SUTID:        proposalSUTID,
+		Method:       "POST",
+		PathTemplate: "/api/refund",
+		Name:         "Refund",
+		Source:       resource.APISourceCode,
 	})
 	if err != nil {
 		t.Fatalf("CreateProposedAPI: %v", err)
@@ -194,23 +200,23 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	if view.Status != resource.APIStatusProposed || view.Source != resource.APISourceCode || view.Method != "POST" {
 		t.Fatalf("api = %+v", view)
 	}
-	if view.SUTID != "1001" || view.EnvironmentID != "1002" {
+	if view.SUTID != "700001" {
 		t.Fatalf("api parents = %+v", view)
 	}
 
-	approved, err := h.svc.ConfirmAPI(context.Background(), 1001, 42)
+	approved, err := h.svc.ConfirmAPI(context.Background(), 1002, 42)
 	if err != nil {
 		t.Fatalf("ConfirmAPI: %v", err)
 	}
 	if approved.Status != resource.APIStatusApproved {
 		t.Fatalf("approved = %+v", approved)
 	}
-	if _, err := h.svc.ConfirmAPI(context.Background(), 1001, 42); err == nil {
+	if _, err := h.svc.ConfirmAPI(context.Background(), 1002, 42); err == nil {
 		t.Fatal("repeated confirm must conflict")
 	}
 
 	second, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
-		EnvironmentID: 1002, Method: "GET", PathTemplate: "/api/orders", Name: "Orders",
+		SUTID: proposalSUTID, Method: "GET", PathTemplate: "/api/orders", Name: "Orders",
 		Source: resource.APISourceAI,
 	})
 	if err != nil {
@@ -221,7 +227,7 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	}
 	// Refresh keeps an existing proposed API on its row and fields.
 	refreshed, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
-		EnvironmentID: 1002, Method: "GET", PathTemplate: "/api/orders", Name: "Orders v2",
+		SUTID: proposalSUTID, Method: "GET", PathTemplate: "/api/orders", Name: "Orders v2",
 		Source: resource.APISourceAI,
 	})
 	if err != nil {
@@ -230,7 +236,7 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	if refreshed.ID != second.ID || refreshed.Name != "Orders v2" || refreshed.Status != resource.APIStatusProposed {
 		t.Fatalf("refresh = %+v", refreshed)
 	}
-	rejected, err := h.svc.RejectAPI(context.Background(), 1002, 42)
+	rejected, err := h.svc.RejectAPI(context.Background(), 1003, 42)
 	if err != nil {
 		t.Fatalf("RejectAPI: %v", err)
 	}
@@ -239,7 +245,7 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 	}
 	// A rejected API is not re-proposed.
 	skipped, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
-		EnvironmentID: 1002, Method: "GET", PathTemplate: "/api/orders", Name: "Orders v3",
+		SUTID: proposalSUTID, Method: "GET", PathTemplate: "/api/orders", Name: "Orders v3",
 		Source: resource.APISourceAI,
 	})
 	if err != nil {
@@ -249,7 +255,7 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 		t.Fatalf("rejected row changed: %+v", skipped)
 	}
 
-	invalid := ProposedAPIInput{EnvironmentID: 1002, Method: "FETCH", PathTemplate: "/x", Name: "x"}
+	invalid := ProposedAPIInput{SUTID: proposalSUTID, Method: "FETCH", PathTemplate: "/x", Name: "x"}
 	if _, err := h.svc.CreateProposedAPI(context.Background(), invalid); err == nil {
 		t.Fatal("invalid method must fail")
 	} else {
@@ -258,81 +264,81 @@ func TestCreateProposedAPIAndLifecycle(t *testing.T) {
 }
 
 // TestFindPageByRouteTemplateMatchesEveryStatus covers the W1-12 catalog lookup
-// key: (environment_id, route_template), independent of status and trailing
+// key: (sut_id, route_template), independent of status and trailing
 // slash, without going through the normalized_url dedupe path.
 func TestFindPageByRouteTemplateMatchesEveryStatus(t *testing.T) {
 	h := newHarness()
 	seedProposalEnvironment(h)
-	approved, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+	approved, err := h.svc.CreatePage(context.Background(), proposalSUTID, PageInput{
 		Name: "Orders", URL: "https://staging.example.test/orders", RouteTemplate: "/orders",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
 	proposed, err := h.svc.CreateProposedPage(context.Background(), ProposedPageInput{
-		EnvironmentID: 1002, Name: "Cart", URL: "https://staging.example.test/cart", RouteTemplate: "/cart",
+		SUTID: proposalSUTID, Name: "Cart", URL: "https://staging.example.test/cart", RouteTemplate: "/cart",
 	})
 	if err != nil {
 		t.Fatalf("CreateProposedPage: %v", err)
 	}
 
-	found, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/orders")
+	found, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), proposalSUTID, "/orders")
 	if err != nil || !ok || found.ID != approved.ID || found.Status != resource.PageStatusApproved {
 		t.Fatalf("approved lookup = %+v ok=%v err=%v", found, ok, err)
 	}
 	// A trailing slash is the same route key.
-	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/orders/")
+	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), proposalSUTID, "/orders/")
 	if err != nil || !ok || found.ID != approved.ID {
 		t.Fatalf("trailing-slash lookup = %+v ok=%v err=%v", found, ok, err)
 	}
-	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/cart")
+	found, ok, err = h.svc.FindPageByRouteTemplate(context.Background(), proposalSUTID, "/cart")
 	if err != nil || !ok || found.ID != proposed.ID || found.Status != resource.PageStatusProposed {
 		t.Fatalf("proposed lookup = %+v ok=%v err=%v", found, ok, err)
 	}
-	if _, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 1002, "/missing"); err != nil || ok {
+	if _, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), proposalSUTID, "/missing"); err != nil || ok {
 		t.Fatalf("missing lookup ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := h.svc.FindPageByRouteTemplate(context.Background(), 9999, "/orders"); err != nil || ok {
-		t.Fatalf("other environment lookup ok=%v err=%v", ok, err)
+		t.Fatalf("other sut lookup ok=%v err=%v", ok, err)
 	}
 }
 
 // TestFindAPIByTemplateMatchesMethodPathAndStatus covers the W1-12 API catalog
-// key: (environment_id, method, path_template), every status, trailing slash.
+// key: (sut_id, method, path_template), every status, trailing slash.
 func TestFindAPIByTemplateMatchesMethodPathAndStatus(t *testing.T) {
 	h := newHarness()
 	seedProposalEnvironment(h)
-	approved, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{
+	approved, err := h.svc.CreateAPI(context.Background(), proposalSUTID, APIInput{
 		Method: "GET", PathTemplate: "/api/orders", Name: "Orders",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
 	proposed, err := h.svc.CreateProposedAPI(context.Background(), ProposedAPIInput{
-		EnvironmentID: 1002, Method: "POST", PathTemplate: "/api/refund", Name: "Refund",
+		SUTID: proposalSUTID, Method: "POST", PathTemplate: "/api/refund", Name: "Refund",
 	})
 	if err != nil {
 		t.Fatalf("CreateProposedAPI: %v", err)
 	}
 
-	found, ok, err := h.svc.FindAPIByTemplate(context.Background(), 1002, "get", "/api/orders")
+	found, ok, err := h.svc.FindAPIByTemplate(context.Background(), proposalSUTID, "get", "/api/orders")
 	if err != nil || !ok || found.ID != approved.ID || found.Status != resource.APIStatusApproved {
 		t.Fatalf("approved lookup = %+v ok=%v err=%v", found, ok, err)
 	}
-	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), 1002, "GET", "/api/orders/")
+	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), proposalSUTID, "GET", "/api/orders/")
 	if err != nil || !ok || found.ID != approved.ID {
 		t.Fatalf("trailing-slash lookup = %+v ok=%v err=%v", found, ok, err)
 	}
-	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), 1002, "POST", "/api/refund")
+	found, ok, err = h.svc.FindAPIByTemplate(context.Background(), proposalSUTID, "POST", "/api/refund")
 	if err != nil || !ok || found.ID != proposed.ID || found.Status != resource.APIStatusProposed {
 		t.Fatalf("proposed lookup = %+v ok=%v err=%v", found, ok, err)
 	}
 	// A different method on the same path is a different endpoint.
-	if _, ok, err := h.svc.FindAPIByTemplate(context.Background(), 1002, "DELETE", "/api/orders"); err != nil || ok {
+	if _, ok, err := h.svc.FindAPIByTemplate(context.Background(), proposalSUTID, "DELETE", "/api/orders"); err != nil || ok {
 		t.Fatalf("method mismatch ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := h.svc.FindAPIByTemplate(context.Background(), 9999, "GET", "/api/orders"); err != nil || ok {
-		t.Fatalf("other environment ok=%v err=%v", ok, err)
+		t.Fatalf("other sut ok=%v err=%v", ok, err)
 	}
 }
 

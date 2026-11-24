@@ -10,33 +10,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// testRequirementVersionLookup resolves the owning version of a requirement for
-// the P4 task ensurer (the agent port has no version).
-type testRequirementVersionLookup struct {
-	repo interface {
-		GetRequirement(ctx context.Context, requirementID int64) (version.Requirement, error)
-	}
-}
-
-func (l testRequirementVersionLookup) GetRequirementVersionID(ctx context.Context, requirementID int64) (int64, error) {
-	requirement, err := l.repo.GetRequirement(ctx, requirementID)
-	if err != nil {
-		return 0, err
-	}
-	return requirement.VersionID, nil
-}
-
-// createP4Version provisions one SUT/environment/version through the public API
-// and returns the string and int64 version IDs.
-func (a *testAPI) createP4Version(title string) (string, int64) {
+// createTestVersion provisions one environment/SUT/version through the public API
+// and returns the string and int64 version IDs. v0.2.4-B: the environment is
+// top-level and owns the SUT (base_url lives on the SUT); the version binds the
+// environment directly.
+func (a *testAPI) createTestVersion(title string) (string, int64) {
 	a.t.Helper()
-	sut := a.data(a.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": title + " SUT", "intro": "p4"}, http.StatusCreated))
-	environment := a.data(a.do(http.MethodPost, "/api/resources/suts/"+sut["id"].(string)+"/environments",
-		map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	environment := a.data(a.do(http.MethodPost, "/api/resources/environments", map[string]any{"name": "dev"}, http.StatusCreated))
+	a.data(a.do(http.MethodPost, "/api/resources/environments/"+environment["id"].(string)+"/suts",
+		map[string]any{"name": title + " SUT", "intro": "p4", "base_url": "http://localhost:8080"}, http.StatusCreated))
 	version := a.data(a.do(http.MethodPost, "/api/versions", map[string]any{
 		"title":          title,
 		"environment_id": environment["id"],
@@ -69,13 +53,13 @@ func (a *testAPI) getRaw(path string, authenticated bool) (int, http.Header, []b
 	return response.StatusCode, response.Header, raw
 }
 
-// TestP4RoutesAuthAndEmptyState pins the assembled P4 API: unauthenticated
+// TestDeliveryRoutesAuthAndEmptyState pins the assembled P4 API: unauthenticated
 // requests are 401, empty lists/chains are 200 (not 404) and unknown entities
 // are 404.
-func TestP4RoutesAuthAndEmptyState(t *testing.T) {
+func TestDeliveryRoutesAuthAndEmptyState(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
-	versionID, _ := api.createP4Version("P4 Routes")
+	versionID, _ := api.createTestVersion("P4 Routes")
 
 	for _, path := range []string{
 		"/api/versions/" + versionID + "/issues",
@@ -114,14 +98,14 @@ func TestP4RoutesAuthAndEmptyState(t *testing.T) {
 	api.login("admin", testSeedAdminPassword)
 }
 
-// TestP4ReportPublishAndHTML exercises the real report pipeline end-to-end: the
+// TestReportPublishAndHTML exercises the real report pipeline end-to-end: the
 // adapter reads the execution/design/version application surfaces, the renderer
 // writes the deterministic HTML, the content ledger stores it and the HTTP
 // endpoint serves the verified bytes.
-func TestP4ReportPublishAndHTML(t *testing.T) {
+func TestReportPublishAndHTML(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
-	versionID, versionIDInt := api.createP4Version("P4 Report")
+	versionID, versionIDInt := api.createTestVersion("P4 Report")
 	ctx := context.Background()
 
 	waveID := int64(910001)
@@ -188,21 +172,26 @@ func TestP4ReportPublishAndHTML(t *testing.T) {
 	}
 }
 
-// TestP4VersionAndRequirementReopen exercises the P4 reopen services through the
+// TestVersionAndRequirementReopen exercises the P4 reopen services through the
 // real HTTP surface: completed version -> running, closed requirement -> draft
 // with the closure reopen count, and the 409/404 matrix.
-func TestP4VersionAndRequirementReopen(t *testing.T) {
+func TestVersionAndRequirementReopen(t *testing.T) {
 	api := newTestAPI(t)
 	api.login("admin", testSeedAdminPassword)
-	versionID, versionIDInt := api.createP4Version("P4 Reopen")
+	versionID, versionIDInt := api.createTestVersion("P4 Reopen")
 	ctx := context.Background()
 
 	// Requirement created through the P1/P4 API, then closed through SQL (the
 	// closure predicate needs execution/design data that this test does not
 	// seed; the reopen path is what is under test here).
 	requirementBody := api.do(http.MethodPost, "/api/versions/"+versionID+"/requirements", map[string]any{
-		"title": "Reopenable requirement", "description": "d", "acceptance_criteria": "a", "priority": "P1",
-		"constraints": json.RawMessage(`{}`),
+		"title": "Reopenable requirement", "priority": "P1",
+		"user_story": map[string]any{"as_a": "a tester", "i_want": "to reopen", "so_that": "scope can grow"},
+		"acceptance_criteria": []map[string]any{
+			{"given": "a closed requirement", "when": "new scope arrives", "then": "it reopens"},
+		},
+		"sut_description": "The version under test.",
+		"constraints":     json.RawMessage(`{}`),
 	}, http.StatusCreated)
 	requirement := api.data(requirementBody)
 	requirementIDString := requirement["id"].(string)

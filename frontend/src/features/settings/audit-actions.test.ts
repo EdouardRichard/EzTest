@@ -32,7 +32,6 @@ describe("AUDIT_ACTIONS", () => {
       "quality.",
       "case.",
       "execution.",
-      "visual.",
       "content.",
     ]
     for (const prefix of prefixes) {

@@ -207,18 +207,14 @@ func (s *ExportService) buildExportData(ctx context.Context, versionID int64) (d
 			Revision:             requirement.Requirement.Revision,
 			Title:                requirement.Requirement.Title,
 			Status:               requirement.Requirement.Status,
-			TargetVersionSUTIDs:  requirement.Requirement.TargetVersionSUTIDs,
 			Scenarios:            make([]design.ExportScenario, 0, len(requirement.Scenarios)),
 		}
 		for _, scenario := range requirement.Scenarios {
 			exportScenario := design.ExportScenario{
-				ID:            scenario.Scenario.ID,
-				Name:          scenario.Scenario.Name,
-				Description:   scenario.Scenario.Description,
-				VersionSUTIDs: scenario.Scenario.VersionSUTIDs,
-				PageIDs:       scenario.Scenario.PageIDs,
-				APIIDs:        scenario.Scenario.APIIDs,
-				Cases:         make([]design.ExportCase, 0, len(scenario.Cases)),
+				ID:          scenario.Scenario.ID,
+				Name:        scenario.Scenario.Name,
+				Description: scenario.Scenario.Description,
+				Cases:       make([]design.ExportCase, 0, len(scenario.Cases)),
 			}
 			for _, item := range scenario.Cases {
 				if item.Current.Status == design.CaseStatusSuperseded {
@@ -236,23 +232,21 @@ func (s *ExportService) buildExportData(ctx context.Context, versionID int64) (d
 					return design.ExportData{}, mapDesignError(err, "case")
 				}
 				exportCase := design.ExportCase{
-					CaseID:              item.Case.ID,
-					VersionID:           detail.Selected.ID,
-					Revision:            detail.Selected.Revision,
-					Title:               detail.Selected.Title,
-					Description:         detail.Selected.Description,
-					Preconditions:       detail.Selected.Preconditions,
-					TestData:            detail.Selected.TestData,
-					Priority:            detail.Selected.Priority,
-					Status:              detail.Selected.Status,
-					DefaultVersionSUTID: detail.Selected.DefaultVersionSUTID,
-					VersionSUTIDs:       detail.Selected.VersionSUTIDs,
-					PageIDs:             detail.Selected.PageIDs,
-					APIIDs:              detail.Selected.APIIDs,
-					CreatedAt:           detail.Selected.CreatedAt,
-					Steps:               detail.Selected.Steps,
-					Assertions:          detail.Selected.Assertions,
-					Sources:             detail.Selected.Sources,
+					CaseID:         item.Case.ID,
+					VersionID:      detail.Selected.ID,
+					Revision:       detail.Selected.Revision,
+					Title:          detail.Selected.Title,
+					Description:    detail.Selected.Description,
+					SutDescription: detail.Selected.SutDescription,
+					Preconditions:  detail.Selected.Preconditions,
+					CoveredACs:     detail.Selected.CoveredACs,
+					TestData:       detail.Selected.TestData,
+					Priority:       detail.Selected.Priority,
+					Status:         detail.Selected.Status,
+					CreatedAt:      detail.Selected.CreatedAt,
+					Steps:          detail.Selected.Steps,
+					Assertions:     detail.Selected.Assertions,
+					Sources:        detail.Selected.Sources,
 				}
 				exportScenario.Cases = append(exportScenario.Cases, exportCase)
 			}

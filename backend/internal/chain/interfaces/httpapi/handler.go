@@ -102,7 +102,7 @@ func parseChainFilter(r *http.Request) (chain.ChainFilter, error) {
 	query := r.URL.Query()
 	var filter chain.ChainFilter
 	var err error
-	if filter.VersionSUTID, err = optionalPositiveID(query.Get("sut_id"), "sut_id"); err != nil {
+	if filter.SUTID, err = optionalPositiveID(query.Get("sut_id"), "sut_id"); err != nil {
 		return chain.ChainFilter{}, err
 	}
 	if filter.PageID, err = optionalPositiveID(query.Get("page_id"), "page_id"); err != nil {

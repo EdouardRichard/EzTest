@@ -42,7 +42,7 @@ func newIssueToolsFixture(t *testing.T) *issueToolsFixture {
 	poster := &fakeTriagePoster{}
 	analysis := NewAnalysisService(analysisRepo, issues.svc, fakeIssueClock{now: analysisTestNow}).WithTriagePoster(poster)
 	waveID := int64(11)
-	versionSUTID := int64(9001)
+	sutID := int64(9001)
 	issues.repo.getIssues[900] = delivery.Issue{
 		ID:               900,
 		VersionID:        7,
@@ -69,7 +69,7 @@ func newIssueToolsFixture(t *testing.T) *issueToolsFixture {
 		{ID: 1, IssueID: 900, Kind: delivery.IssueRefKindCaseRun, RefID: 3001, Role: delivery.IssueRefRoleSource},
 		{ID: 2, IssueID: 900, Kind: delivery.IssueRefKindCaseVersion, RefID: 21, Role: delivery.IssueRefRoleSource},
 		{ID: 3, IssueID: 900, Kind: delivery.IssueRefKindWave, RefID: waveID, Role: delivery.IssueRefRoleSource},
-		{ID: 4, IssueID: 900, Kind: delivery.IssueRefKindEvidence, RefID: 8001, Role: delivery.IssueRefRoleSource, VersionSUTID: &versionSUTID},
+		{ID: 4, IssueID: 900, Kind: delivery.IssueRefKindEvidence, RefID: 8001, Role: delivery.IssueRefRoleSource, SUTID: &sutID},
 	}
 	issues.exec.snapshots[3001] = CaseRunSnapshot{
 		ID:                   3001,
@@ -78,8 +78,8 @@ func newIssueToolsFixture(t *testing.T) *issueToolsFixture {
 		CaseVersionID:        21,
 		RequirementID:        1200,
 		CaseTitle:            "checkout submit",
-		VersionSUTID:         &versionSUTID,
-		VersionSUTIDs:        []int64{versionSUTID},
+		SUTID:                &sutID,
+		SUTIDs:               []int64{sutID},
 		Status:               "failed",
 		FailureClass:         "application",
 		Summary:              "order confirmation missing",

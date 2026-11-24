@@ -22,6 +22,7 @@ import {
   STEP_STATUS_LABEL,
   TELEMETRY_PENDING_WINDOW_MS,
   terminalCauseLabel,
+  terminalCauseRemedy,
   WAVE_STATUS_LABEL,
   WAVE_STATUS_TONE,
   WAVE_TRIGGER_LABEL,
@@ -184,6 +185,38 @@ describe("terminal cause labels (X-01/X-02/X-07)", () => {
   })
 })
 
+describe("capacity terminal cause (T11 context_requirement_exceeds_capacity)", () => {
+  it("labels the cause in Chinese, never the raw snake_case code", () => {
+    expect(CASE_RUN_TERMINAL_CAUSE_LABEL.context_requirement_exceeds_capacity).toBe(
+      "用例所需上下文数超过机群最大容量",
+    )
+    expect(terminalCauseLabel("context_requirement_exceeds_capacity")).toBe(
+      "用例所需上下文数超过机群最大容量",
+    )
+    expect(causeTextLabel("context_requirement_exceeds_capacity")).toBe(
+      "用例所需上下文数超过机群最大容量",
+    )
+  })
+
+  it("overrides the generic resolve_blocker remedy with a capacity remedy", () => {
+    // T11 persists next_action=resolve_blocker, whose 账号/环境/数据 text is the
+    // wrong remedy for a capacity problem; the cause-specific remedy must win.
+    const remedy = terminalCauseRemedy("context_requirement_exceeds_capacity")
+    expect(remedy).toBe("需要提高执行器容量（max_contexts）或减少用例的账号角色数后重新执行")
+    expect(remedy).not.toContain("先解决阻塞条件")
+  })
+
+  it("returns no override for other causes, so callers keep their own fallback", () => {
+    expect(terminalCauseRemedy("blocked")).toBeNull()
+    expect(terminalCauseRemedy("token_budget")).toBeNull()
+    expect(terminalCauseRemedy("")).toBeNull()
+    expect(terminalCauseRemedy(undefined)).toBeNull()
+    // Inherited object properties are not remedies.
+    expect(terminalCauseRemedy("toString")).toBeNull()
+    expect(terminalCauseRemedy("constructor")).toBeNull()
+  })
+})
+
 describe("wave labels", () => {
   it("labels every wave status with a tone", () => {
     expect(WAVE_STATUS_LABEL).toEqual({
@@ -214,9 +247,8 @@ describe("human request labels", () => {
       blocked_recovery: "阻塞恢复",
       login_takeover: "登录接管",
       conflict: "冲突处理",
-      other: "其他",
     })
-    expect(Object.keys(HUMAN_REQUEST_KIND_LABEL)).toHaveLength(6)
+    expect(Object.keys(HUMAN_REQUEST_KIND_LABEL)).toHaveLength(5)
     expect(HUMAN_REQUEST_STATUS_LABEL).toEqual({
       pending: "待处理",
       answered: "已处理",
@@ -238,6 +270,9 @@ describe("detail labels", () => {
     expect(EVIDENCE_KIND_LABEL.db).toBe("数据库")
     expect(EVIDENCE_KIND_LABEL.download).toBe("下载")
     expect(EVIDENCE_KIND_LABEL.text).toBe("文本")
+    expect(EVIDENCE_KIND_LABEL.command).toBe("命令")
+    expect(EVIDENCE_KIND_LABEL.file).toBe("文件")
+    expect(EVIDENCE_KIND_LABEL.trace).toBe("跟踪")
   })
 
   it("labels step statuses, assertion verdicts and assertion kinds", () => {
@@ -257,7 +292,6 @@ describe("detail labels", () => {
     expect(ASSERTION_KIND_LABEL.api).toBe("API")
     expect(ASSERTION_KIND_LABEL.db).toBe("数据库")
     expect(ASSERTION_KIND_LABEL.text).toBe("文本")
-    expect(ASSERTION_KIND_LABEL.visual).toBe("视觉")
   })
 
   it("labels executor states", () => {

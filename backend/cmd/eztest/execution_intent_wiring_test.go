@@ -61,7 +61,7 @@ func TestIntentScanDoesNotWakePerVersion(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() {
-		runExecutionScheduler(ctx, p7FakeLeaderGate(true), intents, versions, nil, nil, wake, 0)
+		runExecutionScheduler(ctx, fakeLeaderGate(true), intents, versions, nil, nil, wake, 0)
 		close(done)
 	}()
 
@@ -90,7 +90,7 @@ func TestIntentScanCompatibilityInterval(t *testing.T) {
 		go func() {
 			// A nil wake disables the startup scan too, so any Ensure call can
 			// only come from a periodic poll.
-			runExecutionScheduler(ctx, p7FakeLeaderGate(true), intents, versions, nil, nil, nil, 0)
+			runExecutionScheduler(ctx, fakeLeaderGate(true), intents, versions, nil, nil, nil, 0)
 			close(done)
 		}()
 		time.Sleep(80 * time.Millisecond)
@@ -112,7 +112,7 @@ func TestIntentScanCompatibilityInterval(t *testing.T) {
 		defer cancel()
 		done := make(chan struct{})
 		go func() {
-			runExecutionScheduler(ctx, p7FakeLeaderGate(true), intents, versions, nil, nil, nil, 5*time.Millisecond)
+			runExecutionScheduler(ctx, fakeLeaderGate(true), intents, versions, nil, nil, nil, 5*time.Millisecond)
 			close(done)
 		}()
 		waitUntil(t, 2*time.Second, func() bool { return intents.count(7) >= 1 },

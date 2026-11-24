@@ -207,13 +207,9 @@ test("executor endpoint is derived from the listen address", () => {
   assert.equal(executorEndpointFromAddress("not-an-address"), null)
 })
 
-test("startPushFromEnv reads manager contexts and health", async () => {
+test("startPushFromEnv reports v2 session counts and drain as degraded", async () => {
   const api = await startApi()
-  const manager = {
-    size: 1,
-    maxContexts: 4,
-    health: async () => ({ status: "degraded", error: "browser unavailable" }),
-  }
+  const sessions = { size: 1, maxSessions: 4, draining: false }
   const client = startPushFromEnv({
     env: {
       EZTEST_API_URL: api.url,
@@ -221,7 +217,7 @@ test("startPushFromEnv reads manager contexts and health", async () => {
       EZTEST_EXECUTOR_ADDR: "127.0.0.1:13337",
       EZTEST_EXECUTOR_HEARTBEAT_SECONDS: "1",
     },
-    manager,
+    sessions,
     version: "0.2.0-p7",
     logger: null,
   })
@@ -232,6 +228,7 @@ test("startPushFromEnv reads manager contexts and health", async () => {
     })
     const register = requestsFor(api.requests, "/api/internal/executors/register")[0]
     assert.equal(register.body.endpoint, "http://127.0.0.1:13337")
+    // Contract: capacity = max sessions, active_contexts = active sessions.
     assert.equal(register.body.capacity, 4)
     assert.equal(register.body.active_contexts, 1)
   } finally {
@@ -242,12 +239,69 @@ test("startPushFromEnv reads manager contexts and health", async () => {
   assert.equal(
     startPushFromEnv({
       env: {},
-      manager,
+      sessions,
       version: "0.2.0-p7",
       logger: null,
     }),
     null,
   )
+})
+
+// The v1 context fallback is deleted with the v1 protocol (R-C2): without a
+// session manager the push reports an empty workstation, and it never probes a
+// browser (a missing browser must not degrade exec/shell/files).
+test("startPushFromEnv without a session manager reports an empty workstation", async () => {
+  const api = await startApi()
+  const client = startPushFromEnv({
+    env: {
+      EZTEST_API_URL: api.url,
+      EZTEST_EXECUTOR_TOKEN: TOKEN,
+      EZTEST_EXECUTOR_ADDR: "127.0.0.1:13337",
+      EZTEST_EXECUTOR_HEARTBEAT_SECONDS: "1",
+    },
+    version: "0.2.0-p7",
+    logger: null,
+  })
+  try {
+    await waitFor(() => requestsFor(api.requests, "/api/internal/executors/register").length === 1, {
+      label: "session-less register",
+    })
+    const register = requestsFor(api.requests, "/api/internal/executors/register")[0]
+    assert.equal(register.body.capacity, 1)
+    assert.equal(register.body.active_contexts, 0)
+  } finally {
+    client.stop()
+    await api.close()
+  }
+})
+
+test("a draining executor heartbeats degraded so the backend stops dispatching", async () => {
+  const api = await startApi()
+  const sessions = { size: 2, maxSessions: 8, draining: true }
+  const client = startPushFromEnv({
+    env: {
+      EZTEST_API_URL: api.url,
+      EZTEST_EXECUTOR_TOKEN: TOKEN,
+      EZTEST_EXECUTOR_ADDR: "127.0.0.1:13337",
+      EZTEST_EXECUTOR_HEARTBEAT_SECONDS: "1",
+    },
+    sessions,
+    version: "0.2.0-p7",
+    logger: null,
+  })
+  try {
+    await waitFor(
+      () => requestsFor(api.requests, "/api/internal/executors/heartbeat").length >= 1,
+      { label: "draining heartbeat", timeoutMs: 5000 },
+    )
+    const heartbeat = requestsFor(api.requests, "/api/internal/executors/heartbeat")[0]
+    assert.equal(heartbeat.body.status, "degraded")
+    assert.equal(heartbeat.body.capacity, 8)
+    assert.equal(heartbeat.body.active_contexts, 2)
+  } finally {
+    client.stop()
+    await api.close()
+  }
 })
 
 test("startFromEnv wires the optional push client", async () => {
@@ -258,20 +312,11 @@ test("startFromEnv wires the optional push client", async () => {
   const { port } = probe.address()
   await new Promise((resolve) => probe.close(resolve))
 
-  const manager = {
-    size: 0,
-    maxContexts: 3,
-    health: async () => ({ status: "ok" }),
-    close: async () => {},
-  }
-  const started = await startFromEnv(
-    {
-      EZTEST_EXECUTOR_TOKEN: TOKEN,
-      EZTEST_EXECUTOR_ADDR: `127.0.0.1:${port}`,
-      EZTEST_API_URL: api.url,
-    },
-    { manager },
-  )
+  const started = await startFromEnv({
+    EZTEST_EXECUTOR_TOKEN: TOKEN,
+    EZTEST_EXECUTOR_ADDR: `127.0.0.1:${port}`,
+    EZTEST_API_URL: api.url,
+  })
   assert.ok(started, "startFromEnv returned null for a valid environment")
   try {
     await waitFor(() => requestsFor(api.requests, "/api/internal/executors/register").length === 1, {
@@ -280,11 +325,13 @@ test("startFromEnv wires the optional push client", async () => {
     const register = requestsFor(api.requests, "/api/internal/executors/register")[0]
     assert.equal(register.authorization, `Bearer ${TOKEN}`)
     assert.equal(register.body.endpoint, `http://127.0.0.1:${port}`)
-    assert.equal(register.body.capacity, 3)
+    // Contract: the wired push body reflects v2 session capacity (default 8).
+    assert.equal(register.body.capacity, 8)
+    assert.equal(register.body.active_contexts, 0)
   } finally {
     started.push?.stop()
     await new Promise((resolve) => started.server.close(resolve))
-    await started.manager.close()
+    await started.sessions.close()
     await api.close()
   }
 })

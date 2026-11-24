@@ -85,18 +85,30 @@ function OverviewStat({ icon, label, value }: CountProps) {
   )
 }
 
-function BindingCard({ binding, index }: { binding: VersionBinding; index: number }) {
-  const repositoryName = binding.repository?.name ?? "未绑定代码仓"
+/**
+ * One SUT of the bound environment (v0.2.4-B). Assets are per-SUT; base_url lives
+ * on the SUT; the code repository is the environment code pool row inherited by
+ * this SUT (matched by sut_id). Accounts are the version's global subset.
+ */
+function SutBindingCard({
+  sut,
+  binding,
+  index,
+}: {
+  sut: VersionBinding["environment"]["suts"][number]
+  binding: VersionBinding
+  index: number
+}) {
+  const repository = binding.repositories.find((row) => row.sut_id === sut.id)
+  const repositoryName = repository?.repository.name ?? "未绑定代码仓"
   return (
     <article className="surface-card p-4">
       <header className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold text-foreground">
-            绑定 {index + 1} · {binding.sut.name}
+            绑定 {index + 1} · {sut.name}
           </h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            {binding.environment.name} · {binding.environment.base_url}
-          </p>
+          <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">{sut.base_url}</p>
         </div>
         <Badge tone={binding.environment.status === "active" ? "success" : "neutral"}>
           {binding.environment.status === "active" ? "环境启用" : "环境停用"}
@@ -106,15 +118,15 @@ function BindingCard({ binding, index }: { binding: VersionBinding; index: numbe
       <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
         <div>
           <dt className="text-muted-foreground">页面</dt>
-          <dd className="font-medium text-foreground">{binding.pages.length} 个页面</dd>
+          <dd className="font-medium text-foreground">{sut.pages.length} 个页面</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">API</dt>
-          <dd className="font-medium text-foreground">{binding.apis.length} 个 API</dd>
+          <dd className="font-medium text-foreground">{sut.apis.length} 个 API</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">目标库</dt>
-          <dd className="font-medium text-foreground">{binding.databases.length} 个目标库</dd>
+          <dd className="font-medium text-foreground">{sut.databases.length} 个目标库</dd>
         </div>
         <div>
           <dt className="text-muted-foreground">测试账号</dt>
@@ -125,9 +137,9 @@ function BindingCard({ binding, index }: { binding: VersionBinding; index: numbe
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3 text-[11px]">
         <span className="text-muted-foreground">代码仓</span>
         <span className="font-medium text-foreground">{repositoryName}</span>
-        {binding.pages.length > 0 ? (
+        {sut.pages.length > 0 ? (
           <span className="text-muted-foreground">
-            页面范围：{binding.pages.map((page) => page.name).join("、")}
+            页面范围：{sut.pages.map((page) => page.name).join("、")}
           </span>
         ) : null}
       </div>
@@ -142,16 +154,15 @@ function VersionOverview({
   version: Version
   showBindings?: boolean
 }) {
-  const totals = version.bindings.reduce(
-    (sum, binding) => ({
-      pages: sum.pages + binding.pages.length,
-      apis: sum.apis + binding.apis.length,
-      databases: sum.databases + binding.databases.length,
-      accounts: sum.accounts + binding.accounts.length,
-      repositories: sum.repositories + (binding.repository ? 1 : 0),
-    }),
-    { pages: 0, apis: 0, databases: 0, accounts: 0, repositories: 0 },
-  )
+  // T19b: the version binds one environment directly (v0.2.4-B); totals come
+  // from the single binding. T20 reworks the per-SUT card display.
+  const totals = {
+    pages: version.binding.pages.length,
+    apis: version.binding.apis.length,
+    databases: version.binding.databases.length,
+    accounts: version.binding.accounts.length,
+    repositories: version.binding.repositories.length,
+  }
 
   return (
     <div className="space-y-4">
@@ -200,19 +211,21 @@ function VersionOverview({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold text-foreground">SUT 绑定概览</h2>
             <span className="text-[11px] text-muted-foreground">
-              共 {version.bindings.length} 个 SUT · 更新于 {formatDateTime(version.updated_at)}
+              环境：{version.binding.environment.name} · 共{" "}
+              {version.binding.environment.suts.length} 个 SUT · 更新于{" "}
+              {formatDateTime(version.updated_at)}
             </span>
           </div>
 
-          {version.bindings.length === 0 ? (
+          {version.binding.environment.suts.length === 0 ? (
             <EmptyState
               title="该版本暂无 SUT 绑定"
-              description="P0 创建接口要求至少一个绑定，请检查数据或重新创建版本。"
+              description="创建接口要求环境至少有一个 SUT，请检查数据或重新创建版本。"
             />
           ) : (
             <div className="grid gap-3 lg:grid-cols-2">
-              {version.bindings.map((binding, index) => (
-                <BindingCard key={binding.id} binding={binding} index={index} />
+              {version.binding.environment.suts.map((sut, index) => (
+                <SutBindingCard key={sut.id} sut={sut} binding={version.binding} index={index} />
               ))}
             </div>
           )}
@@ -220,8 +233,7 @@ function VersionOverview({
       ) : null}
 
       <section className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
-        需求与澄清（P1）、用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
-        已在对应 Tab 提供。
+        需求与澄清、用例设计、执行、探索链路、问题、报告与代码与变更已在对应 Tab 提供。
       </section>
     </div>
   )
@@ -899,8 +911,9 @@ export function VersionDetailPage({
     // W1-14B: a delta pass settles/proposes discovered resources; the frozen
     // scope snapshot changes which binding resources a wave may use.
     onDiscoveryChanged: refreshDiscovery,
-    // W2-12 FE-19/EV-12: a discovery revision was auto-confirmed or rolled back;
-    // show the replacement/auto-confirm notice and refetch the discovery panels.
+    // W2-12 FE-19/EV-12 (R-E2r): the event now only announces a rollback DRAFT
+    // replacement (discovery auto-confirm abolished); show the notice and refetch
+    // the discovery panels. It must never be rendered as an auto-confirm.
     onDesignCaseChanged: (event) => {
       if (event.type !== "case.revision.auto_confirmed") return
       const next = discoveryRevisionFromEventPayload(event.payload)

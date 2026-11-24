@@ -48,12 +48,13 @@ type CaseSourceReader interface {
 	CaseSources(ctx context.Context, versionID int64) ([]CaseSourceRef, error)
 }
 
-// ImpactCandidateView tags one candidate with its analysis repo and the version
-// SUTs bound to that repo (multi-repo union, spec §5.4).
+// ImpactCandidateView tags one candidate with its analysis repo and the SUTs
+// that reach that repo through the environment code pool (multi-repo union,
+// spec §5.4).
 type ImpactCandidateView struct {
 	codeintel.ImpactCandidate
-	RepoID        int64
-	VersionSUTIDs []int64
+	RepoID int64
+	SUTIDs []int64
 }
 
 // ImpactDeps is the impact-analysis wiring. Edges, CaseSources, Reviews and
@@ -146,13 +147,13 @@ func (s *ImpactService) Compute(ctx context.Context, analysisID int64) ([]codein
 	if err != nil {
 		return nil, mapDomainError(err, "code repository")
 	}
-	bindings, err := s.versions.VersionSUTBindings(ctx, analysis.VersionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, analysis.VersionID)
 	if err != nil {
 		return nil, err
 	}
-	versionSUTIDs := versionSUTIDsForRepo(bindings, analysis.RepoID)
+	sutIDs := sutIDsForRepo(bindings, analysis.RepoID)
 	changedPaths, changedFiles := decodeChangedFilesJSON(analysis.ChangedFiles)
-	pages, apis, err := s.sutResources(ctx, versionSUTIDs)
+	pages, apis, err := s.sutResources(ctx, sutIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -384,14 +385,14 @@ func (s *ImpactService) List(ctx context.Context, analysisID int64) ([]ImpactCan
 	if err != nil {
 		return nil, mapDomainError(err, "code impact candidate")
 	}
-	bindings, err := s.versions.VersionSUTBindings(ctx, analysis.VersionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, analysis.VersionID)
 	if err != nil {
 		return nil, err
 	}
-	sutIDs := versionSUTIDsForRepo(bindings, analysis.RepoID)
+	sutIDs := sutIDsForRepo(bindings, analysis.RepoID)
 	views := make([]ImpactCandidateView, 0, len(candidates))
 	for _, candidate := range candidates {
-		views = append(views, ImpactCandidateView{ImpactCandidate: candidate, RepoID: analysis.RepoID, VersionSUTIDs: sutIDs})
+		views = append(views, ImpactCandidateView{ImpactCandidate: candidate, RepoID: analysis.RepoID, SUTIDs: sutIDs})
 	}
 	return views, nil
 }
@@ -442,7 +443,7 @@ func (s *ImpactService) SetSelected(ctx context.Context, analysisID, candidateID
 // version. Evidence is never merged across repositories; the highest-priority
 // source wins and reasons are joined (spec §5.4).
 func (s *ImpactService) Union(ctx context.Context, versionID int64) ([]ImpactCandidateView, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +463,7 @@ func (s *ImpactService) Union(ctx context.Context, versionID int64) ([]ImpactCan
 		if listErr != nil {
 			return nil, mapDomainError(listErr, "code impact candidate")
 		}
-		sutIDs := versionSUTIDsForRepo(bindings, repoID)
+		sutIDs := sutIDsForRepo(bindings, repoID)
 		for _, candidate := range candidates {
 			key := candidateSubjectKey(candidate.SubjectKind, candidate.SubjectID)
 			merged.addCandidate(candidate)
@@ -478,7 +479,7 @@ func (s *ImpactService) Union(ctx context.Context, versionID int64) ([]ImpactCan
 	for _, candidate := range sorted {
 		key := candidateSubjectKey(candidate.SubjectKind, candidate.SubjectID)
 		views = append(views, ImpactCandidateView{
-			ImpactCandidate: candidate, RepoID: repoBySubject[key], VersionSUTIDs: sutsBySubject[key],
+			ImpactCandidate: candidate, RepoID: repoBySubject[key], SUTIDs: sutsBySubject[key],
 		})
 	}
 	return views, nil
@@ -695,30 +696,30 @@ type apiIndex struct {
 	byID    map[int64]APIRef
 }
 
-func (s *ImpactService) sutResources(ctx context.Context, versionSUTIDs []int64) (pageIndex, apiIndex, error) {
+func (s *ImpactService) sutResources(ctx context.Context, sutIDs []int64) (pageIndex, apiIndex, error) {
 	pages := pageIndex{byRoute: map[string]PageRef{}, byID: map[int64]PageRef{}}
 	apis := apiIndex{byRoute: map[string]APIRef{}, byID: map[int64]APIRef{}}
 	if s.resources == nil {
 		return pages, apis, nil
 	}
-	for _, versionSUTID := range versionSUTIDs {
-		refs, err := s.resources.SUTPages(ctx, versionSUTID)
+	for _, sutID := range sutIDs {
+		refs, err := s.resources.SUTPages(ctx, sutID)
 		if err != nil {
 			return pages, apis, err
 		}
 		for _, page := range refs {
-			if page.Status == "rejected" {
+			if page.Status == AssetStatusRejected {
 				continue
 			}
 			pages.byRoute[page.RouteTemplate] = page
 			pages.byID[page.ID] = page
 		}
-		apiRefs, err := s.resources.SUTAPIs(ctx, versionSUTID)
+		apiRefs, err := s.resources.SUTAPIs(ctx, sutID)
 		if err != nil {
 			return pages, apis, err
 		}
 		for _, api := range apiRefs {
-			if api.Status == "rejected" {
+			if api.Status == AssetStatusRejected {
 				continue
 			}
 			apis.byRoute[apiRouteKey(api.Method, api.PathTemplate)] = api
@@ -913,21 +914,21 @@ func (s *ImpactService) mergeUnmapped(analysis codeintel.Analysis, changedPaths 
 
 // --- small helpers ----------------------------------------------------------------
 
-func versionSUTIDsForRepo(bindings []VersionSUTBinding, repoID int64) []int64 {
+func sutIDsForRepo(bindings []SUTRepoBinding, repoID int64) []int64 {
 	ids := make([]int64, 0)
 	seen := map[int64]bool{}
 	for _, binding := range bindings {
-		if binding.RepoID != repoID || seen[binding.VersionSUTID] {
+		if binding.RepoID != repoID || seen[binding.SUTID] {
 			continue
 		}
-		seen[binding.VersionSUTID] = true
-		ids = append(ids, binding.VersionSUTID)
+		seen[binding.SUTID] = true
+		ids = append(ids, binding.SUTID)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
 
-func distinctRepoIDs(bindings []VersionSUTBinding) []int64 {
+func distinctRepoIDs(bindings []SUTRepoBinding) []int64 {
 	ids := make([]int64, 0)
 	seen := map[int64]bool{}
 	for _, binding := range bindings {

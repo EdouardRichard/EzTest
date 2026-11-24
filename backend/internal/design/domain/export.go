@@ -3,6 +3,7 @@ package design
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -75,40 +76,41 @@ type ExportRequirement struct {
 	Revision             int
 	Title                string
 	Status               string
-	TargetVersionSUTIDs  []int64
 	Scenarios            []ExportScenario
 }
 
 // ExportScenario is one scenario node of the export scope.
+//
+// v0.2.4-B (§3.2): the resource ID arrays are gone with the scenario fields
+// they projected.
 type ExportScenario struct {
-	ID            int64
-	Name          string
-	Description   string
-	VersionSUTIDs []int64
-	PageIDs       []int64
-	APIIDs        []int64
-	Cases         []ExportCase
+	ID          int64
+	Name        string
+	Description string
+	Cases       []ExportCase
 }
 
 // ExportCase is one current case version with its immutable children.
+//
+// v0.2.4-B (§3.5 "design export"): the exports describe the system under test
+// in natural language and list the acceptance criteria the case covers, instead
+// of naming default/version SUT and page/API ids.
 type ExportCase struct {
-	CaseID              int64
-	VersionID           int64
-	Revision            int
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	Status              string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	CreatedAt           time.Time
-	Steps               []CaseStep
-	Assertions          []CaseAssertion
-	Sources             []CaseSource
+	CaseID         int64
+	VersionID      int64
+	Revision       int
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Status         string
+	CreatedAt      time.Time
+	Steps          []CaseStep
+	Assertions     []CaseAssertion
+	Sources        []CaseSource
 }
 
 // RenderExport renders one format. It is a pure function: identical ExportData
@@ -133,27 +135,28 @@ func exportFormatName(format string) string {
 	return format
 }
 
-// formatIDs renders an int64 list as comma-separated decimal IDs.
-func formatIDs(values []int64) string {
-	if len(values) == 0 {
-		return "-"
+// exportDash is the "nothing here" cell of the markdown/CSV renderers.
+const exportDash = "-"
+
+// exportText renders one natural-language contract field, falling back to the
+// dash the renderers have always used for an absent value. It replaces
+// formatOptionalID: the v0.2.4-B exports carry prose, so the empty case is an
+// empty string rather than a nil pointer.
+func exportText(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return exportDash
 	}
-	result := ""
-	for index, value := range values {
-		if index > 0 {
-			result += ", "
-		}
-		result += formatInt64(value)
-	}
-	return result
+	return value
 }
 
-// formatOptionalID renders an optional ID or "-".
-func formatOptionalID(value *int64) string {
-	if value == nil {
-		return "-"
+// formatACList renders a covered_acs set as a comma-separated id list. The
+// order is the stored (already normalized, sorted) order so the export is
+// byte-stable for identical content.
+func formatACList(values []string) string {
+	if len(values) == 0 {
+		return exportDash
 	}
-	return formatInt64(*value)
+	return strings.Join(values, ", ")
 }
 
 // exportContext carries the renderer-agnostic header lines.

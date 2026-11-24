@@ -25,26 +25,37 @@ func (a *Adapter) VersionPack(ctx context.Context, versionID int64) (agentapp.Ve
 	if err != nil {
 		return agentapp.VersionPack{}, err
 	}
+	// EffectiveSUTs, not Environment.SUTs: the pack feeds the design AI's page
+	// locators and the model-facing database inventory, so it carries the
+	// version's effective scope (approved pages/APIs, active databases) and never
+	// the proposed/disabled rows of the raw resource catalog.
+	suts := view.Binding.EffectiveSUTs()
+	environmentName := view.Binding.Environment.Name
 	pack := agentapp.VersionPack{
 		VersionID: view.ID,
 		Title:     view.Title,
 		Status:    view.Status,
-		SUTs:      make([]string, 0, len(view.Bindings)),
+		SUTs:      make([]string, 0, len(suts)),
 		Pages:     make([]string, 0),
 		APIs:      make([]string, 0),
 	}
-	for _, binding := range view.Bindings {
-		pack.SUTs = append(pack.SUTs, fmt.Sprintf("%s (%s)", binding.SUT.Name, binding.Environment.Name))
-		for _, page := range binding.Pages {
+	for _, sut := range suts {
+		pack.SUTs = append(pack.SUTs, fmt.Sprintf("%s (%s)", sut.Name, environmentName))
+		for _, page := range sut.Pages {
 			pack.Pages = append(pack.Pages, fmt.Sprintf("%s %s", page.Name, page.RouteTemplate))
 		}
-		for _, api := range binding.APIs {
+		for _, api := range sut.APIs {
 			pack.APIs = append(pack.APIs, fmt.Sprintf("%s %s", api.Method, api.PathTemplate))
 		}
-		// R-E1-2: db assertions may only use a database_id from the bound
-		// environment; the pack carries the inventory so the model can choose
-		// instead of guessing. Empty when the version binds no database.
-		pack.Databases = append(pack.Databases, databaseSummaries(binding)...)
+		// The pack carries the database inventory so the model can choose
+		// instead of guessing. Two id spaces travel with each row and must not be
+		// confused (v0.2.4-B): the database id serves the execution db tools,
+		// while SUTID -- passed in here and rendered by versionPackContent -- is
+		// what a design db assertion takes as its sut_id. The old R-E1-2 rule
+		// ("db assertions may only use a bound database_id") is retired: a design
+		// db assertion names a SUT and is checked for presence only.
+		// Empty when the version binds no database.
+		pack.Databases = append(pack.Databases, databaseSummaries(sut.SUTID, sut.Databases)...)
 	}
 
 	requirements, err := a.listAllRequirements(ctx, versionID)

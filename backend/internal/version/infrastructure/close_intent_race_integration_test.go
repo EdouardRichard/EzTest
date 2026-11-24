@@ -23,7 +23,7 @@ func raceIntent(ids interface{ Next() int64 }, versionID, caseVersionID int64, d
 		ID:                     ids.Next(),
 		VersionID:              versionID,
 		CaseVersionID:          caseVersionID,
-		VersionSUTIDs:          []int64{5001},
+		SUTIDs:                 []int64{5001},
 		EnvironmentFingerprint: strings.Repeat("b", 64),
 		Purpose:                execution.PurposeRetest,
 		Status:                 execution.IntentOpen,
@@ -88,7 +88,7 @@ func TestVersionCloseSerializesWithIntentCreation(t *testing.T) {
 		})
 		go func() {
 			defer close(closeDone)
-			_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+			_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 				ClosedAt: testTime.Add(time.Hour), CloseReason: "racing close",
 			}, func(callbackCtx context.Context, _ version.Version) error {
 				close(locked)
@@ -157,7 +157,7 @@ func TestVersionCloseSerializesWithIntentCreation(t *testing.T) {
 		if err := intents.Create(ctx, raceIntent(fixture.ids, fixture.version.ID, fixture.ids.Next(), "intent-wins")); err != nil {
 			t.Fatalf("create intent: %v", err)
 		}
-		_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+		_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 			ClosedAt: testTime.Add(time.Hour), CloseReason: "must lose",
 		}, func(callbackCtx context.Context, _ version.Version) error {
 			var active int

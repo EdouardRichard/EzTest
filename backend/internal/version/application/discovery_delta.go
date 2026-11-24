@@ -40,7 +40,7 @@ type DiscoveryObservation struct {
 	VersionID        int64
 	WaveID           int64
 	CaseRunID        int64
-	VersionSUTID     int64
+	SUTID            int64
 	EnvironmentID    int64
 	Kind             string
 	Method           string
@@ -82,8 +82,8 @@ var ErrDeltaBusy = errors.New("discovery delta: another evaluation is already ru
 // (the W1-12 registered/rejected/proposed distinction) and proposal creation
 // goes through the existing proposed-resource path.
 type DiscoveryResourceCatalog interface {
-	FindPageByRouteTemplate(ctx context.Context, environmentID int64, routeTemplate string) (resourceapp.PageView, bool, error)
-	FindAPIByTemplate(ctx context.Context, environmentID int64, method, pathTemplate string) (resourceapp.APIView, bool, error)
+	FindPageByRouteTemplate(ctx context.Context, sutID int64, routeTemplate string) (resourceapp.PageView, bool, error)
+	FindAPIByTemplate(ctx context.Context, sutID int64, method, pathTemplate string) (resourceapp.APIView, bool, error)
 	CreateProposedPage(ctx context.Context, input resourceapp.ProposedPageInput) (resourceapp.PageView, error)
 	CreateProposedAPI(ctx context.Context, input resourceapp.ProposedAPIInput) (resourceapp.APIView, error)
 }
@@ -103,7 +103,7 @@ type DeltaItem struct {
 	Method           string `json:"method"`
 	ResourceTemplate string `json:"resource_template"`
 	Host             string `json:"host"`
-	VersionSUTID     int64  `json:"version_sut_id"`
+	SUTID            int64  `json:"sut_id"`
 	EnvironmentID    int64  `json:"environment_id"`
 	WaveID           int64  `json:"wave_id"`
 	CaseRunID        int64  `json:"case_run_id"`
@@ -242,7 +242,7 @@ func (d *DiscoveryDelta) Evaluate(ctx context.Context, versionID, waveID int64) 
 func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int64, facts map[string][]version.Fact, observation DiscoveryObservation, item *DeltaItem) (string, bool, bool, error) {
 	switch item.Kind {
 	case "page":
-		view, found, err := d.resources.FindPageByRouteTemplate(ctx, observation.EnvironmentID, item.ResourceTemplate)
+		view, found, err := d.resources.FindPageByRouteTemplate(ctx, observation.SUTID, item.ResourceTemplate)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -270,7 +270,7 @@ func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int6
 			return classified, false, false, nil
 		}
 		created, err := d.resources.CreateProposedPage(ctx, resourceapp.ProposedPageInput{
-			EnvironmentID: observation.EnvironmentID,
+			SUTID:         observation.SUTID,
 			Name:          item.ResourceTemplate,
 			URL:           discoveryProposedURL(*item),
 			RouteTemplate: item.ResourceTemplate,
@@ -288,7 +288,7 @@ func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int6
 		item.ResourceID = parseResourceID(created.ID)
 		return d.finalizeProposedResource(ctx, versionID, facts, observation, item, created.Status)
 	case "api":
-		view, found, err := d.resources.FindAPIByTemplate(ctx, observation.EnvironmentID, item.Method, item.ResourceTemplate)
+		view, found, err := d.resources.FindAPIByTemplate(ctx, observation.SUTID, item.Method, item.ResourceTemplate)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -314,11 +314,11 @@ func (d *DiscoveryDelta) evaluateObservation(ctx context.Context, versionID int6
 			return classified, false, false, nil
 		}
 		created, err := d.resources.CreateProposedAPI(ctx, resourceapp.ProposedAPIInput{
-			EnvironmentID: observation.EnvironmentID,
-			Method:        item.Method,
-			PathTemplate:  item.ResourceTemplate,
-			Name:          strings.TrimSpace(item.Method + " " + item.ResourceTemplate),
-			Source:        resource.APISourceAI,
+			SUTID:        observation.SUTID,
+			Method:       item.Method,
+			PathTemplate: item.ResourceTemplate,
+			Name:         strings.TrimSpace(item.Method + " " + item.ResourceTemplate),
+			Source:       resource.APISourceAI,
 		})
 		if err != nil {
 			if isInvalidObservationError(err) {
@@ -375,8 +375,8 @@ func unprocessableObservation(observation DiscoveryObservation) string {
 	if kind != "page" && kind != "api" {
 		return "unsupported kind"
 	}
-	if observation.EnvironmentID <= 0 {
-		return "missing environment"
+	if observation.SUTID <= 0 {
+		return "missing sut"
 	}
 	template := discoveryTemplateKey(observation.ResourceTemplate)
 	if template == "" {
@@ -476,7 +476,7 @@ func (d *DiscoveryDelta) loadCurrentFacts(ctx context.Context, versionID int64) 
 	for _, kind := range []string{"page", "api"} {
 		current, err := d.facts.Current(ctx, versionID, kind)
 		if err != nil {
-			d.logger.WarnContext(ctx, "discovery delta: read current facts failed; P9 fact dedupe skipped",
+			d.logger.WarnContext(ctx, "discovery delta: read current facts failed; fact dedupe skipped",
 				"version_id", versionID, "kind", kind, "error", err)
 			continue
 		}
@@ -509,7 +509,7 @@ func (d *DiscoveryDelta) publishDelta(ctx context.Context, versionID, waveID int
 			"method":            item.Method,
 			"resource_template": item.ResourceTemplate,
 			"host":              item.Host,
-			"version_sut_id":    platformid.Format(item.VersionSUTID),
+			"sut_id":            platformid.Format(item.SUTID),
 			"environment_id":    platformid.Format(item.EnvironmentID),
 			"resource_id":       platformid.Format(item.ResourceID),
 			"fact_id":           platformid.Format(item.FactID),
@@ -529,7 +529,7 @@ func (d *DiscoveryDelta) publishDelta(ctx context.Context, versionID, waveID int
 		payload["method"] = item.Method
 		payload["resource_template"] = item.ResourceTemplate
 		payload["host"] = item.Host
-		payload["version_sut_id"] = platformid.Format(item.VersionSUTID)
+		payload["sut_id"] = platformid.Format(item.SUTID)
 		payload["environment_id"] = platformid.Format(item.EnvironmentID)
 		payload["resource_id"] = platformid.Format(item.ResourceID)
 		payload["fact_id"] = platformid.Format(item.FactID)
@@ -560,7 +560,7 @@ func discoveryDeltaFact(versionID int64, observation DiscoveryObservation, item 
 		"host":              item.Host,
 		"source":            "execution",
 		"environment_id":    platformid.Format(item.EnvironmentID),
-		"version_sut_id":    platformid.Format(item.VersionSUTID),
+		"sut_id":            platformid.Format(item.SUTID),
 		"resource_id":       platformid.Format(item.ResourceID),
 		"provenance": map[string]any{
 			"wave_id":        platformid.Format(item.WaveID),
@@ -584,27 +584,28 @@ func discoveryDeltaFact(versionID int64, observation DiscoveryObservation, item 
 	}
 }
 
-// discoveryDeltaFactKey is the P9-compatible identity of one execution fact.
-// The environment is always present (validated before the write) and the API
-// method is uppercase, matching pageFactKey/apiFactKey in the agent context.
+// discoveryDeltaFactKey is the identity of one execution fact. v0.2.4-B: pages
+// and APIs are owned by a SUT, so the SUT (always present, validated before the
+// write) is the scoping dimension; the API method is uppercase, matching
+// pageFactKey/apiFactKey in the agent context.
 func discoveryDeltaFactKey(item DeltaItem) string {
 	template := discoveryTemplateKey(item.ResourceTemplate)
 	if item.Kind == "api" {
-		return fmt.Sprintf("api:env:%d:%s %s", item.EnvironmentID, strings.ToUpper(strings.TrimSpace(item.Method)), template)
+		return fmt.Sprintf("api:sut:%d:%s %s", item.SUTID, strings.ToUpper(strings.TrimSpace(item.Method)), template)
 	}
-	return fmt.Sprintf("page:env:%d:%s", item.EnvironmentID, template)
+	return fmt.Sprintf("page:sut:%d:%s", item.SUTID, template)
 }
 
 // matchingDiscoveryFact finds a current fact describing the same resource. It
-// matches on kind + environment + template (method for APIs) so a P9 fact with
-// a different key convention is reused instead of duplicated.
+// matches on kind + SUT + template (method for APIs) so a fact written under a
+// different key convention is reused instead of duplicated.
 func matchingDiscoveryFact(facts []version.Fact, item DeltaItem) *version.Fact {
 	for index := range facts {
 		fact := &facts[index]
 		if fact.Kind != item.Kind {
 			continue
 		}
-		if environmentID := factPayloadInt(fact.Payload, "environment_id"); environmentID != 0 && environmentID != item.EnvironmentID {
+		if sutID := factPayloadInt(fact.Payload, "sut_id"); sutID != 0 && sutID != item.SUTID {
 			continue
 		}
 		if item.Kind == "api" {
@@ -747,7 +748,7 @@ func deltaItemFromObservation(observation DiscoveryObservation, waveID int64) De
 		Method:           strings.ToUpper(strings.TrimSpace(observation.Method)),
 		ResourceTemplate: discoveryTemplateKey(observation.ResourceTemplate),
 		Host:             observation.Host,
-		VersionSUTID:     observation.VersionSUTID,
+		SUTID:            observation.SUTID,
 		EnvironmentID:    observation.EnvironmentID,
 		WaveID:           observation.WaveID,
 		CaseRunID:        observation.CaseRunID,
@@ -796,7 +797,7 @@ func sortDeltaResult(result *DeltaResult) {
 			if left.EnvironmentID != right.EnvironmentID {
 				return left.EnvironmentID < right.EnvironmentID
 			}
-			return left.VersionSUTID < right.VersionSUTID
+			return left.SUTID < right.SUTID
 		})
 	}
 }

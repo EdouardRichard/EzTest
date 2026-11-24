@@ -72,8 +72,8 @@ const openIssue: IssueView = {
   merged_at: null,
   reopen_count: 0,
   refs: [
-    { kind: "case_run", ref_id: "9302", version_sut_id: "3001", role: "source" },
-    { kind: "wave", ref_id: "9201", version_sut_id: "3001", role: "context" },
+    { kind: "case_run", ref_id: "9302", sut_id: "3001", role: "source" },
+    { kind: "wave", ref_id: "9201", sut_id: "3001", role: "context" },
   ],
   triage: null,
   created_at: created,
@@ -94,8 +94,8 @@ const confirmedIssue: IssueView = {
   merged_at: null,
   reopen_count: 1,
   refs: [
-    { kind: "case_run", ref_id: "9303", version_sut_id: "3002", role: "source" },
-    { kind: "wave", ref_id: "9201", version_sut_id: "3002", role: "context" },
+    { kind: "case_run", ref_id: "9303", sut_id: "3002", role: "source" },
+    { kind: "wave", ref_id: "9201", sut_id: "3002", role: "context" },
   ],
   triage: null,
   created_at: created,
@@ -118,7 +118,7 @@ const mergedIssue: IssueView = {
   recurrence_count: 3,
   last_recurred_at: "2026-11-01T04:30:00Z",
   merged_chain: ["9102"],
-  refs: [{ kind: "case_run", ref_id: "9304", version_sut_id: "3001", role: "source" }],
+  refs: [{ kind: "case_run", ref_id: "9304", sut_id: "3001", role: "source" }],
   triage: null,
   created_at: created,
   updated_at: updated,
@@ -144,9 +144,9 @@ function detailOf(issue: IssueView): IssueDetailView {
 const openDetailFixture: IssueDetailView = {
   ...detailOf(openIssue),
   refs: [
-    { kind: "case_run", ref_id: "9302", version_sut_id: "3001", role: "source" },
-    { kind: "wave", ref_id: "9201", version_sut_id: "3001", role: "context" },
-    { kind: "evidence", ref_id: "9501", version_sut_id: "3001", role: "attachment" },
+    { kind: "case_run", ref_id: "9302", sut_id: "3001", role: "source" },
+    { kind: "wave", ref_id: "9201", sut_id: "3001", role: "context" },
+    { kind: "evidence", ref_id: "9501", sut_id: "3001", role: "attachment" },
   ],
   related_refs: { case_run: 1, wave: 1, evidence: 1 },
   history: [
@@ -296,7 +296,7 @@ describe("IssuesTab", () => {
         status: "confirmed",
         category: "api",
         severity: "minor",
-        versionSutId: "3002",
+        sutId: "3002",
         limit: 20,
       })
     })
@@ -698,8 +698,8 @@ describe("IssuesTab", () => {
       last_retest_case_run_id: "9402",
       refs: [
         ...openDetailFixture.refs,
-        { kind: "wave", ref_id: "9202", version_sut_id: "3001", role: "retest" },
-        { kind: "case_run", ref_id: "9402", version_sut_id: "3001", role: "retest" },
+        { kind: "wave", ref_id: "9202", sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9402", sut_id: "3001", role: "retest" },
       ],
     })
 
@@ -737,18 +737,18 @@ describe("IssuesTab", () => {
       last_retest_wave_id: "9203",
       last_retest_case_run_id: "9403",
       refs: [
-        { kind: "case_run", ref_id: "9302", version_sut_id: "3001", role: "source" },
-        { kind: "case_version", ref_id: "9102", version_sut_id: "3001", role: "source" },
-        { kind: "wave", ref_id: "9201", version_sut_id: "3001", role: "source" },
-        { kind: "evidence", ref_id: "9501", version_sut_id: "3001", role: "source" },
-        { kind: "case_run", ref_id: "9312", version_sut_id: "3001", role: "recurrence" },
-        { kind: "case_version", ref_id: "9112", version_sut_id: "3001", role: "recurrence" },
-        { kind: "wave", ref_id: "9211", version_sut_id: "3001", role: "recurrence" },
-        { kind: "evidence", ref_id: "9511", version_sut_id: "3001", role: "recurrence" },
-        { kind: "wave", ref_id: "9202", version_sut_id: "3001", role: "retest" },
-        { kind: "case_run", ref_id: "9402", version_sut_id: "3001", role: "retest" },
-        { kind: "wave", ref_id: "9203", version_sut_id: "3001", role: "retest" },
-        { kind: "case_run", ref_id: "9403", version_sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9302", sut_id: "3001", role: "source" },
+        { kind: "case_version", ref_id: "9102", sut_id: "3001", role: "source" },
+        { kind: "wave", ref_id: "9201", sut_id: "3001", role: "source" },
+        { kind: "evidence", ref_id: "9501", sut_id: "3001", role: "source" },
+        { kind: "case_run", ref_id: "9312", sut_id: "3001", role: "recurrence" },
+        { kind: "case_version", ref_id: "9112", sut_id: "3001", role: "recurrence" },
+        { kind: "wave", ref_id: "9211", sut_id: "3001", role: "recurrence" },
+        { kind: "evidence", ref_id: "9511", sut_id: "3001", role: "recurrence" },
+        { kind: "wave", ref_id: "9202", sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9402", sut_id: "3001", role: "retest" },
+        { kind: "wave", ref_id: "9203", sut_id: "3001", role: "retest" },
+        { kind: "case_run", ref_id: "9403", sut_id: "3001", role: "retest" },
       ],
     })
 

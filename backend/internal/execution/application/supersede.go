@@ -150,17 +150,24 @@ func (s *IntentService) enqueueReplacement(ctx context.Context, stale execution.
 	if err != nil {
 		return nil, false, "", mapExecutionError(err, "version")
 	}
-	if binding.Stage != intentExecutableStage && binding.Stage != intentCompletedStage {
+	// Same automatic-path stage gate as the initial-intent scan (one shared
+	// predicate, SC-G12): executing, or completed where a new intent reopens.
+	if !intentStageAllowsCreate(binding.Stage) {
 		return nil, false, "version_not_executing", nil
 	}
 	if err := ensureExecutableCaseCompleteness([]execution.CaseSnapshot{replacement}); err != nil {
 		return nil, false, "replacement_incomplete", nil
 	}
+	// SC-F7: the replacement intent is created before any wave, so it keeps the
+	// LIVE catalog read (change detection), exactly like the initial-intent scan.
 	fingerprint, err := EnvironmentFingerprint(binding)
 	if err != nil {
 		return nil, false, "", err
 	}
-	baseline := CodeBaseline(binding)
+	baseline, err := CodeBaseline(binding)
+	if err != nil {
+		return nil, false, "", err
+	}
 	count, err := s.intents.CountInitialFor(ctx, replacement.CaseVersionID, fingerprint, baseline)
 	if err != nil {
 		return nil, false, "", mapExecutionError(err, "intent")
@@ -168,17 +175,16 @@ func (s *IntentService) enqueueReplacement(ctx context.Context, stale execution.
 	if count > 0 {
 		return nil, true, "", nil
 	}
-	if binding.Status == "completed" {
-		if err := s.versions.Reopen(ctx, stale.VersionID); err != nil {
-			return nil, false, "", mapExecutionError(err, "version")
-		}
-	}
+	// R-G9 (SC-G12): no pre-reopen from this out-of-lock status read — the
+	// createIntent loop reopens only after the repository has resolved
+	// dedup/conflicts under the version advisory lock, so an already-queued
+	// replacement never mis-reopens a completed version.
 	now := s.now()
 	next := execution.ExecutionIntent{
 		ID:                     s.ids.Next(),
 		VersionID:              stale.VersionID,
 		CaseVersionID:          replacement.CaseVersionID,
-		VersionSUTIDs:          caseIntentVersionSUTIDs(replacement),
+		SUTIDs:                 SUTIDs(binding),
 		EnvironmentFingerprint: fingerprint,
 		CodeBaseline:           baseline,
 		Purpose:                execution.PurposeInitial,

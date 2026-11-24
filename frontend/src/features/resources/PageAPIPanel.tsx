@@ -100,24 +100,31 @@ export function PageAPIPanel({
   const [generating, setGenerating] = useState(false)
   const [decisionBusy, setDecisionBusy] = useState<string | null>(null)
 
-  const environments = scope.detail?.environments ?? []
-  const environment =
-    environments.find((item) => item.id === scope.environmentId) ?? environments[0] ?? null
+  // v0.2.4-B: pages/APIs are per-SUT (from the SUT aggregate); the environment is
+  // the SUT's single environment. Create/import routes are SUT-scoped.
+  const sutId = scope.sutId
+  const environmentId = scope.environmentId
+  const environmentName =
+    scope.environments.find((environment) => environment.id === environmentId)?.name ??
+    scope.detail?.name ??
+    ""
+  const pages = scope.detail?.pages ?? []
+  const apis = scope.detail?.apis ?? []
 
   const submitPageImport = useCallback(
     async (items: Parameters<typeof importPages>[1]) => {
-      if (!environment) throw new Error("请先选择环境")
-      return importPages(environment.id, items)
+      if (sutId === "") throw new Error("请先选择 SUT")
+      return importPages(sutId, items)
     },
-    [environment],
+    [sutId],
   )
 
   const submitApiImport = useCallback(
     async (items: Parameters<typeof importApis>[1]) => {
-      if (!environment) throw new Error("请先选择环境")
-      return importApis(environment.id, items)
+      if (sutId === "") throw new Error("请先选择 SUT")
+      return importApis(sutId, items)
     },
-    [environment],
+    [sutId],
   )
 
   const loadProposals = useCallback(async (versionId: string) => {
@@ -399,34 +406,26 @@ export function PageAPIPanel({
   ]
 
   const visiblePages =
-    environment === null
-      ? []
-      : statusFilter === "all"
-        ? environment.pages
-        : environment.pages.filter((page) => page.status === statusFilter)
+    statusFilter === "all" ? pages : pages.filter((page) => page.status === statusFilter)
   const visibleApis =
-    environment === null
-      ? []
-      : statusFilter === "all"
-        ? environment.apis
-        : environment.apis.filter((api) => api.status === statusFilter)
+    statusFilter === "all" ? apis : apis.filter((api) => api.status === statusFilter)
 
   return (
     <div className="space-y-5">
       <div>
         <h2 className="text-sm font-semibold text-foreground">
-          页面与 API{environment ? ` · ${environment.name}` : ""}
+          页面与 API{environmentName ? ` · ${environmentName}` : ""}
         </h2>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          维护当前环境的可测页面与 API；导入时逐项校验，重复键由 API 跳过。
+          维护当前 SUT 的可测页面与 API；导入时逐项校验，重复键由 API 跳过。
         </p>
       </div>
 
       <ScopeBar
         suts={scope.suts}
         sutId={scope.sutId}
-        environments={environments}
-        environmentId={environment?.id ?? ""}
+        environments={scope.environments}
+        environmentId={environmentId}
         onSelectSut={onSelectSut}
         onSelectEnvironment={onSelectEnvironment}
       />
@@ -446,10 +445,10 @@ export function PageAPIPanel({
         </Select>
       </div>
 
-      {!environment ? (
+      {environmentId === "" ? (
         <EmptyState
           title="还没有环境"
-          description="页面与 API 必须归属于环境。先在「SUT 与环境」Tab 为当前 SUT 创建环境，再回到这里。"
+          description="当前 SUT 尚未归属环境。先在「SUT 与环境」Tab 创建环境并关联 SUT，再回到这里。"
         />
       ) : (
         <>
@@ -459,7 +458,7 @@ export function PageAPIPanel({
                 <h3 className="text-sm font-semibold text-foreground">
                   页面
                   <span className="ml-2 text-[11px] font-normal text-muted-foreground">
-                    {environment.pages.length} 个
+                    {pages.length} 个
                   </span>
                 </h3>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
@@ -491,7 +490,7 @@ export function PageAPIPanel({
                 <h3 className="text-sm font-semibold text-foreground">
                   API
                   <span className="ml-2 text-[11px] font-normal text-muted-foreground">
-                    {environment.apis.length} 个
+                    {apis.length} 个
                   </span>
                 </h3>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
@@ -675,11 +674,11 @@ export function PageAPIPanel({
         ) : null}
       </section>
 
-      {createPageOpen && environment ? (
+      {createPageOpen && sutId !== "" ? (
         <PageDialog
           onClose={() => setCreatePageOpen(false)}
           onSubmit={async (values) => {
-            await createPage(environment.id, values)
+            await createPage(sutId, values)
             await onRefresh()
           }}
         />
@@ -709,7 +708,7 @@ export function PageAPIPanel({
         />
       ) : null}
 
-      {importPagesOpen && environment ? (
+      {importPagesOpen && sutId !== "" ? (
         <ImportDialog
           title="导入页面"
           itemLabel="页面"
@@ -724,11 +723,11 @@ export function PageAPIPanel({
         />
       ) : null}
 
-      {createApiOpen && environment ? (
+      {createApiOpen && sutId !== "" ? (
         <ApiDialog
           onClose={() => setCreateApiOpen(false)}
           onSubmit={async (values) => {
-            await createApi(environment.id, values)
+            await createApi(sutId, values)
             await onRefresh()
           }}
         />
@@ -758,7 +757,7 @@ export function PageAPIPanel({
         />
       ) : null}
 
-      {importApisOpen && environment ? (
+      {importApisOpen && sutId !== "" ? (
         <ImportDialog
           title="导入 API"
           itemLabel="API"

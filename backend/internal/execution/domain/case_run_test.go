@@ -17,6 +17,7 @@ func TestCaseRunTransitions(t *testing.T) {
 		{CaseRunRunning, CaseRunSuperseded},
 		{CaseRunPaused, CaseRunPending},
 		{CaseRunPaused, CaseRunFailed},
+		{CaseRunPaused, CaseRunInconclusive},
 		{CaseRunPaused, CaseRunSuperseded},
 		{CaseRunInterrupted, CaseRunPending},
 		{CaseRunInterrupted, CaseRunFailed},

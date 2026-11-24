@@ -9,6 +9,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // TestMigrations021Schema pins the additive 0.2.1 schema: the three new tables,
@@ -126,8 +127,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 65 {
-		t.Fatalf("applied %d migrations, want 65: %v", len(applied), applied)
+	if want := expectedMigrationCount(t); len(applied) != want {
+		t.Fatalf("applied %d migrations, want %d: %v", len(applied), want, applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -146,7 +147,9 @@ func TestMigrations021Schema(t *testing.T) {
 		{"idx_version_plan_item_version_status_order", []string{"(version_id, status, sort_order)"}},
 		{"uk_work_item_idempotency", []string{"UNIQUE", "(version_id, kind, idempotency_key)"}},
 		{"uk_conversation_message_part_message_seq", []string{"UNIQUE", "(message_id, seq)"}},
-		{"uk_sut_page_normalized_url", []string{"UNIQUE", "(environment_id, normalized_url)"}},
+		// v0.2.4-B re-scoped the normalized-URL uniqueness from the dropped
+		// environment_id to the owning sut_id.
+		{"uk_sut_page_normalized_url", []string{"UNIQUE", "(sut_id, normalized_url)"}},
 	}
 	for _, index := range indexes {
 		var definition string
@@ -243,6 +246,39 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
+	// V-0017 enum single-source drift gate: the frozen version stage/status
+	// CHECKs cannot be regenerated, so validate them against the Go domain
+	// authority (version.Stages / version.Statuses). A value added in the domain
+	// fails here until the frozen CHECK is migrated; the domain is the one place
+	// the enum is defined and every persisted copy is checked against it.
+	var versionStageCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'version'::regclass AND conname = 'chk_version_stage'
+	`).Scan(&versionStageCheck); err != nil {
+		t.Fatalf("read chk_version_stage: %v", err)
+	}
+	for _, stage := range version.Stages() {
+		if !strings.Contains(versionStageCheck, "'"+string(stage)+"'") {
+			t.Errorf("chk_version_stage rejects domain stage %q: %s", stage, versionStageCheck)
+		}
+	}
+
+	// version.status carries the auto-named inline CHECK from version_0001
+	// (version_status_check); no later migration renames it.
+	var versionStatusCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'version'::regclass AND conname = 'version_status_check'
+	`).Scan(&versionStatusCheck); err != nil {
+		t.Fatalf("read version_status_check: %v", err)
+	}
+	for _, status := range version.Statuses() {
+		if !strings.Contains(versionStatusCheck, "'"+status+"'") {
+			t.Errorf("version_status_check rejects domain status %q: %s", status, versionStatusCheck)
+		}
+	}
+
 	// Same-context FK: parts reference conversation_message (version context),
 	// never agent_message (agent context).
 	var fkTargetsConversationMessage bool
@@ -280,7 +316,9 @@ func TestMigrations021Schema(t *testing.T) {
 	}
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO version (id, title, created_by) VALUES (210001, '0.2.1 migration test', 1)
+		INSERT INTO environment (id, name, status) VALUES (990001, 'fixture env', 'active') ON CONFLICT (id) DO NOTHING;
+		INSERT INTO version (id, title, created_by, environment_id)
+		VALUES (210001, '0.2.1 migration test', 1, 990001)
 	`); err != nil {
 		t.Fatalf("insert version: %v", err)
 	}
@@ -348,22 +386,25 @@ func TestMigrations021Schema(t *testing.T) {
 		t.Errorf("store BIGINT[] depends_on: %v", err)
 	}
 
-	// sut_page: normalized_url is generated and replaces route_template uniqueness.
+	// sut_page: normalized_url is generated and replaces route_template
+	// uniqueness. v0.2.4-B inverted the hierarchy, so the SUT hangs off a
+	// top-level environment and the page carries only sut_id.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut (id, name, created_by) VALUES (210100, '0.2.1 pages', 1)
+		INSERT INTO environment (id, name, status) VALUES (210099, '0.2.1 env', 'active')
 	`); err != nil {
-		t.Fatalf("insert sut: %v", err)
+		t.Fatalf("insert environment: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_environment (id, sut_id, name, base_url) VALUES (210101, 210100, 'prod', 'https://example.test')
+		INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		VALUES (210100, 210099, '0.2.1 pages', 'https://example.test', 1)
 	`); err != nil {
-		t.Fatalf("insert sut_environment: %v", err)
+		t.Fatalf("insert sut: %v", err)
 	}
 	var normalizedURL string
 	var routeTemplate *string
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO sut_page (id, sut_id, environment_id, name, url)
-		VALUES (210110, 210100, 210101, 'login', 'https://Example.TEST:443/Login/?next=%2Fhome#/signin')
+		INSERT INTO sut_page (id, sut_id, name, url)
+		VALUES (210110, 210100, 'login', 'https://Example.TEST:443/Login/?next=%2Fhome#/signin')
 		RETURNING normalized_url, route_template
 	`).Scan(&normalizedURL, &routeTemplate); err != nil {
 		t.Fatalf("insert sut_page: %v", err)
@@ -375,14 +416,14 @@ func TestMigrations021Schema(t *testing.T) {
 		t.Errorf("route_template = %q, want NULL", *routeTemplate)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_page (id, sut_id, environment_id, name, url)
-		VALUES (210111, 210100, 210101, 'login duplicate', 'https://example.test/Login#/signin')
+		INSERT INTO sut_page (id, sut_id, name, url)
+		VALUES (210111, 210100, 'login duplicate', 'https://example.test/Login#/signin')
 	`); err == nil {
 		t.Error("duplicate normalized sut_page URL accepted")
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_page (id, sut_id, environment_id, name, url)
-		VALUES (210112, 210100, 210101, 'orders', 'http://Example.test:80/Orders/')
+		INSERT INTO sut_page (id, sut_id, name, url)
+		VALUES (210112, 210100, 'orders', 'http://Example.test:80/Orders/')
 		RETURNING normalized_url
 	`); err != nil {
 		t.Errorf("insert second distinct normalized sut_page: %v", err)

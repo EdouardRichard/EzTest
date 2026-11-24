@@ -17,7 +17,7 @@ import { loginErrorMessage } from "./login-errors"
 const HIGHLIGHTS = [
   { icon: Sparkles, text: "AI 驱动的需求澄清、用例设计与执行闭环" },
   { icon: Wifi, text: "SSE 实时事件投影，DB 为唯一真值" },
-  { icon: ShieldCheck, text: "受控网络内的单团队测试工作区" },
+  { icon: ShieldCheck, text: "自托管部署的单团队测试工作区" },
 ]
 
 export type LoginPageProps = {

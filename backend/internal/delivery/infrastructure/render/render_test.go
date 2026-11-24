@@ -47,7 +47,7 @@ func newVersionedRenderer(t *testing.T, version string) *HTMLRenderer {
 // sampleSnapshot exercises every report section with fixed, deterministic data.
 func sampleSnapshot() delivery.ReportSnapshot {
 	waveID := int64(12)
-	versionSUTID := int64(31)
+	sutID := int64(31)
 	requirementVersionID := int64(101)
 	closureID := int64(55)
 	reportID := int64(70)
@@ -65,21 +65,21 @@ func sampleSnapshot() delivery.ReportSnapshot {
 		Waves: []delivery.WaveSnapshot{
 			{
 				ID: 12, VersionID: 7, Status: "completed", Trigger: "manual",
-				Counts:       delivery.WaveCountsSnapshot{Total: 2, Passed: 1, Failed: 1, Evidence: 1},
-				ByVersionSUT: []delivery.SUTCountsSnapshot{{VersionSUTID: versionSUTID, Total: 2, Passed: 1, Failed: 1}},
-				ReportID:     &reportID, StartedAt: &renderTime, FinishedAt: &renderTime,
+				Counts:   delivery.WaveCountsSnapshot{Total: 2, Passed: 1, Failed: 1, Evidence: 1},
+				BySUT:    []delivery.SUTCountsSnapshot{{SUTID: sutID, Total: 2, Passed: 1, Failed: 1}},
+				ReportID: &reportID, StartedAt: &renderTime, FinishedAt: &renderTime,
 			},
 			{ID: 11, VersionID: 7, Status: "completed", Trigger: "schedule", Counts: delivery.WaveCountsSnapshot{Total: 1, Passed: 1}, FinishedAt: &renderTime},
 		},
 		CaseRuns: []delivery.CaseRunSnapshot{
 			{
 				ID: 21, VersionID: 7, WaveID: 12, CaseVersionID: 201, CaseTitle: "用例二十一",
-				VersionSUTID: &versionSUTID, VersionSUTIDs: []int64{32, 31},
+				SUTID: &sutID, SUTIDs: []int64{32, 31},
 				Status: "failed", FailureClass: "application", Summary: "断言失败",
 				StepCount: 3, StepFailedCount: 1, AssertionCount: 2, AssertionFailedCount: 1,
 				FailedStepSeq: 2, FailedAssertionSeq: 1, Category: "api", Severity: "major",
 				Evidence: []delivery.EvidenceSnapshot{
-					{ID: 41, CaseRunID: 21, VersionSUTID: &versionSUTID, StepSeq: intPtrValue(2), Kind: "screenshot", SHA256: strings.Repeat("a", 64), SizeBytes: 100},
+					{ID: 41, CaseRunID: 21, SUTID: &sutID, StepSeq: intPtrValue(2), Kind: "screenshot", SHA256: strings.Repeat("a", 64), SizeBytes: 100},
 				},
 				StartedAt: &renderTime, FinishedAt: &renderTime, CreatedAt: renderTime,
 			},
@@ -89,7 +89,7 @@ func sampleSnapshot() delivery.ReportSnapshot {
 			{ID: 1, VersionID: 7, Title: "问题一", Status: delivery.IssueStatusConfirmed, Category: "ui", Severity: "minor", Source: "analysis", CreatedAt: renderTime, UpdatedAt: renderTime},
 			{ID: 3, VersionID: 7, Title: "问题三", Status: delivery.IssueStatusOpen, Category: "api", Severity: "major", Source: "analysis", SourceIssueIDs: []int64{4, 5}, CaseRunIDs: []int64{21}, CreatedAt: renderTime, UpdatedAt: renderTime},
 		},
-		VersionSUTs: []delivery.VersionSUTSnapshot{
+		SUTs: []delivery.SUTSnapshot{
 			{ID: 31, SUTID: 300, SUTName: "API", EnvironmentID: 8, EnvironmentName: "staging"},
 		},
 		Coverage: delivery.CoverageSnapshot{
@@ -133,7 +133,7 @@ func truncationNote(t *testing.T, output []byte) string {
 }
 
 func TestRenderRejectsUnknownTemplateVersion(t *testing.T) {
-	for _, version := range []string{"", "3", "latest", "1 ", "2.0"} {
+	for _, version := range []string{"", "4", "latest", "1 ", "2.0", "3.0"} {
 		renderer, err := NewHTMLRenderer(version)
 		if err == nil {
 			t.Fatalf("NewHTMLRenderer(%q) = %v, want an error", version, renderer)
@@ -667,10 +667,10 @@ func reverseSnapshotSlices(snapshot *delivery.ReportSnapshot) {
 	reverseWaves(snapshot.Waves)
 	reverseCaseRuns(snapshot.CaseRuns)
 	reverseIssues(snapshot.Issues)
-	reverseVersionSUTs(snapshot.VersionSUTs)
+	reverseSUTs(snapshot.SUTs)
 	reverseCoverageGaps(snapshot.Coverage.Gaps)
 	for index := range snapshot.CaseRuns {
-		reverseInt64s(snapshot.CaseRuns[index].VersionSUTIDs)
+		reverseInt64s(snapshot.CaseRuns[index].SUTIDs)
 	}
 	for index := range snapshot.Issues {
 		reverseInt64s(snapshot.Issues[index].SourceIssueIDs)
@@ -689,7 +689,7 @@ func reverseWaves(rows []delivery.WaveSnapshot) {
 		rows[i], rows[j] = rows[j], rows[i]
 	}
 	for index := range rows {
-		sutCounts := rows[index].ByVersionSUT
+		sutCounts := rows[index].BySUT
 		for i, j := 0, len(sutCounts)-1; i < j; i, j = i+1, j-1 {
 			sutCounts[i], sutCounts[j] = sutCounts[j], sutCounts[i]
 		}
@@ -708,7 +708,7 @@ func reverseIssues(rows []delivery.IssueSnapshot) {
 	}
 }
 
-func reverseVersionSUTs(rows []delivery.VersionSUTSnapshot) {
+func reverseSUTs(rows []delivery.SUTSnapshot) {
 	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 		rows[i], rows[j] = rows[j], rows[i]
 	}

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
-	exploreapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/explore"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -35,17 +34,31 @@ const (
 	// shorter than the scheduler's DefaultDispatchLease: the scheduler stamps the
 	// dispatch lease when the work item is only queued, and Prepare replaces it
 	// with this lease once an agent worker actually claims the run.
-	DefaultCaseLease         = 90 * time.Second
-	heartbeatRetryDelay      = time.Second
-	defaultEvidenceMaxBytes  = int64(5 << 20)
-	evidenceMaxPerCaseRun    = execution.EvidenceMaxPerCaseRun
-	maxSUTFilenameLength     = 255
-	executorContextKeyFormat = "run:%d:vs:%d:role:%s"
+	DefaultCaseLease        = 90 * time.Second
+	heartbeatRetryDelay     = time.Second
+	defaultEvidenceMaxBytes = int64(5 << 20)
+	maxSUTFilenameLength    = 255
+	// executorSessionKeyFormat is the executor v2 session key of one
+	// (case_run, SUT, account_role) triple, and what orphan reconciliation
+	// matches on. This literal is duplicated in
+	// infrastructure/executor/client.go SessionKey — the two MUST change in the
+	// same commit or reconciliation silently stops matching.
+	executorSessionKeyFormat = "run:%d:sut:%d:role:%s"
 	// terminalScreenshotTimeout bounds the P3 §6.4 automatic screenshot of a
 	// failed/blocked/inconclusive run. It is independent from the (possibly
 	// canceled) run context: the capture is best-effort and must never extend a
 	// terminal write.
 	terminalScreenshotTimeout = 8 * time.Second
+	// sessionEvidenceSettleTimeout bounds the terminal recording-ledger drain.
+	// It is deliberately NOT the screenshot budget: the drain pulls every
+	// command/file/trace artifact of every session, recomputes sha256 and writes
+	// content + evidence rows, which for a real run is tens/hundreds of MB. An
+	// 8s shared budget was the most likely way to lose a whole ledger.
+	sessionEvidenceSettleTimeout = 60 * time.Second
+	// evidenceDropFactTimeout bounds the evidence-drop FACT write. It runs on a
+	// fresh background context because the settlement budget that just failed
+	// may already be exhausted, and an unrecorded loss is an invisible loss.
+	evidenceDropFactTimeout = 10 * time.Second
 	// runFailureEvidenceFilename names the text evidence carrying the concrete
 	// error of a run that recorded no step/assertion result.
 	runFailureEvidenceFilename = "agent-failure.txt"
@@ -64,10 +77,10 @@ type SUTAPI struct {
 	Path   string
 }
 
-// SUTAPIResolver resolves a version_sut-bound api_id. Optional: when nil,
+// SUTAPIResolver resolves a SUT-bound api_id. Optional: when nil,
 // http.request requires a literal path instead of api_id.
 type SUTAPIResolver interface {
-	API(ctx context.Context, versionID, versionSUTID, apiID int64) (SUTAPI, error)
+	API(ctx context.Context, versionID, sutID, apiID int64) (SUTAPI, error)
 }
 
 // CaseSuccessFact is the passed-case observation handed to the optional
@@ -119,65 +132,195 @@ type CaseFailureHook interface {
 	OnCaseRunFailed(ctx context.Context, fact CaseFailureFact) error
 }
 
-// BrowserContextSpec is one lazily created executor browser context.
-type BrowserContextSpec struct {
-	Key          string
-	AllowedHosts []string
-	BaseURL      string
+// SessionSpec is one lazily created executor session (protocol v2). Workspace is
+// the case_run-scoped directory anchor every command runs in and every recording
+// spills to; BaseURL is an informational hint for the retained browser bridge.
+type SessionSpec struct {
+	Key       string
+	Workspace string
+	BaseURL   string
 	// ExecutorID selects the owning executor endpoint. Zero/unknown ids fall
 	// back to the primary executor endpoint for single-endpoint deployments.
 	ExecutorID int64
 	Metadata   map[string]any
+	// LeaseEpoch mirrors the case_run dispatch epoch: the executor fences every
+	// write with it, so a stale dispatch cannot mutate a taken-over session.
+	LeaseEpoch int64
+	LeaseTTL   time.Duration
 }
 
-// BrowserArtifact is one binary action artifact (base64 transport).
-type BrowserArtifact struct {
-	Kind     string
-	MIME     string
-	Base64   string
-	SHA256   string
-	Filename string
-	Bytes    int
+// ExecCommand is one general-execution command issued inside a session.
+type ExecCommand struct {
+	Argv       []string
+	Shell      bool
+	Stdin      string
+	TimeoutMS  int
+	Background bool
+	Env        map[string]string
 }
 
-// BrowserActionError is the executor's typed action failure.
-type BrowserActionError struct {
-	Code    string
-	Message string
+// ExecOutcome is the settled result of one command plus the evidence it produced.
+type ExecOutcome struct {
+	SessionID       string
+	CommandID       string
+	Exit            *int
+	Outcome         string
+	DurationMS      int64
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	StdoutRef       string
+	StderrRef       string
+	Background      bool
+	TimedOut        bool
+	Cancelled       bool
+	EvidenceIDs     []string
+	EvidenceSkipped int
 }
 
-// BrowserActionResult is one executor action envelope.
-type BrowserActionResult struct {
-	OK        bool
-	Result    json.RawMessage
-	Artifacts []BrowserArtifact
-	Error     *BrowserActionError
+// ShellOperation is one PTY shell operation (protocol v2 shell channel). Op is
+// the protocol verb (create/write/read/close/wait); the unused fields of another
+// op stay zero. The shell.* and pty.* tool families share this ONE channel:
+// shell.open omits Argv (the executor's platform default shell), pty.open names
+// an explicit interactive program (ssh/psql/mysql/REPL) and terminal size.
+type ShellOperation struct {
+	Op        string
+	ShellID   string
+	Argv      []string
+	Cols      int
+	Rows      int
+	Env       map[string]string
+	Data      string
+	Since     int64
+	TimeoutMS int
 }
 
-// BrowserContextRef is one executor context (orphan reconciliation).
-type BrowserContextRef struct {
-	ExecutorID int64
-	ID         string
-	Key        string
+// ShellOutcome is the union answer of the shell operations; which fields are
+// populated depends on the requested op.
+type ShellOutcome struct {
+	ShellID    string
+	PID        int
+	Status     string
+	Data       string
+	NextCursor int64
+	TotalBytes int64
+	Truncated  bool
+	Exit       *int
+	Outcome    string
+	OK         bool
 }
 
-// BrowserExecutor is the executor protocol port consumed by the browser tools.
-// executorID selects the endpoint that owns the context (P8 multi-executor
-// routing); zero falls back to the primary endpoint.
-type BrowserExecutor interface {
-	CreateContext(ctx context.Context, spec BrowserContextSpec) (string, error)
-	Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (BrowserActionResult, error)
-	Cancel(ctx context.Context, executorID int64, contextID string) error
-	Close(ctx context.Context, executorID int64, contextID string) error
-	ListContexts(ctx context.Context, executorID int64) ([]BrowserContextRef, error)
+// FileOperation is one workspace files operation (upload/download/list). Base64
+// carries the upload payload; the workspace confinement is the executor's.
+type FileOperation struct {
+	Op     string
+	Path   string
+	Base64 string
+}
+
+// FileEntry is one workspace directory entry.
+type FileEntry struct {
+	Path  string
+	Bytes int64
+	MIME  string
+	Dir   bool
+}
+
+// FileOutcome is the union answer of the files operations.
+type FileOutcome struct {
+	Path      string
+	Bytes     int64
+	SHA256    string
+	MIME      string
+	Base64    string
+	Files     []FileEntry
+	Truncated bool
+}
+
+// ExecutionArtifact is one recording-layer artifact of a session ledger.
+type ExecutionArtifact struct {
+	Kind            string
+	CommandID       string
+	Path            string
+	SHA256          string
+	Size            int64
+	MIME            string
+	Filename        string
+	Base64          string
+	ContentOmitted  bool
+	ContentReason   string
+	RecordingFailed bool
+	Error           string
+}
+
+// ArtifactPage is one incremental pull of the recording ledger. Gap/Missed mean
+// the settlement cursor fell behind the executor's bounded buffer: the missed
+// artifacts are counted as evidence drops, never silently ignored.
+type ArtifactPage struct {
+	Artifacts      []ExecutionArtifact
+	NextCursor     int64
+	BaseCursor     int64
+	Evicted        int64
+	Gap            bool
+	Missed         int64
+	EvictionFailed int64
+}
+
+// TraceRef describes the trace file of a session, when one exists.
+type TraceRef struct {
+	Available bool
+	Path      string
+	Bytes     int64
+	SHA256    string
+	MIME      string
+}
+
+// ExecutionExecutor is the executor protocol v2 port consumed by the execution
+// use cases. executorID selects the endpoint that owns the session (multi-executor
+// routing); zero falls back to the primary endpoint. Every write carries the
+// session lease epoch so a stale dispatch is fenced by the executor.
+//
+// The transitional Playwright-library browser bridge (BrowserAction) was removed
+// in v0.2.4-C T16: the browser capability domain runs the official playwright-cli
+// over Exec (T15), and browser traffic is pure-recorded via a passive CDP observer
+// read through the optional NetworkLogReader surface (design §4.3).
+type ExecutionExecutor interface {
+	CreateSession(ctx context.Context, spec SessionSpec) (string, error)
+	Exec(ctx context.Context, executorID int64, sessionID string, command ExecCommand, leaseEpoch int64) (ExecOutcome, error)
+	// Shell runs one PTY shell operation (the exec/shell/file capability domains'
+	// interactive channel). Every write carries the session lease epoch.
+	Shell(ctx context.Context, executorID int64, sessionID string, op ShellOperation, leaseEpoch int64) (ShellOutcome, error)
+	// Files runs one workspace files operation (upload/download/list).
+	Files(ctx context.Context, executorID int64, sessionID string, op FileOperation, leaseEpoch int64) (FileOutcome, error)
+	Artifacts(ctx context.Context, executorID int64, sessionID string, since int64) (ArtifactPage, error)
+	Trace(ctx context.Context, executorID int64, sessionID string) (TraceRef, error)
+	// RenewLease keeps a session lease alive while a long command runs: the
+	// command deadline (15min) is far above the session TTL (300s), so without
+	// renewal the executor's orphan sweeper would reclaim a running session.
+	RenewLease(ctx context.Context, executorID int64, sessionID string, leaseEpoch int64) error
+	Cancel(ctx context.Context, executorID int64, sessionID string) error
+	Close(ctx context.Context, executorID int64, sessionID string) error
+}
+
+// NetworkLogReader is the OPTIONAL browser-traffic read surface (T16, design
+// §4.3 pure recording). An executor adapter that supports passive CDP traffic
+// recording implements it; the terminal discovery capture type-asserts for it
+// (the GeneralExecutionPort precedent) and skips best-effort when absent. The
+// raw payload is the recorded network log {items:[...], recording, degraded}.
+type NetworkLogReader interface {
+	NetworkLog(ctx context.Context, executorID int64, sessionID string, tail int) (json.RawMessage, error)
 }
 
 // HTTPRequestData is one target-SUT HTTP request issued by http.request.
+// TimeoutMS bounds the whole request (connect + body read); zero uses the
+// adapter default (15s). v0.2.4-C T12 (P8): configurable per call.
 type HTTPRequestData struct {
-	Method  string
-	URL     string
-	Headers map[string]string
-	Body    []byte
+	Method    string
+	URL       string
+	Headers   map[string]string
+	Body      []byte
+	TimeoutMS int
 }
 
 // HTTPResponseData is one target-SUT HTTP response.
@@ -194,12 +337,24 @@ type HTTPDoer interface {
 	Do(ctx context.Context, req HTTPRequestData) (HTTPResponseData, error)
 }
 
-// DBQueryResult is one read-only target-database query result.
+// DBQueryResult is one target-database query result. v0.2.4-C T12 (P8): general
+// read-write SQL — RowsAffected/CommandTag describe write statements; Rows holds
+// the returned rows (unbounded unless MaxRows explicitly caps them).
 type DBQueryResult struct {
-	Columns   []string
-	Rows      [][]string
-	RowCount  int
-	Truncated bool
+	Columns      []string
+	Rows         [][]string
+	RowCount     int
+	Truncated    bool
+	RowsAffected int64
+	CommandTag   string
+}
+
+// DBQueryOptions bounds one db.query call. MaxRows <= 0 means unlimited (the
+// old hard 200-row cap is lifted); StatementTimeoutMS <= 0 uses the adapter
+// default (5s). Both are configurable per call (P8).
+type DBQueryOptions struct {
+	MaxRows            int
+	StatementTimeoutMS int
 }
 
 // TableColumn is one column of a target database table.
@@ -216,10 +371,11 @@ type TableSchema struct {
 	Columns []TableColumn
 }
 
-// DatabaseQuerier runs read-only queries and schema summaries on the target
-// PostgreSQL database (adapter owns the DSN/statement timeout/READ ONLY tx).
+// DatabaseQuerier runs general read-write SQL and schema summaries on the target
+// PostgreSQL database (adapter owns the DSN/statement timeout/transaction mode).
+// v0.2.4-C T12 (P8): the read-only restriction is lifted.
 type DatabaseQuerier interface {
-	Query(ctx context.Context, dsn, username, password, sql string, maxRows int) (DBQueryResult, error)
+	Query(ctx context.Context, dsn, username, password, sql string, opts DBQueryOptions) (DBQueryResult, error)
 	Schema(ctx context.Context, dsn, username, password, schema string) ([]TableSchema, error)
 }
 
@@ -239,8 +395,12 @@ type CaseRunnerDeps struct {
 	Humans      HumanRequestRepository
 	Cases       CaseReader
 	Bindings    SUTBindingResolver
+	// Versions resolves the current environment fingerprint / code baseline for
+	// the command-log replay same-fingerprint gate (EV-006). Optional: a nil
+	// reader disables replay (the entry returns a configuration error).
+	Versions    VersionReader
 	APIs        SUTAPIResolver
-	Browser     BrowserExecutor
+	Execution   ExecutionExecutor
 	Credentials CredentialReader
 	Content     ContentStore
 	HTTPClient  HTTPDoer
@@ -249,7 +409,6 @@ type CaseRunnerDeps struct {
 	Gaps        GapEnsurer
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
-	Visual      VisualAssertPort
 	// Discovery receives the terminal-state discovery observations (WP-1).
 	// Optional: a nil writer skips the observation write; W1-11 provides the
 	// postgres adapter and assembles it.
@@ -260,12 +419,22 @@ type CaseRunnerDeps struct {
 	// KnowledgeFailureHook receives failed-case observations so the knowledge
 	// reused by the failed run can be marked suspect. Optional and best effort.
 	KnowledgeFailureHook CaseFailureHook
-	Settings             SettingsReader
-	Clock                Clock
-	IDs                  IDGenerator
-	Events               EventPublisher
-	Audit                AuditRecorder
-	InstanceID           string
+	// Resolutions reads the run's sut_resolution facts — the knowledge page/API
+	// dimension true source (v0.2.4-F T14, SC-F10): the latest fact carries the
+	// resolved SUT's validated (touched) asset ids, non-empty even for a
+	// directory-hit run that never explores (controller ruling P20). Optional:
+	// a nil reader keeps the dimension empty (never fabricated).
+	Resolutions execution.SUTResolutionRepository
+	// Registrations reads the resolved SUTs' asset_registration facts — the
+	// proven-discovery share of the knowledge page/API dimension (SC-F10).
+	// Optional: a nil reader keeps that share empty.
+	Registrations execution.AssetRegistrationRepository
+	Settings      SettingsReader
+	Clock         Clock
+	IDs           IDGenerator
+	Events        EventPublisher
+	Audit         AuditRecorder
+	InstanceID    string
 	// LeaseTTL overrides the case_run lease. Values below 80s (the executor
 	// client bound is 75s) are raised to the minimum; zero selects the 90s
 	// default.
@@ -288,8 +457,9 @@ type CaseRunner struct {
 	humans      HumanRequestRepository
 	cases       CaseReader
 	bindings    SUTBindingResolver
+	versions    VersionReader
 	apis        SUTAPIResolver
-	browser     BrowserExecutor
+	execution   ExecutionExecutor
 	credentials CredentialReader
 	content     ContentStore
 	httpClient  HTTPDoer
@@ -298,33 +468,31 @@ type CaseRunner struct {
 	gaps        GapEnsurer
 	teamRoom    TeamRoom
 	human       HumanRequestService
-	visual      VisualAssertPort
 	discovery   DiscoveryObservationWriter
 	knowledge   CaseSuccessHook
 	// knowledgeFailure is the optional failed-case knowledge hook.
 	knowledgeFailure CaseFailureHook
-	settings         SettingsReader
-	clock            Clock
-	ids              IDGenerator
-	events           EventPublisher
-	audit            AuditRecorder
-	instanceID       string
-	leaseTTL         time.Duration
-	heartbeat        time.Duration
+	// resolutions/registrations feed the knowledge page/API dimension true
+	// source (SC-F10); nil keeps the dimension empty.
+	resolutions   execution.SUTResolutionRepository
+	registrations execution.AssetRegistrationRepository
+	settings      SettingsReader
+	clock         Clock
+	ids           IDGenerator
+	events        EventPublisher
+	audit         AuditRecorder
+	instanceID    string
+	leaseTTL      time.Duration
+	heartbeat     time.Duration
 	// attribution is the deterministic four-value failure attribution the
 	// analyze.failure result exposes to the failure_analyst model (Task 37).
-	attribution *exploreapp.FailureAttribution
+	attribution *FailureAttribution
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
 	heartbeats  map[int64]*leaseHeartbeat
 	waitTotals  map[int64]time.Duration
 	waitStarted map[int64]time.Time
-	// executorLimitations carries the structured executor capability code
-	// returned by the browser tool (an executor action error) to the next
-	// failed/blocked step record of the same run. It is the structured origin of
-	// the X-02 marker; the step-record free text is only a fallback.
-	executorLimitations map[int64]string
 }
 
 // leaseHeartbeat is one independent renewal timer. The dispatch epoch is part of
@@ -362,8 +530,9 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		humans:      deps.Humans,
 		cases:       deps.Cases,
 		bindings:    deps.Bindings,
+		versions:    deps.Versions,
 		apis:        deps.APIs,
-		browser:     deps.Browser,
+		execution:   deps.Execution,
 		credentials: deps.Credentials,
 		content:     deps.Content,
 		httpClient:  deps.HTTPClient,
@@ -372,26 +541,26 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		gaps:        deps.Gaps,
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
-		visual:      deps.Visual,
 		discovery:   deps.Discovery,
 		knowledge:   deps.KnowledgeHook,
 		// knowledgeFailure is optional: a nil field disables the failed-case
 		// notification.
-		knowledgeFailure:    deps.KnowledgeFailureHook,
-		settings:            deps.Settings,
-		clock:               deps.Clock,
-		ids:                 deps.IDs,
-		events:              deps.Events,
-		audit:               deps.Audit,
-		instanceID:          deps.InstanceID,
-		leaseTTL:            lease,
-		heartbeat:           heartbeat,
-		attribution:         exploreapp.NewFailureAttribution(),
-		activeRuns:          map[int64]context.CancelFunc{},
-		heartbeats:          map[int64]*leaseHeartbeat{},
-		waitTotals:          map[int64]time.Duration{},
-		waitStarted:         map[int64]time.Time{},
-		executorLimitations: map[int64]string{},
+		knowledgeFailure: deps.KnowledgeFailureHook,
+		resolutions:      deps.Resolutions,
+		registrations:    deps.Registrations,
+		settings:         deps.Settings,
+		clock:            deps.Clock,
+		ids:              deps.IDs,
+		events:           deps.Events,
+		audit:            deps.Audit,
+		instanceID:       deps.InstanceID,
+		leaseTTL:         lease,
+		heartbeat:        heartbeat,
+		attribution:      NewFailureAttribution(),
+		activeRuns:       map[int64]context.CancelFunc{},
+		heartbeats:       map[int64]*leaseHeartbeat{},
+		waitTotals:       map[int64]time.Duration{},
+		waitStarted:      map[int64]time.Time{},
 	}
 }
 
@@ -424,42 +593,6 @@ func (s *CaseRunner) ClearRun(caseRunID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.activeRuns, caseRunID)
-	delete(s.executorLimitations, caseRunID)
-}
-
-// rememberExecutorLimitation records the structured executor capability code of
-// the last failed browser action. It is consumed by the next failed/blocked step
-// record of the same run, so the marker is sourced from the executor error code
-// instead of the model's prose (X-02).
-func (s *CaseRunner) rememberExecutorLimitation(caseRunID int64, code string) {
-	if caseRunID <= 0 || !execution.IsExecutorLimitationCode(code) {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.executorLimitations == nil {
-		s.executorLimitations = map[int64]string{}
-	}
-	s.executorLimitations[caseRunID] = code
-}
-
-// takeExecutorLimitation consumes the structured capability code remembered for
-// this run. A legacy step-record fallback may still supply a code in the error
-// text; the remembered executor code wins when both exist.
-func (s *CaseRunner) takeExecutorLimitation(caseRunID int64) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	code, ok := s.executorLimitations[caseRunID]
-	delete(s.executorLimitations, caseRunID)
-	return code, ok
-}
-
-// clearExecutorLimitation forgets any structured capability code of a previous
-// attempt so a redispatch cannot attribute a new step to a stale executor error.
-func (s *CaseRunner) clearExecutorLimitation(caseRunID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.executorLimitations, caseRunID)
 }
 
 // Prepare validates and claims one execute.case work item, then returns the
@@ -570,9 +703,6 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	if !ok {
 		return execution.TaskSnapshot{}, platform.LeaseLost()
 	}
-	// A new attempt starts clean: never attribute its first step to an executor
-	// action error observed by a previous attempt.
-	s.clearExecutorLimitation(caseRun.ID)
 	startedRun, err := s.caseRuns.Get(ctx, caseRun.ID)
 	if err != nil {
 		return execution.TaskSnapshot{}, mapExecutionError(err, "case_run")
@@ -600,10 +730,17 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 		"status": string(startedRun.Status),
 	})
 
+	// Every binding of a version shares one environment (version binds an
+	// environment directly, v0.2.4-B); stamp it once for the task context.
+	environmentID := int64(0)
+	if len(suts) > 0 {
+		environmentID = suts[0].EnvironmentID
+	}
 	return execution.TaskSnapshot{
 		Case:            caseSnapshot,
 		Intent:          intent,
 		CaseRun:         startedRun,
+		EnvironmentID:   environmentID,
 		SUTs:            suts,
 		PriorSteps:      priorSteps,
 		PriorAssertions: priorAssertions,
@@ -621,60 +758,52 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	if err != nil {
 		return nil, err
 	}
-	caseStep, ok := findStep(caseSnapshot, in.Seq)
-	if !ok {
+	// v0.2.4-B: the step is looked up only to validate the seq — a step no
+	// longer carries a target id to inherit, so there is nothing else to read.
+	if _, ok := findStep(caseSnapshot, in.Seq); !ok {
 		return nil, platform.Invalid("seq", fmt.Sprintf("step %d is not part of the case", in.Seq))
 	}
 	status := execution.StepStatus(in.Status)
 	if !status.Valid() {
 		return nil, platform.Invalid("status", "unsupported step status")
 	}
-	target := caseStep.TargetVersionSUTID
-	if in.VersionSUTID != nil {
-		// An unresolved case target (a snapshot read before the default
-		// inheritance was applied) accepts the model's resolved target instead
-		// of rejecting the recording call.
-		if caseStep.TargetVersionSUTID > 0 && *in.VersionSUTID != caseStep.TargetVersionSUTID {
-			return nil, platform.Invalid("version_sut_id", "does not match the case step target")
-		}
-		target = *in.VersionSUTID
+	// in.VersionSUTID is the agent-owned tool DTO Go field
+	// (tools.StepRecordInput / tools.AssertionRecordInput); its value is a SUT
+	// id. The model-facing WIRE key is sut_id since v0.2.4-C T14 (R-C1); the Go
+	// field name is internal and kept. See the lockstep note in tools.go.
+	target, err := s.recordedStepTarget(ctx, scope, caseRun, in.VersionSUTID)
+	if err != nil {
+		return nil, err
 	}
 	now := s.now()
 	result := execution.StepResult{
-		ID:                 s.nextID(),
-		CaseRunID:          caseRun.ID,
-		Seq:                in.Seq,
-		TargetVersionSUTID: optionalID(target),
-		Status:             status,
-		Observed:           map[string]any{},
-		Error:              truncateRunes(in.Error, execution.MaxStepErrorLength),
-		CreatedAt:          now,
-		UpdatedAt:          now,
+		ID:          s.nextID(),
+		CaseRunID:   caseRun.ID,
+		Seq:         in.Seq,
+		TargetSUTID: optionalID(target),
+		Status:      status,
+		Observed:    map[string]any{},
+		Error:       truncateRunes(in.Error, execution.MaxStepErrorLength),
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	if strings.TrimSpace(in.Observed) != "" {
 		result.Observed["summary"] = truncateRunes(in.Observed, 4000)
 	}
 	// The executor action error carries a structured capability code when the
 	// executor cannot perform the action at all (for example
-	// file_chooser_unavailable). The browser tool remembers that executor code and
-	// it is attached to this step, so the marker does not depend on the model
-	// copying the code into free text (v0.2.3 X-02). A code token inside the
-	// recorded error is a closed-allowlist fallback for older producers; nothing
-	// is inferred from prose.
+	// file_chooser_unavailable). The code token inside the recorded error is
+	// matched against the domain's CLOSED allowlist (ExecutorLimitationCodeFromError)
+	// and attached to this step as a structured marker; nothing is inferred from
+	// prose. (X-02: the in-memory remembered-code producer was the retired browser
+	// bridge; with the bridge deleted in v0.2.4-C the error-text allowlist is the
+	// single producer, and the dead remember/take mechanism was removed in T22.)
 	if status == execution.StepFailed || status == execution.StepBlocked {
-		if code, ok := s.takeExecutorLimitation(caseRun.ID); ok {
-			result.Observed[execution.ExecutorLimitationKey] = map[string]any{
-				execution.ExecutorLimitationCodeKey: code,
-			}
-		} else if code, ok := execution.ExecutorLimitationCodeFromError(in.Error); ok {
+		if code, ok := execution.ExecutorLimitationCodeFromError(in.Error); ok {
 			result.Observed[execution.ExecutorLimitationKey] = map[string]any{
 				execution.ExecutorLimitationCodeKey: code,
 			}
 		}
-	} else if status == execution.StepPassed || status == execution.StepSkipped {
-		// The action error was not attributed to this passed/skipped step: drop
-		// the remembered code so a later unrelated step is not misread.
-		s.clearExecutorLimitation(caseRun.ID)
 	}
 	if status == execution.StepRunning {
 		result.StartedAt = &now
@@ -682,7 +811,7 @@ func (s *CaseRunner) StepRecord(ctx context.Context, scope tools.Scope, in tools
 	if status.Terminal() {
 		result.FinishedAt = &now
 	}
-	ok, err = s.results.UpsertStep(ctx, result, caseRun.DispatchEpoch, caseRun.DispatchToken)
+	ok, err := s.results.UpsertStep(ctx, result, caseRun.DispatchEpoch, caseRun.DispatchToken)
 	if err != nil {
 		return nil, mapExecutionError(err, "step_result")
 	}
@@ -720,27 +849,37 @@ func (s *CaseRunner) AssertionRecord(ctx context.Context, scope tools.Scope, in 
 	if !verdict.Valid() {
 		return nil, platform.Invalid("verdict", "unsupported assertion verdict")
 	}
-	target := assertion.TargetVersionSUTID
+	target := assertion.SUTID
 	if in.VersionSUTID != nil {
-		if assertion.TargetVersionSUTID > 0 && *in.VersionSUTID != assertion.TargetVersionSUTID {
-			return nil, platform.Invalid("version_sut_id", "does not match the case assertion target")
+		if assertion.SUTID > 0 && *in.VersionSUTID != assertion.SUTID {
+			return nil, platform.Invalid("sut_id", "does not match the case assertion target")
 		}
 		target = *in.VersionSUTID
 	}
+	if target <= 0 {
+		// v0.2.4-B: only a db assertion still carries a design SUT id, so a
+		// ui/api/text assertion resolves its recorded target the same way a
+		// step does.
+		resolved, resolveErr := s.recordedStepTarget(ctx, scope, caseRun, nil)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		target = resolved
+	}
 	now := s.now()
 	result := execution.AssertionResult{
-		ID:                 s.nextID(),
-		CaseRunID:          caseRun.ID,
-		StepSeq:            in.StepSeq,
-		AssertionSeq:       in.AssertionSeq,
-		Kind:               assertion.Kind,
-		Verdict:            verdict,
-		Reason:             truncateRunes(in.Reason, execution.MaxAssertionReasonLength),
-		Expected:           truncateRunes(assertion.Expected, execution.MaxExpectedLength),
-		Actual:             truncateRunes(in.Actual, execution.MaxActualLength),
-		TargetVersionSUTID: optionalID(target),
-		CreatedAt:          now,
-		UpdatedAt:          now,
+		ID:           s.nextID(),
+		CaseRunID:    caseRun.ID,
+		StepSeq:      in.StepSeq,
+		AssertionSeq: in.AssertionSeq,
+		Kind:         assertion.Kind,
+		Verdict:      verdict,
+		Reason:       truncateRunes(in.Reason, execution.MaxAssertionReasonLength),
+		Expected:     truncateRunes(assertion.Expected, execution.MaxExpectedLength),
+		Actual:       truncateRunes(in.Actual, execution.MaxActualLength),
+		TargetSUTID:  optionalID(target),
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	ok, err = s.results.UpsertAssertion(ctx, result, caseRun.DispatchEpoch, caseRun.DispatchToken)
 	if err != nil {
@@ -786,31 +925,25 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, mapExecutionError(err, "assertion_result")
 	}
-	steps = execution.NormalizeVisualSteps(steps, assertions)
-	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
-		Case:       caseSnapshot,
-		Steps:      steps,
-		Assertions: assertions,
-		Finish:     &candidate,
-	})
+	status, class, summary, err := s.aggregateRunVerdict(ctx, caseRun, caseSnapshot, steps, assertions, candidate)
 	if err != nil {
-		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
+		return execution.CaseRun{}, err
 	}
-	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
-	// A structured executor capability limitation wins over the text heuristics
-	// and assertion evidence: the executor could not perform the action, so the
-	// run is blocked, never a SUT application defect (v0.2.3 X-02).
-	status, class, summary = applyExecutorCapabilityLimitation(status, class, summary, steps)
-	// Terminal-state discovery capture (R-EX-1): every active browser context is
-	// read before it is closed, at all four terminal states, and stored as
-	// DB-29 observations plus redacted network evidence. Best effort only.
+	// Terminal-state discovery capture (R-EX-1): every active session is read
+	// before it is closed, at all four terminal states, and stored as DB-29
+	// observations plus verbatim network evidence (GD-01). Best effort only.
 	s.captureTerminalObservations(ctx, caseRun, status)
 	// P3 §6.4 automatic evidence: a failed/blocked/inconclusive run with a live
-	// browser context captures one screenshot before the terminal write so the
-	// failure is triageable instead of a zero-evidence row (QA-F1).
+	// session captures one screenshot before the terminal write so the failure
+	// is triageable instead of a zero-evidence row (QA-F1).
 	s.captureTerminalEvidence(ctx, caseRun, status)
-	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
-		summary.EvidenceCount = evidenceCount
+	// Recording ledger → evidence, at every terminal state.
+	s.settleSessionEvidence(ctx, caseRun)
+	// The captures/drain above may have dropped evidence: re-aggregate so the
+	// art.4.5 degradation sees the final fact instead of a stale count.
+	status, class, summary, err = s.aggregateRunVerdict(ctx, caseRun, caseSnapshot, steps, assertions, candidate)
+	if err != nil {
+		return execution.CaseRun{}, err
 	}
 	if caseRun.Summary.HumanRequestID > 0 {
 		summary.HumanRequestID = caseRun.Summary.HumanRequestID
@@ -848,6 +981,20 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 		s.postTerminalHandoff(ctx, caseRun, finished)
 	}
 	return finished, nil
+}
+
+// ReplayCaseRun is the command-log replay entry (v0.2.4-C EV-006). It re-executes
+// a terminal source run's recorded command log under the same environment
+// fingerprint + workspace snapshot and re-validates the assertions SERVER-side
+// (no model run, no model self-report). Replay is a verification, not a retest:
+// it never replaces the authoritative source verdict. The body lives in
+// replay.go; the deterministic settlement aggregation (execution.Aggregate) is
+// reused and the four-state terminal write entry (writeTerminal) is untouched.
+func (s *CaseRunner) ReplayCaseRun(ctx context.Context, versionID, sourceCaseRunID, actorID int64) (ReplayResult, error) {
+	if versionID <= 0 || sourceCaseRunID <= 0 {
+		return ReplayResult{}, platform.Invalid("case_run_id", "replay requires a version and a source case_run id")
+	}
+	return s.runReplay(ctx, versionID, sourceCaseRunID, actorID)
 }
 
 // Finalize is called by the worker run sink after the agent loop ends.
@@ -929,6 +1076,17 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int6
 				return mapExecutionError(err, "case_run")
 			}
 			// A lost fence means a newer dispatch owns the row and finalizes it.
+			return nil
+		}
+		if classification.Exhausted {
+			// P6 (design §4.5): the dispatch attempt budget is spent and the run
+			// exhausted its budget. This is never a failed verdict — settle
+			// inconclusive with the concrete budget cause and a rerun next action,
+			// exactly like a settlement-ended run that never called case_finish.
+			outcome := newIncompleteRunOutcome(result)
+			if err := s.finalizeWithCandidate(ctx, caseRun, execution.FinishCandidate{Verdict: execution.CaseRunInconclusive}, runErr, &outcome, usage, ""); err != nil {
+				return err
+			}
 			return nil
 		}
 		candidate := execution.FinishCandidate{
@@ -1031,43 +1189,6 @@ func runResultTokens(usage map[string]int) int {
 	return total
 }
 
-// visualSymptomReached reports whether the visual assertion that left an
-// inconclusive run without a usable result was actually reached before the run
-// ended: the case step holding it was recorded, or the visual assertion itself
-// has a result row. A run stopped by the budget before that step has no visual
-// observation at all, so visual_assertion_not_run is only the downstream
-// symptom of the stop (QA release T9); a reached step (or a recorded visual
-// result) is a real observation and keeps its own cause/next action.
-func visualSymptomReached(caseSnapshot execution.CaseSnapshot, steps []execution.StepResult, assertions []execution.AssertionResult) bool {
-	recordedSteps := make(map[int]struct{}, len(steps))
-	for _, step := range steps {
-		recordedSteps[step.Seq] = struct{}{}
-	}
-	visualResults := make(map[[2]int]execution.AssertionResult, len(assertions))
-	for _, result := range assertions {
-		if result.Kind == execution.AssertionKindVisual {
-			visualResults[[2]int{result.StepSeq, result.AssertionSeq}] = result
-		}
-	}
-	for _, visual := range caseSnapshot.Assertions {
-		if visual.Kind != execution.AssertionKindVisual {
-			continue
-		}
-		result, hasResult := visualResults[[2]int{visual.StepSeq, visual.AssertionSeq}]
-		if hasResult && result.Verdict != execution.AssertionSkipped && result.Verdict != execution.AssertionInconclusive {
-			continue // this visual assertion did not block the verdict
-		}
-		if hasResult {
-			return true
-		}
-		_, stepRecorded := recordedSteps[visual.StepSeq]
-		return stepRecorded
-	}
-	// Visual results outside the snapshot (a legacy snapshot read) mean the
-	// visual tool ran, so the symptom was observed.
-	return len(visualResults) > 0
-}
-
 func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun execution.CaseRun, candidate execution.FinishCandidate, failure error, incomplete *incompleteRunOutcome, usage *execution.CaseRunUsage, terminalCause string) error {
 	caseSnapshot, err := s.caseForRun(ctx, caseRun)
 	if err != nil {
@@ -1081,15 +1202,21 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if err != nil {
 		return mapExecutionError(err, "assertion_result")
 	}
-	steps = execution.NormalizeVisualSteps(steps, assertions)
-	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
-		Case: caseSnapshot, Steps: steps, Assertions: assertions, Finish: &candidate,
-	})
+	status, class, summary, err := s.aggregateRunVerdict(ctx, caseRun, caseSnapshot, steps, assertions, candidate)
 	if err != nil {
-		return platform.Invalid("verdict", err.Error())
+		return err
 	}
-	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
-	status, class, summary = applyExecutorCapabilityLimitation(status, class, summary, steps)
+	// Terminal-state discovery capture (R-EX-1) on the agent-loop finalization
+	// path too: read every active session before it is closed.
+	s.captureTerminalObservations(ctx, caseRun, status)
+	s.captureTerminalEvidence(ctx, caseRun, status)
+	// Recording ledger → evidence, then re-aggregate so a drop produced by the
+	// captures/drain degrades the verdict (constitution art.4.5).
+	s.settleSessionEvidence(ctx, caseRun)
+	status, class, summary, err = s.aggregateRunVerdict(ctx, caseRun, caseSnapshot, steps, assertions, candidate)
+	if err != nil {
+		return err
+	}
 	if failure != nil {
 		// Persist the concrete failure reason (delivery reports and attribution
 		// read summary.last_error): a failed/blocked run must explain itself.
@@ -1097,17 +1224,9 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	}
 	// An incomplete verdict explains why the run stopped and offers the human
 	// next step. The verdict itself is untouched: a 1/4-step run stays
-	// inconclusive, never a pass. The explicit settlement cause also wins over a
-	// downstream visual symptom: when a budget/turn stop happens before the
-	// visual step, the aggregate sees no visual result and reports
-	// visual_assertion_not_run even though the baseline/config may be healthy
-	// (QA release T9). That symptom is only trusted once the run actually
-	// reached the visual step; before that the budget/agent stop is the real
-	// cause and rerun is the human next step.
+	// inconclusive, never a pass.
 	explained := incomplete != nil && status == execution.CaseRunInconclusive &&
-		(summary.VerdictReason == execution.VerdictReasonIncomplete ||
-			(summary.VerdictReason == execution.VerdictReasonVisualAssertionNotRun &&
-				!visualSymptomReached(caseSnapshot, steps, assertions)))
+		summary.VerdictReason == execution.VerdictReasonIncomplete
 	if explained {
 		summary.TerminalCause = incomplete.Cause
 		summary.NextAction = incomplete.NextAction
@@ -1126,13 +1245,6 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	}
 	if usage != nil {
 		summary.Usage = usage
-	}
-	// Terminal-state discovery capture (R-EX-1) on the agent-loop finalization
-	// path too: read every active browser context before it is closed.
-	s.captureTerminalObservations(ctx, caseRun, status)
-	s.captureTerminalEvidence(ctx, caseRun, status)
-	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
-		summary.EvidenceCount = evidenceCount
 	}
 	finished, terminalWrote, err := s.writeTerminal(ctx, caseRun, status, class, summary)
 	if err != nil {
@@ -1250,6 +1362,8 @@ func (s *CaseRunner) startLeaseHeartbeat(ctx context.Context, caseRun execution.
 				if !s.renewLease(heartbeatCtx, caseRun) {
 					return
 				}
+				// The executor session leases ride the same heartbeat.
+				s.renewSessionLeases(heartbeatCtx, caseRun)
 			}
 		}
 	}()
@@ -1276,6 +1390,35 @@ func (s *CaseRunner) renewLease(ctx context.Context, caseRun execution.CaseRun) 
 			timer.Stop()
 			return false
 		case <-timer.C:
+		}
+	}
+}
+
+// renewSessionLeases keeps the executor session leases of one run alive on the
+// same cadence as the case_run lease. A command may run far longer than the
+// session TTL, so without this the executor's orphan sweeper would reclaim a
+// session that is still working. Best effort: a failure is logged and retried on
+// the next tick; a genuinely lost lease surfaces as a typed 409 on the next write.
+func (s *CaseRunner) renewSessionLeases(ctx context.Context, caseRun execution.CaseRun) {
+	if s.execution == nil || s.sutContexts == nil {
+		return
+	}
+	rows, err := s.sutContexts.ListByCaseRun(ctx, caseRun.ID)
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		if row.SessionID == "" || row.Status != execution.SUTContextActive {
+			continue
+		}
+		executorID := int64(0)
+		if row.ExecutorID != nil {
+			executorID = *row.ExecutorID
+		}
+		if renewErr := s.execution.RenewLease(ctx, executorID, row.SessionID, caseRun.DispatchEpoch); renewErr != nil {
+			slog.WarnContext(ctx, "executor session lease renewal failed",
+				"case_run_id", caseRun.ID, "session_id", row.SessionID,
+				"lease_epoch", caseRun.DispatchEpoch, "error", renewErr)
 		}
 	}
 }
@@ -1362,12 +1505,18 @@ type finalRunFailure struct {
 	Class     execution.FailureClass
 	Retryable bool
 	Cause     string
+	// Exhausted marks a P6 budget exhaustion (design §4.5): it is re-dispatched
+	// within the attempt budget and, once that budget is spent, settles
+	// inconclusive (rerun) — NEVER failed. Budget starvation is a GOV defect, not
+	// a model-incapable failure verdict (constitution art.3).
+	Exhausted bool
 }
 
-// executorContextsPath is the executor endpoint that lazily creates the browser
-// context (the first browser action). A failure there is the pre-first-action
-// failure the UAT evidence pointed at.
-const executorContextsPath = "/v1/contexts"
+// executorSessionsPath is the executor endpoint that lazily creates the session
+// (the first execution call). A failure there is the pre-first-action failure the
+// UAT evidence pointed at. The published terminal cause code keeps its
+// pre-v2 spelling (executor_context_create_failed) for contract stability.
+const executorSessionsPath = "/v1/sessions"
 
 // classifyFinalRunError maps an agent run failure to the P3 failure taxonomy,
 // its retry eligibility and a stable terminal cause. Only a refused dial (the
@@ -1388,7 +1537,13 @@ func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
 			// agent loop (unresolvable step target, stale case, missing binding):
 			// this is a blocked case, not an automation failure.
 			return finalRunFailure{Class: execution.FailureClassBlocked, Cause: execution.VerdictReasonBlocked}
-		case "budget", "model_error", "ai_unavailable", "invalid_payload", "profile_not_found":
+		case "budget":
+			// P6 (design §4.5): a turn/time/stall budget exhaustion is re-dispatched
+			// within the attempt budget and then settles inconclusive, never failed.
+			// The retry/terminal decision is server-side here (constitution art.3),
+			// independent of the agent loop's own retryable flag.
+			return finalRunFailure{Class: execution.FailureClassModel, Retryable: true, Exhausted: true}
+		case "model_error", "ai_unavailable", "invalid_payload", "profile_not_found":
 			return finalRunFailure{Class: execution.FailureClassModel, Retryable: runErr.Retryable}
 		case "tool_failure":
 			var apiErr *platform.Error
@@ -1417,12 +1572,12 @@ func classifyFinalRunError(ctx context.Context, err error) finalRunFailure {
 // reports the transport phase in Details.phase; only a dial failure (connection
 // refused/unreachable) keeps the executor_lost class.
 func classifyExecutorError(apiErr *platform.Error) (execution.FailureClass, string, bool) {
-	contextCreate := executorErrorField(apiErr, "method") == http.MethodPost &&
-		executorErrorField(apiErr, "path") == executorContextsPath
+	sessionCreate := executorErrorField(apiErr, "method") == http.MethodPost &&
+		executorErrorField(apiErr, "path") == executorSessionsPath
 	switch apiErr.Code {
 	case "executor_timeout":
 		cause := execution.TerminalCauseExecutorTimeout
-		if contextCreate {
+		if sessionCreate {
 			cause = execution.TerminalCauseExecutorContextCreateFailed
 		}
 		return execution.FailureClassTimeout, cause, true
@@ -1431,7 +1586,7 @@ func classifyExecutorError(apiErr *platform.Error) (execution.FailureClass, stri
 			return execution.FailureClassExecutorLost, string(execution.FailureClassExecutorLost), true
 		}
 		cause := execution.TerminalCauseExecutorUnavailable
-		if contextCreate {
+		if sessionCreate {
 			cause = execution.TerminalCauseExecutorContextCreateFailed
 		}
 		return execution.FailureClassEnvironment, cause, true
@@ -1448,70 +1603,13 @@ func executorErrorField(apiErr *platform.Error, key string) string {
 	return value
 }
 
-// applyExecutorCapabilityLimitation turns a failed/blocked/inconclusive run
-// carrying the structured executor limitation marker into a blocked run with
-// terminal_cause=executor_capability. It never touches a passed/skipped run.
-func applyExecutorCapabilityLimitation(status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary, steps []execution.StepResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
-	switch status {
-	case execution.CaseRunFailed, execution.CaseRunBlocked, execution.CaseRunInconclusive:
-	default:
-		return status, class, summary
-	}
-	step, code, ok := execution.ExecutorLimitationStep(steps)
-	if !ok {
-		return status, class, summary
-	}
-	reason := "the executor could not perform the action"
-	if code != "" {
-		reason = "executor capability limitation " + code
-	}
-	summary.VerdictReason = execution.VerdictReasonBlocked
-	summary.TerminalCause = execution.TerminalCauseExecutorCapability
-	summary.NextAction = execution.NextActionResolveBlocker
-	summary.LastError = fmt.Sprintf("%s (step %d)", reason, step.Seq)
-	return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
-}
-
-// writeTerminal persists the terminal verdict when this owner still holds the
-// dispatch fence. The bool reports whether this call won the CAS: false means
-// another owner already finalized the run (or the fence was lost), so callers
-// must not repeat one-time side effects such as the knowledge success hook.
+// writeTerminal persists the terminal verdict through the single settlement
+// entry (settleTerminalVerdict). The bool reports whether this call won the
+// CAS: false means another owner already finalized the run (or the fence was
+// lost), so callers must not repeat one-time side effects such as the knowledge
+// success hook.
 func (s *CaseRunner) writeTerminal(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus, class execution.FailureClass, summary execution.CaseRunSummary) (execution.CaseRun, bool, error) {
-	now := s.now()
-	// The aggregate rebuilds the verdict summary from scratch; keep the
-	// dispatch-time executor snapshot assembled by the scheduler (X-01).
-	summary.Dispatch = caseRun.Summary.Dispatch
-	ok, err := s.caseRuns.UpdateCAS(ctx, caseRun.ID, caseRun.DispatchEpoch, caseRun.DispatchToken, func(run *execution.CaseRun) error {
-		run.Status = status
-		run.FailureClass = class
-		run.Summary = summary
-		if run.StartedAt == nil {
-			run.StartedAt = &now
-		}
-		run.FinishedAt = &now
-		run.LeaseUntil = nil
-		return nil
-	})
-	if err != nil {
-		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
-	}
-	if !ok {
-		// Another owner already finalized the run; return the stored truth
-		// (Finish is idempotent for terminal rows).
-		current, getErr := s.caseRuns.Get(ctx, caseRun.ID)
-		if getErr != nil {
-			return execution.CaseRun{}, false, mapExecutionError(getErr, "case_run")
-		}
-		if current.Status.Finished() {
-			return current, false, nil
-		}
-		return execution.CaseRun{}, false, platform.LeaseLost()
-	}
-	finished, err := s.caseRuns.Get(ctx, caseRun.ID)
-	if err != nil {
-		return execution.CaseRun{}, false, mapExecutionError(err, "case_run")
-	}
-	return finished, true, nil
+	return settleTerminalVerdict(ctx, s.caseRuns, s.now(), caseRun, status, class, summary)
 }
 
 func (s *CaseRunner) caseSnapshot(ctx context.Context, scope tools.Scope, caseRun execution.CaseRun) (execution.CaseSnapshot, error) {
@@ -1551,90 +1649,101 @@ func mapCaseReadError(err error) error {
 	return mapExecutionError(err, "case_version")
 }
 
-// executionSUTBindings resolves the SUTs referenced by the case snapshot and
-// validates every step/assertion target against the version bindings. P2 allows
-// a step target to be empty (inherit case_version.default_version_sut_id); a
-// case with no default target inherits the version's sole binding. The resolved
-// targets are written back to the snapshot so the task context, the SUT context
-// rows and the recorded results all carry the same version_sut_id.
+// recordedStepTarget resolves the SUT a step/assertion result is recorded
+// against.
+//
+// v0.2.4-B (T9 design contract): a case step no longer carries a target SUT id,
+// so the model's explicit tool argument is authoritative and must name a bound
+// SUT. When it is omitted the run falls back to the intent's SUT set if that is
+// unambiguous (exactly one bound SUT), and otherwise leaves the nullable
+// step_result.target_sut_id empty rather than rejecting the record — QA-F1: the
+// agent must always be able to record a step, and per-SUT attribution is
+// best-effort metadata, not a gate.
+func (s *CaseRunner) recordedStepTarget(ctx context.Context, scope tools.Scope, caseRun execution.CaseRun, explicit *int64) (int64, error) {
+	if explicit != nil {
+		if _, err := s.bindingFor(ctx, scope.VersionID, *explicit); err != nil {
+			return 0, err
+		}
+		return *explicit, nil
+	}
+	if s.intents != nil {
+		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil &&
+			len(intent.SUTIDs) == 1 && intent.SUTIDs[0] > 0 {
+			return intent.SUTIDs[0], nil
+		}
+	}
+	return 0, nil
+}
+
+// executionSUTBindings resolves the SUTs a case run may use and validates the
+// one target id design still supplies. The resolved set is written back to the
+// snapshot so the task context, the SUT context rows and the recorded results
+// all carry the same sut_id.
+//
+// v0.2.4-B (T9 design contract): a case no longer names SUTs, pages or APIs —
+// steps carry prose target_description instead — so the case cannot narrow the
+// version's binding set and the per-step "targets unbound SUT" gate is gone
+// with the ids it checked. What remains is:
+//
+//   - every effective SUT of the bound environment is in scope (the caller
+//     already filtered to EffectiveSUTs, so proposed/disabled resources are out);
+//   - a db assertion still names a SUT (design case_assertion.sut_id) and that
+//     id must be bound, because design now validates only its existence;
+//   - the single-binding fallback that stamps DefaultSUTID, so a recorded
+//     step/assertion whose tool call omitted sut_id still resolves.
+//     QA-F1: a run must never be rejected before the agent can record anything,
+//     so an unresolvable multi-SUT target is left 0 for the model to supply
+//     rather than failing the run here.
 //
 // account_role is deliberately not validated against the bound test accounts:
 // the design contract allows any role label (for example "anonymous" for a
 // logged-out step), an unbound role simply runs an unauthenticated browser
 // context, and account.credentials returns a typed business error if the model
-// asks for credentials that do not exist. Rejecting the role here killed the
-// whole run before any step/assertion/evidence could be recorded (QA-F1).
+// asks for credentials that do not exist.
 func executionSUTBindings(snapshot *execution.CaseSnapshot, bindings []execution.SUTBinding) ([]execution.SUTBinding, error) {
 	if snapshot == nil {
 		return nil, platform.StateConflict("the case snapshot is missing")
 	}
+	if len(bindings) == 0 {
+		return nil, platform.StateConflict("the version has no active SUT bindings")
+	}
 	byID := make(map[int64]execution.SUTBinding, len(bindings))
+	ids := make([]int64, 0, len(bindings))
 	for _, binding := range bindings {
-		byID[binding.VersionSUTID] = binding
-	}
-	fallback := snapshot.DefaultVersionSUTID
-	if fallback <= 0 && len(bindings) == 1 {
-		fallback = bindings[0].VersionSUTID
-		snapshot.DefaultVersionSUTID = fallback
-	}
-	used := make([]int64, 0, len(bindings))
-	seen := map[int64]struct{}{}
-	add := func(id int64) {
-		if id <= 0 {
-			return
-		}
-		if _, ok := seen[id]; ok {
-			return
-		}
-		seen[id] = struct{}{}
-		used = append(used, id)
-	}
-	for _, id := range snapshot.VersionSUTIDs {
-		add(id)
-	}
-	add(fallback)
-	for i := range snapshot.Steps {
-		step := &snapshot.Steps[i]
-		target := step.TargetVersionSUTID
-		if target <= 0 {
-			target = fallback
-			step.TargetVersionSUTID = target
-		}
-		if target <= 0 {
-			return nil, platform.StateConflict(fmt.Sprintf(
-				"step %d has no target version_sut: set case_step.target_version_sut_id or case_version.default_version_sut_id", step.Seq))
-		}
-		if _, ok := byID[target]; !ok {
-			return nil, platform.StateConflict(fmt.Sprintf("step %d targets unbound version_sut %s", step.Seq, platformid.Format(target)))
-		}
-		add(target)
-	}
-	for i := range snapshot.Assertions {
-		assertion := &snapshot.Assertions[i]
-		target := assertion.TargetVersionSUTID
-		if target <= 0 {
-			target = fallback
-			assertion.TargetVersionSUTID = target
-		}
-		if target <= 0 {
-			// The assertion carries only informational target metadata; the
-			// step target still routes the browser/API action.
+		if binding.SUTID <= 0 {
 			continue
 		}
-		if _, ok := byID[target]; !ok {
-			return nil, platform.StateConflict(fmt.Sprintf(
-				"assertion %d.%d targets unbound version_sut %s", assertion.StepSeq, assertion.AssertionSeq, platformid.Format(target)))
+		if _, ok := byID[binding.SUTID]; ok {
+			continue
 		}
-		add(target)
+		byID[binding.SUTID] = binding
+		ids = append(ids, binding.SUTID)
 	}
-	snapshot.VersionSUTIDs = sortedSUTIDs(used)
-	resolved := make([]execution.SUTBinding, 0, len(used))
-	for _, id := range used {
-		binding, ok := byID[id]
-		if !ok {
-			return nil, platform.StateConflict(fmt.Sprintf("version_sut %s is not bound to the version", platformid.Format(id)))
+	if len(ids) == 0 {
+		return nil, platform.StateConflict("the version has no active SUT bindings")
+	}
+	// A case with no explicit target is unambiguous when the version binds a
+	// single SUT, so that binding is the recorded-target fallback.
+	if len(ids) == 1 {
+		snapshot.DefaultSUTID = ids[0]
+	} else {
+		snapshot.DefaultSUTID = 0
+	}
+	snapshot.SUTIDs = sortedSUTIDs(ids)
+	for i := range snapshot.Assertions {
+		assertion := &snapshot.Assertions[i]
+		if assertion.SUTID <= 0 {
+			assertion.SUTID = snapshot.DefaultSUTID
+			continue
 		}
-		resolved = append(resolved, binding)
+		if _, ok := byID[assertion.SUTID]; !ok {
+			return nil, platform.StateConflict(fmt.Sprintf(
+				"assertion %d.%d targets unbound SUT %s", assertion.StepSeq, assertion.AssertionSeq, platformid.Format(assertion.SUTID)))
+		}
+	}
+	resolved := make([]execution.SUTBinding, 0, len(snapshot.SUTIDs))
+	for _, id := range snapshot.SUTIDs {
+		resolved = append(resolved, byID[id])
 	}
 	return resolved, nil
 }
@@ -1653,10 +1762,26 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 	}
 	byKey := make(map[string]execution.CaseRunSUTContext, len(existing))
 	for _, row := range existing {
-		byKey[sutContextKey(row.VersionSUTID, row.AccountRole)] = row
+		byKey[sutContextKey(row.SUTID, row.AccountRole)] = row
 	}
-	for _, step := range snapshot.Steps {
-		key := sutContextKey(step.TargetVersionSUTID, step.AccountRole)
+	// v0.2.4-B (T9 design contract): a step no longer names its SUT, so the
+	// (SUT, role) pairs to pre-warm cannot be derived per step. Only the
+	// unambiguous single-binding case is pre-warmed here, exactly as before; a
+	// multi-SUT version creates each context lazily in ensureBrowserContext once
+	// the model picks a SUT for a tool call, which avoids reserving executor
+	// browser contexts for SUTs the run may never touch.
+	prewarmSUTID := snapshot.DefaultSUTID
+	prewarmSteps := snapshot.Steps
+	if prewarmSUTID <= 0 {
+		prewarmSteps = nil
+	}
+	seenRoles := make(map[string]struct{}, len(prewarmSteps))
+	for _, step := range prewarmSteps {
+		if _, seen := seenRoles[step.AccountRole]; seen {
+			continue
+		}
+		seenRoles[step.AccountRole] = struct{}{}
+		key := sutContextKey(prewarmSUTID, step.AccountRole)
 		if row, ok := byKey[key]; ok {
 			rowID := row.ID
 			if _, updateErr := s.sutContexts.UpdateCAS(ctx, rowID, func(target *execution.CaseRunSUTContext) error {
@@ -1664,7 +1789,7 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 				target.ExecutorID = caseRun.OwnerExecutorID
 				if target.Status == execution.SUTContextClosed || target.Status == execution.SUTContextFailed {
 					target.Status = execution.SUTContextCreating
-					target.BrowserContextID = ""
+					target.SessionID = ""
 					target.ClosedAt = nil
 				}
 				return nil
@@ -1674,15 +1799,15 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 			continue
 		}
 		if err := s.sutContexts.Create(ctx, execution.CaseRunSUTContext{
-			ID:           s.nextID(),
-			CaseRunID:    caseRun.ID,
-			VersionSUTID: step.TargetVersionSUTID,
-			AccountRole:  step.AccountRole,
-			ExecutorID:   caseRun.OwnerExecutorID,
-			LeaseEpoch:   epoch,
-			Status:       execution.SUTContextCreating,
-			CreatedAt:    s.now(),
-			UpdatedAt:    s.now(),
+			ID:          s.nextID(),
+			CaseRunID:   caseRun.ID,
+			SUTID:       prewarmSUTID,
+			AccountRole: step.AccountRole,
+			ExecutorID:  caseRun.OwnerExecutorID,
+			LeaseEpoch:  epoch,
+			Status:      execution.SUTContextCreating,
+			CreatedAt:   s.now(),
+			UpdatedAt:   s.now(),
 		}); err != nil {
 			if errors.Is(err, execution.ErrDuplicate) {
 				continue
@@ -1767,11 +1892,15 @@ func (s *CaseRunner) recordRunFailureEvidence(ctx context.Context, caseRun execu
 }
 
 // captureTerminalEvidence implements the P3 §6.4 automatic capture: when a
-// case_run reaches failed/blocked/inconclusive and one of its browser contexts
-// is still active, take one screenshot and store it as evidence. The capture is
-// best effort and bounded; a missing/dead context never changes the verdict.
+// case_run reaches failed/blocked/inconclusive and one of its sessions is still
+// active, take one screenshot through the official playwright CLI (over the
+// general exec channel) and store it as evidence. The executor binds the CLI
+// named session (-s) to this session and settles the PNG as a screenshot
+// artifact; the recording-ledger drain turns it into evidence. The capture is
+// best effort and bounded: a session that never opened a browser has nothing to
+// capture (the CLI errors) and a missing/dead session never changes the verdict.
 func (s *CaseRunner) captureTerminalEvidence(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus) {
-	if s.browser == nil || s.evidence == nil || s.content == nil || s.sutContexts == nil {
+	if s.execution == nil || s.evidence == nil || s.content == nil || s.sutContexts == nil {
 		return
 	}
 	switch status {
@@ -1785,7 +1914,7 @@ func (s *CaseRunner) captureTerminalEvidence(ctx context.Context, caseRun execut
 	}
 	var target *execution.CaseRunSUTContext
 	for i := range rows {
-		if rows[i].Status == execution.SUTContextActive && rows[i].BrowserContextID != "" {
+		if rows[i].Status == execution.SUTContextActive && rows[i].SessionID != "" {
 			target = &rows[i]
 			break
 		}
@@ -1799,11 +1928,106 @@ func (s *CaseRunner) captureTerminalEvidence(ctx context.Context, caseRun execut
 	if target.ExecutorID != nil {
 		executorID = *target.ExecutorID
 	}
-	result, actionErr := s.browser.Action(actionCtx, executorID, target.BrowserContextID, "screenshot", json.RawMessage(`{}`))
-	if actionErr != nil || result.Error != nil {
+	// CLI screenshot over exec (T15 replaces the retained browser bridge for this
+	// capture). The executor injects -s=<session> and settles the screenshot
+	// artifact; a best-effort capture failure (no browser opened, dead session)
+	// never changes the verdict.
+	_, execErr := s.execution.Exec(actionCtx, executorID, target.SessionID, ExecCommand{
+		Argv: []string{"playwright-cli", "screenshot"},
+	}, target.LeaseEpoch)
+	if execErr != nil {
 		return
 	}
-	_, _ = s.storeBrowserEvidence(actionCtx, caseRun, target.VersionSUTID, "screenshot", result, 0)
+	// Drain the recording ledger so the screenshot artifact becomes evidence. A
+	// SETTLEMENT failure (the screenshot was taken and then lost) is counted like
+	// any other lost evidence — storeExecutionEvidence records the drop fact on a
+	// fresh context and degrades the verdict (constitution art.4.5).
+	if _, _, storeErr := s.storeExecutionEvidence(actionCtx, caseRun, *target, 0); storeErr != nil {
+		slog.WarnContext(actionCtx, "terminal screenshot settlement failed",
+			"case_run_id", caseRun.ID, "session_id", target.SessionID, "error", storeErr)
+	}
+}
+
+// settleSessionEvidence drains the recording ledger of every session of the run
+// into immutable evidence BEFORE the terminal write, at all four terminal states.
+// Without it a passed run would never settle its command/file/trace artifacts,
+// and a background command's evidence would be lost when the session closes.
+func (s *CaseRunner) settleSessionEvidence(ctx context.Context, caseRun execution.CaseRun) {
+	if s.execution == nil || s.sutContexts == nil || s.evidence == nil || s.content == nil {
+		return
+	}
+	rows, err := s.sutContexts.ListByCaseRun(ctx, caseRun.ID)
+	if err != nil {
+		// The session ledger could not be read at all, so the WHOLE terminal
+		// drain is abandoned — for a passed run this is its ONLY drain. Count one
+		// explicit loss (the un-drained recording's size is unknown) on a FRESH
+		// background context, mirroring recordSettlementFailure: the caller's
+		// budget may already be expired, and a loss that cannot be recorded stays
+		// invisible — exactly what art.4.5 forbids. The re-aggregation after this
+		// drain reads the persisted fact and degrades the verdict to inconclusive.
+		slog.ErrorContext(ctx, "terminal evidence settlement could not list the run's sessions; the un-drained recording is counted as dropped",
+			"case_run_id", caseRun.ID, "error", err)
+		factCtx, cancel := context.WithTimeout(context.Background(), evidenceDropFactTimeout)
+		defer cancel()
+		s.recordEvidenceDrops(factCtx, caseRun, 1, "evidence_settlement_failed", execution.EvidenceKind(""), nil)
+		return
+	}
+	settleCtx, cancel := context.WithTimeout(context.Background(), sessionEvidenceSettleTimeout)
+	defer cancel()
+	for _, row := range rows {
+		if row.SessionID == "" || row.Status == execution.SUTContextClosed {
+			continue
+		}
+		// storeExecutionEvidence already counted the un-settled remainder as an
+		// evidence drop (on a fresh context, so an expired budget cannot hide the
+		// loss) — the settlement re-aggregates afterwards and degrades the verdict.
+		// The error is still surfaced here: a terminal drain that silently
+		// swallowed it is how a passed run lost its whole ledger.
+		if _, _, err := s.storeExecutionEvidence(settleCtx, caseRun, row, 0); err != nil {
+			slog.ErrorContext(ctx, "terminal evidence settlement failed",
+				"case_run_id", caseRun.ID, "session_id", row.SessionID, "error", err)
+		}
+	}
+}
+
+// aggregateRunVerdict is the single settlement aggregation entry: it reads the
+// persisted evidence-drop fact and applies the deterministic four-state verdict
+// plus the structured executor-capability override. Settlement calls it again
+// after the terminal captures so a drop produced by a capture is not missed
+// (constitution art.4.5).
+func (s *CaseRunner) aggregateRunVerdict(
+	ctx context.Context,
+	caseRun execution.CaseRun,
+	snapshot execution.CaseSnapshot,
+	steps []execution.StepResult,
+	assertions []execution.AssertionResult,
+	candidate execution.FinishCandidate,
+) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary, error) {
+	dropped := caseRun.EvidenceDropped
+	if s.caseRuns != nil {
+		if fresh, err := s.caseRuns.Get(ctx, caseRun.ID); err == nil {
+			dropped = fresh.EvidenceDropped
+		}
+	}
+	caseRun.EvidenceDropped = dropped
+	// The evidence gate reads the live count before the verdict; a read failure
+	// aborts the terminal write (503, retryable). The structured executor
+	// capability limitation is applied inside Aggregate (single verdict
+	// authority, v0.2.3 X-02).
+	status, class, summary, err := aggregateWithEvidenceFacts(ctx, s.evidence, caseRun, execution.VerdictInput{
+		Case:       snapshot,
+		Steps:      steps,
+		Assertions: assertions,
+		Finish:     &candidate,
+	})
+	if err != nil {
+		var apiErr *platform.Error
+		if errors.As(err, &apiErr) {
+			return "", "", execution.CaseRunSummary{}, apiErr
+		}
+		return "", "", execution.CaseRunSummary{}, platform.Invalid("verdict", err.Error())
+	}
+	return status, class, summary, nil
 }
 
 func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
@@ -1819,8 +2043,8 @@ func (s *CaseRunner) closeSUTContexts(ctx context.Context, caseRunID int64) {
 		if row.ExecutorID != nil {
 			executorID = *row.ExecutorID
 		}
-		if row.BrowserContextID != "" && s.browser != nil {
-			_ = s.browser.Close(ctx, executorID, row.BrowserContextID)
+		if row.SessionID != "" && s.execution != nil {
+			_ = s.execution.Close(ctx, executorID, row.SessionID)
 		}
 		if row.Status == execution.SUTContextClosed {
 			continue
@@ -1841,7 +2065,8 @@ func (s *CaseRunner) notifyCaseSuccess(ctx context.Context, versionID int64, cas
 	if s.knowledge == nil || caseRun.Status != execution.CaseRunPassed || versionID <= 0 {
 		return
 	}
-	fact := caseSuccessFact(versionID, caseRun, snapshot, summary)
+	resolution, registrations := s.knowledgeObservationFacts(ctx, caseRun.ID)
+	fact := caseSuccessFact(versionID, caseRun, snapshot, summary, resolution, registrations)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			slog.Default().ErrorContext(ctx, "knowledge success hook panicked",
@@ -1861,7 +2086,8 @@ func (s *CaseRunner) notifyCaseFailure(ctx context.Context, versionID int64, cas
 	if s.knowledgeFailure == nil || caseRun.Status != execution.CaseRunFailed || versionID <= 0 {
 		return
 	}
-	fact := caseFailureFact(versionID, caseRun, snapshot, class)
+	resolution, registrations := s.knowledgeObservationFacts(ctx, caseRun.ID)
+	fact := caseFailureFact(versionID, caseRun, snapshot, class, resolution, registrations)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			slog.Default().ErrorContext(ctx, "knowledge failure hook panicked",
@@ -1875,8 +2101,10 @@ func (s *CaseRunner) notifyCaseFailure(ctx context.Context, versionID int64, cas
 }
 
 // caseSuccessFact projects one passed case snapshot into the hook observation:
-// identifiers only, deduplicated and in case order.
-func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary) CaseSuccessFact {
+// identifiers only, deduplicated and in case order. The page/API dimension is
+// the execution-fact true source (SC-F10): the run's latest sut_resolution
+// validated assets plus the resolved SUTs' proven asset registrations.
+func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, summary execution.CaseRunSummary, resolution execution.SUTResolution, registrations []execution.AssetRegistration) CaseSuccessFact {
 	fact := CaseSuccessFact{
 		VersionID:     versionID,
 		CaseRunID:     caseRun.ID,
@@ -1884,20 +2112,20 @@ func caseSuccessFact(versionID int64, caseRun execution.CaseRun, snapshot execut
 		Title:         snapshot.Title,
 		EvidenceCount: summary.EvidenceCount,
 	}
-	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot, resolution, registrations)
 	return fact
 }
 
 // caseFailureFact projects one failed case snapshot into the failure hook
 // observation. It deliberately carries no title and no summary text.
-func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass) CaseFailureFact {
+func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execution.CaseSnapshot, class execution.FailureClass, resolution execution.SUTResolution, registrations []execution.AssetRegistration) CaseFailureFact {
 	fact := CaseFailureFact{
 		VersionID:     versionID,
 		CaseRunID:     caseRun.ID,
 		CaseVersionID: caseRun.CaseVersionID,
 		FailureClass:  class,
 	}
-	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot)
+	fact.AccountRoles, fact.PageIDs, fact.APIIDs = caseObservationIDs(snapshot, resolution, registrations)
 	return fact
 }
 
@@ -1909,36 +2137,111 @@ func caseFailureFact(versionID int64, caseRun execution.CaseRun, snapshot execut
 // unbound (R2-OBS-02). Custom unbound roles keep their existing unmapped warning.
 const UnauthenticatedAccountRole = "anonymous"
 
-// caseObservationIDs extracts the deduplicated page/API/account-role
-// back-references of one case snapshot in case order. The documented
-// unauthenticated role is skipped: it has no credentials to reuse and no
-// knowledge binding dimension.
-func caseObservationIDs(snapshot execution.CaseSnapshot) (roles []string, pages []int64, apis []int64) {
+// caseObservationIDs extracts the knowledge back-references of one case run.
+// The account-role dimension comes from the snapshot in case order; the
+// documented unauthenticated role is skipped (it has no credentials to reuse
+// and no knowledge binding dimension).
+//
+// v0.2.4-F T14 (SC-F10, R-E7) RESTORES the page/API dimension as a TRUE SOURCE
+// (the C T22 "not restored, no clean source" decision is explicitly revisited —
+// release notes §8.3/§19): the P16 sut_resolution fact records the resolved
+// SUT's validated page/API asset ids server-side at Prepare (controller ruling
+// P20 — non-empty even for a directory-hit run that never explores), and the
+// P17 asset_registration facts record the proven discoveries of the resolved
+// SUTs. The dimension is the deduplicated union of both. Without facts it stays
+// legitimately EMPTY: a prose step target is never turned into an id (C T22
+// ruling — heuristic id fabrication is forgery).
+// TestKnowledgePageAPIDimensionDecision pins the positive projection;
+// TestKnowledgeDimensionNoFabricatedID pins the empty-without-facts guard.
+func caseObservationIDs(snapshot execution.CaseSnapshot, resolution execution.SUTResolution, registrations []execution.AssetRegistration) (roles []string, pages []int64, apis []int64) {
 	seenRoles := map[string]struct{}{}
-	seenPages := map[int64]struct{}{}
-	seenAPIs := map[int64]struct{}{}
 	for _, step := range snapshot.Steps {
 		role := strings.TrimSpace(step.AccountRole)
-		if role != "" && !strings.EqualFold(role, UnauthenticatedAccountRole) {
-			if _, seen := seenRoles[role]; !seen {
-				seenRoles[role] = struct{}{}
-				roles = append(roles, role)
-			}
+		if role == "" || strings.EqualFold(role, UnauthenticatedAccountRole) {
+			continue
 		}
-		if step.TargetPageID != nil && *step.TargetPageID > 0 {
-			if _, seen := seenPages[*step.TargetPageID]; !seen {
-				seenPages[*step.TargetPageID] = struct{}{}
-				pages = append(pages, *step.TargetPageID)
-			}
+		if _, seen := seenRoles[role]; seen {
+			continue
 		}
-		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
-			if _, seen := seenAPIs[*step.TargetAPIID]; !seen {
-				seenAPIs[*step.TargetAPIID] = struct{}{}
-				apis = append(apis, *step.TargetAPIID)
-			}
+		seenRoles[role] = struct{}{}
+		roles = append(roles, role)
+	}
+	pageIDs := append([]int64(nil), resolution.TouchedPageIDs...)
+	apiIDs := append([]int64(nil), resolution.TouchedAPIIDs...)
+	for _, registration := range LatestApprovedAssetRegistrations(registrations) {
+		switch registration.AssetKind {
+		case execution.AssetKindPage:
+			pageIDs = append(pageIDs, registration.AssetID)
+		case execution.AssetKindAPI:
+			apiIDs = append(apiIDs, registration.AssetID)
 		}
 	}
-	return roles, pages, apis
+	return roles, sortedUniqueInt64(pageIDs), sortedUniqueInt64(apiIDs)
+}
+
+// knowledgeObservationFacts reads the server-recorded facts that carry the
+// knowledge page/API dimension (SC-F10): the run's LATEST sut_resolution fact
+// (append order, id ascending — latest wins) and the asset_registration facts
+// of the resolved SUTs. A read failure degrades the dimension with a loud
+// warning: the knowledge hooks are best effort and must never fail or block
+// settlement, and the dimension is never fabricated to cover a read gap
+// (constitution art.7.6 — the degradation is observable, not silent).
+func (s *CaseRunner) knowledgeObservationFacts(ctx context.Context, caseRunID int64) (execution.SUTResolution, []execution.AssetRegistration) {
+	if s.resolutions == nil {
+		return execution.SUTResolution{}, nil
+	}
+	resolutions, err := s.resolutions.ListSUTResolutions(ctx, caseRunID)
+	if err != nil {
+		slog.WarnContext(ctx, "knowledge dimension: sut_resolution read failed; page/API dimension degraded to empty",
+			"case_run_id", caseRunID, "error", err)
+		return execution.SUTResolution{}, nil
+	}
+	if len(resolutions) == 0 {
+		return execution.SUTResolution{}, nil
+	}
+	latest := resolutions[len(resolutions)-1]
+	var registrations []execution.AssetRegistration
+	if s.registrations != nil {
+		for _, sutID := range latest.SUTIDs {
+			rows, err := s.registrations.ListAssetRegistrations(ctx, sutID)
+			if err != nil {
+				slog.WarnContext(ctx, "knowledge dimension: asset_registration read failed; this SUT's proven registrations are missing from the dimension",
+					"case_run_id", caseRunID, "sut_id", sutID, "error", err)
+				continue
+			}
+			registrations = append(registrations, rows...)
+		}
+	}
+	return latest, registrations
+}
+
+// LatestApprovedAssetRegistrations derives the effective proven registrations
+// from append-only asset_registration facts (one or more SUTs, append order):
+// per (asset_kind, asset_id) the LATEST fact wins, and only a latest
+// gate_result=approved fact counts — a later non-approved fact retires the
+// asset. It is the SINGLE "latest wins + approved" authority shared by the
+// knowledge dimension projection (caseObservationIDs) and the case_author
+// discovery producer's composition-root adapter (SC-F10).
+func LatestApprovedAssetRegistrations(registrations []execution.AssetRegistration) []execution.AssetRegistration {
+	type assetKey struct {
+		kind string
+		id   int64
+	}
+	latest := make(map[assetKey]execution.AssetRegistration, len(registrations))
+	for _, registration := range registrations {
+		key := assetKey{registration.AssetKind, registration.AssetID}
+		if previous, seen := latest[key]; !seen || registration.ID >= previous.ID {
+			latest[key] = registration
+		}
+	}
+	out := make([]execution.AssetRegistration, 0, len(latest))
+	for _, registration := range latest {
+		if registration.GateResult == AssetGateApproved {
+			out = append(out, registration)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 func (s *CaseRunner) resetWaitTracking(caseRunID int64, now time.Time) {
@@ -2022,12 +2325,12 @@ func (s *CaseRunner) intSetting(key string, fallback int64) int64 {
 	return value
 }
 
-func caseContextKey(caseRunID, versionSUTID int64, role string) string {
-	return fmt.Sprintf(executorContextKeyFormat, caseRunID, versionSUTID, role)
+func caseSessionKey(caseRunID, sutID int64, role string) string {
+	return fmt.Sprintf(executorSessionKeyFormat, caseRunID, sutID, role)
 }
 
-func sutContextKey(versionSUTID int64, role string) string {
-	return platformid.Format(versionSUTID) + "|" + role
+func sutContextKey(sutID int64, role string) string {
+	return platformid.Format(sutID) + "|" + role
 }
 
 func findStep(snapshot execution.CaseSnapshot, seq int) (execution.CaseStep, bool) {
@@ -2049,15 +2352,6 @@ func findAssertion(snapshot execution.CaseSnapshot, stepSeq, assertionSeq int) (
 }
 
 func ptrTime(value time.Time) *time.Time { return &value }
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
-}
 
 // truncateRunes bounds a string by rune count so multibyte text is never cut in
 // the middle of a character.

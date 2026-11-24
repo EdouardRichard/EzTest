@@ -24,6 +24,18 @@
       "preset": "recommended"
     }
   },
+  "overrides": [
+    {
+      "includes": ["src/features/clarification/**", "src/features/design/**", "e2e/**"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noThenProperty": "off"
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "quoteStyle": "double",

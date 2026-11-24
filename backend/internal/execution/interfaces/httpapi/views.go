@@ -37,11 +37,11 @@ type CaseRunCountsView struct {
 	Superseded   int `json:"superseded"`
 }
 
-// ExecutionQuotas is the frozen 3/2/1 quota projection.
+// ExecutionQuotas is the single global concurrency projection (design P5,
+// v0.2.4-F): execution.max_concurrent_case_runs, 0 = unlimited. The retired
+// global/per_sut/cross_system trio is gone from the wire.
 type ExecutionQuotas struct {
-	Global      int64 `json:"global"`
-	PerSUT      int64 `json:"per_sut"`
-	CrossSystem int64 `json:"cross_system"`
+	MaxConcurrentCaseRuns int64 `json:"max_concurrent_case_runs"`
 }
 
 // ExecutorStatusView is the overview executor block (registered row or offline).
@@ -108,7 +108,7 @@ type IntentView struct {
 	CaseVersionID string   `json:"case_version_id"`
 	CaseID        *string  `json:"case_id"`
 	CaseTitle     string   `json:"case_title"`
-	VersionSUTIDs []string `json:"version_sut_ids"`
+	SUTIDs        []string `json:"sut_ids"`
 	Purpose       string   `json:"purpose"`
 	Status        string   `json:"status"`
 	AttemptNo     int      `json:"attempt_no"`
@@ -142,17 +142,13 @@ type CaseRunDispatchView struct {
 
 // CaseRunSummaryView is the stable subset of case_run.summary.
 type CaseRunSummaryView struct {
-	VerdictReason      string  `json:"verdict_reason"`
-	AssertionTotal     int     `json:"assertion_total"`
-	AssertionFailed    int     `json:"assertion_failed"`
-	StepTotal          int     `json:"step_total"`
-	StepFailed         int     `json:"step_failed"`
-	EvidenceCount      int     `json:"evidence_count"`
-	VisualSkipped      int     `json:"visual_skipped"`
-	VisualPassed       int     `json:"visual_passed"`
-	VisualFailed       int     `json:"visual_failed"`
-	VisualInconclusive int     `json:"visual_inconclusive"`
-	HumanRequestID     *string `json:"human_request_id"`
+	VerdictReason   string  `json:"verdict_reason"`
+	AssertionTotal  int     `json:"assertion_total"`
+	AssertionFailed int     `json:"assertion_failed"`
+	StepTotal       int     `json:"step_total"`
+	StepFailed      int     `json:"step_failed"`
+	EvidenceCount   int     `json:"evidence_count"`
+	HumanRequestID  *string `json:"human_request_id"`
 	// LastError/TerminalCause/NextAction explain an incomplete run: the concrete
 	// stop cause, the observable detail and the suggested human next step (QA Q2).
 	// A non-terminal row carries no verdict reason, and a raw failure enum is
@@ -184,31 +180,31 @@ type CaseRunView struct {
 	Summary       CaseRunSummaryView `json:"summary"`
 	StartedAt     *string            `json:"started_at"`
 	FinishedAt    *string            `json:"finished_at"`
-	VersionSUTIDs []string           `json:"version_sut_ids"`
+	SUTIDs        []string           `json:"sut_ids"`
 	EvidenceCount int                `json:"evidence_count"`
 }
 
 // CaseRunStepView is one step_result row of a case-run detail.
 type CaseRunStepView struct {
-	Seq                int            `json:"seq"`
-	TargetVersionSUTID *string        `json:"target_version_sut_id"`
-	Status             string         `json:"status"`
-	Observed           map[string]any `json:"observed"`
-	Error              string         `json:"error"`
-	StartedAt          *string        `json:"started_at"`
-	FinishedAt         *string        `json:"finished_at"`
+	Seq         int            `json:"seq"`
+	TargetSUTID *string        `json:"target_sut_id"`
+	Status      string         `json:"status"`
+	Observed    map[string]any `json:"observed"`
+	Error       string         `json:"error"`
+	StartedAt   *string        `json:"started_at"`
+	FinishedAt  *string        `json:"finished_at"`
 }
 
 // CaseRunAssertionView is one assertion_result row of a case-run detail.
 type CaseRunAssertionView struct {
-	StepSeq            int     `json:"step_seq"`
-	AssertionSeq       int     `json:"assertion_seq"`
-	Kind               string  `json:"kind"`
-	Verdict            string  `json:"verdict"`
-	Expected           string  `json:"expected"`
-	Actual             string  `json:"actual"`
-	Reason             string  `json:"reason"`
-	TargetVersionSUTID *string `json:"target_version_sut_id"`
+	StepSeq      int     `json:"step_seq"`
+	AssertionSeq int     `json:"assertion_seq"`
+	Kind         string  `json:"kind"`
+	Verdict      string  `json:"verdict"`
+	Expected     string  `json:"expected"`
+	Actual       string  `json:"actual"`
+	Reason       string  `json:"reason"`
+	TargetSUTID  *string `json:"target_sut_id"`
 }
 
 // CaseRunDetailView is the case-run detail envelope (steps + assertions + first
@@ -225,7 +221,7 @@ type CaseRunDetailView struct {
 type EvidenceView struct {
 	ID           string  `json:"id"`
 	CaseRunID    string  `json:"case_run_id"`
-	VersionSUTID *string `json:"version_sut_id"`
+	SUTID        *string `json:"sut_id"`
 	StepSeq      *int    `json:"step_seq"`
 	AssertionSeq *int    `json:"assertion_seq"`
 	Kind         string  `json:"kind"`
@@ -236,28 +232,22 @@ type EvidenceView struct {
 	CreatedAt    string  `json:"created_at"`
 }
 
-// evidenceKinds is the EvidenceView.kind API enum (spec §4.2): the eight P3
-// kinds plus the two P5 visual kinds. It is also the accepted ?kind= filter
-// set of GET /api/versions/{id}/evidence.
+// evidenceKinds is the EvidenceView.kind API enum, derived from the domain
+// evidence-kind registry (single source of truth). It is also the accepted
+// ?kind= filter set of GET /api/versions/{id}/evidence.
 func evidenceKinds() []string {
-	return []string{
-		string(execution.EvidenceScreenshot),
-		string(execution.EvidenceSnapshot),
-		string(execution.EvidenceConsole),
-		string(execution.EvidenceNetwork),
-		string(execution.EvidenceHTTP),
-		string(execution.EvidenceDB),
-		string(execution.EvidenceDownload),
-		string(execution.EvidenceText),
-		string(execution.EvidenceVisualActual),
-		string(execution.EvidenceVisualDiff),
+	kinds := execution.EvidenceKinds()
+	values := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		values = append(values, string(kind))
 	}
+	return values
 }
 
 // HumanRequestPayloadView is the frozen human_request payload projection.
 type HumanRequestPayloadView struct {
 	Reason        string  `json:"reason"`
-	VersionSUTID  *string `json:"version_sut_id"`
+	SUTID         *string `json:"sut_id"`
 	AccountRole   string  `json:"account_role"`
 	PageURL       string  `json:"page_url"`
 	ChallengeKind string  `json:"challenge_kind"`
@@ -314,7 +304,7 @@ func toIntentView(intent execution.ExecutionIntent, caseID, title string) Intent
 		VersionID:     platformid.Format(intent.VersionID),
 		CaseVersionID: platformid.Format(intent.CaseVersionID),
 		CaseTitle:     title,
-		VersionSUTIDs: idsToStrings(intent.VersionSUTIDs),
+		SUTIDs:        idsToStrings(intent.SUTIDs),
 		Purpose:       string(intent.Purpose),
 		Status:        string(intent.Status),
 		AttemptNo:     intent.AttemptNo,
@@ -326,7 +316,7 @@ func toIntentView(intent execution.ExecutionIntent, caseID, title string) Intent
 	return view
 }
 
-func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, evidenceCount int) CaseRunView {
+func toCaseRunView(run execution.CaseRun, meta caseMeta, sutIDs []int64, evidenceCount int) CaseRunView {
 	terminalCause, nextAction := execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
 	// A non-terminal row has no terminal explanation: never expose a persisted
 	// verdict reason/cause that an older deployment wrote on a running row
@@ -377,27 +367,23 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 		FailureClass:  failureClass,
 		Attempts:      run.Attempts,
 		Summary: CaseRunSummaryView{
-			VerdictReason:      verdictReason,
-			AssertionTotal:     run.Summary.AssertionTotal,
-			AssertionFailed:    run.Summary.AssertionFailed,
-			StepTotal:          run.Summary.StepTotal,
-			StepFailed:         run.Summary.StepFailed,
-			EvidenceCount:      run.Summary.EvidenceCount,
-			VisualSkipped:      run.Summary.VisualSkipped,
-			VisualPassed:       run.Summary.VisualPassed,
-			VisualFailed:       run.Summary.VisualFailed,
-			VisualInconclusive: run.Summary.VisualInconclusive,
-			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
-			LastError:          lastError,
-			TerminalCause:      terminalCause,
-			NextAction:         nextAction,
-			RetryReason:        run.Summary.RetryReason,
-			Dispatch:           toCaseRunDispatchView(run.Summary.Dispatch),
-			Usage:              usage,
+			VerdictReason:   verdictReason,
+			AssertionTotal:  run.Summary.AssertionTotal,
+			AssertionFailed: run.Summary.AssertionFailed,
+			StepTotal:       run.Summary.StepTotal,
+			StepFailed:      run.Summary.StepFailed,
+			EvidenceCount:   run.Summary.EvidenceCount,
+			HumanRequestID:  optionalIDString(run.Summary.HumanRequestID),
+			LastError:       lastError,
+			TerminalCause:   terminalCause,
+			NextAction:      nextAction,
+			RetryReason:     run.Summary.RetryReason,
+			Dispatch:        toCaseRunDispatchView(run.Summary.Dispatch),
+			Usage:           usage,
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),
-		VersionSUTIDs: idsToStrings(versionSUTIDs),
+		SUTIDs:        idsToStrings(sutIDs),
 		EvidenceCount: evidenceCount,
 	}
 }
@@ -443,7 +429,6 @@ func isKnownVerdictReason(value string) bool {
 		execution.VerdictReasonStepFailed, execution.VerdictReasonIncomplete,
 		execution.VerdictReasonEmptyCase, execution.VerdictReasonNoAssertions,
 		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure,
-		execution.VerdictReasonVisualAssertionNotRun,
 		execution.VerdictReasonHumanTimeout, execution.VerdictReasonHumanCancelled:
 		return true
 	default:
@@ -467,8 +452,7 @@ func isRawCaseRunCause(value string) bool {
 	case execution.VerdictReasonPassed, execution.VerdictReasonAssertionFailed,
 		execution.VerdictReasonStepFailed, execution.VerdictReasonIncomplete,
 		execution.VerdictReasonEmptyCase, execution.VerdictReasonNoAssertions,
-		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure,
-		execution.VerdictReasonVisualAssertionNotRun:
+		execution.VerdictReasonBlocked, execution.VerdictReasonAgentFailure:
 		return true
 	default:
 		return false
@@ -481,26 +465,26 @@ func toCaseRunStepView(step execution.StepResult) CaseRunStepView {
 		observed = map[string]any{}
 	}
 	return CaseRunStepView{
-		Seq:                step.Seq,
-		TargetVersionSUTID: optionalIDStringPtr(step.TargetVersionSUTID),
-		Status:             string(step.Status),
-		Observed:           observed,
-		Error:              step.Error,
-		StartedAt:          formatOptionalTime(step.StartedAt),
-		FinishedAt:         formatOptionalTime(step.FinishedAt),
+		Seq:         step.Seq,
+		TargetSUTID: optionalIDStringPtr(step.TargetSUTID),
+		Status:      string(step.Status),
+		Observed:    observed,
+		Error:       step.Error,
+		StartedAt:   formatOptionalTime(step.StartedAt),
+		FinishedAt:  formatOptionalTime(step.FinishedAt),
 	}
 }
 
 func toCaseRunAssertionView(assertion execution.AssertionResult) CaseRunAssertionView {
 	return CaseRunAssertionView{
-		StepSeq:            assertion.StepSeq,
-		AssertionSeq:       assertion.AssertionSeq,
-		Kind:               assertion.Kind,
-		Verdict:            string(assertion.Verdict),
-		Expected:           assertion.Expected,
-		Actual:             assertion.Actual,
-		Reason:             assertion.Reason,
-		TargetVersionSUTID: optionalIDStringPtr(assertion.TargetVersionSUTID),
+		StepSeq:      assertion.StepSeq,
+		AssertionSeq: assertion.AssertionSeq,
+		Kind:         assertion.Kind,
+		Verdict:      string(assertion.Verdict),
+		Expected:     assertion.Expected,
+		Actual:       assertion.Actual,
+		Reason:       assertion.Reason,
+		TargetSUTID:  optionalIDStringPtr(assertion.TargetSUTID),
 	}
 }
 
@@ -508,7 +492,7 @@ func toEvidenceView(evidence execution.Evidence) EvidenceView {
 	return EvidenceView{
 		ID:           platformid.Format(evidence.ID),
 		CaseRunID:    platformid.Format(evidence.CaseRunID),
-		VersionSUTID: optionalIDStringPtr(evidence.VersionSUTID),
+		SUTID:        optionalIDStringPtr(evidence.SUTID),
 		StepSeq:      evidence.StepSeq,
 		AssertionSeq: evidence.AssertionSeq,
 		Kind:         string(evidence.Kind),
@@ -532,7 +516,7 @@ func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 		Status:         string(request.Status),
 		Payload: HumanRequestPayloadView{
 			Reason:        payloadString(payload, execution.HumanPayloadReason),
-			VersionSUTID:  payloadIDString(payload, execution.HumanPayloadVersionSUTID),
+			SUTID:         payloadIDString(payload, execution.HumanPayloadSUTID),
 			AccountRole:   payloadString(payload, execution.HumanPayloadAccountRole),
 			PageURL:       payloadString(payload, execution.HumanPayloadPageURL),
 			ChallengeKind: payloadString(payload, execution.HumanPayloadChallengeKind),
@@ -728,7 +712,7 @@ func toCaseRunCounts(counts execution.WaveCounts) CaseRunCountsView {
 }
 
 func emptyWaveCounts() execution.WaveCounts {
-	return execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}}
+	return execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}}
 }
 
 func addWaveCounts(total *execution.WaveCounts, item execution.WaveCounts) {

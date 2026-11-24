@@ -87,13 +87,14 @@ func (executableCaseReader) CaseVersionLabel(context.Context, int64, int64) (exe
 	return executionapp.CaseVersionLabel{}, execution.ErrNotFound
 }
 
-// TestEvidenceKindsIncludeVisualKinds pins the EvidenceView.kind API enum
-// (spec §4.2): the eight P3 kinds stay valid and the two P5 visual evidence
-// kinds are added for GET /evidence filtering and evidence views.
-func TestEvidenceKindsIncludeVisualKinds(t *testing.T) {
+// TestEvidenceKindsPinsAPIEnum pins the EvidenceView.kind API enum to the
+// domain evidence-kind registry (single source): the eight legacy kinds plus
+// the recording-layer kinds command/file/trace are the accepted GET /evidence
+// filter set.
+func TestEvidenceKindsPinsAPIEnum(t *testing.T) {
 	kinds := evidenceKinds()
-	if len(kinds) != 10 {
-		t.Fatalf("evidence kinds = %d, want 10", len(kinds))
+	if len(kinds) != 11 {
+		t.Fatalf("evidence kinds = %d, want 11", len(kinds))
 	}
 	seen := make(map[string]bool, len(kinds))
 	for _, kind := range kinds {
@@ -104,10 +105,21 @@ func TestEvidenceKindsIncludeVisualKinds(t *testing.T) {
 	}
 	for _, want := range []string{
 		"screenshot", "snapshot", "console", "network", "http", "db", "download", "text",
-		"visual_actual", "visual_diff",
+		"command", "file", "trace",
 	} {
 		if !seen[want] {
 			t.Fatalf("evidence kind %q is missing from the API enum", want)
+		}
+	}
+	// The API enum must stay derived from the domain registry, not a second
+	// hand-maintained truth.
+	registry := execution.EvidenceKinds()
+	if len(kinds) != len(registry) {
+		t.Fatalf("API enum has %d kinds, domain registry has %d", len(kinds), len(registry))
+	}
+	for _, kind := range registry {
+		if !seen[string(kind)] {
+			t.Fatalf("domain registry kind %q missing from the API enum", kind)
 		}
 	}
 }
@@ -186,15 +198,6 @@ func TestCaseRunSummaryViewExplainsEveryTerminalRun(t *testing.T) {
 			wantNext:  execution.NextActionRerun,
 		},
 		{
-			name: "visual assertion not run",
-			run: execution.CaseRun{
-				Status:  execution.CaseRunInconclusive,
-				Summary: execution.CaseRunSummary{VerdictReason: execution.VerdictReasonVisualAssertionNotRun},
-			},
-			wantCause: execution.VerdictReasonVisualAssertionNotRun,
-			wantNext:  execution.NextActionRepairVisual,
-		},
-		{
 			name: "failed environment",
 			run: execution.CaseRun{
 				Status: execution.CaseRunFailed, FailureClass: execution.FailureClassEnvironment,
@@ -269,24 +272,6 @@ func TestCaseRunSummaryViewCarriesUsage(t *testing.T) {
 	}, caseMeta{}, nil, 0)
 	if without.Summary.Usage != nil {
 		t.Fatalf("usage view = %+v, want nil when the row has no persisted usage", without.Summary.Usage)
-	}
-}
-
-// TestCaseRunSummaryViewCarriesVisualCounts pins the P5 summary fields
-// (spec §4.2): visual_passed/failed/inconclusive are exposed and visual_skipped
-// stays in the payload for compatibility but is 0 on the P5 path.
-func TestCaseRunSummaryViewCarriesVisualCounts(t *testing.T) {
-	view := toCaseRunView(execution.CaseRun{
-		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
-		Status: execution.CaseRunInconclusive,
-		Summary: execution.CaseRunSummary{
-			VerdictReason: "missing_visual_baseline", VisualPassed: 2,
-			VisualFailed: 1, VisualInconclusive: 3, VisualSkipped: 0,
-		},
-	}, caseMeta{}, nil, 0)
-	if view.Summary.VisualPassed != 2 || view.Summary.VisualFailed != 1 ||
-		view.Summary.VisualInconclusive != 3 || view.Summary.VisualSkipped != 0 {
-		t.Fatalf("summary view = %+v", view.Summary)
 	}
 }
 

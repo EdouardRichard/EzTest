@@ -23,8 +23,6 @@ import { anchorFixture } from "@/features/anchors/test-fixtures"
 import { RequirementEditor } from "./RequirementEditor"
 import { requirementDetailFixture } from "./test-fixtures"
 
-const targetOptions = { suts: [], pages: [], apis: [] }
-
 describe("RequirementEditor code anchors", () => {
   beforeEach(() => {
     for (const fn of Object.values(anchorApi)) fn.mockReset()
@@ -39,7 +37,6 @@ describe("RequirementEditor code anchors", () => {
       <RequirementEditor
         versionId="2001"
         requirement={requirementDetailFixture}
-        targetOptions={targetOptions}
         onUpdated={vi.fn()}
       />,
     )

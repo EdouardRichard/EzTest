@@ -20,9 +20,15 @@ const handoff: HandoffView = {
       current_version_id: "6101",
       revision: 2,
       title: "下单流程支持优惠券",
-      description: "结算时可用优惠券抵扣",
-      acceptance_criteria: "优惠券金额正确抵扣",
+      user_story: { as_a: "买家", i_want: "结算时用优惠券抵扣", so_that: "下单更优惠" },
+      rules: "",
+      acceptance_criteria: [
+        { id: "AC-1", given: "结算页", when: "使用优惠券", then: "金额正确抵扣" },
+      ],
       priority: "P1",
+      sut_description: "订单结算页",
+      scope_out: "",
+      account_roles_hint: [],
       status: "confirmed",
       source_quote: "用户希望下单可用券",
       confidence: 0.92,
@@ -67,12 +73,20 @@ const handoff: HandoffView = {
     next: null,
   },
   resources: {
-    suts: [{ id: "1" }],
-    pages: [{ id: "2" }, { id: "3" }],
-    apis: [{ id: "4" }],
+    environment: { id: "e1", name: "测试环境", status: "active" },
+    suts: [
+      {
+        sut_id: "1",
+        name: "订单中心",
+        base_url: "https://order.test",
+        pages: [{ id: "2" }, { id: "3" }],
+        apis: [{ id: "4" }],
+        databases: [],
+      },
+    ],
     accounts: [],
-    databases: [],
     repositories: [{ id: "5" }],
+    truncated: false,
   },
 }
 
@@ -89,6 +103,15 @@ describe("HandoffPanel", () => {
     render(<HandoffPanel versionId="2001" />)
 
     expect(await screen.findByText("下单流程支持优惠券")).toBeInTheDocument()
+    // v0.2.4-B: the V1 user story, structured AC (read-only id) and sut_description.
+    expect(
+      screen.getByText(/作为买家，我希望结算时用优惠券抵扣，以便下单更优惠/),
+    ).toBeInTheDocument()
+    expect(screen.getByText("AC-1")).toBeInTheDocument()
+    expect(
+      screen.getByText(/Given 结算页 · When 使用优惠券 · Then 金额正确抵扣/),
+    ).toBeInTheDocument()
+    expect(screen.getByText(/被测系统：订单结算页/)).toBeInTheDocument()
     expect(screen.getByText("优惠券是否可叠加？")).toBeInTheDocument()
     expect(screen.getByText("下单接口返回优惠金额")).toBeInTheDocument()
     expect(screen.getByText("退款优惠券是否返还？")).toBeInTheDocument()

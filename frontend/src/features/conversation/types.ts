@@ -1,7 +1,7 @@
 /**
  * Wire types for the P6 AI-conversation workspace (0.2.1).
  *
- * Part kinds are pinned by `docs/version-V0.2/contracts/openapi.yaml`
+ * Part kinds are pinned by `docs/openapi/api.yaml`
  * (`MessagePart` oneOf and `MessagePartView`). IDs are decimal strings and
  * timestamps are RFC3339. The parts-history endpoint returns the bare
  * `{data: MessagePartView[]}` envelope (no cursor); streaming rows are ordered
@@ -24,8 +24,31 @@ export type MessagePartType =
  * `conversation_message_part.part_type` enum (OpenAPI `MessagePartView`).
  * Image parts live in the `conversation_message.parts` snapshot only; the
  * append-only streaming table CHECK has no `image` value.
+ *
+ * ONE runtime authority for the streaming part vocabulary, mirrored from the Go
+ * domain `version.StreamingMessagePartTypes()` and pinned in the Go direction by
+ * `TestEnumAuthorityFrontendStreamingPartTypes`
+ * (backend/internal/version/domain/enum_authority_test.go): a member added or
+ * removed on either side fails CI. The type is DERIVED from the list so the
+ * runtime set and the compile-time union can never drift apart.
+ *
+ * It is also the seq-assignment vocabulary: an assistant message's streaming
+ * parts carry a 1-based seq in part order (server `publishMessageEvent` /
+ * `assistantStreamParts`), which is how an HTTP snapshot is seeded into the live
+ * stream projection (v0.2.4-D fix wave, I-1).
  */
-export type StreamingPartType = Exclude<MessagePartType, "image">
+export const STREAMING_PART_TYPES = [
+  "text",
+  "thinking",
+  "tool_call",
+  "job_card",
+  "attachment",
+  "requirement_card",
+  "case_card",
+  "error",
+] as const
+
+export type StreamingPartType = (typeof STREAMING_PART_TYPES)[number]
 
 /** One append-only history row of `GET .../messages/{mid}/parts`. */
 export type MessagePartView = {
@@ -74,11 +97,6 @@ export type JobStatus =
   | "cancelled"
 
 export type JobKind =
-  | "explore.login"
-  | "explore.page"
-  | "explore.api"
-  | "explore.coverage"
-  | "explore.gap"
   | "design.cases"
   | "review.cases"
   | "execute.batch"
@@ -174,3 +192,44 @@ export type MessagePart =
   | RequirementCardPart
   | CaseCardPart
   | ErrorPart
+
+/**
+ * Lifecycle of an incremental Host reply head (`conversation_message.stream_state`,
+ * v0.2.4-D). Full `conversation.message` frames carry it: the Begin placeholder is
+ * `streaming`, the terminal frame `complete`/`interrupted`; batch-path messages
+ * normalize to `complete`.
+ */
+export type MessageStreamState = "streaming" | "complete" | "interrupted"
+
+/**
+ * `conversation.message.delta` event payload (v0.2.4-D, SC-D2) — the TS mirror of
+ * the ONE authoritative Go schema `versionapp.MessageDelta`
+ * (`backend/internal/version/application/conversation_stream.go`, json tags).
+ * The DB stores the full snapshot per seq; the event carries only the increment.
+ * Exactly ONE of two modes is present per delta:
+ *
+ * - Append mode (text/thinking pure growth): `increment` is the new text suffix
+ *   (always non-empty) and `offset` is the UTF-16 code-unit length of the
+ *   accumulated text BEFORE the suffix — matching JavaScript `String.length`, so
+ *   a replayed frame is deduped by offset. `offset` is omitted when 0.
+ * - Replace mode (every other part type, any same-seq type change, and any
+ *   text/thinking rewrite or metadata-only change such as thinking duration):
+ *   `part` is the full `MessagePart` contract snapshot and replaces the part at
+ *   `seq` wholesale; `offset`/`increment` are absent.
+ *
+ * `seq` is the 1-based `conversation_message_part` seq; `message_id` and
+ * `conversation_id` are decimal string IDs. The terminal head state is carried by
+ * the full `conversation.message` frame (`stream_state`), not by each delta.
+ */
+export type MessageDelta = {
+  message_id: string
+  conversation_id: string
+  seq: number
+  part_type: StreamingPartType
+  /** Append mode only; omitted when 0. UTF-16 code units (== JS String.length). */
+  offset?: number
+  /** Append mode only; always non-empty. */
+  increment?: string
+  /** Replace mode only; full MessagePart snapshot, replaces the part at seq. */
+  part?: MessagePart
+}

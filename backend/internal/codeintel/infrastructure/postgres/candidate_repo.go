@@ -135,10 +135,10 @@ func (r *ImpactEdgeRepository) ImpactEdges(ctx context.Context, repoID int64, co
 		FROM code_edge e
 		JOIN code_entity src ON src.id = e.src_entity_id
 		JOIN code_entity dst ON dst.id = e.dst_entity_id
-		WHERE e.repo_id = $1 AND e.commit_sha = $2 AND e.rel = 'route_to_api'
+		WHERE e.repo_id = $1 AND e.commit_sha = $2 AND e.rel = $3
 		  AND src.fact_key <> '' AND dst.fact_key <> ''
 		ORDER BY e.id ASC
-	`, repoID, commitSHA)
+	`, repoID, commitSHA, string(codeintel.EdgeRouteToAPI))
 	if err != nil {
 		return nil, wrapDB("list impact edges", err)
 	}

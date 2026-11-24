@@ -31,7 +31,7 @@ func TestCaseBlockedRunCarriesTerminalExplanationAndHandoff(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunBlocked})
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunBlocked})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
@@ -76,18 +76,23 @@ func TestCaseBlockedRunCarriesTerminalExplanationAndHandoff(t *testing.T) {
 func TestCaseAssertionFailureCarriesExplanationWithoutHandoff(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "登录页可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "按钮缺失", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
 
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+	if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+		Kind: "text", Text: "failure evidence",
+	}); err != nil {
+		t.Fatalf("EvidenceText: %v", err)
+	}
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 		Verdict: execution.CaseRunFailed,
 	})
 	if err != nil {
@@ -114,17 +119,17 @@ func TestCaseAssertionFailureCarriesExplanationWithoutHandoff(t *testing.T) {
 func TestCaseRunUsageSurfacedAfterFinalize(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "登录页可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "按钮可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed}); err != nil {
+	if _, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed}); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
 
@@ -155,17 +160,17 @@ func TestCaseRunUsageSurfacedAfterFinalize(t *testing.T) {
 func TestCasePassedRunHasNoTerminalExplanation(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "登录页可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "按钮可见", VersionSUTID: int64ptr(7),
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}

@@ -1,13 +1,12 @@
-import type { ReactNode } from "react"
+import type { HTMLAttributes, ReactNode } from "react"
 
 import { cn } from "./cn"
 
 export type BadgeTone = "neutral" | "info" | "success" | "warning" | "danger"
 
-export type BadgeProps = {
+export type BadgeProps = HTMLAttributes<HTMLSpanElement> & {
   tone?: BadgeTone
   children: ReactNode
-  className?: string
 }
 
 const TONE_CLASSES: Record<BadgeTone, string> = {
@@ -18,9 +17,10 @@ const TONE_CLASSES: Record<BadgeTone, string> = {
   danger: "border-transparent bg-destructive/10 text-destructive",
 }
 
-export function Badge({ tone = "neutral", children, className }: BadgeProps) {
+export function Badge({ tone = "neutral", children, className, ...props }: BadgeProps) {
   return (
     <span
+      {...props}
       data-tone={tone}
       className={cn(
         "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium",

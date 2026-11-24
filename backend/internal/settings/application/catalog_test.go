@@ -7,10 +7,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/domain"
 )
 
-// TestP7SettingsRemainFrozen pins the eleven P7 keys and the report template
+// TestOrchestrationSettingsRemainFrozen pins the eleven P7 keys and the report template
 // version default "2" for new databases. The catalog grew to 85 in P8 and to
 // 98 in v0.22 but the P7 keys/defaults must not change.
-func TestP7SettingsRemainFrozen(t *testing.T) {
+func TestOrchestrationSettingsRemainFrozen(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
 
 	cases := []struct {
@@ -52,19 +52,23 @@ func TestP7SettingsRemainFrozen(t *testing.T) {
 	}
 
 	templateVersion := defs[indexOf(t, defs, "report.template_version")]
-	if string(templateVersion.Default) != `"2"` {
-		t.Fatalf("report.template_version default = %s, want \"2\"", templateVersion.Default)
+	if string(templateVersion.Default) != `"3"` {
+		t.Fatalf("report.template_version default = %s, want \"3\" (v0.2.4-G R-G10b: the human-useful v3 report is the production default)", templateVersion.Default)
 	}
 }
 
-// TestP8SettingsPinsCatalog pins the two P8 keys (spec §7: 83 -> 85) and the
+// TestRetentionSettingsPinsCatalog pins the two P8 keys (spec §7: 83 -> 85) and the
 // two P8 category counts. Both are hot-reloadable and non-secret; the P7
 // defaults stay unchanged. The v0.22 additions grow the catalog to 98, W1-2
-// removes seven dead keys (91), and W2-15 removes the four gc.* aliases (87).
-func TestP8SettingsPinsCatalog(t *testing.T) {
+// removes seven dead keys (91), W2-15 removes the four gc.* aliases (87),
+// v0.2.4-B removes the seven visual.* keys (80), v0.2.4-C adds
+// execution.evidence_max_per_case_run (81) and execution.max_case_turns (82),
+// v0.2.4-E adds the four quality-gate keys (86), and v0.2.4-F replaces the
+// three-dimension quota keys with execution.max_concurrent_case_runs (84).
+func TestRetentionSettingsPinsCatalog(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 87 {
-		t.Fatalf("catalog has %d keys, want 87 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(defs))
+	if len(defs) != 86 {
+		t.Fatalf("catalog has %d keys, want 86 (P8: 83 -> 85, v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases, v0.2.4-B removes 7 visual.* keys, v0.2.4-C adds evidence_max_per_case_run + max_case_turns, v0.2.4-E adds 4 quality-gate keys, v0.2.4-F removes global/per_sut/cross_system concurrency and adds max_concurrent_case_runs, v0.2.4-G adds 2 report evidence display caps)", len(defs))
 	}
 
 	cases := []struct {
@@ -79,6 +83,11 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 	}{
 		{"security.rate_limit_per_minute", "security", settings.TypeNumber, "0", false, true, floatPtr(0), floatPtr(60000)},
 		{"retention.event_days", "retention", settings.TypeNumber, "90", false, true, floatPtr(1), floatPtr(3650)},
+		// v0.2.4-C recording layer: 0 = unlimited evidence rows per case run.
+		{"execution.evidence_max_per_case_run", "execution", settings.TypeNumber, "0", false, true, floatPtr(0), nil},
+		// v0.2.4-F design P5: the single global concurrent-case-run limit,
+		// 0 = unlimited by default; replaces the retired 3/2/1 trio.
+		{"execution.max_concurrent_case_runs", "execution", settings.TypeNumber, "0", false, true, floatPtr(0), nil},
 	}
 	for _, tc := range cases {
 		def := defs[indexOf(t, defs, tc.key)]
@@ -96,12 +105,13 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 		}
 	}
 
-	// P7 keys and defaults remain untouched.
+	// P7 keys stay; report.template_version's default flipped to "3" in
+	// v0.2.4-G (R-G10b: the human-useful fixed report is the production default).
 	if def := defs[indexOf(t, defs, "security.audit_retention_days")]; string(def.Default) != "90" {
 		t.Fatalf("security.audit_retention_days = %s, want 90", def.Default)
 	}
-	if def := defs[indexOf(t, defs, "report.template_version")]; string(def.Default) != `"2"` {
-		t.Fatalf("report.template_version = %s, want \"2\"", def.Default)
+	if def := defs[indexOf(t, defs, "report.template_version")]; string(def.Default) != `"3"` {
+		t.Fatalf("report.template_version = %s, want \"3\"", def.Default)
 	}
 
 	counts := map[string]int{}
@@ -109,8 +119,8 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 		counts[def.Category]++
 	}
 	wantCounts := map[string]int{
-		"report":    12,
-		"execution": 12,
+		"report":    14, // + evidence_max_per_case_run + evidence_max_total (v0.2.4-G)
+		"execution": 12, // - global/per_sut/cross_system concurrency + max_concurrent_case_runs (v0.2.4-F)
 		"knowledge": 3,
 		"retention": 8, // 7 P7 keys + retention.event_days
 		"security":  2, // audit_retention_days + rate_limit_per_minute (W1-2 removed mask_secrets)
@@ -127,12 +137,16 @@ func TestP8SettingsPinsCatalog(t *testing.T) {
 // the raised context window default, the new compaction/vision/tool/question
 // keys, and the already-existing agent.tool_result_max_bytes unchanged at
 // 32768. The v0.22 additions grew the catalog from 85 to 98 keys; W1-2 removes
-// seven dead keys (91), W2-15 removes the four gc.* aliases (87), and
-// question.blocking must not exist.
+// seven dead keys (91), W2-15 removes the four gc.* aliases (87), v0.2.4-B
+// removes the seven visual.* keys (80), v0.2.4-C adds
+// execution.evidence_max_per_case_run (81) + execution.max_case_turns (82),
+// v0.2.4-E adds the four quality-gate keys (86), v0.2.4-F replaces the
+// three-dimension quota keys with execution.max_concurrent_case_runs (84),
+// and question.blocking must not exist.
 func TestV022Settings(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 87 {
-		t.Fatalf("catalog has %d keys, want 87 (v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases)", len(defs))
+	if len(defs) != 86 {
+		t.Fatalf("catalog has %d keys, want 86 (v0.22: 85 -> 98, W1-2 removes 7 dead keys, W2-15 removes 4 gc.* aliases, v0.2.4-B removes 7 visual.* keys, v0.2.4-C adds evidence_max_per_case_run + max_case_turns, v0.2.4-E adds 4 quality-gate keys, v0.2.4-F removes the 3 quota keys and adds max_concurrent_case_runs, v0.2.4-G adds 2 report evidence display caps)", len(defs))
 	}
 
 	byKey := make(map[string]settings.Definition, len(defs))
@@ -184,12 +198,93 @@ func TestV022Settings(t *testing.T) {
 	}
 }
 
+// TestEQualityGateSettingsRegistered pins the four v0.2.4-E quality-gate keys
+// (spec SC-E1/SC-E3/SC-E4, plan T1): the placeholder word list and minimum
+// sut_description length for requirement confirmation, and the judge rework
+// limit and judge model override for the independent design judge.
+func TestEQualityGateSettingsRegistered(t *testing.T) {
+	defs := Definitions("http://localhost:13336")
+	byKey := map[string]settings.Definition{}
+	for _, d := range defs {
+		byKey[d.Key] = d
+	}
+	for _, key := range []string{"validation.placeholder_terms", "validation.min_description_chars", "design.max_rework_rounds", "design.judge_model"} {
+		if _, ok := byKey[key]; !ok {
+			t.Fatalf("settings key %q not registered", key)
+		}
+	}
+	if string(byKey["validation.min_description_chars"].Default) != "20" {
+		t.Fatalf("min_description_chars default = %s, want 20", byKey["validation.min_description_chars"].Default)
+	}
+	if string(byKey["design.max_rework_rounds"].Default) != "1" {
+		t.Fatalf("max_rework_rounds default = %s, want 1", byKey["design.max_rework_rounds"].Default)
+	}
+
+	// H-F10b #1: existence + two numeric defaults is not the contract. The E
+	// quality gate depends on the TYPE (a JSON array vs a number vs a string),
+	// the CATEGORY (the settings UI grouping), the INTEGER flag and the MIN
+	// floor (the service fails closed below it), and on the exact published
+	// placeholder seed list. Pin all of them, so a metadata edit that silently
+	// relaxes or reshapes the gate fails here instead of at confirm time.
+	metadata := []struct {
+		key      string
+		category string
+		typ      settings.Type
+		def      string
+		integer  bool
+		min      *float64
+	}{
+		{"validation.placeholder_terms", "validation", settings.TypeJSON,
+			`["TBD","TODO","待定","待补充","xxx","占位","placeholder","暂无","略"]`, false, nil},
+		{"validation.min_description_chars", "validation", settings.TypeNumber, "20", true, floatPtr(1)},
+		{"design.max_rework_rounds", "design", settings.TypeNumber, "1", true, floatPtr(0)},
+		{"design.judge_model", "design", settings.TypeString, `""`, false, nil},
+	}
+	for _, want := range metadata {
+		got := byKey[want.key]
+		if got.Category != want.category {
+			t.Errorf("%s category = %q, want %q", want.key, got.Category, want.category)
+		}
+		if got.Type != want.typ {
+			t.Errorf("%s type = %q, want %q", want.key, got.Type, want.typ)
+		}
+		if string(got.Default) != want.def {
+			t.Errorf("%s default = %s, want %s", want.key, got.Default, want.def)
+		}
+		if got.Integer != want.integer {
+			t.Errorf("%s integer = %v, want %v", want.key, got.Integer, want.integer)
+		}
+		switch {
+		case want.min == nil && got.Min != nil:
+			t.Errorf("%s min = %v, want none", want.key, *got.Min)
+		case want.min != nil && got.Min == nil:
+			t.Errorf("%s min is unset, want %v (the service fails closed below it)", want.key, *want.min)
+		case want.min != nil && *got.Min != *want.min:
+			t.Errorf("%s min = %v, want %v", want.key, *got.Min, *want.min)
+		}
+		if strings.TrimSpace(got.Description) == "" {
+			t.Errorf("%s has no description", want.key)
+		}
+	}
+	// design.max_rework_rounds deliberately has NO upper bound: an administrator
+	// may configure any budget (the DEV-E3 escalation invariant must hold for
+	// every value, not just the default). Pin the absence so an added ceiling is
+	// a conscious contract change.
+	if byKey["design.max_rework_rounds"].Max != nil {
+		t.Errorf("design.max_rework_rounds gained an upper bound (%v); the escalation invariant is pinned for unbounded budgets",
+			*byKey["design.max_rework_rounds"].Max)
+	}
+}
+
 // TestDeadSettingsDisposed pins the W1-2 disposition of the 13 settings that
 // had no production reader: seven dead keys are removed from the catalog and
 // six are kept because their readers are wired by W1-2. W2-15 removes the four
-// gc.* aliases so retention.* is the only GC settings family.
+// gc.* aliases so retention.* is the only GC settings family. v0.2.4-F (design
+// P5, constitution VI.6 -- deletion recorded in the shared release notes)
+// removes the three-dimension concurrency quota keys, replaced by the single
+// execution.max_concurrent_case_runs.
 func TestDeadSettingsDisposed(t *testing.T) {
-	byKey := make(map[string]bool, 87)
+	byKey := make(map[string]bool, 86)
 	for _, def := range Definitions("http://127.0.0.1:13336") {
 		byKey[def.Key] = true
 	}
@@ -197,6 +292,7 @@ func TestDeadSettingsDisposed(t *testing.T) {
 		"paths.attachment_dir", "paths.evidence_dir", "paths.report_dir", "paths.export_dir",
 		"security.mask_secrets", "feature.experimental", "vision.required",
 		"gc.retention_days", "gc.max_bytes", "gc.dry_run", "gc.grace_days",
+		"execution.global_concurrency", "execution.per_sut_concurrency", "execution.cross_system_concurrency",
 	} {
 		if byKey[removed] {
 			t.Fatalf("%s must be removed from the catalog", removed)
@@ -205,6 +301,7 @@ func TestDeadSettingsDisposed(t *testing.T) {
 	for _, wired := range []string{
 		"vision.max_images_per_attachment", "vision.max_image_bytes", "tool.retry_max",
 		"compaction.overflow_retries", "search.max_results_per_type", "todos.max_items",
+		"execution.max_concurrent_case_runs",
 	} {
 		if !byKey[wired] {
 			t.Fatalf("%s must stay in the catalog (wired)", wired)

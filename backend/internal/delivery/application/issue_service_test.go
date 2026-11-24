@@ -919,12 +919,12 @@ func TestIssueServiceListPassesFilterThrough(t *testing.T) {
 		{ID: 8, VersionID: 7, Status: delivery.IssueStatusOpen},
 	}
 	filter := IssueFilter{
-		Status:       "open",
-		Category:     "api",
-		Severity:     "minor",
-		VersionSUTID: issueServiceTestInt64(5),
-		Before:       100,
-		Limit:        10,
+		Status:   "open",
+		Category: "api",
+		Severity: "minor",
+		SUTID:    issueServiceTestInt64(5),
+		Before:   100,
+		Limit:    10,
 	}
 	issues, err := fixture.svc.List(context.Background(), 7, filter)
 	if err != nil {
@@ -951,7 +951,7 @@ func TestIssueServiceListRejectsInvalidArguments(t *testing.T) {
 		{name: "status", version: 7, filter: IssueFilter{Status: "closed"}},
 		{name: "category", version: 7, filter: IssueFilter{Category: "network"}},
 		{name: "severity", version: 7, filter: IssueFilter{Severity: "critical"}},
-		{name: "version_sut", version: 7, filter: IssueFilter{VersionSUTID: issueServiceTestInt64(0)}},
+		{name: "sut", version: 7, filter: IssueFilter{SUTID: issueServiceTestInt64(0)}},
 		{name: "before", version: 7, filter: IssueFilter{Before: -1}},
 		{name: "limit", version: 7, filter: IssueFilter{Limit: -1}},
 	}
@@ -1631,7 +1631,7 @@ func TestIssueServiceRecurrenceRepositoryFailureReturnsError(t *testing.T) {
 	})
 }
 
-func TestIssueServiceDedupeHitOnOpenIssueKeepsP4Behavior(t *testing.T) {
+func TestIssueServiceDedupeHitOnOpenIssueKeepsDeliveryBehavior(t *testing.T) {
 	fixture := newIssueServiceFixture()
 	fixture.exec.snapshots[52] = issueServiceTestSnapshot(52)
 	fixture.repo.createCreated = false
@@ -1732,7 +1732,7 @@ func seedManualCaseRun(fixture *issueServiceFixture) {
 		VersionID:     7,
 		CaseVersionID: 21,
 		RequirementID: 31,
-		VersionSUTID:  issueServiceTestInt64(5),
+		SUTID:         issueServiceTestInt64(5),
 	}
 }
 

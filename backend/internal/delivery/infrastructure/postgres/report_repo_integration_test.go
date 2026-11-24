@@ -453,7 +453,7 @@ func TestReportRepoRefsAndWaveReportID(t *testing.T) {
 		{Kind: "case_run", RefID: 3002},
 		{Kind: "issue", RefID: 4001},
 		{Kind: "requirement", RefID: 5001},
-		{Kind: "version_sut", RefID: 6001},
+		{Kind: "sut", RefID: 6001},
 	}
 	if err := repo.InsertRefs(ctx, revision.ID, refs); err != nil {
 		t.Fatalf("InsertRefs: %v", err)

@@ -20,7 +20,8 @@ func TestFailedStepRequirementDeviationIsApplication(t *testing.T) {
 				},
 			},
 		},
-		Assertions: []AssertionResult{passedAssertion(1, 1, "ui")},
+		Assertions:    []AssertionResult{passedAssertion(1, 1, "ui")},
+		EvidenceCount: 1,
 	}
 	status, class, summary, err := Aggregate(in)
 	if err != nil {
@@ -39,8 +40,9 @@ func TestFailedStepRequirementDeviationIsApplication(t *testing.T) {
 
 func TestFailedStepAutomationStaysAutomation(t *testing.T) {
 	in := VerdictInput{
-		Case:  caseSnapshotForVerdict(1),
-		Steps: []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed, Error: "target_not_found: selector #submit"}},
+		Case:          caseSnapshotForVerdict(1),
+		Steps:         []StepResult{{CaseRunID: 1, Seq: 1, Status: StepFailed, Error: "target_not_found: selector #submit"}},
+		EvidenceCount: 1,
 	}
 	status, class, summary, err := Aggregate(in)
 	if err != nil {

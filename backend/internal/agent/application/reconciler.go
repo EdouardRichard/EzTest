@@ -75,9 +75,10 @@ type StageJobSelectionReader interface {
 type StageTransitionReader interface {
 	// LastStageReason returns the reason recorded on the stage transition that
 	// created the stage visit which started at enteredAt. It returns "" when
-	// the transition record is missing (unknown/legacy reason, retention, or
-	// an event not yet persisted) or belongs to a different visit; callers
-	// must treat that as "unknown" and never repair.
+	// the transition record is missing (unknown/legacy reason, or a fact not
+	// yet persisted) or belongs to a different visit; callers must treat that
+	// as "unknown" and never repair. The production reader reads the durable
+	// stage_transition fact (V-0020), so event retention no longer drops it.
 	LastStageReason(ctx context.Context, versionID int64, enteredAt time.Time) (string, error)
 }
 
@@ -94,11 +95,11 @@ type DesignReconciler interface {
 	Reconcile(ctx context.Context) error
 }
 
-// P7Ensurer is the P7 control-plane surface (report PDF backfill and other
+// ReportEnsurer is the P7 control-plane surface (report PDF backfill and other
 // P7 ensure rules) run by the reconciler after the P4 rules. It must be
 // idempotent: repeated scans never add duplicate work items.
-type P7Ensurer interface {
-	ReconcileP7(ctx context.Context) error
+type ReportEnsurer interface {
+	ReconcileReportRenders(ctx context.Context) error
 }
 
 // ReconcilerDeps wires the P1+P2+P4 reconciler. It only ensures work items and
@@ -109,15 +110,15 @@ type ReconcilerDeps struct {
 	Attachments   PendingAttachmentReader
 	Design        DesignReconciler
 	Queue         WorkQueueEnsurer
-	// P4 is the P4 delivery/steward ensure surface. Nil keeps the P4 rules
+	// P4 is the P4 delivery/closure rule surface. Nil keeps the P4 rules
 	// disabled for P1-P3 wiring (and in unit tests of the earlier rules).
-	P4 P4Ensurer
+	Delivery DeliveryEnsurer
 	// RunningVersions lists the running versions the P4 rules reconcile. Nil
 	// keeps the P4 rules disabled.
-	RunningVersions P4VersionLister
+	RunningVersions DeliveryVersionLister
 	// P7 is the P7 ensure surface (report PDF backfill). Nil keeps the P7
 	// rules disabled for P1-P6 wiring and earlier-rule unit tests.
-	P7 P7Ensurer
+	ReportRender ReportEnsurer
 	// Stages reads the version stage for the R49 stage-entry-job recovery.
 	// Nil disables the rule (earlier-rule unit tests and degraded wiring).
 	Stages VersionStageReader
@@ -133,8 +134,9 @@ type ReconcilerDeps struct {
 	// nil degrades to the execute.batch typed skip.
 	StageJobSelection StageJobSelectionReader
 	// StageTransitions tells R49 whether the current stage visit was created by
-	// a transition that owns the stage-entry job. eventingpg.StageTransitionReader
-	// satisfies it; nil disables the rule.
+	// a transition that owns the stage-entry job. versionpg.StageReasonReader
+	// satisfies it from the durable stage_transition fact (V-0020); nil disables
+	// the rule.
 	StageTransitions StageTransitionReader
 	// Debounce overrides the event-driven wake window. Zero uses
 	// DefaultReconcileDebounce; tests may shorten it.
@@ -150,7 +152,7 @@ type ReconcilerDeps struct {
 
 // Reconciler repairs the control plane: version projection, conversation
 // opening/reply/curate tasks, attachment ingest tasks, the P2 design planner
-// scan, the P4 delivery/steward ensure rules, the R49 stage-entry-job recovery
+// scan, the P4 delivery/closure rules, the R49 stage-entry-job recovery
 // and the P7 backfill. Reconcile runs one pass (startup and each debounced
 // Notify wake); every ensure uses a dedupe key, so repeated passes never add
 // duplicate work.
@@ -160,9 +162,9 @@ type Reconciler struct {
 	attachments      PendingAttachmentReader
 	design           DesignReconciler
 	queue            WorkQueueEnsurer
-	p4               P4Ensurer
-	runningVersions  P4VersionLister
-	p7               P7Ensurer
+	delivery         DeliveryEnsurer
+	runningVersions  DeliveryVersionLister
+	reportRender     ReportEnsurer
 	stages           VersionStageReader
 	stageJobs        versionapp.StageJobEnqueuer
 	stageJobLookup   StageJobPresence
@@ -203,9 +205,9 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		attachments:      deps.Attachments,
 		design:           deps.Design,
 		queue:            deps.Queue,
-		p4:               deps.P4,
+		delivery:         deps.Delivery,
 		runningVersions:  deps.RunningVersions,
-		p7:               deps.P7,
+		reportRender:     deps.ReportRender,
 		stages:           deps.Stages,
 		stageJobs:        deps.StageJobs,
 		stageJobLookup:   deps.StageJobPresence,
@@ -249,12 +251,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 	// P4 runs last among the pre-P7 rules: its failures are aggregated, never
 	// hiding or skipping the P1-P3 rules above.
-	if err := r.reconcileP4(ctx); err != nil {
+	if err := r.reconcileDelivery(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	// P7 runs after P4: report PDF backfill depends on the P4 report rules and
 	// must never hide a P4 failure. Nil keeps the hook disabled.
-	if err := r.reconcileP7(ctx); err != nil {
+	if err := r.reconcileReportRender(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -538,21 +540,21 @@ func (r *Reconciler) missingStageJob(ctx context.Context, versionID int64, kind 
 	return !present, nil
 }
 
-// reconcileP7 runs the P7 ensure surface (report PDF backfill). It is optional
+// reconcileReportRender runs the P7 ensure surface (report PDF backfill). It is optional
 // so P1-P6 wiring keeps starting, and its error is aggregated with every other
 // rule by Reconcile.
-func (r *Reconciler) reconcileP7(ctx context.Context) error {
-	if r.p7 == nil {
+func (r *Reconciler) reconcileReportRender(ctx context.Context) error {
+	if r.reportRender == nil {
 		return nil
 	}
-	if err := r.p7.ReconcileP7(ctx); err != nil {
-		return fmt.Errorf("p7 reconcile: %w", err)
+	if err := r.reportRender.ReconcileReportRenders(ctx); err != nil {
+		return fmt.Errorf("reportRender reconcile: %w", err)
 	}
 	return nil
 }
 
 // reconcileDesign runs the design Planner scan (auto-design, pending scopes,
-// critic/data-plan derivation and the stale safety net). The design reconciler
+// critic derivation and the stale safety net). The design reconciler
 // is optional so P1-only wiring keeps starting.
 func (r *Reconciler) reconcileDesign(ctx context.Context) error {
 	if r.design == nil {

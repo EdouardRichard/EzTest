@@ -70,8 +70,8 @@ func newAnalysisIntegrationFixture(t *testing.T, pool *pgxpool.Pool, repoPath st
 		t.Fatalf("snowflake: %v", err)
 	}
 	git := gitx.New(nil, 10*time.Second)
-	versions := &integrationVersions{bindings: []codeintelapp.VersionSUTBinding{{
-		VersionSUTID: 11, VersionID: 1, RepoID: 10, Branch: "main",
+	versions := &integrationVersions{bindings: []codeintelapp.SUTRepoBinding{{
+		SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main",
 	}}}
 	resources := &integrationResources{repo: codeintelapp.RepoRef{ID: 10, Name: "fixture", Path: repoPath, Branch: "main"}}
 	extractor := &integrationExtractor{

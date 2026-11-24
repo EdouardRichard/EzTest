@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Cross-language behaviour gate for the conversation streaming seq assignment (v0.2.4-H H-E19).",
+    "The Go authority is backend/internal/version/application/conversation.go: publishMessageEvent's",
+    "seq loop (:1137-1144) and assistantStreamParts (:1180-1200). Both assign a 1-based seq, in part",
+    "order, ONLY to an assistant message's parts whose type is in the one streaming enum",
+    "(version.IsStreamingMessagePartType); snapshot-only types (image/rollback_proposal) stay unsequenced.",
+    "The frontend mirror is frontend/src/features/clarification/useConversation.ts:streamingSnapshotParts.",
+    "This fixture is the SHARED case set both implementations are evaluated against",
+    "(Go: conversation_seq_gate_test.go; TS: conversation-seq.authority.test.ts). A semantic drift on",
+    "either side fails its own gate instead of silently diverging.",
+    "expected_seqs is aligned 1:1 with parts: the 1-based seq for a sequenced part, null otherwise."
+  ],
+  "cases": [
+    {
+      "name": "all_streaming_types_in_order",
+      "role": "assistant",
+      "parts": [
+        { "type": "thinking" },
+        { "type": "text" },
+        { "type": "tool_call" },
+        { "type": "job_card" },
+        { "type": "attachment" },
+        { "type": "requirement_card" },
+        { "type": "case_card" },
+        { "type": "error" }
+      ],
+      "expected_seqs": [1, 2, 3, 4, 5, 6, 7, 8]
+    },
+    {
+      "name": "snapshot_only_types_never_sequenced_interleaved",
+      "role": "assistant",
+      "parts": [
+        { "type": "image" },
+        { "type": "text" },
+        { "type": "rollback_proposal" },
+        { "type": "thinking" },
+        { "type": "image" }
+      ],
+      "expected_seqs": [null, 1, null, 2, null]
+    },
+    {
+      "name": "empty_parts",
+      "role": "assistant",
+      "parts": [],
+      "expected_seqs": []
+    },
+    {
+      "name": "non_assistant_role_is_never_sequenced",
+      "role": "user",
+      "parts": [
+        { "type": "text" },
+        { "type": "thinking" },
+        { "type": "image" }
+      ],
+      "expected_seqs": [null, null, null]
+    },
+    {
+      "name": "assistant_text_only",
+      "role": "assistant",
+      "parts": [{ "type": "text" }],
+      "expected_seqs": [1]
+    },
+    {
+      "name": "assistant_only_snapshot_only_parts",
+      "role": "assistant",
+      "parts": [
+        { "type": "image" },
+        { "type": "rollback_proposal" }
+      ],
+      "expected_seqs": [null, null]
+    }
+  ]
+}

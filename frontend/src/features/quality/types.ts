@@ -4,7 +4,7 @@ import type { BadgeTone } from "@/components/ui/Badge"
  * Wire types for the P6 quality centre.
  *
  * Names/fields are pinned by the frozen P6 OpenAPI contract
- * (`docs/version-V0.2/contracts/openapi.yaml`): IDs are decimal strings,
+ * (`docs/openapi/api.yaml`): IDs are decimal strings,
  * timestamps RFC3339 UTC, and every metric value is derived by the server. The
  * page never invents a default metric value: `available=false` / `value=null`
  * means "unavailable", never 0.
@@ -131,18 +131,12 @@ export const EVAL_METRIC_LABEL: Record<string, string> = {
   classification_accuracy: "分类准确率",
   issue_false_positive_rate: "问题误报率",
   supplement_hit_rate: "补充命中率",
-  visual_classification_accuracy: "视觉分类准确率",
   execution_pass_rate: "执行通过率",
   case_coverage: "用例覆盖率",
 }
 
 /** v0.22 snapshot metrics offered by the trend chart selector. */
-export const TREND_METRICS: string[] = [
-  "design_coverage",
-  "execution_pass_rate",
-  "case_coverage",
-  "visual_classification_accuracy",
-]
+export const TREND_METRICS: string[] = ["design_coverage", "execution_pass_rate", "case_coverage"]
 
 export const EVAL_REASON_LABEL: Record<string, string> = {
   ok: "通过",

@@ -10,6 +10,7 @@ import (
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // ---- shared test doubles for Task 6 planner/scheduler/intent tests ----
@@ -52,6 +53,19 @@ func (p *corePublisher) types() []string {
 	return result
 }
 
+// payloads returns the payloads of every event of one type, in publish order.
+func (p *corePublisher) payloads(eventType string) []map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([]map[string]any, 0)
+	for _, event := range p.events {
+		if event.Type == eventType {
+			result = append(result, event.Payload)
+		}
+	}
+	return result
+}
+
 func (p *corePublisher) count(eventType string) int {
 	count := 0
 	for _, item := range p.types() {
@@ -82,6 +96,14 @@ type fakeIntentStore struct {
 	byID       map[int64]execution.ExecutionIntent
 	createC    int
 	createErrs []error // returned (and consumed) before the next successful Create
+	// versions mirrors the repository's under-lock version guard (R-G9): when
+	// wired, Create resolves the natural-key dedup FIRST and only a genuinely
+	// new intent on a completed version reports ErrVersionCompleted — the same
+	// conflict ordering as postgres guardIntentScope, so service tests exercise
+	// the real reopen-and-retry contract instead of a fake that silently skips
+	// the guard (method discipline 9: the fake must model the collaborator's
+	// strategy, not replace it).
+	versions *fakeVersionReader
 	// transitionErr injects a failure of the execution claim transition
 	// (open/claimed -> running) that dispatchPending performs after the work
 	// item was queued. It pins the intent-Transition failure release path.
@@ -123,6 +145,18 @@ func (s *fakeIntentStore) Create(_ context.Context, intent execution.ExecutionIn
 			return execution.ErrDuplicate
 		}
 	}
+	// R-G9 conflict ordering (mirrors postgres guardIntentScope): the dedup
+	// above resolves BEFORE the completed-version reopen signal, so a duplicate
+	// never triggers the service's reopen-and-retry loop. A missing binding is
+	// allowed, like the repository's missing-row tolerance.
+	if s.versions != nil {
+		s.versions.mu.Lock()
+		binding, ok := s.versions.bindings[intent.VersionID]
+		s.versions.mu.Unlock()
+		if ok && binding.Status == versiondomain.StatusCompleted {
+			return execution.ErrVersionCompleted
+		}
+	}
 	if intent.ID == 0 {
 		s.nextID++
 		intent.ID = 100 + s.nextID
@@ -140,6 +174,30 @@ func (s *fakeIntentStore) Get(_ context.Context, id int64) (execution.ExecutionI
 		return execution.ExecutionIntent{}, execution.ErrNotFound
 	}
 	return intent, nil
+}
+
+// CreateAndTransition models the atomic repository contract: insert already
+// transitioned, or insert nothing (a failed guard rolls the insert back).
+func (s *fakeIntentStore) CreateAndTransition(_ context.Context, intent execution.ExecutionIntent, from []execution.IntentStatus, to execution.IntentStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matched := len(from) == 0
+	for _, status := range from {
+		if intent.Status == status {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return execution.ErrStateConflict
+	}
+	if _, ok := s.byID[intent.ID]; ok {
+		return execution.ErrDuplicate
+	}
+	intent.Status = to
+	s.byID[intent.ID] = intent
+	s.createC++
+	return nil
 }
 
 func (s *fakeIntentStore) List(_ context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.ExecutionIntent, bool, error) {
@@ -355,7 +413,7 @@ func (s *fakeWaveStore) Counts(_ context.Context, waveID int64) (execution.WaveC
 			runs = live
 		}
 	}
-	counts := execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}}
+	counts := execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}}
 	for _, run := range runs {
 		counts.Total++
 		switch run.Status {
@@ -462,6 +520,29 @@ func (s *fakeCaseRunStore) Create(_ context.Context, run execution.CaseRun) erro
 	return nil
 }
 
+// CreateAndTransition models the atomic repository contract: insert already
+// transitioned, or insert nothing (a failed guard/fence rolls the insert back).
+func (s *fakeCaseRunStore) CreateAndTransition(_ context.Context, run execution.CaseRun, from []execution.CaseRunStatus, to execution.CaseRunStatus, epoch int64, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matched := len(from) == 0
+	for _, status := range from {
+		if run.Status == status {
+			matched = true
+			break
+		}
+	}
+	if !matched || (epoch != 0 && run.DispatchEpoch != epoch) || (token != "" && run.DispatchToken != token) {
+		return execution.ErrStateConflict
+	}
+	if _, ok := s.byID[run.ID]; ok {
+		return execution.ErrDuplicate
+	}
+	run.Status = to
+	s.byID[run.ID] = run
+	return nil
+}
+
 func (s *fakeCaseRunStore) UpdateCAS(_ context.Context, id int64, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -484,10 +565,47 @@ func (s *fakeCaseRunStore) UpdateCAS(_ context.Context, id int64, epoch int64, t
 func (s *fakeCaseRunStore) Update(_ context.Context, run execution.CaseRun) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.byID[run.ID]; !ok {
+	stored, ok := s.byID[run.ID]
+	if !ok {
 		return false, nil
 	}
+	// Mirror the production terminal-transition guard (V-0022): Update can
+	// never move a row into or out of a terminal status; only non-terminal
+	// changes and same-status rewrites are allowed. A refused terminal
+	// transition is a loud conflict, never a silent no-op.
+	if run.Status != stored.Status && (run.Status.Terminal() || stored.Status.Terminal()) {
+		return false, execution.ErrStateConflict
+	}
 	s.byID[run.ID] = run
+	return true, nil
+}
+
+// ReclassifyTerminal mirrors the production guarded terminal->terminal
+// reclassification primitive: only a failed/blocked/inconclusive terminal row
+// whose result stays in that set (domain CanReclassifyTo), fenced by epoch/token.
+func (s *fakeCaseRunStore) ReclassifyTerminal(_ context.Context, id int64, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.byID[id]
+	if !ok {
+		return false, execution.ErrNotFound
+	}
+	if !run.Status.CanReclassifyTo(run.Status) {
+		return false, nil
+	}
+	if (epoch > 0 && run.DispatchEpoch != epoch) || (token != "" && run.DispatchToken != token) {
+		return false, nil
+	}
+	priorStatus := run.Status
+	if mutate != nil {
+		if err := mutate(&run); err != nil {
+			return false, err
+		}
+	}
+	if !priorStatus.CanReclassifyTo(run.Status) {
+		return false, execution.ErrStateConflict
+	}
+	s.byID[id] = run
 	return true, nil
 }
 
@@ -510,6 +628,18 @@ func (s *fakeCaseRunStore) Transition(_ context.Context, id int64, from []execut
 
 func (s *fakeCaseRunStore) ClaimLease(context.Context, int64, int64, time.Time) (bool, error) {
 	return true, nil
+}
+
+func (s *fakeCaseRunStore) AddEvidenceDrop(_ context.Context, id int64, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.byID[id]
+	if !ok {
+		return 0, execution.ErrNotFound
+	}
+	run.EvidenceDropped += delta
+	s.byID[id] = run
+	return run.EvidenceDropped, nil
 }
 
 func (s *fakeCaseRunStore) ListRunningByExecutor(_ context.Context, executorID int64) ([]execution.CaseRun, error) {
@@ -624,7 +754,7 @@ func (r *fakeVersionReader) Reopen(_ context.Context, id int64) error {
 	defer r.mu.Unlock()
 	r.reopened = append(r.reopened, id)
 	binding := r.bindings[id]
-	binding.Status = "running"
+	binding.Status = versiondomain.StatusRunning
 	r.bindings[id] = binding
 	return nil
 }
@@ -634,6 +764,47 @@ type fakeExecutorRegistry struct {
 	sequence []execution.ExecutorInstance
 	selected int
 	err      error
+	// fleetCapacity / fleetErr drive MaxDispatchableCapacity. A zero
+	// fleetCapacity derives the maximum from the configured executor or
+	// sequence, so single-executor fixtures keep maxCap == the selected
+	// capacity and behave exactly as before review round 4.
+	fleetCapacity int
+	fleetErr      error
+	// ceilingCalls counts MaxDispatchableCapacity invocations. Review round 7:
+	// the probe costs an executorConfig (three settings reads) plus a full
+	// repo.List, so it must run only on a structural rejection -- hoisting it
+	// above the reason check made it run on every rejection in a busy wave.
+	ceilingCalls int
+	// fleetZero forces MaxDispatchableCapacity to return 0 with no error, which
+	// is distinct from fleetErr: it exercises the zero branch of
+	// fleetCapacityCeiling's fail-closed rule (review round 7, Minor 1).
+	fleetZero bool
+}
+
+// MaxDispatchableCapacity implements executionapp.ExecutorRegistry. It is the
+// fleet-wide maximum, deliberately NOT the executor Select would return -- see
+// Scheduler.fleetCapacityCeiling.
+func (r *fakeExecutorRegistry) MaxDispatchableCapacity(context.Context) (int, error) {
+	r.ceilingCalls++
+	if r.fleetErr != nil {
+		return 0, r.fleetErr
+	}
+	if r.fleetZero {
+		return 0, nil
+	}
+	if r.fleetCapacity > 0 {
+		return r.fleetCapacity, nil
+	}
+	best := 0
+	if r.executor != nil && r.executor.Capacity > best {
+		best = r.executor.Capacity
+	}
+	for i := range r.sequence {
+		if r.sequence[i].Capacity > best {
+			best = r.sequence[i].Capacity
+		}
+	}
+	return best, nil
 }
 
 func (r *fakeExecutorRegistry) Select(context.Context) (*execution.ExecutorInstance, error) {
@@ -742,8 +913,11 @@ type task6Fixture struct {
 	events     *corePublisher
 	clock      *coreClock
 	ids        *coreIDs
-	intent     *IntentService
-	scheduler  *Scheduler
+	// teamRoom receives the human handoff post of a run the scheduler itself
+	// terminates (review round 4, Important 2).
+	teamRoom  *fakeTeamRoom
+	intent    *IntentService
+	scheduler *Scheduler
 }
 
 func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
@@ -760,10 +934,13 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		queue:      &fakeWorkQueue{},
 		analysis:   &fakeAnalyzer{},
 		events:     &corePublisher{},
+		teamRoom:   &fakeTeamRoom{},
 		clock:      &coreClock{now: now},
 		ids:        &coreIDs{next: 1000},
 	}
 	f.waves.runsStore = f.runs
+	// The intent store mirrors the repository's under-lock version guard (R-G9).
+	f.intents.versions = f.versions
 	f.waves.claim = func(intents []execution.ExecutionIntent) {
 		for _, intent := range intents {
 			_, _ = f.intents.Transition(context.Background(), intent.ID, []execution.IntentStatus{execution.IntentOpen}, execution.IntentClaimed)
@@ -778,7 +955,35 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		Clock:           f.clock,
 		Events:          f.events,
 	})
-	f.scheduler = NewScheduler(SchedulerDeps{
+	f.scheduler = f.newScheduler(f.quota)
+	return f
+}
+
+// newScheduler builds the fixture scheduler with the given quota reader and no
+// settings source: the degraded-assembly shape (unbounded admission, no
+// resource governance). Passing a nil reader makes runningUsage fall through
+// to the real ListRunning producer path instead of the injected fake.
+func (f *task6Fixture) newScheduler(quotaReader QuotaReader) *Scheduler {
+	return f.newSchedulerWithSettings(quotaReader, nil)
+}
+
+// newSchedulerWithQuota builds the fixture scheduler with an explicit admin
+// global limit driven through the REAL settings path (the construction-time
+// Quota port was removed by ruling P12 -- a settings fake is the only way to
+// configure a limit, exactly like production). Claim headroom is generous (4)
+// so these tests exercise the admin-limit mechanics in isolation.
+func (f *task6Fixture) newSchedulerWithQuota(quota execution.Quota, quotaReader QuotaReader) *Scheduler {
+	return f.newSchedulerWithSettings(quotaReader, &fakeSettings{values: map[string]any{
+		SettingMaxConcurrentCaseRuns:  int64(quota.Global),
+		settingAgentMaxConcurrentRuns: int64(4),
+	}})
+}
+
+// newSchedulerWithSettings wires the settings reader the production
+// composition root passes, so the live per-tick quota read and the
+// claim-headroom admission bound are exercised against the real code path.
+func (f *task6Fixture) newSchedulerWithSettings(quotaReader QuotaReader, settings SettingsReader) *Scheduler {
+	return NewScheduler(SchedulerDeps{
 		Intents:     f.intents,
 		Waves:       f.waves,
 		CaseRuns:    f.runs,
@@ -786,8 +991,8 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		Versions:    f.versions,
 		Executors:   f.registry,
 		WorkQueue:   f.queue,
-		Quota:       domainQuota(3, 2, 1),
-		QuotaReader: f.quota,
+		QuotaReader: quotaReader,
+		Settings:    settings,
 		Analyzer:    f.analysis,
 		Replanner:   f.intent,
 		IDs:         f.ids,
@@ -795,12 +1000,12 @@ func newTask6Fixture(t interface{ Fatalf(string, ...any) }) *task6Fixture {
 		Events:      f.events,
 		Instance:    "api-1",
 		LeaseTTL:    30 * time.Second,
+		TeamRoom:    f.teamRoom,
 	})
-	return f
 }
 
-func domainQuota(global, perSUT, crossSystem int) execution.Quota {
-	return execution.Quota{Global: global, PerSUT: perSUT, CrossSystem: crossSystem}
+func domainQuota(global int) execution.Quota {
+	return execution.Quota{Global: global}
 }
 
 func task6Snapshot(caseVersionID int64, suts ...int64) execution.CaseSnapshot {
@@ -809,17 +1014,24 @@ func task6Snapshot(caseVersionID int64, suts ...int64) execution.CaseSnapshot {
 		CaseVersionID:        caseVersionID,
 		RequirementID:        caseVersionID + 2000,
 		RequirementVersionID: caseVersionID + 3000,
-		DefaultVersionSUTID:  suts[0],
+		DefaultSUTID:         suts[0],
 		Title:                "case",
 		Priority:             "P2",
-		VersionSUTIDs:        suts,
+		SUTIDs:               suts,
 	}
 	for index := range suts {
+		// v0.2.4-B: a step no longer carries a target SUT id, and the account
+		// role stays empty for every step exactly as before. NOTE (review
+		// M-new-1): requiredContextCount is the DISTINCT ROLE count, not
+		// "1 role x len(suts)" -- the roles x bound-SUTs product was the C1
+		// livelock and is gone. This fixture therefore reserves 1 context
+		// whatever the number of SUTs passed here, so a multi-SUT fixture
+		// reserves FEWER contexts than it did before fix round 2.
 		snapshot.Steps = append(snapshot.Steps, execution.CaseStep{
-			Seq: index + 1, Action: "step", TargetVersionSUTID: suts[index],
+			Seq: index + 1, Action: "step", TargetDescription: "target",
 		})
 		snapshot.Assertions = append(snapshot.Assertions, execution.CaseAssertion{
-			StepSeq: index + 1, AssertionSeq: 1, Kind: "ui", Expected: "ok", TargetVersionSUTID: suts[index],
+			StepSeq: index + 1, AssertionSeq: 1, Kind: "ui", Expected: "ok", SUTID: suts[index],
 		})
 	}
 	return snapshot
@@ -828,8 +1040,10 @@ func task6Snapshot(caseVersionID int64, suts ...int64) execution.CaseSnapshot {
 func task6Binding(versionID int64, status string, sutIDs ...int64) VersionBinding {
 	binding := VersionBinding{VersionID: versionID, Status: status, Stage: intentExecutableStage}
 	for index, sutID := range sutIDs {
-		binding.SUTs = append(binding.SUTs, VersionSUTBinding{
-			VersionSUTID: sutID, SUTID: sutID + 100, EnvironmentID: sutID + 200,
+		binding.SUTs = append(binding.SUTs, SUTBinding{
+			// One SUT key since v0.2.4-B: this used to carry the binding-row
+			// id (sutID) and the SUT id (sutID+100) side by side.
+			SUTID: sutID, EnvironmentID: sutID + 200,
 			SUTName: "sut", EnvironmentName: "env", BaseURL: fmt.Sprintf("http://127.0.0.1:%d", 13330+index),
 			PageIDs: []int64{}, APIIDs: []int64{}, DatabaseIDs: []int64{}, AccountRoles: []string{"user"},
 		})

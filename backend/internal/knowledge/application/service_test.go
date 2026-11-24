@@ -107,11 +107,22 @@ func (r *fakeRepo) ListForInjection(_ context.Context, query knowledge.Injection
 type fakeUsage struct {
 	batches [][]knowledge.Usage
 	err     error
+
+	stats      knowledgeapp.UsageStats
+	statsErr   error
+	statsID    int64
+	statsCalls int
 }
 
 func (u *fakeUsage) Insert(_ context.Context, usages []knowledge.Usage) error {
 	u.batches = append(u.batches, usages)
 	return u.err
+}
+
+func (u *fakeUsage) StatsByItem(_ context.Context, itemID int64) (knowledgeapp.UsageStats, error) {
+	u.statsCalls++
+	u.statsID = itemID
+	return u.stats, u.statsErr
 }
 
 type fakeSettings struct {

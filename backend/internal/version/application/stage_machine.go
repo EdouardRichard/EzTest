@@ -513,7 +513,14 @@ func (m *StageMachine) resumeTo(ctx context.Context, current version.StageState,
 // asks the dispatcher for the stage-entry job. Event delivery and job enqueue
 // are best effort: the DB row is the source of truth and a later reconciler
 // can recreate a missed job (spec §5.7).
+//
+// V-0020: the transition reason and actor ride on next into ApplyStage, which
+// persists them as a durable stage_transition fact in the SAME transaction as
+// the stage row. The fact survives event retention, so the R49 repair keeps
+// working after retention.event_days deletes the version.stage_changed event.
 func (m *StageMachine) apply(ctx context.Context, current, next version.StageState, reason, blocker string, job *StageJob) error {
+	next.Reason = reason
+	next.Actor = stageEventActor(ctx)
 	if err := m.repo.ApplyStage(ctx, current.Stage, next); err != nil {
 		return mapStageRepositoryError(err)
 	}
@@ -824,6 +831,10 @@ type StageService struct {
 	reports     StageReports
 	closer      StageVersionCloser
 	handoff     StageHandoffGenerator
+	// designReview is the shared designing -> case_review review predicate (T9).
+	// The composition root (T13) wires the SAME designapp.ReviewGateService here
+	// and into the design reconciler's converge path. nil fails closed.
+	designReview DesignReviewGate
 }
 
 // StageServiceDeps wires the v0.22 stage service. Repo is required. Events,
@@ -862,6 +873,18 @@ func NewStageService(deps StageServiceDeps) *StageService {
 		closer:      deps.Closer,
 		handoff:     deps.Handoff,
 	}
+}
+
+// SetDesignReviewGate installs the shared design review gate port (T9). It is a
+// setter because the composition root builds the design gate after the stage
+// service (T13) and wires the SAME instance into the design reconciler's
+// converge path. Without it the designing -> case_review edge fails closed
+// (requireCaseDrafts): manual advance can never bypass the review predicate.
+func (s *StageService) SetDesignReviewGate(gate DesignReviewGate) *StageService {
+	if s != nil {
+		s.designReview = gate
+	}
+	return s
 }
 
 // Stage returns the current stage projection.
@@ -1326,7 +1349,16 @@ func (s *StageService) requireCaseDrafts(ctx context.Context, versionID int64) e
 			"compute the coverage matrix before reviewing cases",
 			"case_review", nil)
 	}
-	return nil
+	// T9 shared review gate: the SAME predicate the design reconciler's converge
+	// path calls (designapp.ReviewGateService). It adds the AC-coverage and
+	// judge-review completeness checks on top of the legacy count/coverage gates
+	// above. nil fails closed so manual advance cannot bypass review; the gate's
+	// typed 409 names the coverage gap / unreviewed cases and propagates untouched
+	// (it is already the actionable verdict, not a generic gate failure).
+	if s.designReview == nil {
+		return newStageGateNotConfigured("design_review")
+	}
+	return s.designReview.ReviewGate(ctx, versionID)
 }
 
 func (s *StageService) requireExecutable(ctx context.Context, versionID int64) error {

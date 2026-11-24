@@ -34,7 +34,7 @@ export type ChainNodeView = {
   ref_id: string
   label: string
   status?: string | null
-  version_sut_id?: string | null
+  sut_id?: string | null
   requirement_id?: string | null
   case_version_id?: string | null
   wave_id?: string | null
@@ -168,7 +168,7 @@ export type ChainView = {
 /* --------------------------------- requests -------------------------------- */
 
 export type ChainQuery = {
-  /** `version_sut_id` (decimal string). */
+  /** `sut_id` (decimal string). */
   sutId?: string
   pageId?: string
   waveId?: string

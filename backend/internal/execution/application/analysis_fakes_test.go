@@ -113,12 +113,77 @@ func (s *fakeSettings) Bool(_ context.Context, key string) (bool, error) {
 	return false, execution.ErrNotFound
 }
 
+// fakeEvidenceStore is the in-memory evidence repository of the internal test
+// package (the executionapp_test package has its own fakeEvidenceRepo). It
+// mirrors the production contract: CountByCaseRun reads the persisted rows, and
+// countErr injects a read failure so a test can prove the verdict path surfaces
+// it instead of swallowing it.
+type fakeEvidenceStore struct {
+	mu       sync.Mutex
+	rows     []execution.Evidence
+	countErr error
+}
+
+func newFakeEvidenceStore() *fakeEvidenceStore { return &fakeEvidenceStore{} }
+
+func (f *fakeEvidenceStore) Insert(_ context.Context, evidence execution.Evidence) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows = append(f.rows, evidence)
+	return nil
+}
+
+func (f *fakeEvidenceStore) Get(_ context.Context, id int64) (execution.Evidence, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, row := range f.rows {
+		if row.ID == id {
+			return row, nil
+		}
+	}
+	return execution.Evidence{}, execution.ErrNotFound
+}
+
+func (f *fakeEvidenceStore) ListByCaseRun(_ context.Context, caseRunID int64, _ int) ([]execution.Evidence, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows := make([]execution.Evidence, 0)
+	for _, row := range f.rows {
+		if row.CaseRunID == caseRunID {
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
+}
+
+func (f *fakeEvidenceStore) ListByVersion(_ context.Context, _ int64, _ execution.EvidenceFilter) ([]execution.Evidence, bool, error) {
+	return nil, false, nil
+}
+
+func (f *fakeEvidenceStore) InsertRef(_ context.Context, _ execution.EvidenceRef) error { return nil }
+
+func (f *fakeEvidenceStore) CountByCaseRun(_ context.Context, caseRunID int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
+	count := 0
+	for _, row := range f.rows {
+		if row.CaseRunID == caseRunID {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // analysisFixture wires the deterministic analysis service with in-memory
 // fakes. It reuses the Task 6 repository fakes.
 type analysisFixture struct {
 	waves        *fakeWaveStore
 	runs         *fakeCaseRunStore
 	results      *fakeResultStore
+	evidence     *fakeEvidenceStore
 	cases        *fakeCaseReader
 	requirements *fakeCoverageReader
 	gaps         *fakeGapEnsurer
@@ -137,6 +202,7 @@ func newAnalysisFixture() *analysisFixture {
 		waves:        newFakeWaveStore(),
 		runs:         newFakeCaseRunStore(),
 		results:      newFakeResultStore(),
+		evidence:     newFakeEvidenceStore(),
 		cases:        &fakeCaseReader{cases: map[int64]execution.CaseSnapshot{}},
 		requirements: &fakeCoverageReader{},
 		gaps:         &fakeGapEnsurer{},
@@ -155,6 +221,7 @@ func newAnalysisFixture() *analysisFixture {
 		Waves:        f.waves,
 		CaseRuns:     f.runs,
 		Results:      f.results,
+		Evidence:     f.evidence,
 		Cases:        f.cases,
 		Requirements: f.requirements,
 		Gaps:         f.gaps,
@@ -191,6 +258,16 @@ func (f *analysisFixture) addFailedStep(caseRunID int64, seq int) {
 	f.results.steps[caseRunID] = append(f.results.steps[caseRunID], execution.StepResult{
 		CaseRunID: caseRunID, Seq: seq, Status: execution.StepFailed, Error: "target_not_found",
 	})
+}
+
+// addEvidenceRows seeds n immutable evidence rows for a run so the evidence
+// gate (constitution art.1.2) sees the persisted count the fixture declares.
+func (f *analysisFixture) addEvidenceRows(caseRunID int64, n int) {
+	for i := 0; i < n; i++ {
+		_ = f.evidence.Insert(context.Background(), execution.Evidence{
+			CaseRunID: caseRunID, Kind: execution.EvidenceText,
+		})
+	}
 }
 
 func (f *analysisFixture) addCase(caseVersionID, requirementID, requirementVersionID int64, priority string) {

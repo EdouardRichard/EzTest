@@ -22,7 +22,6 @@ func snapshotRunFixture() qualityapp.EvalRun {
 		{Name: quality.MetricDesignCoverage, Value: 0.9, Threshold: 0.8, Passed: true},
 		{Name: quality.MetricExecutionPassRate, Value: 0.5, Threshold: 0.8, Passed: false},
 		{Name: quality.MetricCaseCoverage, Value: 1, Threshold: 0.8, Passed: true},
-		{Name: quality.MetricVisualClassificationAccuracy, Value: 0.9, Threshold: 0.8, Passed: true},
 	}
 	return run
 }
@@ -167,11 +166,6 @@ func (p *handlerSnapshotPorts) CountExecutionPass(context.Context, *int64) (int,
 	return 0, 0, nil
 }
 
-func (p *handlerSnapshotPorts) VisualClassification(context.Context, *int64) (int, int, error) {
-	p.calls++
-	return 0, 0, nil
-}
-
 type handlerVersionExists struct {
 	exists    bool
 	versionID int64
@@ -191,7 +185,7 @@ func TestQualityUnknownVersion404WithRealService(t *testing.T) {
 	ports := &handlerSnapshotPorts{}
 	existence := &handlerVersionExists{exists: false}
 	service := qualityapp.NewService(repo, &handlerIDs{}, handlerClock{}, nil, nil, nil).
-		WithSnapshotPorts(ports, ports, ports, ports).
+		WithSnapshotPorts(ports, ports, ports).
 		WithVersionExistence(existence)
 	mux := newQualityMux(service, "admin")
 

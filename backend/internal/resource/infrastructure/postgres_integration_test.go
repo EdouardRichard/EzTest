@@ -90,19 +90,17 @@ func assertAPIErr(t *testing.T, err error, status int, code string) *platform.Er
 	return apiErr
 }
 
-func createSUT(t *testing.T, e *env, name string) resourceapp.SUTView {
-	t.Helper()
-	view, err := e.svc.CreateSUT(context.Background(), resourceapp.SUTInput{Name: name, Intro: name}, 42)
-	if err != nil {
-		t.Fatalf("CreateSUT(%q): %v", name, err)
-	}
-	return view
+// testBaseURL derives a valid absolute base_url from a SUT name (base_url moved
+// down from the environment to the SUT in v0.2.4-B).
+func testBaseURL(name string) string {
+	return "https://" + strings.ToLower(strings.Join(strings.Fields(name), "-")) + ".example.com"
 }
 
-func createEnvironment(t *testing.T, e *env, sutID int64, name string, isDefault bool) resourceapp.EnvironmentView {
+// createEnvironment creates one top-level environment.
+func createEnvironment(t *testing.T, e *env, name string) resourceapp.EnvironmentView {
 	t.Helper()
-	view, err := e.svc.CreateEnvironment(context.Background(), sutID, resourceapp.EnvironmentInput{
-		Name: name, BaseURL: "https://" + name + ".example.com", IsDefault: isDefault,
+	view, err := e.svc.CreateEnvironment(context.Background(), resourceapp.EnvironmentInput{
+		Name: name, Description: name + " environment",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateEnvironment(%q): %v", name, err)
@@ -110,104 +108,150 @@ func createEnvironment(t *testing.T, e *env, sutID int64, name string, isDefault
 	return view
 }
 
-func TestRepositoryUniquenessAndDefaultUnset(t *testing.T) {
+// createSUT creates one SUT inside a dedicated top-level environment, so each
+// SUT of a test is independently owned and the per-environment name uniqueness
+// does not interfere.
+func createSUT(t *testing.T, e *env, name string) resourceapp.SUTView {
+	t.Helper()
+	environment := createEnvironment(t, e, name+"-env")
+	return createSUTIn(t, e, int64Of(t, environment.ID), name)
+}
+
+// createSUTIn creates one SUT inside an existing environment.
+func createSUTIn(t *testing.T, e *env, environmentID int64, name string) resourceapp.SUTView {
+	t.Helper()
+	view, err := e.svc.CreateSUT(context.Background(), environmentID, resourceapp.SUTInput{
+		Name: name, Intro: name, BaseURL: testBaseURL(name),
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT(%q): %v", name, err)
+	}
+	return view
+}
+
+func TestRepositoryUniquenessInTheInvertedHierarchy(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 
-	sut := createSUT(t, e, "Order Center")
+	environment := createEnvironment(t, e, "prod")
+	environmentID := int64Of(t, environment.ID)
+	sut := createSUTIn(t, e, environmentID, "Order Center")
 	sutID := int64Of(t, sut.ID)
-	if _, err := e.repo.GetSUT(ctx, sutID); err != nil {
+	if stored, err := e.repo.GetSUT(ctx, sutID); err != nil {
 		t.Fatalf("GetSUT: %v", err)
+	} else if stored.EnvironmentID != environmentID || stored.BaseURL != testBaseURL("Order Center") {
+		t.Fatalf("stored sut = %#v", stored)
 	}
-	_, err := e.svc.CreateSUT(ctx, resourceapp.SUTInput{Name: "order center"}, 42)
-	assertAPIErr(t, err, 409, "conflict")
-	_, err = e.svc.CreateSUT(ctx, resourceapp.SUTInput{Name: " "}, 42)
-	assertAPIErr(t, err, 400, "invalid_argument")
 
-	prod := createEnvironment(t, e, sutID, "prod", true)
-	if !prod.IsDefault {
-		t.Fatal("prod is not default")
-	}
-	staging := createEnvironment(t, e, sutID, "staging", true)
-	if !staging.IsDefault {
-		t.Fatal("staging is not default")
-	}
-	var defaults int
-	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut_environment WHERE sut_id = $1 AND is_default`, sutID).Scan(&defaults); err != nil {
-		t.Fatalf("count defaults: %v", err)
-	}
-	if defaults != 1 {
-		t.Fatalf("defaults = %d, want 1", defaults)
-	}
-	storedProd, err := e.repo.GetEnvironment(ctx, int64Of(t, prod.ID))
-	if err != nil {
-		t.Fatalf("GetEnvironment: %v", err)
-	}
-	if storedProd.IsDefault {
-		t.Fatal("previous default still set in the database")
-	}
-	_, err = e.svc.CreateEnvironment(ctx, sutID, resourceapp.EnvironmentInput{
-		Name: "PROD", BaseURL: "https://prod2.example.com",
+	// The SUT name is unique per environment, case-insensitively.
+	_, err := e.svc.CreateSUT(ctx, environmentID, resourceapp.SUTInput{
+		Name: "order center", BaseURL: "https://dup.example.com",
 	}, 42)
 	assertAPIErr(t, err, 409, "conflict")
+	_, err = e.svc.CreateSUT(ctx, environmentID, resourceapp.SUTInput{Name: "   ", BaseURL: "https://blank.example.com"}, 42)
+	assertAPIErr(t, err, 400, "invalid_argument")
+	// base_url is mandatory on the SUT now.
+	_, err = e.svc.CreateSUT(ctx, environmentID, resourceapp.SUTInput{Name: "No URL"}, 42)
+	apiErr := assertAPIErr(t, err, 400, "invalid_argument")
+	if apiErr.Details["field"] != "base_url" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+	// The same name in another environment is fine.
+	other := createEnvironment(t, e, "staging")
+	twin := createSUTIn(t, e, int64Of(t, other.ID), "Order Center")
+	if twin.Name != "Order Center" {
+		t.Fatalf("twin = %#v", twin)
+	}
 
-	environmentID := int64Of(t, staging.ID)
-	page, err := e.svc.CreatePage(ctx, environmentID, resourceapp.PageInput{
+	// Environment names are globally unique and case-insensitive.
+	_, err = e.svc.CreateEnvironment(ctx, resourceapp.EnvironmentInput{Name: "PROD"}, 42)
+	assertAPIErr(t, err, 409, "conflict")
+
+	// The old derived hierarchy is gone: no sut_environment table, no is_default.
+	var legacyTable bool
+	if err := e.pool.QueryRow(ctx, `SELECT to_regclass('sut_environment') IS NOT NULL`).Scan(&legacyTable); err != nil {
+		t.Fatalf("check sut_environment: %v", err)
+	}
+	if legacyTable {
+		t.Fatal("sut_environment still exists after the v0.2.4-B inversion")
+	}
+
+	page, err := e.svc.CreatePage(ctx, sutID, resourceapp.PageInput{
 		Name: "Order list", URL: "https://app.example.com/orders?state=open",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	if page.RouteTemplate != "/orders" {
-		t.Fatalf("route = %q", page.RouteTemplate)
+	if page.RouteTemplate != "/orders" || page.SUTID != sut.ID {
+		t.Fatalf("page = %#v", page)
 	}
-	_, err = e.svc.CreatePage(ctx, environmentID, resourceapp.PageInput{
+	_, err = e.svc.CreatePage(ctx, sutID, resourceapp.PageInput{
 		Name: "duplicate", URL: "https://app.example.com/orders?x=1",
 	}, 42)
-	apiErr := assertAPIErr(t, err, 409, "page_url_exists")
+	apiErr = assertAPIErr(t, err, 409, "page_url_exists")
 	if apiErr.Details["field"] != "url" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
+	// The same normalized URL under the twin SUT is a different page.
+	if _, err := e.svc.CreatePage(ctx, int64Of(t, twin.ID), resourceapp.PageInput{
+		Name: "Order list", URL: "https://app.example.com/orders",
+	}, 42); err != nil {
+		t.Fatalf("page uniqueness must be scoped to the SUT: %v", err)
+	}
 
-	api, err := e.svc.CreateAPI(ctx, environmentID, resourceapp.APIInput{
+	api, err := e.svc.CreateAPI(ctx, sutID, resourceapp.APIInput{
 		Method: "GET", PathTemplate: "/api/orders", Name: "List orders",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
-	_, err = e.svc.CreateAPI(ctx, environmentID, resourceapp.APIInput{
+	if api.SUTID != sut.ID {
+		t.Fatalf("api = %#v", api)
+	}
+	_, err = e.svc.CreateAPI(ctx, sutID, resourceapp.APIInput{
 		Method: "GET", PathTemplate: "/api/orders", Name: "dup",
 	}, 42)
 	assertAPIErr(t, err, 409, "conflict")
+	if _, err := e.svc.CreateAPI(ctx, int64Of(t, twin.ID), resourceapp.APIInput{
+		Method: "GET", PathTemplate: "/api/orders", Name: "List orders",
+	}, 42); err != nil {
+		t.Fatalf("api uniqueness must be scoped to the SUT: %v", err)
+	}
 
 	database, err := e.svc.CreateDatabase(ctx, sutID, resourceapp.DatabaseInput{
-		EnvironmentID: environmentID, Name: "Orders DB",
-		DSN: "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
+		Name: "Orders DB",
+		DSN:  "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
-	if !database.PasswordSet || !database.ReadOnly {
+	if !database.PasswordSet || !database.ReadOnly || database.SUTID != sut.ID {
 		t.Fatalf("database view = %#v", database)
 	}
 	_, err = e.svc.CreateDatabase(ctx, sutID, resourceapp.DatabaseInput{
-		EnvironmentID: environmentID, Name: "orders db",
-		DSN: "postgres://db.example.com:5432/other", Username: "reader",
+		Name: "orders db",
+		DSN:  "postgres://db.example.com:5432/other", Username: "reader",
 	}, 42)
 	assertAPIErr(t, err, 409, "conflict")
+	if _, err := e.svc.CreateDatabase(ctx, int64Of(t, twin.ID), resourceapp.DatabaseInput{
+		Name: "Orders DB", DSN: "postgres://db.example.com:5432/twin", Username: "reader",
+	}, 42); err != nil {
+		t.Fatalf("database name uniqueness must be scoped to the SUT: %v", err)
+	}
 
-	account, err := e.svc.CreateAccount(ctx, sutID, resourceapp.AccountInput{
-		EnvironmentID: environmentID, Username: "Order_Admin", Password: "secret",
+	account, err := e.svc.CreateAccount(ctx, resourceapp.AccountInput{
+		SUTID: &sutID, Username: "Order_Admin", Password: "secret",
 		Roles: []string{"order_admin", "auditor"},
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	if !account.PasswordSet || len(account.Roles) != 2 {
+	if !account.PasswordSet || len(account.Roles) != 2 || account.SUTID != sut.ID {
 		t.Fatalf("account = %#v", account)
 	}
-	_, err = e.svc.CreateAccount(ctx, sutID, resourceapp.AccountInput{
-		EnvironmentID: environmentID, Username: "order_admin", Password: "x",
+	// The pool stays global: the username is unique across SUTs.
+	_, err = e.svc.CreateAccount(ctx, resourceapp.AccountInput{
+		Username: "order_admin", Password: "x",
 	}, 42)
 	assertAPIErr(t, err, 409, "conflict")
 
@@ -231,11 +275,9 @@ func TestRepositoryUniquenessAndDefaultUnset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateSUT: %v", err)
 	}
-	if updated.Name != "Orders Platform" {
+	if updated.Name != "Orders Platform" || updated.EnvironmentID != environment.ID {
 		t.Fatalf("updated = %#v", updated)
 	}
-	_ = page
-	_ = api
 
 	var storedPassword string
 	if err := e.pool.QueryRow(ctx, `SELECT password FROM test_account WHERE id = $1`, int64Of(t, account.ID)).Scan(&storedPassword); err != nil {
@@ -244,14 +286,23 @@ func TestRepositoryUniquenessAndDefaultUnset(t *testing.T) {
 	if storedPassword != "secret" {
 		t.Fatalf("stored password = %q", storedPassword)
 	}
+	var storedAffinity int64
+	if err := e.pool.QueryRow(ctx, `SELECT sut_id FROM test_account WHERE id = $1`, int64Of(t, account.ID)).Scan(&storedAffinity); err != nil {
+		t.Fatalf("read account affinity: %v", err)
+	}
+	if storedAffinity != sutID {
+		t.Fatalf("stored affinity = %d, want %d", storedAffinity, sutID)
+	}
 }
 
 func TestSUTFamilyRoundTripAndClear(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 
-	created, err := e.svc.CreateSUT(ctx, resourceapp.SUTInput{
-		Name: "Order Center", Intro: "orders", Family: familyPtr("  payments  "),
+	environment := createEnvironment(t, e, "prod")
+	created, err := e.svc.CreateSUT(ctx, int64Of(t, environment.ID), resourceapp.SUTInput{
+		Name: "Order Center", Intro: "orders", BaseURL: "https://order.example.com",
+		Family: familyPtr("  payments  "),
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT: %v", err)
@@ -312,11 +363,22 @@ func TestSUTFamilyRoundTripAndClear(t *testing.T) {
 	_, err = e.svc.UpdateSUT(ctx, sutID, resourceapp.SUTPatch{Family: familyPtr("Orders")}, 42)
 	assertAPIErr(t, err, 400, "invalid_argument")
 	_, err = e.repo.CreateSUT(ctx, resource.SUT{
-		ID: 700001, Name: "Uppercase Family", Family: familyPtr("Orders"),
+		ID: 700001, EnvironmentID: int64Of(t, environment.ID), Name: "Uppercase Family",
+		BaseURL: "https://upper.example.com", Family: familyPtr("Orders"),
+		Source: resource.SUTSourceAdmin, Status: resource.SUTStatusApproved,
 		CreatedBy: 42, CreatedAt: testNow, UpdatedAt: testNow,
 	})
 	if err == nil {
 		t.Fatal("repo accepted an uppercase family")
+	}
+	// The environment FK is enforced by the database, not only by the service.
+	if _, err := e.repo.CreateSUT(ctx, resource.SUT{
+		ID: 700002, EnvironmentID: 987654321, Name: "Ghost",
+		BaseURL: "https://ghost.example.com",
+		Source:  resource.SUTSourceAdmin, Status: resource.SUTStatusApproved,
+		CreatedBy: 42, CreatedAt: testNow, UpdatedAt: testNow,
+	}); !errors.Is(err, resource.ErrNotFound) {
+		t.Fatalf("an unknown environment_id must be rejected, got %v", err)
 	}
 
 	// The empty string clears the family.
@@ -340,27 +402,27 @@ func TestRepositoryAggregationAndCatalog(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 
-	first := createSUT(t, e, "Order Center")
-	firstID := int64Of(t, first.ID)
-	prod := createEnvironment(t, e, firstID, "prod", true)
+	prod := createEnvironment(t, e, "prod")
 	prodID := int64Of(t, prod.ID)
+	first := createSUTIn(t, e, prodID, "Order Center")
+	firstID := int64Of(t, first.ID)
 
-	page, err := e.svc.CreatePage(ctx, prodID, resourceapp.PageInput{Name: "orders", URL: "https://orders.example.com/orders"}, 42)
+	page, err := e.svc.CreatePage(ctx, firstID, resourceapp.PageInput{Name: "orders", URL: "https://orders.example.com/orders"}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	api, err := e.svc.CreateAPI(ctx, prodID, resourceapp.APIInput{Method: "POST", PathTemplate: "/api/orders", Name: "Create order"}, 42)
+	api, err := e.svc.CreateAPI(ctx, firstID, resourceapp.APIInput{Method: "POST", PathTemplate: "/api/orders", Name: "Create order"}, 42)
 	if err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
 	database, err := e.svc.CreateDatabase(ctx, firstID, resourceapp.DatabaseInput{
-		EnvironmentID: prodID, Name: "orders", DSN: "postgres://db/orders", Username: "reader",
+		Name: "orders", DSN: "postgres://db/orders", Username: "reader",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
-	account, err := e.svc.CreateAccount(ctx, firstID, resourceapp.AccountInput{
-		EnvironmentID: prodID, Username: "admin", Password: "pw", Roles: []string{"admin"},
+	account, err := e.svc.CreateAccount(ctx, resourceapp.AccountInput{
+		SUTID: &firstID, Username: "admin", Password: "pw", Roles: []string{"admin"},
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
@@ -372,11 +434,19 @@ func TestRepositoryAggregationAndCatalog(t *testing.T) {
 		t.Fatalf("CreateRepository: %v", err)
 	}
 
-	second := createSUT(t, e, "Billing")
-	secondID := int64Of(t, second.ID)
-	dev := createEnvironment(t, e, secondID, "dev", false)
-	devID := int64Of(t, dev.ID)
-	if _, err := e.svc.CreatePage(ctx, devID, resourceapp.PageInput{Name: "invoices", URL: "https://billing.example.com/invoices"}, 42); err != nil {
+	// A second SUT of the same environment plus a second environment with its own
+	// SUT: the catalog is a forest of environments.
+	sibling := createSUTIn(t, e, prodID, "Billing")
+	if _, err := e.svc.CreatePage(ctx, int64Of(t, sibling.ID), resourceapp.PageInput{
+		Name: "invoices", URL: "https://billing.example.com/invoices",
+	}, 42); err != nil {
+		t.Fatalf("CreatePage sibling: %v", err)
+	}
+	dev := createEnvironment(t, e, "dev")
+	second := createSUTIn(t, e, int64Of(t, dev.ID), "Shipping")
+	if _, err := e.svc.CreatePage(ctx, int64Of(t, second.ID), resourceapp.PageInput{
+		Name: "shipments", URL: "https://shipping.example.com/shipments",
+	}, 42); err != nil {
 		t.Fatalf("CreatePage second: %v", err)
 	}
 
@@ -384,24 +454,83 @@ func TestRepositoryAggregationAndCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSUT: %v", err)
 	}
-	if len(detail.Environments) != 1 {
-		t.Fatalf("environments = %#v", detail.Environments)
+	if detail.EnvironmentID != prod.ID || detail.BaseURL != testBaseURL("Order Center") {
+		t.Fatalf("sut hierarchy = %#v", detail)
 	}
-	nested := detail.Environments[0]
-	if len(nested.Pages) != 1 || len(nested.APIs) != 1 || len(nested.Databases) != 1 || len(nested.Accounts) != 1 {
-		t.Fatalf("nested = %#v", nested)
+	if len(detail.Pages) != 1 || len(detail.APIs) != 1 || len(detail.Databases) != 1 {
+		t.Fatalf("nested = %#v", detail)
 	}
-	if nested.Pages[0].ID != page.ID || nested.APIs[0].ID != api.ID ||
-		nested.Databases[0].ID != database.ID || nested.Accounts[0].ID != account.ID {
-		t.Fatalf("nested ids = %#v", nested)
+	if detail.Pages[0].ID != page.ID || detail.APIs[0].ID != api.ID || detail.Databases[0].ID != database.ID {
+		t.Fatalf("nested ids = %#v", detail)
 	}
 
 	environment, err := e.svc.GetEnvironment(ctx, prodID)
 	if err != nil {
 		t.Fatalf("GetEnvironment: %v", err)
 	}
-	if len(environment.Pages) != 1 || len(environment.Accounts) != 1 {
-		t.Fatalf("environment = %#v", environment)
+	if len(environment.SUTs) != 2 {
+		t.Fatalf("environment suts = %#v", environment.SUTs)
+	}
+	if len(environment.SUTs[0].Pages) != 1 || len(environment.SUTs[1].Pages) != 1 {
+		t.Fatalf("environment nested assets = %#v", environment.SUTs)
+	}
+
+	// The environment code pool is the union of its SUTs' repositories (GD-03).
+	if _, err := e.svc.AddSUTRepository(ctx, firstID, resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, repository.ID), Role: "backend",
+	}, 42); err != nil {
+		t.Fatalf("AddSUTRepository first: %v", err)
+	}
+	secondRepo, err := e.svc.CreateRepository(ctx, resourceapp.RepositoryInput{
+		Name: "billing", Path: "https://git.example.com/billing.git",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateRepository second: %v", err)
+	}
+	if _, err := e.svc.AddSUTRepository(ctx, int64Of(t, sibling.ID), resourceapp.SUTRepositoryInput{
+		RepositoryID: int64Of(t, secondRepo.ID),
+	}, 42); err != nil {
+		t.Fatalf("AddSUTRepository sibling: %v", err)
+	}
+	pool_, err := e.svc.ListEnvironmentRepositories(ctx, prodID)
+	if err != nil {
+		t.Fatalf("ListEnvironmentRepositories: %v", err)
+	}
+	if len(pool_) != 2 || pool_[0].Repository.ID != repository.ID || pool_[1].Repository.ID != secondRepo.ID {
+		t.Fatalf("environment code pool = %#v", pool_)
+	}
+	if pool_[0].SUTID != first.ID || pool_[1].SUTID != sibling.ID {
+		t.Fatalf("pool ownership = %#v", pool_)
+	}
+	emptyPool, err := e.svc.ListEnvironmentRepositories(ctx, int64Of(t, dev.ID))
+	if err != nil {
+		t.Fatalf("ListEnvironmentRepositories dev: %v", err)
+	}
+	if len(emptyPool) != 0 {
+		t.Fatalf("dev pool = %#v", emptyPool)
+	}
+
+	// The baseline write path round-trips through the same column codeintel and
+	// the version binding resolution share.
+	const commit = "0123456789abcdef0123456789abcdef01234567"
+	if err := e.svc.SetSUTRepositoryBaselineCommit(ctx, firstID, int64Of(t, repository.ID), commit); err != nil {
+		t.Fatalf("SetSUTRepositoryBaselineCommit: %v", err)
+	}
+	pool_, err = e.svc.ListEnvironmentRepositories(ctx, prodID)
+	if err != nil {
+		t.Fatalf("ListEnvironmentRepositories after baseline: %v", err)
+	}
+	if pool_[0].CodeBaselineCommit != commit || pool_[1].CodeBaselineCommit != "" {
+		t.Fatalf("baselines = %#v", pool_)
+	}
+	var storedCommit *string
+	if err := e.pool.QueryRow(ctx, `
+		SELECT code_baseline_commit FROM sut_repository WHERE sut_id = $1 AND repo_id = $2
+	`, firstID, int64Of(t, repository.ID)).Scan(&storedCommit); err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	if storedCommit == nil || *storedCommit != commit {
+		t.Fatalf("stored baseline = %v", storedCommit)
 	}
 
 	repoView, err := e.svc.GetRepository(ctx, int64Of(t, repository.ID))
@@ -416,15 +545,44 @@ func TestRepositoryAggregationAndCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Catalog: %v", err)
 	}
-	if len(catalog) != 2 || catalog[0].ID != first.ID || catalog[1].ID != second.ID {
+	if len(catalog) != 2 || catalog[0].ID != prod.ID || catalog[1].ID != dev.ID {
 		t.Fatalf("catalog = %#v", catalog)
 	}
-	if len(catalog[1].Environments) != 1 || catalog[1].Environments[0].Pages[0].RouteTemplate != "/invoices" {
+	if len(catalog[0].SUTs) != 2 || len(catalog[1].SUTs) != 1 {
+		t.Fatalf("catalog suts = %#v", catalog)
+	}
+	if catalog[1].SUTs[0].Pages[0].RouteTemplate != "/shipments" {
 		t.Fatalf("catalog second = %#v", catalog[1])
+	}
+
+	accounts, err := e.svc.ListAllAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAllAccounts: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ID != account.ID {
+		t.Fatalf("accounts = %#v", accounts)
+	}
+
+	assets, err := e.svc.ListAssetsBySUT(ctx, firstID)
+	if err != nil {
+		t.Fatalf("ListAssetsBySUT: %v", err)
+	}
+	if len(assets.Pages) != 1 || len(assets.APIs) != 1 || len(assets.Databases) != 1 {
+		t.Fatalf("assets = %#v", assets)
+	}
+	suts, err := e.svc.ListSUTsByEnvironment(ctx, prodID)
+	if err != nil {
+		t.Fatalf("ListSUTsByEnvironment: %v", err)
+	}
+	if len(suts) != 2 || suts[0].ID != first.ID || suts[1].ID != sibling.ID {
+		t.Fatalf("suts by environment = %#v", suts)
 	}
 
 	if _, err := e.repo.GetSUT(ctx, 123456789); !errors.Is(err, resource.ErrNotFound) {
 		t.Fatalf("missing SUT error = %v", err)
+	}
+	if _, err := e.repo.GetEnvironment(ctx, 123456789); !errors.Is(err, resource.ErrNotFound) {
+		t.Fatalf("missing environment error = %v", err)
 	}
 }
 
@@ -432,15 +590,15 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 
-	sut := createSUT(t, e, "Order Center")
-	sutID := int64Of(t, sut.ID)
-	environment := createEnvironment(t, e, sutID, "prod", true)
+	environment := createEnvironment(t, e, "prod")
 	environmentID := int64Of(t, environment.ID)
-	if _, err := e.svc.CreatePage(ctx, environmentID, resourceapp.PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
+	sut := createSUTIn(t, e, environmentID, "Order Center")
+	sutID := int64Of(t, sut.ID)
+	if _, err := e.svc.CreatePage(ctx, sutID, resourceapp.PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
 
-	pages, err := e.svc.ImportPages(ctx, environmentID, []resourceapp.PageInput{
+	pages, err := e.svc.ImportPages(ctx, sutID, []resourceapp.PageInput{
 		{Name: "orders again", URL: "https://app.example.com/orders"},
 		{Name: "users", URL: "https://app.example.com/users"},
 		{Name: "users again", URL: "https://app.example.com/users?x=1"},
@@ -453,10 +611,10 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 		t.Fatalf("import pages = %#v", pages)
 	}
 
-	if _, err := e.svc.CreateAPI(ctx, environmentID, resourceapp.APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
+	if _, err := e.svc.CreateAPI(ctx, sutID, resourceapp.APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
-	apis, err := e.svc.ImportAPIs(ctx, environmentID, []resourceapp.APIInput{
+	apis, err := e.svc.ImportAPIs(ctx, sutID, []resourceapp.APIInput{
 		{Method: "GET", PathTemplate: "/api/orders", Name: "orders again"},
 		{Method: "POST", PathTemplate: "/api/orders", Name: "create"},
 		{Method: "POST", PathTemplate: "/api/orders", Name: "create again"},
@@ -469,7 +627,7 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 		t.Fatalf("import apis = %#v", apis)
 	}
 
-	_, err = e.svc.ImportPages(ctx, environmentID, []resourceapp.PageInput{
+	_, err = e.svc.ImportPages(ctx, sutID, []resourceapp.PageInput{
 		{Name: "valid", URL: "https://app.example.com/valid"},
 		{Name: "invalid", URL: "not-a-url"},
 	}, 42)
@@ -478,7 +636,7 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 	var pageCount int
-	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE environment_id = $1`, environmentID).Scan(&pageCount); err != nil {
+	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE sut_id = $1`, sutID).Scan(&pageCount); err != nil {
 		t.Fatalf("count pages: %v", err)
 	}
 	if pageCount != 3 {
@@ -486,12 +644,12 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 	}
 
 	if _, err := e.svc.CreateDatabase(ctx, sutID, resourceapp.DatabaseInput{
-		EnvironmentID: environmentID, Name: "orders", DSN: "postgres://db/orders", Username: "reader",
+		Name: "orders", DSN: "postgres://db/orders", Username: "reader",
 	}, 42); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
-	if _, err := e.svc.CreateAccount(ctx, sutID, resourceapp.AccountInput{
-		EnvironmentID: environmentID, Username: "admin", Password: "pw",
+	if _, err := e.svc.CreateAccount(ctx, resourceapp.AccountInput{
+		SUTID: &sutID, Username: "admin", Password: "pw",
 	}, 42); err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
@@ -501,22 +659,39 @@ func TestRepositoryImportSkipsAndCascade(t *testing.T) {
 		t.Fatal("delete of in-use SUT succeeded")
 	}
 	e.usage.inUse["sut"] = false
-	if err := e.svc.DeleteEnvironment(ctx, environmentID, 42); err != nil {
-		t.Fatalf("DeleteEnvironment: %v", err)
-	}
-	var environments int
-	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut_environment WHERE sut_id = $1`, sutID).Scan(&environments); err != nil {
-		t.Fatalf("count environments: %v", err)
-	}
-	if environments != 0 {
-		t.Fatalf("environments = %d", environments)
-	}
-
 	if err := e.svc.DeleteSUT(ctx, sutID, 42); err != nil {
 		t.Fatalf("DeleteSUT: %v", err)
 	}
 	if _, err := e.repo.GetSUT(ctx, sutID); !errors.Is(err, resource.ErrNotFound) {
 		t.Fatalf("deleted SUT error = %v", err)
+	}
+	var assets int
+	if err := e.pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM sut_page) + (SELECT count(*) FROM sut_api)
+		     + (SELECT count(*) FROM target_database)
+	`).Scan(&assets); err != nil {
+		t.Fatalf("count assets: %v", err)
+	}
+	if assets != 0 {
+		t.Fatalf("deleting the SUT left %d asset rows", assets)
+	}
+	// The account pool is global: deleting a SUT clears the affinity instead of
+	// deleting the credential.
+	var affinity *int64
+	if err := e.pool.QueryRow(ctx, `SELECT sut_id FROM test_account WHERE username = 'admin'`).Scan(&affinity); err != nil {
+		t.Fatalf("read account affinity: %v", err)
+	}
+	if affinity != nil {
+		t.Fatalf("affinity = %d, want NULL after the SUT was deleted", *affinity)
+	}
+
+	// Deleting the environment cascades its SUTs.
+	sibling := createSUTIn(t, e, environmentID, "Billing")
+	if err := e.svc.DeleteEnvironment(ctx, environmentID, 42); err != nil {
+		t.Fatalf("DeleteEnvironment: %v", err)
+	}
+	if _, err := e.repo.GetSUT(ctx, int64Of(t, sibling.ID)); !errors.Is(err, resource.ErrNotFound) {
+		t.Fatalf("the environment cascade must remove its SUTs, got %v", err)
 	}
 	var suts int
 	if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM sut`).Scan(&suts); err != nil {
@@ -541,7 +716,7 @@ func TestRepositoryPagination(t *testing.T) {
 	if len(first) != 2 || !hasMore {
 		t.Fatalf("first = %#v, hasMore = %v", first, hasMore)
 	}
-	if first[0].ID != "1005" || first[1].ID != "1004" {
+	if first[0].ID != "1014" || first[1].ID != "1011" {
 		t.Fatalf("first page = %#v", first)
 	}
 	before := int64Of(t, first[1].ID)
@@ -549,7 +724,7 @@ func TestRepositoryPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListSUTs page 2: %v", err)
 	}
-	if len(second) != 2 || !hasMore || second[0].ID != "1003" {
+	if len(second) != 2 || !hasMore || second[0].ID != "1008" {
 		t.Fatalf("second = %#v, hasMore = %v", second, hasMore)
 	}
 
@@ -564,7 +739,7 @@ func TestRepositoryPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepositories: %v", err)
 	}
-	if len(repos) != 2 || !hasMore || repos[0].ID != "1008" || repos[1].ID != "1007" {
+	if len(repos) != 2 || !hasMore || repos[0].ID != "1018" || repos[1].ID != "1017" {
 		t.Fatalf("repos = %#v, hasMore = %v", repos, hasMore)
 	}
 	before = int64Of(t, repos[1].ID)
@@ -572,7 +747,7 @@ func TestRepositoryPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepositories page 2: %v", err)
 	}
-	if len(last) != 1 || hasMore || last[0].ID != "1006" {
+	if len(last) != 1 || hasMore || last[0].ID != "1016" {
 		t.Fatalf("last = %#v, hasMore = %v", last, hasMore)
 	}
 }
@@ -582,11 +757,9 @@ func TestRepositoryPasswordNeverLeaksInViews(t *testing.T) {
 	ctx := context.Background()
 	sut := createSUT(t, e, "Order Center")
 	sutID := int64Of(t, sut.ID)
-	environment := createEnvironment(t, e, sutID, "prod", true)
-	environmentID := int64Of(t, environment.ID)
 
 	database, err := e.svc.CreateDatabase(ctx, sutID, resourceapp.DatabaseInput{
-		EnvironmentID: environmentID, Name: "orders", DSN: "postgres://db/orders",
+		Name: "orders", DSN: "postgres://db/orders",
 		Username: "reader", Password: "db-secret",
 	}, 42)
 	if err != nil {
@@ -595,8 +768,8 @@ func TestRepositoryPasswordNeverLeaksInViews(t *testing.T) {
 	if !database.PasswordSet {
 		t.Fatal("password_set = false")
 	}
-	account, err := e.svc.CreateAccount(ctx, sutID, resourceapp.AccountInput{
-		EnvironmentID: environmentID, Username: "admin", Password: "acct-secret",
+	account, err := e.svc.CreateAccount(ctx, resourceapp.AccountInput{
+		SUTID: &sutID, Username: "admin", Password: "acct-secret",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)

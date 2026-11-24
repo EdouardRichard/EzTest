@@ -25,41 +25,46 @@ type RequirementGraphView struct {
 	Title                string
 	Status               string
 	DesignStatus         string
-	TargetVersionSUTIDs  []int64
 	Scenarios            []ScenarioGraphView
 }
 
 // ScenarioGraphView is one scenario node.
+//
+// v0.2.4-B (§3.2): the resource ID arrays are gone with the scenario fields
+// they projected.
 type ScenarioGraphView struct {
 	ID                   int64
 	RequirementVersionID int64
 	Name                 string
 	Description          string
-	VersionSUTIDs        []int64
-	PageIDs              []int64
-	APIIDs               []int64
 	SortOrder            int
 	Cases                []CaseCardView
 }
 
 // CaseCardView is one case card of the design graph.
+//
+// v0.2.4-B (§3.2/§5.2): the card names the system under test in prose and lists
+// the acceptance criteria the case covers, instead of default/version SUT and
+// page/API ids.
 type CaseCardView struct {
-	CaseID              int64
-	CurrentVersionID    int64
-	Revision            int
-	Title               string
-	Priority            string
-	Status              string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	StepCount           int
-	AssertionCount      int
+	CaseID           int64
+	CurrentVersionID int64
+	Revision         int
+	Title            string
+	Priority         string
+	Status           string
+	SutDescription   string
+	CoveredACs       []string
+	StepCount        int
+	AssertionCount   int
 	// ExecutionVerdict is the latest execution result of the current case
 	// version (spec §9.3); a case without an execution is inconclusive.
 	ExecutionVerdict string
-	CreatedAt        time.Time
+	// ReviewState is the judge review projection of the current case version
+	// (spec SC-E5, T16); empty when the judgment gate is not wired or its read
+	// fails -- a read-projection gap, never a fabricated verdict.
+	ReviewState design.ReviewState
+	CreatedAt   time.Time
 }
 
 // GraphView is the full version design graph snapshot.
@@ -85,26 +90,23 @@ type CaseVersionSummaryView struct {
 
 // CaseStepView is one step of a selected case version.
 type CaseStepView struct {
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetPageID       *int64
-	TargetAPIID        *int64
-	AccountRole        string
-	Data               json.RawMessage
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              json.RawMessage
 }
 
-// CaseAssertionView is one assertion of a selected case version.
+// CaseAssertionView is one assertion of a selected case version. SUTID is the
+// SUT a kind=db assertion reads (v0.2.4-B §3.2, renamed from database_id).
 type CaseAssertionView struct {
-	ID                 int64
-	StepSeq            int
-	Kind               string
-	Target             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetAPIID        *int64
-	DatabaseID         *int64
+	ID       int64
+	StepSeq  int
+	Kind     string
+	Target   string
+	Expected string
+	SUTID    *int64
 }
 
 // CaseSourceView is one provenance row of a selected case version.
@@ -118,23 +120,21 @@ type CaseSourceView struct {
 
 // CaseVersionDetailView is the selected immutable case version.
 type CaseVersionDetailView struct {
-	CaseVersionID       int64
-	Revision            int
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	Status              string
-	ContentHash         string
-	CreatedAt           time.Time
-	Steps               []CaseStepView
-	Assertions          []CaseAssertionView
-	Sources             []CaseSourceView
+	CaseVersionID  int64
+	Revision       int
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Status         string
+	ContentHash    string
+	CreatedAt      time.Time
+	Steps          []CaseStepView
+	Assertions     []CaseAssertionView
+	Sources        []CaseSourceView
 }
 
 // CaseDetailView is the case detail read model.
@@ -149,6 +149,11 @@ type CaseDetailView struct {
 	Versions             []CaseVersionSummaryView
 	Selected             CaseVersionDetailView
 	Confirmable          bool
+	// ReviewState is the judge review projection of the CURRENT case version
+	// (spec SC-E5, T16) -- always the current version, even when Selected is a
+	// historical revision; empty when the judgment gate is unwired/unreadable
+	// or the case has no current version.
+	ReviewState design.ReviewState
 }
 
 // RoundView is one design round projection.
@@ -172,6 +177,25 @@ type OverviewView struct {
 	ActiveRound               *RoundView
 }
 
+// JudgmentCaseJudgmentView is one case's entry in the judgment read report
+// (T16, spec SC-E5): its current version, the single-authority review_state
+// projection, and the latest judge fact bound to that exact version (nil when
+// the case has not been judged yet, or only a stale verdict exists).
+type JudgmentCaseJudgmentView struct {
+	CaseID           int64
+	CurrentVersionID int64
+	ReviewState      design.ReviewState
+	Judgment         *design.Judgment
+}
+
+// JudgmentReportView is the read-only judgment report of a version, optionally
+// narrowed to one requirement (T16). Cases enumerates every current case of
+// the version (or requirement) -- not only the judged ones -- so the report
+// doubles as the case_review/designing review-state view.
+type JudgmentReportView struct {
+	Cases []JudgmentCaseJudgmentView
+}
+
 // ProposeInput is one case.graph_propose payload.
 type ProposeInput struct {
 	RequirementID        int64
@@ -183,33 +207,31 @@ type ProposeInput struct {
 
 // ScenarioInput is one submitted scenario node.
 type ScenarioInput struct {
-	Ref           string
-	ID            *int64
-	Name          string
-	Description   string
-	VersionSUTIDs []int64
-	PageIDs       []int64
-	APIIDs        []int64
-	SortOrder     int
+	Ref         string
+	ID          *int64
+	Name        string
+	Description string
+	SortOrder   int
 }
 
 // CaseInput is one submitted logical case.
+//
+// v0.2.4-B (§5.2): SutDescription, Preconditions and CoveredACs are required
+// contract elements; ValidateProposal rejects a proposal missing any of them.
 type CaseInput struct {
-	Ref                 string
-	ID                  *int64
-	ScenarioRef         string
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	Steps               []StepInput
-	Assertions          []AssertionInput
-	Sources             []SourceInput
+	Ref            string
+	ID             *int64
+	ScenarioRef    string
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Steps          []StepInput
+	Assertions     []AssertionInput
+	Sources        []SourceInput
 	// Trigger/SourceObservationID/AutoConfirmedBy/RollbackOf carry the
 	// discovery/rollback provenance of a programmatic proposal (spec DB-30).
 	// A zero Trigger means the normal manual propose.
@@ -221,25 +243,22 @@ type CaseInput struct {
 
 // StepInput is one submitted step.
 type StepInput struct {
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetPageID       *int64
-	TargetAPIID        *int64
-	AccountRole        string
-	Data               json.RawMessage
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              json.RawMessage
 }
 
-// AssertionInput is one submitted assertion.
+// AssertionInput is one submitted assertion. SUTID is required for kind=db and
+// ignored otherwise.
 type AssertionInput struct {
-	StepSeq            int
-	Kind               string
-	Target             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetAPIID        *int64
-	DatabaseID         *int64
+	StepSeq  int
+	Kind     string
+	Target   string
+	Expected string
+	SUTID    *int64
 }
 
 // SourceInput is one submitted provenance row.
@@ -270,17 +289,15 @@ func toDomainProposal(in ProposeInput) design.Proposal {
 	for _, scenario := range in.Scenarios {
 		proposal.Scenarios = append(proposal.Scenarios, design.ScenarioProposal{
 			Ref: scenario.Ref, ID: scenario.ID, Name: scenario.Name,
-			Description: scenario.Description, VersionSUTIDs: scenario.VersionSUTIDs,
-			PageIDs: scenario.PageIDs, APIIDs: scenario.APIIDs, SortOrder: scenario.SortOrder,
+			Description: scenario.Description, SortOrder: scenario.SortOrder,
 		})
 	}
 	for _, item := range in.Cases {
 		proposalCase := design.CaseProposal{
 			Ref: item.Ref, ID: item.ID, ScenarioRef: item.ScenarioRef, Title: item.Title,
-			Description: item.Description, Preconditions: item.Preconditions,
+			Description: item.Description, SutDescription: item.SutDescription,
+			Preconditions: item.Preconditions, CoveredACs: item.CoveredACs,
 			TestData: item.TestData, Priority: item.Priority,
-			DefaultVersionSUTID: item.DefaultVersionSUTID, VersionSUTIDs: item.VersionSUTIDs,
-			PageIDs: item.PageIDs, APIIDs: item.APIIDs,
 			Steps:      make([]design.StepProposal, 0, len(item.Steps)),
 			Assertions: make([]design.AssertionProposal, 0, len(item.Assertions)),
 			Sources:    make([]design.SourceProposal, 0, len(item.Sources)),
@@ -288,15 +305,14 @@ func toDomainProposal(in ProposeInput) design.Proposal {
 		for _, step := range item.Steps {
 			proposalCase.Steps = append(proposalCase.Steps, design.StepProposal{
 				Seq: step.Seq, Action: step.Action, Expected: step.Expected,
-				TargetVersionSUTID: step.TargetVersionSUTID, TargetPageID: step.TargetPageID,
-				TargetAPIID: step.TargetAPIID, AccountRole: step.AccountRole, Data: step.Data,
+				TargetDescription: step.TargetDescription,
+				AccountRole:       step.AccountRole, Data: step.Data,
 			})
 		}
 		for _, assertion := range item.Assertions {
 			proposalCase.Assertions = append(proposalCase.Assertions, design.AssertionProposal{
 				StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
-				Expected: assertion.Expected, TargetVersionSUTID: assertion.TargetVersionSUTID,
-				TargetAPIID: assertion.TargetAPIID, DatabaseID: assertion.DatabaseID,
+				Expected: assertion.Expected, SUTID: assertion.SUTID,
 			})
 		}
 		for _, source := range item.Sources {

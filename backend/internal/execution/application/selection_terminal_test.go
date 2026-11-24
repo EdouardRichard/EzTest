@@ -206,8 +206,8 @@ func finishRunningRuns(t *testing.T, f *task6Fixture, waveID int64) {
 		run.Status = execution.CaseRunPassed
 		run.FailureClass = ""
 		run.Summary = execution.CaseRunSummary{VerdictReason: execution.VerdictReasonPassed}
-		if ok, err := f.runs.Update(context.Background(), run); err != nil || !ok {
-			t.Fatalf("finish run %d: ok=%v err=%v", run.ID, ok, err)
-		}
+		// Fixture seeding of a terminal state: the production Update primitive
+		// refuses terminal transitions (V-0022 single terminal entry).
+		f.runs.byID[run.ID] = run
 	}
 }

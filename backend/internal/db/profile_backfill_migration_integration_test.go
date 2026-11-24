@@ -12,8 +12,9 @@ import (
 
 // TestAgentProfileSeedVersionMigrationUpgradesLegacyRows replays a pre-v0.2.3
 // database (migrations 1..64), inserts the five retired profiles the v0.22
-// model dropped, then applies the 65th migration. It asserts the upgrade keeps
-// the rows (audit/history), disables them, and leaves seed_version at 0 for the
+// model dropped, then applies the pending migration tail (derived from
+// order.txt: agent_0009 onwards). It asserts the upgrade keeps the rows
+// (audit/history), disables them, and leaves seed_version at 0 for the
 // startup profile backfill.
 func TestAgentProfileSeedVersionMigrationUpgradesLegacyRows(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
@@ -67,8 +68,19 @@ func TestAgentProfileSeedVersionMigrationUpgradesLegacyRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 1 || applied[0] != "agent_0009_profile_seed_version.sql" {
-		t.Fatalf("applied = %v, want only agent_0009_profile_seed_version.sql", applied)
+	// Everything after the replayed prefix is pending: agent_0009 plus any
+	// migrations appended since (derived from order.txt, not hardcoded).
+	want := orderedMigrationNames(t)[through:]
+	if len(applied) != len(want) {
+		t.Fatalf("applied = %v, want %v", applied, want)
+	}
+	for i := range want {
+		if applied[i] != want[i] {
+			t.Fatalf("applied = %v, want %v", applied, want)
+		}
+	}
+	if applied[0] != "agent_0009_profile_seed_version.sql" {
+		t.Fatalf("first pending migration = %q, want agent_0009_profile_seed_version.sql", applied[0])
 	}
 
 	for _, key := range retired {

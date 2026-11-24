@@ -15,17 +15,8 @@ import (
 // (the delivery repositories cap a page at 100).
 const deliveryPageSize = 100
 
-// Report ref kinds that are not exposed as delivery-domain constants (the
-// delivery constants cover the issue ref kinds only). They mirror the
-// delivery_report_ref kind check of the P4 migration.
-const (
-	reportRefKindIssue      = "issue"
-	reportRefKindCaseRun    = "case_run"
-	reportRefKindVersionSUT = "version_sut"
-)
-
 // IssueReader is the delivery application issue read surface: the list page
-// plus the issue's logical refs (case_run/wave/requirement/version_sut).
+// plus the issue's logical refs (case_run/wave/requirement/sut).
 type IssueReader interface {
 	List(ctx context.Context, versionID int64, f deliveryapp.IssueFilter) ([]delivery.Issue, error)
 	ListRefs(ctx context.Context, issueID int64) ([]delivery.IssueRef, error)
@@ -155,8 +146,8 @@ func issueNode(issue delivery.Issue, refs []delivery.IssueRef) chain.Node {
 		case delivery.IssueRefKindEvidence:
 			evidenceCount++
 		}
-		if ref.VersionSUTID != nil {
-			sutIDs = append(sutIDs, *ref.VersionSUTID)
+		if ref.SUTID != nil {
+			sutIDs = append(sutIDs, *ref.SUTID)
 		}
 		refRows = append(refRows, map[string]any{
 			"kind":   ref.Kind,
@@ -164,9 +155,9 @@ func issueNode(issue delivery.Issue, refs []delivery.IssueRef) chain.Node {
 		})
 	}
 	node.Meta["evidence_count"] = evidenceCount
-	node.VersionSUTIDs = sortUniqueIDs(sutIDs)
-	if len(node.VersionSUTIDs) == 1 {
-		node.VersionSUTID = int64Ptr(node.VersionSUTIDs[0])
+	node.SUTIDs = sortUniqueIDs(sutIDs)
+	if len(node.SUTIDs) == 1 {
+		node.SUTID = int64Ptr(node.SUTIDs[0])
 	}
 	if len(refRows) > 0 {
 		node.Meta["refs"] = refRows
@@ -245,11 +236,11 @@ func reportNode(report delivery.Report, refs []delivery.ReportRef, revisions []d
 	refRows := make([]map[string]any, 0, len(refs))
 	for _, ref := range refs {
 		switch ref.Kind {
-		case reportRefKindIssue:
+		case delivery.ReportRefKindIssue:
 			issueIDs = append(issueIDs, ref.RefID)
-		case reportRefKindCaseRun:
+		case delivery.ReportRefKindCaseRun:
 			caseRunIDs = append(caseRunIDs, ref.RefID)
-		case reportRefKindVersionSUT:
+		case delivery.ReportRefKindSUT:
 			sutIDs = append(sutIDs, ref.RefID)
 		}
 		refRows = append(refRows, map[string]any{
@@ -277,9 +268,9 @@ func reportNode(report delivery.Report, refs []delivery.ReportRef, revisions []d
 		node.Meta["case_run_ids"] = sortUniqueIDs(caseRunIDs)
 	}
 	if len(sutIDs) > 0 {
-		node.VersionSUTIDs = sortUniqueIDs(sutIDs)
-		if len(node.VersionSUTIDs) == 1 {
-			node.VersionSUTID = int64Ptr(node.VersionSUTIDs[0])
+		node.SUTIDs = sortUniqueIDs(sutIDs)
+		if len(node.SUTIDs) == 1 {
+			node.SUTID = int64Ptr(node.SUTIDs[0])
 		}
 	}
 	if len(refRows) > 0 {

@@ -285,7 +285,7 @@ func TestProfileAdminList(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	if len(views) != 11 {
-		t.Fatalf("views = %d, want 11 (1 clarification Host + 3 design + 3 execution + 3 delivery/steward + 1 knowledge_curator)", len(views))
+		t.Fatalf("views = %d, want 11 (1 clarification Host + 3 design + 3 execution + 2 delivery + 1 knowledge_curator + 1 design_judge; GD-17 removed version_steward)", len(views))
 	}
 	host := findProfileView(t, views, agentapp.ProfileKeyClarificationHost)
 	if host.ID == 0 || host.Key != agentapp.ProfileKeyClarificationHost {
@@ -411,6 +411,47 @@ func TestProfileAdminPatchClearsModel(t *testing.T) {
 	}
 }
 
+// TestProfileAdminPatchJudgeModelRejected pins the T13 fix-round-1 single
+// authority: the design.judge_model SETTING owns the design_judge model
+// (wireJudgeModel applies it at assembly), so an admin Model PATCH on
+// design_judge is a competing write path and is rejected with a 400 field error
+// naming the setting. Other profiles' Model PATCH and design_judge non-model
+// PATCH are unaffected.
+func TestProfileAdminPatchJudgeModelRejected(t *testing.T) {
+	service, repo, _, _ := newProfileAdminService(t)
+	model := "deepseek-flash"
+	for _, input := range []agentapp.PatchInput{
+		{SetModel: true, Model: &model},
+		{SetModel: true, Model: nil},
+	} {
+		_, _, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyDesignJudge, input)
+		if err == nil {
+			t.Fatal("design_judge Model PATCH must be rejected")
+		}
+		apiErr := platform.AsError(err)
+		if apiErr.Status != 400 || apiErr.Details["field"] != "model" {
+			t.Fatalf("err = %#v, want 400 field=model", apiErr)
+		}
+		if !strings.Contains(apiErr.Message, "design.judge_model") {
+			t.Fatalf("error must name the design.judge_model setting: %q", apiErr.Message)
+		}
+		if repo.updateCalls != 0 {
+			t.Fatalf("rejected PATCH must not write, update calls = %d", repo.updateCalls)
+		}
+	}
+	// A non-model design_judge PATCH still works (only the model field is owned
+	// by the setting).
+	budgets := agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600}
+	if _, _, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyDesignJudge, agentapp.PatchInput{Budgets: &budgets}); err != nil {
+		t.Fatalf("design_judge budgets PATCH: %v", err)
+	}
+	// Other profiles keep the admin Model PATCH surface.
+	view, changed, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyCaseExecutor, agentapp.PatchInput{SetModel: true, Model: &model})
+	if err != nil || !changed || view.Model == nil || *view.Model != model {
+		t.Fatalf("other-profile Model PATCH = %v/%v/%#v", err, changed, view.Model)
+	}
+}
+
 func TestProfileAdminPatchValidation(t *testing.T) {
 	service, repo, _, _ := newProfileAdminService(t)
 	unknownModel := "not-a-model"
@@ -507,6 +548,63 @@ func TestProfileAdminPatchRejectsToolOutsideRoleWhitelist(t *testing.T) {
 	}
 	if len(audit.events) != 2 || audit.events[1].Action != agentapp.ActionProfileUpdated {
 		t.Fatalf("audit after allowed edit = %#v", audit.events)
+	}
+}
+
+// TestProfileAdminPatchAcceptsDomainWildcard pins Ruling T11-A (v0.2.4-C T13):
+// the admin editor accepts "namespace.*" capability-domain entries when the
+// namespace has registered members, rejects unknown/empty domains, and still
+// enforces the role whitelist for role-scoped profiles.
+func TestProfileAdminPatchAcceptsDomainWildcard(t *testing.T) {
+	repo := newFakeProfileAdminRepo(t)
+	audit := &fakeProfileAudit{}
+	registry := tools.NewRegistry(
+		stubProfileTool{name: tools.ToolContextTaskPack},
+		stubProfileTool{name: tools.ToolExecRun},
+		stubProfileTool{name: tools.ToolShellRead},
+	)
+	service := agentapp.NewProfileAdminService(repo, registry, nil, audit)
+
+	// case_executor is unmapped: its profile whitelist is the only surface, and
+	// a domain wildcard whose namespace exists in the registry is a legal entry.
+	wildcards := []string{"exec.*", "shell.*", tools.ToolContextTaskPack}
+	view, changed, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyCaseExecutor,
+		agentapp.PatchInput{AllowedTools: &wildcards})
+	if err != nil {
+		t.Fatalf("domain wildcard Patch: %v", err)
+	}
+	if !changed || !sameStrings(view.AllowedTools, wildcards) {
+		t.Fatalf("wildcard view = %#v changed=%v, want %v", view, changed, wildcards)
+	}
+	if !sameStrings(repo.profiles[agentapp.ProfileKeyCaseExecutor].AllowedTools, wildcards) {
+		t.Fatalf("stored wildcard tools = %v", repo.profiles[agentapp.ProfileKeyCaseExecutor].AllowedTools)
+	}
+
+	// An unknown domain and the empty domain are typed 400s on allowed_tools.
+	for _, bad := range [][]string{{"bogus.*"}, {".*"}, {"exec.*", "bogus.*"}} {
+		_, _, err := service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyCaseExecutor,
+			agentapp.PatchInput{AllowedTools: &bad})
+		if err == nil {
+			t.Fatalf("Patch accepted unknown domain %v", bad)
+		}
+		apiErr := platform.AsError(err)
+		if apiErr.Status != 400 || apiErr.Details["field"] != "allowed_tools" {
+			t.Fatalf("unknown domain error = %#v", apiErr)
+		}
+	}
+
+	// A role-scoped profile may not widen itself with a wildcard outside its
+	// role: exec.* is registered but outside the assistant whitelist.
+	denied := []string{"exec.*"}
+	_, _, err = service.Patch(context.Background(), adminActor(), agentapp.ProfileKeyClarificationHost,
+		agentapp.PatchInput{AllowedTools: &denied})
+	if err == nil {
+		t.Fatal("Patch accepted a domain wildcard outside the role whitelist")
+	}
+	apiErr := platform.AsError(err)
+	if apiErr.Status != 400 || apiErr.Details["field"] != "allowed_tools" ||
+		apiErr.Details["reason"] != "role_whitelist" || apiErr.Details["tool"] != "exec.*" {
+		t.Fatalf("role wildcard denial details = %#v", apiErr.Details)
 	}
 }
 
@@ -807,6 +905,14 @@ func TestAdminCatalogRegistryCoversV022ProfileTools(t *testing.T) {
 	catalog := tools.AdminCatalogRegistry()
 	for _, names := range agentapp.V022ProfileTools() {
 		for _, name := range names {
+			// A capability-domain wildcard is covered when its namespace has
+			// registered members (the same rule validateAllowedTools applies).
+			if domain, wildcard := strings.CutSuffix(name, ".*"); wildcard {
+				if len(catalog.NamesInDomain(domain)) == 0 {
+					t.Fatalf("admin catalog has no members for profile wildcard %q", name)
+				}
+				continue
+			}
 			if _, ok := catalog.Get(name); !ok {
 				t.Fatalf("admin catalog is missing v0.22 profile tool %q", name)
 			}

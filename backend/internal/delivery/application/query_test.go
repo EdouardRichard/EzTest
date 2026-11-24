@@ -9,11 +9,11 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-func deliveryP6Int64Ptr(value int64) *int64 { return &value }
+func deliveryInt64Ptr(value int64) *int64 { return &value }
 
-// fakeP6DeliveryReader is the delivery-context P6 read source used by the query
+// fakeDeliveryQueryReader is the delivery-context P6 read source used by the query
 // port tests.
-type fakeP6DeliveryReader struct {
+type fakeDeliveryQueryReader struct {
 	validityNum   int
 	validityDenom int
 	validityErr   error
@@ -38,33 +38,33 @@ type fakeP6DeliveryReader struct {
 	openCalls int
 }
 
-func (f *fakeP6DeliveryReader) CountIssueValidity(_ context.Context, versionID *int64) (int, int, error) {
+func (f *fakeDeliveryQueryReader) CountIssueValidity(_ context.Context, versionID *int64) (int, int, error) {
 	f.validityCalls++
 	f.validityScope = versionID
 	return f.validityNum, f.validityDenom, f.validityErr
 }
 
-func (f *fakeP6DeliveryReader) SearchIssues(_ context.Context, q string, limit int) ([]IssueSearchRow, error) {
+func (f *fakeDeliveryQueryReader) SearchIssues(_ context.Context, q string, limit int) ([]IssueSearchRow, error) {
 	f.issueCalls++
 	f.issueQ, f.issueLimit = q, limit
 	return f.issueRows, f.issueErr
 }
 
-func (f *fakeP6DeliveryReader) SearchReports(_ context.Context, q string, limit int) ([]ReportSearchRow, error) {
+func (f *fakeDeliveryQueryReader) SearchReports(_ context.Context, q string, limit int) ([]ReportSearchRow, error) {
 	f.reportCalls++
 	f.reportQ, f.reportLimit = q, limit
 	return f.reportRows, f.reportErr
 }
 
-func (f *fakeP6DeliveryReader) ListOpenIssues(_ context.Context, limit int) ([]OpenIssueRow, error) {
+func (f *fakeDeliveryQueryReader) ListOpenIssues(_ context.Context, limit int) ([]OpenIssueRow, error) {
 	f.openCalls++
 	f.openLimit = limit
 	return f.openRows, f.openErr
 }
 
-func TestP6CountIssueValidity(t *testing.T) {
+func TestCountIssueValidity(t *testing.T) {
 	t.Run("empty store returns zero counts", func(t *testing.T) {
-		reader := &fakeP6DeliveryReader{}
+		reader := &fakeDeliveryQueryReader{}
 		service := NewQueryService(reader)
 
 		num, denom, err := service.CountIssueValidity(context.Background(), nil)
@@ -80,10 +80,10 @@ func TestP6CountIssueValidity(t *testing.T) {
 	})
 
 	t.Run("version filter is forwarded", func(t *testing.T) {
-		reader := &fakeP6DeliveryReader{validityNum: 2, validityDenom: 3}
+		reader := &fakeDeliveryQueryReader{validityNum: 2, validityDenom: 3}
 		service := NewQueryService(reader)
 
-		num, denom, err := service.CountIssueValidity(context.Background(), deliveryP6Int64Ptr(7))
+		num, denom, err := service.CountIssueValidity(context.Background(), deliveryInt64Ptr(7))
 		if err != nil {
 			t.Fatalf("CountIssueValidity: %v", err)
 		}
@@ -96,7 +96,7 @@ func TestP6CountIssueValidity(t *testing.T) {
 	})
 
 	t.Run("zero denominator is reported without error", func(t *testing.T) {
-		service := NewQueryService(&fakeP6DeliveryReader{})
+		service := NewQueryService(&fakeDeliveryQueryReader{})
 
 		num, denom, err := service.CountIssueValidity(context.Background(), nil)
 		if err != nil {
@@ -108,10 +108,10 @@ func TestP6CountIssueValidity(t *testing.T) {
 	})
 
 	t.Run("non-positive version is rejected", func(t *testing.T) {
-		reader := &fakeP6DeliveryReader{}
+		reader := &fakeDeliveryQueryReader{}
 		service := NewQueryService(reader)
 
-		if _, _, err := service.CountIssueValidity(context.Background(), deliveryP6Int64Ptr(-1)); err == nil {
+		if _, _, err := service.CountIssueValidity(context.Background(), deliveryInt64Ptr(-1)); err == nil {
 			t.Fatal("expected invalid_argument for version_id=-1")
 		}
 		if reader.validityCalls != 0 {
@@ -121,7 +121,7 @@ func TestP6CountIssueValidity(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := NewQueryService(&fakeP6DeliveryReader{validityErr: want})
+		service := NewQueryService(&fakeDeliveryQueryReader{validityErr: want})
 
 		if _, _, err := service.CountIssueValidity(context.Background(), nil); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)
@@ -129,8 +129,8 @@ func TestP6CountIssueValidity(t *testing.T) {
 	})
 }
 
-func TestP6SearchIssues(t *testing.T) {
-	reader := &fakeP6DeliveryReader{issueRows: []IssueSearchRow{
+func TestSearchIssues(t *testing.T) {
+	reader := &fakeDeliveryQueryReader{issueRows: []IssueSearchRow{
 		{ID: 9, VersionID: 7, VersionTitle: "Login SUT", Title: "Login button 500", Status: "open", Severity: "major"},
 	}}
 	service := NewQueryService(reader)
@@ -168,8 +168,8 @@ func TestP6SearchIssues(t *testing.T) {
 	}
 }
 
-func TestP6SearchReports(t *testing.T) {
-	reader := &fakeP6DeliveryReader{reportRows: []ReportSearchRow{
+func TestSearchReports(t *testing.T) {
+	reader := &fakeDeliveryQueryReader{reportRows: []ReportSearchRow{
 		{ID: 4, VersionID: 7, VersionTitle: "Login SUT", Kind: "wave", Status: "published"},
 		{ID: 5, VersionID: 7, VersionTitle: "Login SUT", Kind: "version", Status: "draft"},
 	}}
@@ -199,9 +199,9 @@ func TestP6SearchReports(t *testing.T) {
 	}
 }
 
-func TestP6ListOpenIssuesBuildsTodos(t *testing.T) {
+func TestListOpenIssuesBuildsTodos(t *testing.T) {
 	created := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
-	reader := &fakeP6DeliveryReader{openRows: []OpenIssueRow{
+	reader := &fakeDeliveryQueryReader{openRows: []OpenIssueRow{
 		{ID: 1, VersionID: 7, VersionTitle: "Login SUT", Title: "major bug", Severity: "major", CreatedAt: created},
 		{ID: 2, VersionID: 7, VersionTitle: "Login SUT", Title: "minor bug", Severity: "minor", CreatedAt: created},
 		{ID: 3, VersionID: 7, VersionTitle: "Login SUT", Title: "trivial bug", Severity: "trivial", CreatedAt: created},
@@ -251,7 +251,7 @@ func TestP6ListOpenIssuesBuildsTodos(t *testing.T) {
 	}
 }
 
-func TestP6DeliveryQueryServiceRequiresReader(t *testing.T) {
+func TestDeliveryQueryServiceRequiresReader(t *testing.T) {
 	service := NewQueryService(nil)
 	_, _, err := service.CountIssueValidity(context.Background(), nil)
 	if err == nil {

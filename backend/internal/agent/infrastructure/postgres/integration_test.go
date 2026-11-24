@@ -966,6 +966,101 @@ func TestApplyProfileSeedBackfillFencesConcurrentAdminEdit(t *testing.T) {
 	}
 }
 
+// TestApplyProfileSeedBackfillRemovesRetiredTools pins the v0.2.4-C seed-3
+// repository contract: the retired browser.* names are dropped and the
+// domain-level increment unioned in ONE seed_version-fenced UPDATE, preserving
+// administrator-added tools and fencing a concurrent admin edit.
+func TestApplyProfileSeedBackfillRemovesRetiredTools(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewRuntimeRepository(pool, newIDs(t))
+	ctx := context.Background()
+
+	legacy := agent.AgentProfile{
+		Key:          agentapp.ProfileKeyCaseExecutor,
+		Name:         "用例执行器",
+		SystemPrompt: "[profile:case_executor] legacy prompt",
+		AllowedTools: []string{
+			"context.task_pack", "browser.goto", "browser.snapshot",
+			"http.request", "admin.custom_tool",
+		},
+		Budgets:     agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400},
+		Enabled:     true,
+		SeedVersion: 2,
+	}
+	if _, created, err := repo.EnsureProfile(ctx, legacy); err != nil || !created {
+		t.Fatalf("EnsureProfile: created=%v err=%v", created, err)
+	}
+
+	// A concurrent admin PATCH lands before the marker write: its tool and
+	// budget must survive the fenced backfill.
+	adminTools := append(append([]string(nil), legacy.AllowedTools...), "admin.concurrent_tool")
+	customBudgets := agent.ProfileBudgets{MaxTurns: 40, SoftSeconds: 500, HardSeconds: 800}
+	if _, changed, err := repo.UpdateProfile(ctx, legacy.Key, agent.ProfileUpdate{
+		AllowedTools: &adminTools,
+		Budgets:      &customBudgets,
+	}); err != nil || !changed {
+		t.Fatalf("admin PATCH: changed=%v err=%v", changed, err)
+	}
+
+	increment := agentapp.V022ProfileTools()[legacy.Key]
+	removals := []string{"browser.goto", "browser.snapshot"}
+	got, applied, err := repo.ApplyProfileSeedBackfill(ctx, legacy.Key, agent.ProfileSeedBackfill{
+		AddAllowedTools:    increment,
+		RemoveAllowedTools: removals,
+		BudgetUpgrade: &agent.ProfileBudgetUpgrade{
+			Legacy:  agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400},
+			Current: agent.ProfileBudgets{MaxTurns: 0, SoftSeconds: 1200, HardSeconds: 2400},
+		},
+		SeedVersion: agentapp.ProfileSeedVersion,
+	})
+	if err != nil || !applied {
+		t.Fatalf("ApplyProfileSeedBackfill: applied=%v err=%v", applied, err)
+	}
+	for _, name := range got.AllowedTools {
+		// browser.cli is the T15 browser-domain passthrough the increment adds;
+		// only the retired atomic actions (browser.goto/snapshot) must be gone.
+		if tools.ToolDomain(name) == "browser" && name != tools.ToolBrowserCLI {
+			t.Fatalf("retired browser tool survived the SQL cleanup: %q in %v", name, got.AllowedTools)
+		}
+	}
+	for _, name := range increment {
+		if !containsProfileTool(got.AllowedTools, name) {
+			t.Fatalf("cleanup dropped the increment entry %q: %v", name, got.AllowedTools)
+		}
+	}
+	if !containsProfileTool(got.AllowedTools, "admin.custom_tool") ||
+		!containsProfileTool(got.AllowedTools, "admin.concurrent_tool") ||
+		!containsProfileTool(got.AllowedTools, "http.request") {
+		t.Fatalf("concurrent admin / still-registered tools lost: %v", got.AllowedTools)
+	}
+	if got.Budgets != customBudgets {
+		t.Fatalf("concurrent admin budgets overwritten: %+v, want %+v", got.Budgets, customBudgets)
+	}
+	if got.SeedVersion != agentapp.ProfileSeedVersion {
+		t.Fatalf("seed version = %d, want %d", got.SeedVersion, agentapp.ProfileSeedVersion)
+	}
+	seen := make(map[string]bool, len(got.AllowedTools))
+	for _, name := range got.AllowedTools {
+		if seen[name] {
+			t.Fatalf("duplicate tool %q after union+removal: %v", name, got.AllowedTools)
+		}
+		seen[name] = true
+	}
+
+	// The marker fences a second pass: no rewrite, no re-removal, no re-add.
+	again, appliedAgain, err := repo.ApplyProfileSeedBackfill(ctx, legacy.Key, agent.ProfileSeedBackfill{
+		AddAllowedTools:    increment,
+		RemoveAllowedTools: removals,
+		SeedVersion:        agentapp.ProfileSeedVersion,
+	})
+	if err != nil || appliedAgain {
+		t.Fatalf("second ApplyProfileSeedBackfill: applied=%v err=%v", appliedAgain, err)
+	}
+	if !containsProfileTool(again.AllowedTools, "admin.concurrent_tool") || again.Budgets != customBudgets {
+		t.Fatalf("second pass changed the row: %#v", again)
+	}
+}
+
 func containsProfileTool(tools []string, want string) bool {
 	for _, name := range tools {
 		if name == want {

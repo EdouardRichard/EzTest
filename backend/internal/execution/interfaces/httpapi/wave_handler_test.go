@@ -112,7 +112,7 @@ func (w *waveHandlerWaves) Transition(context.Context, int64, []execution.WaveSt
 func (w *waveHandlerWaves) Counts(_ context.Context, waveID int64) (execution.WaveCounts, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	counts := execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}}
+	counts := execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}}
 	for range w.runs[waveID] {
 		counts.Total++
 		counts.Pending++

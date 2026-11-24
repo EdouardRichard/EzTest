@@ -42,8 +42,8 @@ func newAnalysisFixture(t *testing.T) *analysisFixture {
 			ancestor:      true,
 		},
 		extractor: &fakeExtractor{model: "deepseek-flash", outputs: map[string]FactExtractOutput{}, errs: map[string]error{}},
-		versions: &fakeVersionReader{bindings: []VersionSUTBinding{{
-			VersionSUTID: 11, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitA,
+		versions: &fakeVersionReader{bindings: []SUTRepoBinding{{
+			SUTID: 21, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitA,
 		}}},
 		resources: &fakeResourceReader{repos: map[int64]RepoRef{10: {ID: 10, Name: "repo", Path: "/tmp/repo", Branch: "main"}}},
 		runs:      newFakeIndexRepo(),
@@ -94,10 +94,13 @@ func TestAnalysisStartRejectsNonAncestorHead(t *testing.T) {
 	requireAPIError(t, err, http.StatusUnprocessableEntity, "invalid_head")
 }
 
+// TestAnalysisStartRejectsConflictingRepoBaselines pins the 409 guard: the same
+// repository reached through two SUTs with different pinned commits has no
+// single analysis base.
 func TestAnalysisStartRejectsConflictingRepoBaselines(t *testing.T) {
 	fixture := newAnalysisFixture(t)
-	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
-		VersionSUTID: 12, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitB,
+	fixture.versions.bindings = append(fixture.versions.bindings, SUTRepoBinding{
+		SUTID: 22, VersionID: 1, RepoID: 10, Branch: "main", CodeBaselineCommit: testCommitB,
 	})
 	_, _, err := fixture.service.Start(context.Background(), 1, 10, testCommitB, false)
 	apiErr := requireAPIError(t, err, http.StatusConflict, "state_conflict")
@@ -107,13 +110,13 @@ func TestAnalysisStartRejectsConflictingRepoBaselines(t *testing.T) {
 }
 
 // TestAnalysisStartUsesRepoIndexBaselineForSecondRepository covers the
-// multi-repo analysis path: the version_sut baseline belongs to the first
-// repository, so a second repository must fall back to its own done index
-// commit instead of creating an analysis against a foreign commit.
+// multi-repo analysis path: the second repository's pinned baseline does not
+// resolve in its local clone, so it must fall back to its own done index commit
+// instead of creating an analysis against an unresolvable commit.
 func TestAnalysisStartUsesRepoIndexBaselineForSecondRepository(t *testing.T) {
 	fixture := newAnalysisFixture(t)
-	fixture.versions.bindings = append(fixture.versions.bindings, VersionSUTBinding{
-		VersionSUTID: 11, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
+	fixture.versions.bindings = append(fixture.versions.bindings, SUTRepoBinding{
+		SUTID: 21, VersionID: 1, RepoID: 20, Branch: "main", CodeBaselineCommit: testCommitA,
 	})
 	fixture.resources.repos[20] = RepoRef{ID: 20, Name: "web", Path: "/tmp/web", Branch: "main"}
 	fixture.git.resolveErrRefs = map[string]error{testCommitA: errors.New("unknown revision")}

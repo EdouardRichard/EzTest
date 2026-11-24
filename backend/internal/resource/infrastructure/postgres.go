@@ -1,4 +1,8 @@
 // Package resourcepg is the PostgreSQL adapter for the resource catalog.
+//
+// v0.2.4-B inverted the hierarchy: environment is a top-level table, sut carries
+// environment_id and base_url, and the assets (sut_page/sut_api/target_database)
+// are owned by sut_id alone.
 package resourcepg
 
 import (
@@ -40,8 +44,8 @@ func wrapDB(op string, err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23505": // unique_violation
-			// Page uniqueness is (environment_id, normalized_url); keep
-			// route_template collisions non-unique.
+			// Page uniqueness is (sut_id, normalized_url); keep route_template
+			// collisions non-unique.
 			if pgErr.ConstraintName == "uk_sut_page_normalized_url" {
 				return resource.ErrPageURLDuplicate
 			}
@@ -64,11 +68,145 @@ func (r *Repository) exec(ctx context.Context, op, query string, args ...any) er
 	return nil
 }
 
+// ---------- Environment ----------
+
+const environmentColumns = `id, name, description, status, created_at, updated_at`
+
+// ListEnvironments returns environments ordered by ID descending.
+func (r *Repository) ListEnvironments(ctx context.Context, limit int, beforeID *int64) ([]resource.Environment, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+environmentColumns+`
+		FROM environment
+		WHERE ($1::BIGINT IS NULL OR id < $1)
+		ORDER BY id DESC
+		LIMIT $2
+	`, beforeID, limit)
+	if err != nil {
+		return nil, wrapDB("list environments", err)
+	}
+	defer rows.Close()
+
+	items := make([]resource.Environment, 0, limit)
+	for rows.Next() {
+		item, err := scanEnvironment(rows)
+		if err != nil {
+			return nil, wrapDB("scan environment", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("list environments", err)
+	}
+	return items, nil
+}
+
+// GetEnvironment returns one environment.
+func (r *Repository) GetEnvironment(ctx context.Context, id int64) (resource.Environment, error) {
+	row := r.pool.QueryRow(ctx, `SELECT `+environmentColumns+` FROM environment WHERE id = $1`, id)
+	item, err := scanEnvironment(row)
+	if err != nil {
+		return resource.Environment{}, wrapDB("get environment", err)
+	}
+	return item, nil
+}
+
+// CreateEnvironment inserts a top-level environment.
+func (r *Repository) CreateEnvironment(ctx context.Context, environment resource.Environment) (resource.Environment, error) {
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO environment (id, name, description, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING created_at, updated_at
+	`, environment.ID, environment.Name, environment.Description, environment.Status,
+		environment.CreatedAt, environment.UpdatedAt)
+	if err := row.Scan(&environment.CreatedAt, &environment.UpdatedAt); err != nil {
+		return resource.Environment{}, wrapDB("create environment", err)
+	}
+	return environment, nil
+}
+
+// UpdateEnvironment updates an environment.
+func (r *Repository) UpdateEnvironment(ctx context.Context, environment resource.Environment) (resource.Environment, error) {
+	if err := r.exec(ctx, "update environment", `
+		UPDATE environment
+		SET name = $2, description = $3, status = $4, updated_at = $5
+		WHERE id = $1
+	`, environment.ID, environment.Name, environment.Description, environment.Status,
+		environment.UpdatedAt); err != nil {
+		return resource.Environment{}, err
+	}
+	return environment, nil
+}
+
+// DeleteEnvironment deletes an environment. Its SUTs and their assets cascade
+// through fk_sut_environment; the sut_repository associations of those SUTs are
+// logical cross-table rows without an FK, so they are removed explicitly in the
+// same transaction to avoid orphans.
+func (r *Repository) DeleteEnvironment(ctx context.Context, id int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("delete environment: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM sut_repository WHERE sut_id IN (SELECT id FROM sut WHERE environment_id = $1)
+	`, id); err != nil {
+		return wrapDB("delete environment sut repositories", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM environment WHERE id = $1`, id)
+	if err != nil {
+		return wrapDB("delete environment", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return resource.ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("delete environment: commit: %w", err)
+	}
+	return nil
+}
+
+func scanEnvironment(row rowScanner) (resource.Environment, error) {
+	var item resource.Environment
+	if err := row.Scan(&item.ID, &item.Name, &item.Description, &item.Status,
+		&item.CreatedAt, &item.UpdatedAt); err != nil {
+		return resource.Environment{}, err
+	}
+	return item, nil
+}
+
 // ---------- SUT ----------
 
-const sutColumns = `id, name, intro, family, created_by, created_at, updated_at`
+const sutColumns = `id, environment_id, name, intro, base_url, family, source, status, created_by, created_at, updated_at`
 
-// ListSUTs returns SUTs ordered by ID descending.
+// ListSUTsByEnvironment returns every SUT of one environment in ID order.
+func (r *Repository) ListSUTsByEnvironment(ctx context.Context, environmentID int64) ([]resource.SUT, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+sutColumns+`
+		FROM sut
+		WHERE environment_id = $1
+		ORDER BY id ASC
+	`, environmentID)
+	if err != nil {
+		return nil, wrapDB("list suts by environment", err)
+	}
+	defer rows.Close()
+
+	items := make([]resource.SUT, 0)
+	for rows.Next() {
+		item, err := scanSUT(rows)
+		if err != nil {
+			return nil, wrapDB("scan sut", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("list suts by environment", err)
+	}
+	return items, nil
+}
+
+// ListSUTs returns SUTs across every environment ordered by ID descending.
 func (r *Repository) ListSUTs(ctx context.Context, limit int, beforeID *int64) ([]resource.SUT, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+sutColumns+`
@@ -109,27 +247,80 @@ func (r *Repository) GetSUT(ctx context.Context, id int64) (resource.SUT, error)
 // CreateSUT inserts a SUT.
 func (r *Repository) CreateSUT(ctx context.Context, sut resource.SUT) (resource.SUT, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut (id, name, intro, family, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO sut (id, environment_id, name, intro, base_url, family, source, status, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at, updated_at
-	`, sut.ID, sut.Name, sut.Intro, sut.Family, sut.CreatedBy, sut.CreatedAt, sut.UpdatedAt)
+	`, sut.ID, sut.EnvironmentID, sut.Name, sut.Intro, sut.BaseURL, sut.Family,
+		sut.Source, sut.Status, sut.CreatedBy, sut.CreatedAt, sut.UpdatedAt)
 	if err := row.Scan(&sut.CreatedAt, &sut.UpdatedAt); err != nil {
 		return resource.SUT{}, wrapDB("create sut", err)
 	}
 	return sut, nil
 }
 
-// UpdateSUT updates the editable SUT columns.
+// CreateSUTWithRegistration inserts a SUT and its birth registration fact in ONE
+// transaction (v0.2.4-B R-B4, I-1). The SUT and its audit-trail birth record must
+// commit together: if the append fails (connection drop, pool timeout, constraint),
+// the SUT INSERT is rolled back too, so a SUT can never exist without its birth
+// record — a half-apply the read path would otherwise surface as a successful empty
+// list with no repair path. This is the same state-change-plus-fact-in-one-tx
+// pattern that closed V-0020 (ApplyStage). AppendSUTRegistration remains the
+// standalone append path for later (subproject F) registrations; append-only is
+// untouched.
+func (r *Repository) CreateSUTWithRegistration(ctx context.Context, sut resource.SUT, registration resource.SUTRegistration) (resource.SUT, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return resource.SUT{}, fmt.Errorf("create sut with registration: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	row := tx.QueryRow(ctx, `
+		INSERT INTO sut (id, environment_id, name, intro, base_url, family, source, status, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING created_at, updated_at
+	`, sut.ID, sut.EnvironmentID, sut.Name, sut.Intro, sut.BaseURL, sut.Family,
+		sut.Source, sut.Status, sut.CreatedBy, sut.CreatedAt, sut.UpdatedAt)
+	if err := row.Scan(&sut.CreatedAt, &sut.UpdatedAt); err != nil {
+		return resource.SUT{}, wrapDB("create sut", err)
+	}
+
+	evidence, err := encodeStrings(registration.EvidenceRefs)
+	if err != nil {
+		return resource.SUT{}, fmt.Errorf("encode registration evidence_refs: %w", err)
+	}
+	regRow := tx.QueryRow(ctx, `
+		INSERT INTO sut_registration (id, sut_id, source, evidence_refs, resolution_method, gate_result, created_at, created_by)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
+		RETURNING created_at
+	`, registration.ID, registration.SUTID, registration.Source, evidence,
+		registration.ResolutionMethod, registration.GateResult, registration.CreatedAt, registration.CreatedBy)
+	if err := regRow.Scan(&registration.CreatedAt); err != nil {
+		return resource.SUT{}, wrapDB("append sut registration", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return resource.SUT{}, fmt.Errorf("create sut with registration: commit: %w", err)
+	}
+	return sut, nil
+}
+
+// UpdateSUT updates the editable SUT columns. The owning environment is not
+// movable, so environment_id is never rewritten.
 func (r *Repository) UpdateSUT(ctx context.Context, sut resource.SUT) (resource.SUT, error) {
+	// status is written so the admin reject path (RejectSUT, v0.2.4-F R-B4/R-F1)
+	// persists proposed/approved → rejected. The admin edit path (UpdateSUT) loads
+	// the full row first, so it writes the unchanged status back (no behavior change);
+	// source is immutable after creation and is deliberately not updated.
 	if err := r.exec(ctx, "update sut", `
-		UPDATE sut SET name = $2, intro = $3, family = $4, updated_at = $5 WHERE id = $1
-	`, sut.ID, sut.Name, sut.Intro, sut.Family, sut.UpdatedAt); err != nil {
+		UPDATE sut SET name = $2, intro = $3, base_url = $4, family = $5, updated_at = $6, status = $7
+		WHERE id = $1
+	`, sut.ID, sut.Name, sut.Intro, sut.BaseURL, sut.Family, sut.UpdatedAt, sut.Status); err != nil {
 		return resource.SUT{}, err
 	}
 	return sut, nil
 }
 
-// DeleteSUT deletes a SUT; environments and resources cascade. The v0.22
+// DeleteSUT deletes a SUT; its pages, APIs and target databases cascade. The
 // sut_repository associations are logical cross-table rows without an FK, so
 // they are removed explicitly in the same transaction to avoid orphans.
 func (r *Repository) DeleteSUT(ctx context.Context, id int64) error {
@@ -157,102 +348,95 @@ func (r *Repository) DeleteSUT(ctx context.Context, id int64) error {
 
 func scanSUT(row rowScanner) (resource.SUT, error) {
 	var item resource.SUT
-	if err := row.Scan(&item.ID, &item.Name, &item.Intro, &item.Family, &item.CreatedBy, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.EnvironmentID, &item.Name, &item.Intro, &item.BaseURL,
+		&item.Family, &item.Source, &item.Status, &item.CreatedBy, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.SUT{}, err
 	}
 	return item, nil
 }
 
-// ---------- Environment ----------
+// ---------- SUT registration (append-only, v0.2.4-B R-B4) ----------
 
-const environmentColumns = `id, sut_id, name, base_url, is_default, status, created_at, updated_at`
+const sutRegistrationColumns = `id, sut_id, source, evidence_refs, resolution_method, gate_result, created_at, created_by`
 
-// ListEnvironments returns every environment of a SUT in ID order.
-func (r *Repository) ListEnvironments(ctx context.Context, sutID int64) ([]resource.Environment, error) {
+// AppendSUTRegistration inserts one registration fact. It is one of two INSERT
+// paths for sut_registration (the other is CreateSUTWithRegistration, which writes
+// a SUT and its birth fact in one transaction); there is still no Update/Delete, so
+// registering the same SUT twice appends a second row and never rewrites the first
+// (append-only). This is the standalone append path for LATER registrations of an
+// existing SUT (e.g. subproject F's Agent proposals). Creating a NEW SUT must go
+// through CreateSUTWithRegistration so the SUT and its birth record commit together
+// — do not wire CreateSUT + AppendSUTRegistration as two steps (that re-introduces
+// the I-1 half-apply).
+func (r *Repository) AppendSUTRegistration(ctx context.Context, registration resource.SUTRegistration) (resource.SUTRegistration, error) {
+	evidence, err := encodeStrings(registration.EvidenceRefs)
+	if err != nil {
+		return resource.SUTRegistration{}, fmt.Errorf("encode registration evidence_refs: %w", err)
+	}
+	row := r.pool.QueryRow(ctx, `
+		INSERT INTO sut_registration (id, sut_id, source, evidence_refs, resolution_method, gate_result, created_at, created_by)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
+		RETURNING created_at
+	`, registration.ID, registration.SUTID, registration.Source, evidence,
+		registration.ResolutionMethod, registration.GateResult, registration.CreatedAt, registration.CreatedBy)
+	if err := row.Scan(&registration.CreatedAt); err != nil {
+		return resource.SUTRegistration{}, wrapDB("append sut registration", err)
+	}
+	return registration, nil
+}
+
+// ListSUTRegistrations returns one SUT's registration facts in time order
+// (created_at, then id). It is the production read path behind
+// GET /api/resources/suts/{id}/registrations.
+func (r *Repository) ListSUTRegistrations(ctx context.Context, sutID int64) ([]resource.SUTRegistration, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT `+environmentColumns+`
-		FROM sut_environment
+		SELECT `+sutRegistrationColumns+`
+		FROM sut_registration
 		WHERE sut_id = $1
-		ORDER BY id ASC
+		ORDER BY created_at ASC, id ASC
 	`, sutID)
 	if err != nil {
-		return nil, wrapDB("list environments", err)
+		return nil, wrapDB("list sut registrations", err)
 	}
 	defer rows.Close()
 
-	items := make([]resource.Environment, 0)
+	items := make([]resource.SUTRegistration, 0)
 	for rows.Next() {
-		item, err := scanEnvironment(rows)
+		item, err := scanSUTRegistration(rows)
 		if err != nil {
-			return nil, wrapDB("scan environment", err)
+			return nil, wrapDB("scan sut registration", err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, wrapDB("list environments", err)
+		return nil, wrapDB("list sut registrations", err)
 	}
 	return items, nil
 }
 
-// GetEnvironment returns one environment.
-func (r *Repository) GetEnvironment(ctx context.Context, id int64) (resource.Environment, error) {
-	row := r.pool.QueryRow(ctx, `SELECT `+environmentColumns+` FROM sut_environment WHERE id = $1`, id)
-	item, err := scanEnvironment(row)
+func scanSUTRegistration(row rowScanner) (resource.SUTRegistration, error) {
+	var item resource.SUTRegistration
+	var evidence []byte
+	if err := row.Scan(&item.ID, &item.SUTID, &item.Source, &evidence,
+		&item.ResolutionMethod, &item.GateResult, &item.CreatedAt, &item.CreatedBy); err != nil {
+		return resource.SUTRegistration{}, err
+	}
+	decoded, err := decodeStrings(evidence)
 	if err != nil {
-		return resource.Environment{}, wrapDB("get environment", err)
+		return resource.SUTRegistration{}, fmt.Errorf("decode registration evidence_refs: %w", err)
 	}
-	return item, nil
-}
-
-// CreateEnvironment inserts an environment.
-func (r *Repository) CreateEnvironment(ctx context.Context, environment resource.Environment) (resource.Environment, error) {
-	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut_environment (id, sut_id, name, base_url, is_default, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING created_at, updated_at
-	`, environment.ID, environment.SUTID, environment.Name, environment.BaseURL,
-		environment.IsDefault, environment.Status, environment.CreatedAt, environment.UpdatedAt)
-	if err := row.Scan(&environment.CreatedAt, &environment.UpdatedAt); err != nil {
-		return resource.Environment{}, wrapDB("create environment", err)
-	}
-	return environment, nil
-}
-
-// UpdateEnvironment updates an environment.
-func (r *Repository) UpdateEnvironment(ctx context.Context, environment resource.Environment) (resource.Environment, error) {
-	if err := r.exec(ctx, "update environment", `
-		UPDATE sut_environment
-		SET name = $2, base_url = $3, is_default = $4, status = $5, updated_at = $6
-		WHERE id = $1
-	`, environment.ID, environment.Name, environment.BaseURL, environment.IsDefault,
-		environment.Status, environment.UpdatedAt); err != nil {
-		return resource.Environment{}, err
-	}
-	return environment, nil
-}
-
-// DeleteEnvironment deletes an environment; its resources cascade.
-func (r *Repository) DeleteEnvironment(ctx context.Context, id int64) error {
-	return r.exec(ctx, "delete environment", `DELETE FROM sut_environment WHERE id = $1`, id)
-}
-
-func scanEnvironment(row rowScanner) (resource.Environment, error) {
-	var item resource.Environment
-	if err := row.Scan(&item.ID, &item.SUTID, &item.Name, &item.BaseURL,
-		&item.IsDefault, &item.Status, &item.CreatedAt, &item.UpdatedAt); err != nil {
-		return resource.Environment{}, err
-	}
+	item.EvidenceRefs = decoded
 	return item, nil
 }
 
 // ---------- Page ----------
 
-const pageColumns = `id, sut_id, environment_id, name, url, route_template, page_type,
+const pageColumns = `id, sut_id, name, url, route_template, page_type,
 	auth_role, module, status, source, created_at, updated_at`
 
-// ListPages returns every page of an environment in ID order.
-func (r *Repository) ListPages(ctx context.Context, environmentID int64) ([]resource.Page, error) {
-	return r.listPages(ctx, `WHERE environment_id = $1 ORDER BY id ASC`, environmentID)
+// ListPages returns every page of a SUT in ID order.
+func (r *Repository) ListPages(ctx context.Context, sutID int64) ([]resource.Page, error) {
+	return r.listPages(ctx, `WHERE sut_id = $1 ORDER BY id ASC`, sutID)
 }
 
 // GetPage returns one page.
@@ -265,18 +449,18 @@ func (r *Repository) GetPage(ctx context.Context, id int64) (resource.Page, erro
 	return item, nil
 }
 
-// GetPageByRouteTemplate resolves one page by (environment_id, route_template)
-// in any status. The comparison uses the same trailing-slash normalization as
-// the discovery observations (root keeps its slash).
-func (r *Repository) GetPageByRouteTemplate(ctx context.Context, environmentID int64, routeTemplate string) (resource.Page, error) {
+// GetPageByRouteTemplate resolves one page by (sut_id, route_template) in any
+// status. The comparison uses the same trailing-slash normalization as the
+// discovery observations (root keeps its slash).
+func (r *Repository) GetPageByRouteTemplate(ctx context.Context, sutID int64, routeTemplate string) (resource.Page, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT `+pageColumns+`
 		FROM sut_page
-		WHERE environment_id = $1
+		WHERE sut_id = $1
 		  AND rtrim(COALESCE(route_template, ''), '/') = $2
 		ORDER BY id ASC
 		LIMIT 1
-	`, environmentID, normalizeTemplateLookup(routeTemplate))
+	`, sutID, normalizeTemplateLookup(routeTemplate))
 	item, err := scanPage(row)
 	if err != nil {
 		return resource.Page{}, wrapDB("get page by route template", err)
@@ -294,11 +478,11 @@ func normalizeTemplateLookup(value string) string {
 // CreatePage inserts a page.
 func (r *Repository) CreatePage(ctx context.Context, page resource.Page) (resource.Page, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template,
+		INSERT INTO sut_page (id, sut_id, name, url, route_template,
 			page_type, auth_role, module, status, source, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING created_at, updated_at
-	`, page.ID, page.SUTID, page.EnvironmentID, page.Name, page.URL, page.RouteTemplate,
+	`, page.ID, page.SUTID, page.Name, page.URL, page.RouteTemplate,
 		page.PageType, page.AuthRole, page.Module, page.Status, page.Source, page.CreatedAt, page.UpdatedAt)
 	if err := row.Scan(&page.CreatedAt, &page.UpdatedAt); err != nil {
 		return resource.Page{}, wrapDB("create page", err)
@@ -348,7 +532,7 @@ func (r *Repository) listPages(ctx context.Context, where string, args ...any) (
 
 func scanPage(row rowScanner) (resource.Page, error) {
 	var item resource.Page
-	if err := row.Scan(&item.ID, &item.SUTID, &item.EnvironmentID, &item.Name, &item.URL,
+	if err := row.Scan(&item.ID, &item.SUTID, &item.Name, &item.URL,
 		&item.RouteTemplate, &item.PageType, &item.AuthRole, &item.Module,
 		&item.Status, &item.Source, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.Page{}, err
@@ -358,12 +542,12 @@ func scanPage(row rowScanner) (resource.Page, error) {
 
 // ---------- API ----------
 
-const apiColumns = `id, sut_id, environment_id, method, path_template, name,
+const apiColumns = `id, sut_id, method, path_template, name,
 	auth_role, source, status, schema_ref, created_at, updated_at`
 
-// ListAPIs returns every API of an environment in ID order.
-func (r *Repository) ListAPIs(ctx context.Context, environmentID int64) ([]resource.API, error) {
-	return r.listAPIs(ctx, `WHERE environment_id = $1 ORDER BY id ASC`, environmentID)
+// ListAPIs returns every API of a SUT in ID order.
+func (r *Repository) ListAPIs(ctx context.Context, sutID int64) ([]resource.API, error) {
+	return r.listAPIs(ctx, `WHERE sut_id = $1 ORDER BY id ASC`, sutID)
 }
 
 // GetAPI returns one API.
@@ -376,19 +560,19 @@ func (r *Repository) GetAPI(ctx context.Context, id int64) (resource.API, error)
 	return item, nil
 }
 
-// GetAPIByTemplate resolves one API by (environment_id, method, path_template)
-// in any status. The method comparison is case-insensitive; the path uses the
-// same trailing-slash normalization as the page lookup.
-func (r *Repository) GetAPIByTemplate(ctx context.Context, environmentID int64, method, pathTemplate string) (resource.API, error) {
+// GetAPIByTemplate resolves one API by (sut_id, method, path_template) in any
+// status. The method comparison is case-insensitive; the path uses the same
+// trailing-slash normalization as the page lookup.
+func (r *Repository) GetAPIByTemplate(ctx context.Context, sutID int64, method, pathTemplate string) (resource.API, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT `+apiColumns+`
 		FROM sut_api
-		WHERE environment_id = $1
+		WHERE sut_id = $1
 		  AND upper(method) = upper($2)
 		  AND rtrim(COALESCE(path_template, ''), '/') = $3
 		ORDER BY id ASC
 		LIMIT 1
-	`, environmentID, strings.TrimSpace(method), normalizeTemplateLookup(pathTemplate))
+	`, sutID, strings.TrimSpace(method), normalizeTemplateLookup(pathTemplate))
 	item, err := scanAPI(row)
 	if err != nil {
 		return resource.API{}, wrapDB("get api by template", err)
@@ -399,11 +583,11 @@ func (r *Repository) GetAPIByTemplate(ctx context.Context, environmentID int64, 
 // CreateAPI inserts an API.
 func (r *Repository) CreateAPI(ctx context.Context, api resource.API) (resource.API, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name,
+		INSERT INTO sut_api (id, sut_id, method, path_template, name,
 			auth_role, source, status, schema_ref, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at, updated_at
-	`, api.ID, api.SUTID, api.EnvironmentID, api.Method, api.PathTemplate, api.Name,
+	`, api.ID, api.SUTID, api.Method, api.PathTemplate, api.Name,
 		api.AuthRole, api.Source, api.Status, api.SchemaRef, api.CreatedAt, api.UpdatedAt)
 	if err := row.Scan(&api.CreatedAt, &api.UpdatedAt); err != nil {
 		return resource.API{}, wrapDB("create api", err)
@@ -453,7 +637,7 @@ func (r *Repository) listAPIs(ctx context.Context, where string, args ...any) ([
 
 func scanAPI(row rowScanner) (resource.API, error) {
 	var item resource.API
-	if err := row.Scan(&item.ID, &item.SUTID, &item.EnvironmentID, &item.Method,
+	if err := row.Scan(&item.ID, &item.SUTID, &item.Method,
 		&item.PathTemplate, &item.Name, &item.AuthRole, &item.Source,
 		&item.Status, &item.SchemaRef, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.API{}, err
@@ -463,34 +647,12 @@ func scanAPI(row rowScanner) (resource.API, error) {
 
 // ---------- Target database ----------
 
-const databaseColumns = `id, sut_id, environment_id, name, kind, dsn, username,
+const databaseColumns = `id, sut_id, name, kind, dsn, username,
 	password, read_only, status, created_at, updated_at`
 
 // ListDatabases returns every target database of a SUT in ID order.
 func (r *Repository) ListDatabases(ctx context.Context, sutID int64) ([]resource.TargetDatabase, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT `+databaseColumns+`
-		FROM target_database
-		WHERE sut_id = $1
-		ORDER BY id ASC
-	`, sutID)
-	if err != nil {
-		return nil, wrapDB("list databases", err)
-	}
-	defer rows.Close()
-
-	items := make([]resource.TargetDatabase, 0)
-	for rows.Next() {
-		item, err := scanDatabase(rows)
-		if err != nil {
-			return nil, wrapDB("scan database", err)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, wrapDB("list databases", err)
-	}
-	return items, nil
+	return r.listDatabases(ctx, `WHERE sut_id = $1 ORDER BY id ASC`, sutID)
 }
 
 // GetDatabase returns one target database.
@@ -506,11 +668,11 @@ func (r *Repository) GetDatabase(ctx context.Context, id int64) (resource.Target
 // CreateDatabase inserts a target database.
 func (r *Repository) CreateDatabase(ctx context.Context, database resource.TargetDatabase) (resource.TargetDatabase, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO target_database (id, sut_id, environment_id, name, kind, dsn,
+		INSERT INTO target_database (id, sut_id, name, kind, dsn,
 			username, password, read_only, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING created_at, updated_at
-	`, database.ID, database.SUTID, database.EnvironmentID, database.Name, database.Kind,
+	`, database.ID, database.SUTID, database.Name, database.Kind,
 		database.DSN, database.Username, database.Password, database.ReadOnly,
 		database.Status, database.CreatedAt, database.UpdatedAt)
 	if err := row.Scan(&database.CreatedAt, &database.UpdatedAt); err != nil {
@@ -540,7 +702,7 @@ func (r *Repository) DeleteDatabase(ctx context.Context, id int64) error {
 
 func scanDatabase(row rowScanner) (resource.TargetDatabase, error) {
 	var item resource.TargetDatabase
-	if err := row.Scan(&item.ID, &item.SUTID, &item.EnvironmentID, &item.Name, &item.Kind,
+	if err := row.Scan(&item.ID, &item.SUTID, &item.Name, &item.Kind,
 		&item.DSN, &item.Username, &item.Password, &item.ReadOnly, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.TargetDatabase{}, err
@@ -550,7 +712,7 @@ func scanDatabase(row rowScanner) (resource.TargetDatabase, error) {
 
 // ---------- Test account ----------
 
-const accountColumns = `id, username, password, roles,
+const accountColumns = `id, sut_id, username, password, roles,
 	notes, status, created_at, updated_at`
 
 // ListAccounts returns the global test-account pool in ID order (v0.22 DB-15).
@@ -596,11 +758,11 @@ func (r *Repository) CreateAccount(ctx context.Context, account resource.TestAcc
 		return resource.TestAccount{}, fmt.Errorf("encode account roles: %w", err)
 	}
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO test_account (id, username, password, roles,
+		INSERT INTO test_account (id, sut_id, username, password, roles,
 			notes, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
 		RETURNING created_at, updated_at
-	`, account.ID, account.Username,
+	`, account.ID, account.SUTID, account.Username,
 		account.Password, roles, account.Notes, account.Status, account.CreatedAt, account.UpdatedAt)
 	if err := row.Scan(&account.CreatedAt, &account.UpdatedAt); err != nil {
 		return resource.TestAccount{}, wrapDB("create account", err)
@@ -619,10 +781,10 @@ func (r *Repository) UpdateAccount(ctx context.Context, account resource.TestAcc
 	}
 	if err := r.exec(ctx, "update account", `
 		UPDATE test_account
-		SET username = $2, password = $3, roles = $4::jsonb, notes = $5,
-			status = $6, updated_at = $7
+		SET sut_id = $2, username = $3, password = $4, roles = $5::jsonb, notes = $6,
+			status = $7, updated_at = $8
 		WHERE id = $1
-	`, account.ID, account.Username, account.Password, roles, account.Notes,
+	`, account.ID, account.SUTID, account.Username, account.Password, roles, account.Notes,
 		account.Status, account.UpdatedAt); err != nil {
 		return resource.TestAccount{}, err
 	}
@@ -640,7 +802,7 @@ func (r *Repository) DeleteAccount(ctx context.Context, id int64) error {
 func scanAccount(row rowScanner) (resource.TestAccount, error) {
 	var item resource.TestAccount
 	var roles []byte
-	if err := row.Scan(&item.ID, &item.Username,
+	if err := row.Scan(&item.ID, &item.SUTID, &item.Username,
 		&item.Password, &roles, &item.Notes, &item.Status,
 		&item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.TestAccount{}, err
@@ -774,17 +936,41 @@ func scanRepository(row rowScanner) (resource.CodeRepository, error) {
 
 // ---------- SUT repositories ----------
 
-const sutRepositoryColumns = `id, sut_id, repo_id, role, enabled, created_at, updated_at`
+const sutRepositoryColumns = `id, sut_id, repo_id, role, COALESCE(code_baseline_commit, ''),
+	enabled, created_at, updated_at`
 
 // ListSUTRepositories returns the SUT-level repository associations ordered by
-// repository ID so the version binding baseline is deterministic (v0.22 DB-12).
+// repository ID so the deterministic code baseline is stable (v0.22 DB-12).
 func (r *Repository) ListSUTRepositories(ctx context.Context, sutID int64) ([]resource.SUTRepository, error) {
+	return r.listSUTRepositories(ctx, `WHERE sut_id = $1`, sutID)
+}
+
+// ListEnvironmentSUTRepositories returns the environment's SUT-repository
+// associations (v0.2.4-B GD-03), ordered by repository ID then SUT ID then
+// association ID so a repository shared by two SUTs of the same environment
+// resolves to one deterministic row (first wins).
+//
+// H-B1 (v0.2.4-H): this query is RAW catalog state — it does NOT gate on the SUT
+// registration status. The R-B4 effective-scope gate (a proposed/rejected SUT
+// contributes nothing to version scope, including its repository associations,
+// so it can never supply pool[0] and decide the code baseline) is applied by
+// Service.ListEnvironmentRepositories through the SINGLE predicate
+// resourceapp.SUTView.IsApproved. The former SQL mirror of that predicate — and
+// the hand-written lockstep agreement it needed with the version handoff adapter
+// — is gone: one rule, one implementation, and the in-memory repository fake now
+// agrees with the SQL adapter instead of silently diverging from it.
+func (r *Repository) ListEnvironmentSUTRepositories(ctx context.Context, environmentID int64) ([]resource.SUTRepository, error) {
+	return r.listSUTRepositories(ctx, `
+		WHERE sut_id IN (SELECT id FROM sut WHERE environment_id = $1)`,
+		environmentID)
+}
+
+func (r *Repository) listSUTRepositories(ctx context.Context, where string, args ...any) ([]resource.SUTRepository, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+sutRepositoryColumns+`
-		FROM sut_repository
-		WHERE sut_id = $1
-		ORDER BY repo_id ASC, id ASC
-	`, sutID)
+		FROM sut_repository `+where+`
+		ORDER BY repo_id ASC, sut_id ASC, id ASC
+	`, args...)
 	if err != nil {
 		return nil, wrapDB("list sut repositories", err)
 	}
@@ -792,9 +978,8 @@ func (r *Repository) ListSUTRepositories(ctx context.Context, sutID int64) ([]re
 
 	items := make([]resource.SUTRepository, 0)
 	for rows.Next() {
-		var item resource.SUTRepository
-		if err := rows.Scan(&item.ID, &item.SUTID, &item.RepoID, &item.Role, &item.Enabled,
-			&item.CreatedAt, &item.UpdatedAt); err != nil {
+		item, err := scanSUTRepository(rows)
+		if err != nil {
 			return nil, wrapDB("scan sut repository", err)
 		}
 		items = append(items, item)
@@ -808,11 +993,11 @@ func (r *Repository) ListSUTRepositories(ctx context.Context, sutID int64) ([]re
 // CreateSUTRepository inserts one SUT-repository association.
 func (r *Repository) CreateSUTRepository(ctx context.Context, repository resource.SUTRepository) (resource.SUTRepository, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut_repository (id, sut_id, repo_id, role, enabled, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO sut_repository (id, sut_id, repo_id, role, code_baseline_commit, enabled, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8)
 		RETURNING created_at, updated_at
 	`, repository.ID, repository.SUTID, repository.RepoID, repository.Role,
-		repository.Enabled, repository.CreatedAt, repository.UpdatedAt)
+		repository.CodeBaselineCommit, repository.Enabled, repository.CreatedAt, repository.UpdatedAt)
 	if err := row.Scan(&repository.CreatedAt, &repository.UpdatedAt); err != nil {
 		return resource.SUTRepository{}, wrapDB("create sut repository", err)
 	}
@@ -824,58 +1009,82 @@ func (r *Repository) DeleteSUTRepository(ctx context.Context, id int64) error {
 	return r.exec(ctx, "delete sut repository", `DELETE FROM sut_repository WHERE id = $1`, id)
 }
 
+// SetSUTRepositoryBaselineCommit pins the resolved commit SHA of one
+// (SUT, repository) pair; an empty commit clears it back to unresolved. It is
+// the single write path shared by the version binding resolution and the code
+// index backfill.
+func (r *Repository) SetSUTRepositoryBaselineCommit(ctx context.Context, sutID, repoID int64, commit string) error {
+	if err := r.exec(ctx, "set sut repository baseline commit", `
+		UPDATE sut_repository
+		SET code_baseline_commit = NULLIF($3, ''), updated_at = now()
+		WHERE sut_id = $1 AND repo_id = $2
+	`, sutID, repoID, commit); err != nil {
+		return err
+	}
+	return nil
+}
+
+func scanSUTRepository(row rowScanner) (resource.SUTRepository, error) {
+	var item resource.SUTRepository
+	if err := row.Scan(&item.ID, &item.SUTID, &item.RepoID, &item.Role,
+		&item.CodeBaselineCommit, &item.Enabled, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		return resource.SUTRepository{}, err
+	}
+	return item, nil
+}
+
 // ---------- Aggregates ----------
 
-// GetSUTGraph returns a SUT with every nested resource.
-func (r *Repository) GetSUTGraph(ctx context.Context, sutID int64) (resource.SUTGraph, error) {
-	sut, err := r.GetSUT(ctx, sutID)
+// GetEnvironmentGraph returns one environment with its SUTs and every asset
+// those SUTs own.
+func (r *Repository) GetEnvironmentGraph(ctx context.Context, environmentID int64) (resource.EnvironmentGraph, error) {
+	environment, err := r.GetEnvironment(ctx, environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	environments, err := r.ListEnvironments(ctx, sutID)
+	suts, err := r.ListSUTsByEnvironment(ctx, environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	pages, err := r.listPages(ctx, `WHERE sut_id = $1 ORDER BY id ASC`, sutID)
+	pages, err := r.listPages(ctx, `
+		WHERE sut_id IN (SELECT id FROM sut WHERE environment_id = $1) ORDER BY id ASC`, environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	apis, err := r.listAPIs(ctx, `WHERE sut_id = $1 ORDER BY id ASC`, sutID)
+	apis, err := r.listAPIs(ctx, `
+		WHERE sut_id IN (SELECT id FROM sut WHERE environment_id = $1) ORDER BY id ASC`, environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	databases, err := r.ListDatabases(ctx, sutID)
+	databases, err := r.listDatabases(ctx, `
+		WHERE sut_id IN (SELECT id FROM sut WHERE environment_id = $1) ORDER BY id ASC`, environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	accounts, err := r.ListAccounts(ctx)
-	if err != nil {
-		return resource.SUTGraph{}, err
-	}
-	return resource.SUTGraph{
-		SUT:          sut,
-		Environments: environments,
-		Pages:        pages,
-		APIs:         apis,
-		Databases:    databases,
-		Accounts:     accounts,
+	return resource.EnvironmentGraph{
+		Environment: environment,
+		SUTs:        suts,
+		Pages:       pages,
+		APIs:        apis,
+		Databases:   databases,
 	}, nil
 }
 
-// ListCatalog returns every SUT with nested resources in ID order.
-func (r *Repository) ListCatalog(ctx context.Context) ([]resource.SUTGraph, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+sutColumns+` FROM sut ORDER BY id ASC`)
+// ListCatalog returns every environment with its nested SUTs and assets, ordered
+// by environment ID ascending.
+func (r *Repository) ListCatalog(ctx context.Context) ([]resource.EnvironmentGraph, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+environmentColumns+` FROM environment ORDER BY id ASC`)
 	if err != nil {
 		return nil, wrapDB("list catalog", err)
 	}
-	suts := make([]resource.SUT, 0)
+	environments := make([]resource.Environment, 0)
 	for rows.Next() {
-		item, err := scanSUT(rows)
+		item, err := scanEnvironment(rows)
 		if err != nil {
 			rows.Close()
-			return nil, wrapDB("scan catalog sut", err)
+			return nil, wrapDB("scan catalog environment", err)
 		}
-		suts = append(suts, item)
+		environments = append(environments, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -883,7 +1092,7 @@ func (r *Repository) ListCatalog(ctx context.Context) ([]resource.SUTGraph, erro
 	}
 	rows.Close()
 
-	environments, err := r.listAllEnvironments(ctx)
+	suts, err := r.listAllSUTs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -895,18 +1104,14 @@ func (r *Repository) ListCatalog(ctx context.Context) ([]resource.SUTGraph, erro
 	if err != nil {
 		return nil, err
 	}
-	databases, err := r.listAllDatabases(ctx)
-	if err != nil {
-		return nil, err
-	}
-	accounts, err := r.listAllAccounts(ctx)
+	databases, err := r.listDatabases(ctx, `ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
 
-	envsBySUT := make(map[int64][]resource.Environment, len(suts))
-	for _, item := range environments {
-		envsBySUT[item.SUTID] = append(envsBySUT[item.SUTID], item)
+	sutsByEnvironment := make(map[int64][]resource.SUT, len(environments))
+	for _, item := range suts {
+		sutsByEnvironment[item.EnvironmentID] = append(sutsByEnvironment[item.EnvironmentID], item)
 	}
 	pagesBySUT := make(map[int64][]resource.Page, len(suts))
 	for _, item := range pages {
@@ -920,51 +1125,53 @@ func (r *Repository) ListCatalog(ctx context.Context) ([]resource.SUTGraph, erro
 	for _, item := range databases {
 		databasesBySUT[item.SUTID] = append(databasesBySUT[item.SUTID], item)
 	}
-	accountsBySUT := make(map[int64][]resource.TestAccount, len(suts))
-	// The test-account pool is global (DB-15); every SUT detail exposes the same
-	// pool because accounts no longer have SUT ownership.
-	for _, sut := range suts {
-		accountsBySUT[sut.ID] = accounts
-	}
 
-	graphs := make([]resource.SUTGraph, 0, len(suts))
-	for _, sut := range suts {
-		graphs = append(graphs, resource.SUTGraph{
-			SUT:          sut,
-			Environments: envsBySUT[sut.ID],
-			Pages:        pagesBySUT[sut.ID],
-			APIs:         apisBySUT[sut.ID],
-			Databases:    databasesBySUT[sut.ID],
-			Accounts:     accountsBySUT[sut.ID],
+	graphs := make([]resource.EnvironmentGraph, 0, len(environments))
+	for _, environment := range environments {
+		environmentSUTs := sutsByEnvironment[environment.ID]
+		graphPages := make([]resource.Page, 0)
+		graphAPIs := make([]resource.API, 0)
+		graphDatabases := make([]resource.TargetDatabase, 0)
+		for _, sut := range environmentSUTs {
+			graphPages = append(graphPages, pagesBySUT[sut.ID]...)
+			graphAPIs = append(graphAPIs, apisBySUT[sut.ID]...)
+			graphDatabases = append(graphDatabases, databasesBySUT[sut.ID]...)
+		}
+		graphs = append(graphs, resource.EnvironmentGraph{
+			Environment: environment,
+			SUTs:        environmentSUTs,
+			Pages:       graphPages,
+			APIs:        graphAPIs,
+			Databases:   graphDatabases,
 		})
 	}
 	return graphs, nil
 }
 
-func (r *Repository) listAllEnvironments(ctx context.Context) ([]resource.Environment, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+environmentColumns+` FROM sut_environment ORDER BY id ASC`)
+func (r *Repository) listAllSUTs(ctx context.Context) ([]resource.SUT, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+sutColumns+` FROM sut ORDER BY id ASC`)
 	if err != nil {
-		return nil, wrapDB("list all environments", err)
+		return nil, wrapDB("list all suts", err)
 	}
 	defer rows.Close()
-	items := make([]resource.Environment, 0)
+	items := make([]resource.SUT, 0)
 	for rows.Next() {
-		item, err := scanEnvironment(rows)
+		item, err := scanSUT(rows)
 		if err != nil {
-			return nil, wrapDB("scan environment", err)
+			return nil, wrapDB("scan sut", err)
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, wrapDB("list all environments", err)
+		return nil, wrapDB("list all suts", err)
 	}
 	return items, nil
 }
 
-func (r *Repository) listAllDatabases(ctx context.Context) ([]resource.TargetDatabase, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+databaseColumns+` FROM target_database ORDER BY id ASC`)
+func (r *Repository) listDatabases(ctx context.Context, where string, args ...any) ([]resource.TargetDatabase, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+databaseColumns+` FROM target_database `+where, args...)
 	if err != nil {
-		return nil, wrapDB("list all databases", err)
+		return nil, wrapDB("list databases", err)
 	}
 	defer rows.Close()
 	items := make([]resource.TargetDatabase, 0)
@@ -976,27 +1183,7 @@ func (r *Repository) listAllDatabases(ctx context.Context) ([]resource.TargetDat
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, wrapDB("list all databases", err)
-	}
-	return items, nil
-}
-
-func (r *Repository) listAllAccounts(ctx context.Context) ([]resource.TestAccount, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+accountColumns+` FROM test_account ORDER BY id ASC`)
-	if err != nil {
-		return nil, wrapDB("list all accounts", err)
-	}
-	defer rows.Close()
-	items := make([]resource.TestAccount, 0)
-	for rows.Next() {
-		item, err := scanAccount(rows)
-		if err != nil {
-			return nil, wrapDB("scan account", err)
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, wrapDB("list all accounts", err)
+		return nil, wrapDB("list databases", err)
 	}
 	return items, nil
 }

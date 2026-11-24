@@ -73,6 +73,7 @@ var Actions = []Action{
 	{Name: "version.updated", Label: "更新版本"},
 	{Name: "version.reopened", Label: "重开版本"},
 	{Name: "version.closed", Label: "关闭版本"},
+	{Name: "version.waived", Label: "豁免关闭版本"},
 	{Name: "version.binding.changed", Label: "变更版本绑定"},
 	{Name: "version.code_baseline_unresolved", Label: "代码基线未解析"},
 	{Name: "version.stage_decision", Label: "阶段决策"},
@@ -90,6 +91,7 @@ var Actions = []Action{
 	{Name: "requirement.relation_created", Label: "创建需求关系"},
 	{Name: "requirement.closed", Label: "关闭需求"},
 	{Name: "requirement.reopened", Label: "重开需求"},
+	{Name: "requirement.waived", Label: "豁免需求闭环"},
 
 	{Name: "agent.profile.updated", Label: "更新 Agent Profile"},
 	{Name: "agent.profile.tool_denied", Label: "Profile 工具调用被拒"},
@@ -106,8 +108,10 @@ var Actions = []Action{
 	{Name: "quality.eval_recorded", Label: "记录质量评估"},
 	{Name: "case.updated", Label: "更新用例"},
 	{Name: "execution.credentials_read", Label: "读取执行凭证"},
-	{Name: "visual.diff.create", Label: "创建视觉差异"},
 	{Name: "content.uploaded", Label: "上传内容"},
+	{Name: "skill.created", Label: "创建技能"},
+	{Name: "skill.updated", Label: "更新技能"},
+	{Name: "skill.deleted", Label: "删除技能"},
 }
 
 // HasAction reports whether name is one of the catalog's canonical actions.

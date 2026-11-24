@@ -14,6 +14,7 @@ vi.mock("./api", async (importOriginal) => {
     deleteEnvironment: vi.fn(),
     updateSut: vi.fn(),
     deleteSut: vi.fn(),
+    rejectSut: vi.fn(),
   }
 })
 
@@ -30,6 +31,7 @@ import type { ResourceScope } from "./types"
 
 const baseScope: ResourceScope = {
   suts: [sutListItemFixture, secondSutFixture],
+  environments: [environmentFixture, secondEnvironmentFixture],
   sutId: "1001",
   environmentId: "1101",
   detail: sutFixture,
@@ -66,24 +68,44 @@ describe("SUTPanel", () => {
     vi.mocked(api.deleteEnvironment).mockReset()
     vi.mocked(api.updateSut).mockReset()
     vi.mocked(api.deleteSut).mockReset()
+    vi.mocked(api.rejectSut).mockReset()
   })
 
   afterEach(cleanup)
 
-  it("lists SUTs, selects another SUT and shows the selected SUT environments", () => {
+  it("lists SUTs and top-level environments, selects another SUT", () => {
     const { onSelectSut } = renderPanel()
 
     expect(screen.getByRole("table", { name: "SUT 列表" })).toBeInTheDocument()
     expect(screen.getByText("订单中心")).toBeInTheDocument()
     expect(screen.getByText("支付网关")).toBeInTheDocument()
     expect(screen.getByText("payments")).toBeInTheDocument()
+    // v0.2.4-B: environments are top-level (they own SUTs); no per-SUT default flag.
     expect(screen.getByRole("table", { name: "环境列表" })).toBeInTheDocument()
     expect(screen.getByText("测试环境")).toBeInTheDocument()
     expect(screen.getByText("预发环境")).toBeInTheDocument()
-    expect(screen.getByText("默认")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: "支付网关" }))
     expect(onSelectSut).toHaveBeenCalledWith("1002")
+  })
+
+  it("rejects an Agent-registered SUT via the admin audit entry", async () => {
+    vi.mocked(api.rejectSut).mockResolvedValue({ ...sutFixture, status: "rejected" })
+    const { onRefresh } = renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "驳回 SUT 订单中心" }))
+    fireEvent.click(screen.getByRole("button", { name: "驳回 SUT" }))
+
+    await waitFor(() => expect(api.rejectSut).toHaveBeenCalledWith("1001"))
+    expect(onRefresh).toHaveBeenCalled()
+  })
+
+  it("hides the reject action for an already-rejected SUT", () => {
+    renderPanel({
+      scope: { ...baseScope, suts: [{ ...sutListItemFixture, status: "rejected" }] },
+    })
+    expect(screen.queryByRole("button", { name: "驳回 SUT 订单中心" })).not.toBeInTheDocument()
+    expect(screen.getByText("已驳回")).toBeInTheDocument()
   })
 
   it("shows loading, error and empty states", () => {
@@ -143,8 +165,8 @@ describe("SUTPanel", () => {
 
     fireEvent.change(screen.getByLabelText("SUT 名称"), { target: { value: "支付网关" } })
     fireEvent.change(screen.getByLabelText("简介"), { target: { value: "支付主链路" } })
-    fireEvent.change(screen.getByLabelText("默认环境名称"), { target: { value: "测试环境" } })
-    fireEvent.change(screen.getByLabelText("环境地址"), {
+    fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "测试环境" } })
+    fireEvent.change(screen.getByLabelText("SUT 地址"), {
       target: { value: "https://pay.test" },
     })
     fireEvent.click(screen.getByRole("button", { name: "创建 SUT" }))
@@ -168,8 +190,8 @@ describe("SUTPanel", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "新建 SUT" })[0] as HTMLElement)
     fireEvent.change(screen.getByLabelText("SUT 名称"), { target: { value: "支付网关" } })
-    fireEvent.change(screen.getByLabelText("默认环境名称"), { target: { value: "测试环境" } })
-    fireEvent.change(screen.getByLabelText("环境地址"), {
+    fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "测试环境" } })
+    fireEvent.change(screen.getByLabelText("SUT 地址"), {
       target: { value: "https://pay.test" },
     })
     fireEvent.change(screen.getByLabelText("系统族（family）"), {
@@ -214,28 +236,49 @@ describe("SUTPanel", () => {
     expect(onRefresh).toHaveBeenCalled()
   })
 
-  it("refreshes the SUT list when the default environment fails after the SUT was created", async () => {
+  it("clears the SUT family on edit by sending an empty string in the update payload", async () => {
+    vi.mocked(api.updateSut).mockResolvedValue(sutFixture)
+    const { onRefresh } = renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑 SUT 订单中心" }))
+    // The dialog pre-fills the current family ("payments"); clearing it must reach
+    // the API as family:"" so the backend clears the stored value.
+    fireEvent.change(screen.getByLabelText("系统族（family）"), { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存 SUT" }))
+
+    await waitFor(() =>
+      expect(api.updateSut).toHaveBeenCalledWith("1001", {
+        name: "订单中心",
+        intro: "订单主链路",
+        family: "",
+      }),
+    )
+    expect(onRefresh).toHaveBeenCalled()
+  })
+
+  it("refreshes the list when the SUT create fails after the environment was created", async () => {
     vi.mocked(api.createSutWithDefaultEnvironment).mockRejectedValue(
       new api.DefaultEnvironmentError(
-        sutFixture,
-        new ApiError({ status: 409, code: "conflict", message: "environment name already exists" }),
+        environmentFixture,
+        new ApiError({ status: 409, code: "conflict", message: "sut name already exists" }),
       ),
     )
     const { onRefresh } = renderPanel({ scope: { ...baseScope, suts: [], detail: null } })
 
     fireEvent.click(screen.getAllByRole("button", { name: "新建 SUT" })[0] as HTMLElement)
     fireEvent.change(screen.getByLabelText("SUT 名称"), { target: { value: "订单中心" } })
-    fireEvent.change(screen.getByLabelText("默认环境名称"), { target: { value: "测试环境" } })
-    fireEvent.change(screen.getByLabelText("环境地址"), {
+    fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "测试环境" } })
+    fireEvent.change(screen.getByLabelText("SUT 地址"), {
       target: { value: "https://order.test" },
     })
     fireEvent.click(screen.getByRole("button", { name: "创建 SUT" }))
 
-    expect(await screen.findByText(/默认环境创建失败/)).toBeInTheDocument()
-    expect(onRefresh).toHaveBeenCalledWith("1001")
+    expect(await screen.findByText(/SUT 创建失败/)).toBeInTheDocument()
+    // The SUT was never created, so the refresh must NOT prefer a SUT id.
+    expect(onRefresh).toHaveBeenCalledWith()
   })
 
-  it("creates and edits environments for the selected SUT", async () => {
+  it("creates and edits top-level environments", async () => {
     vi.mocked(api.createEnvironment).mockResolvedValue(secondEnvironmentFixture)
     vi.mocked(api.updateEnvironment).mockResolvedValue(environmentFixture)
     const { onRefresh } = renderPanel()
@@ -245,17 +288,15 @@ describe("SUTPanel", () => {
     expect(await screen.findByText("请输入环境名称")).toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText("环境名称"), { target: { value: "预发环境" } })
-    fireEvent.change(screen.getByLabelText("环境地址"), {
-      target: { value: "https://pre.order.test" },
-    })
-    fireEvent.click(screen.getByLabelText("设为默认环境"))
+    fireEvent.change(screen.getByLabelText("环境描述"), { target: { value: "预发联调" } })
     fireEvent.click(screen.getByRole("button", { name: "创建环境" }))
 
+    // v0.2.4-B: environments are top-level; the body is {name, description, status}
+    // (base_url/is_default were deleted with the per-SUT environment model).
     await waitFor(() =>
-      expect(api.createEnvironment).toHaveBeenCalledWith("1001", {
+      expect(api.createEnvironment).toHaveBeenCalledWith({
         name: "预发环境",
-        baseUrl: "https://pre.order.test",
-        isDefault: true,
+        description: "预发联调",
         status: "active",
       }),
     )
@@ -268,8 +309,7 @@ describe("SUTPanel", () => {
     await waitFor(() =>
       expect(api.updateEnvironment).toHaveBeenCalledWith("1102", {
         name: "预发环境 2",
-        baseUrl: "https://pre.order.test",
-        isDefault: false,
+        description: "预发联调环境",
         status: "active",
       }),
     )

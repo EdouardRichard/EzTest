@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,121 +38,30 @@ type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// VersionContext is the version-existence gate for design proposals.
+//
+// v0.2.4-B: this function used to build four resource maps (allowed version_sut
+// ids and page/api/db -> version_sut lookups) for the proposal ownership group.
+// Both the maps (design.VersionContext) and their only consumer (§5.2 "删 SUT
+// 归属组") were deleted, so the four queries that filled them went with them --
+// they read version_sut / version_sut.scope_exclude / sut_page / sut_api /
+// target_database.environment_id, all dropped by resource_0004 + version_0015/0016.
+// T27 reduced the projection to the version id: GraphService.Propose discards the
+// value and only checks the error, so selecting status / auto_design_new_requirements
+// projected fields no caller consumes. A missing version still reports
+// design.ErrNotFound so a proposal into it 404s on "version" rather than falling
+// through to the requirement read.
 func (r *Repository) VersionContext(ctx context.Context, versionID int64) (design.VersionContext, error) {
 	var view design.VersionContext
-	var autoDesign bool
 	if err := r.pool.QueryRow(ctx, `
-		SELECT id, status, auto_design_new_requirements
+		SELECT id
 		FROM version
 		WHERE id = $1
-	`, versionID).Scan(&view.VersionID, &view.Status, &autoDesign); err != nil {
+	`, versionID).Scan(&view.VersionID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return design.VersionContext{}, design.ErrNotFound
 		}
 		return design.VersionContext{}, fmt.Errorf("read version context: %w", err)
-	}
-	view.AutoDesignNewRequirements = autoDesign
-	view.PageToSUT = map[int64]int64{}
-	view.APIToSUT = map[int64]int64{}
-	view.DBTOSUT = map[int64]int64{}
-
-	rows, err := r.pool.Query(ctx, `
-		SELECT id
-		FROM version_sut
-		WHERE version_id = $1 AND status = 'active'
-		ORDER BY id
-	`, versionID)
-	if err != nil {
-		return design.VersionContext{}, fmt.Errorf("read version bindings: %w", err)
-	}
-	versionSUTIDs := make([]int64, 0)
-	for rows.Next() {
-		var versionSUTID int64
-		if err := rows.Scan(&versionSUTID); err != nil {
-			rows.Close()
-			return design.VersionContext{}, fmt.Errorf("scan version binding: %w", err)
-		}
-		versionSUTIDs = append(versionSUTIDs, versionSUTID)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return design.VersionContext{}, fmt.Errorf("scan version bindings: %w", err)
-	}
-	view.AllowedVersionSUTs = versionSUTIDs
-
-	// v0.22 DB-11: the version range is the bound environment's approved pages
-	// and APIs minus the version_sut.scope_exclude IDs. Entities proposed by
-	// discovery are not part of the range until approved.
-	pageRows, err := r.pool.Query(ctx, `
-		SELECT vs.id, p.id
-		FROM version_sut vs
-		JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
-		WHERE vs.version_id = $1 AND vs.status = 'active' AND p.status = 'approved'
-		  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
-		ORDER BY p.id
-	`, versionID)
-	if err != nil {
-		return design.VersionContext{}, fmt.Errorf("read version pages: %w", err)
-	}
-	for pageRows.Next() {
-		var versionSUTID, pageID int64
-		if err := pageRows.Scan(&versionSUTID, &pageID); err != nil {
-			pageRows.Close()
-			return design.VersionContext{}, fmt.Errorf("scan version page: %w", err)
-		}
-		view.PageToSUT[pageID] = versionSUTID
-	}
-	pageRows.Close()
-	if err := pageRows.Err(); err != nil {
-		return design.VersionContext{}, fmt.Errorf("scan version pages: %w", err)
-	}
-
-	apiRows, err := r.pool.Query(ctx, `
-		SELECT vs.id, a.id
-		FROM version_sut vs
-		JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
-		WHERE vs.version_id = $1 AND vs.status = 'active' AND a.status = 'approved'
-		  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
-		ORDER BY a.id
-	`, versionID)
-	if err != nil {
-		return design.VersionContext{}, fmt.Errorf("read version APIs: %w", err)
-	}
-	for apiRows.Next() {
-		var versionSUTID, apiID int64
-		if err := apiRows.Scan(&versionSUTID, &apiID); err != nil {
-			apiRows.Close()
-			return design.VersionContext{}, fmt.Errorf("scan version API: %w", err)
-		}
-		view.APIToSUT[apiID] = versionSUTID
-	}
-	apiRows.Close()
-	if err := apiRows.Err(); err != nil {
-		return design.VersionContext{}, fmt.Errorf("scan version APIs: %w", err)
-	}
-
-	databaseRows, err := r.pool.Query(ctx, `
-		SELECT vs.id, d.id
-		FROM version_sut vs
-		JOIN target_database d ON d.sut_id = vs.sut_id AND d.environment_id = vs.environment_id
-		WHERE vs.version_id = $1 AND vs.status = 'active' AND d.status = 'active'
-		  AND NOT (vs.scope_exclude -> 'databases' @> to_jsonb(d.id))
-		ORDER BY d.id
-	`, versionID)
-	if err != nil {
-		return design.VersionContext{}, fmt.Errorf("read version databases: %w", err)
-	}
-	for databaseRows.Next() {
-		var versionSUTID, databaseID int64
-		if err := databaseRows.Scan(&versionSUTID, &databaseID); err != nil {
-			databaseRows.Close()
-			return design.VersionContext{}, fmt.Errorf("scan version database: %w", err)
-		}
-		view.DBTOSUT[databaseID] = versionSUTID
-	}
-	databaseRows.Close()
-	if err := databaseRows.Err(); err != nil {
-		return design.VersionContext{}, fmt.Errorf("scan version databases: %w", err)
 	}
 	return view, nil
 }
@@ -163,18 +75,17 @@ func requirementRef(ctx context.Context, q querier, versionID, requirementID int
 	var currentVersionID *int64
 	var revision *int
 	var title *string
-	var targetSUTs []byte
+	var criteria []byte
 	err := q.QueryRow(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title,
-		       COALESCE(rv.description, ''), COALESCE(rv.acceptance_criteria, ''),
-		       r.status, COALESCE(rv.priority, 'P2'), COALESCE(rv.target_version_suts, '[]'::jsonb)
+		       r.status, COALESCE(rv.priority, $3), COALESCE(rv.sut_description, ''),
+		       COALESCE(rv.acceptance_criteria, '[]'::jsonb)
 		FROM requirement r
 		LEFT JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.id = $1 AND r.version_id = $2
-	`, requirementID, versionID).Scan(
+	`, requirementID, versionID, version.DefaultPriority).Scan(
 		&ref.ID, &ref.VersionID, &currentVersionID, &revision, &title,
-		&ref.Description, &ref.AcceptanceCriteria,
-		&ref.Status, &ref.Priority, &targetSUTs,
+		&ref.Status, &ref.Priority, &ref.SutDescription, &criteria,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return design.RequirementRef{}, design.ErrNotFound
@@ -191,10 +102,58 @@ func requirementRef(ctx context.Context, q querier, versionID, requirementID int
 	if title != nil {
 		ref.Title = *title
 	}
-	if ref.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
+	if ref.ACIDs, err = decodeACIDs(criteria); err != nil {
 		return design.RequirementRef{}, err
 	}
 	return ref, nil
+}
+
+// decodeACIDs reads the requirement's acceptance_criteria JSONB document -- the
+// [{id, given, when, then}] array the version context writes (design v1.3.1
+// §5.1) -- and returns just the ids, in id order.
+//
+// Design only needs the id set: it is what a case's covered_acs must be a subset
+// of (§5.2). The given/when/then text stays in the version context, which owns
+// it, so this reader does not have to mirror that shape.
+//
+// The order is by the numeric suffix of "AC-<n>", not lexicographic, so AC-2
+// sorts before AC-10. The sequence parser is version.ACIDSequence -- the same
+// canonical authority the version write path uses (constitution 五.1) -- so this
+// reader cannot drift from it on what counts as a valid id (it rejects a
+// non-canonical "AC-007" exactly as the writer does). A blank id is skipped (it
+// is not an id at all); a non-blank id that does not parse is still returned,
+// sorted last -- dropping it would silently shrink the set a proposal's
+// covered_acs is validated against, which fails closed in the wrong direction.
+func decodeACIDs(raw []byte) ([]string, error) {
+	ids := make([]string, 0)
+	if len(raw) == 0 {
+		return ids, nil
+	}
+	var criteria []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &criteria); err != nil {
+		return nil, fmt.Errorf("decode acceptance criteria: %w", err)
+	}
+	for _, criterion := range criteria {
+		id := strings.TrimSpace(criterion.ID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.SliceStable(ids, func(i, j int) bool {
+		left, leftOK := version.ACIDSequence(ids[i])
+		right, rightOK := version.ACIDSequence(ids[j])
+		if leftOK != rightOK {
+			return leftOK
+		}
+		if leftOK {
+			return left < right
+		}
+		return ids[i] < ids[j]
+	})
+	return ids, nil
 }
 
 func (r *Repository) CountPendingDesign(ctx context.Context, versionID int64) (int, error) {
@@ -203,12 +162,12 @@ func (r *Repository) CountPendingDesign(ctx context.Context, versionID int64) (i
 		SELECT count(*)
 		FROM requirement r
 		WHERE r.version_id = $1
-		  AND r.status = 'clarified'
+		  AND r.status = $2
 		  AND NOT EXISTS (
 		      SELECT 1 FROM design_scope ds
-		      WHERE ds.version_id = $1 AND ds.requirement_id = r.id AND ds.status = 'active'
+		      WHERE ds.version_id = $1 AND ds.requirement_id = r.id AND ds.status = $3
 		  )
-	`, versionID).Scan(&count)
+	`, versionID, string(version.RequirementClarified), design.ScopeStatusActive).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count pending design requirements: %w", err)
 	}
@@ -336,6 +295,24 @@ func encodeIDStrings(ids []string) ([]byte, error) {
 		return nil, fmt.Errorf("encode ID string array: %w", err)
 	}
 	return encoded, nil
+}
+
+// decodeStringArray reads a JSONB array of strings, the shape case_version
+// .covered_acs uses (v0.2.4-B §5.2). A NULL/empty column decodes to an empty
+// non-nil slice, never nil, so callers can range over it and a len() check
+// without a nil guard.
+func decodeStringArray(raw []byte) ([]string, error) {
+	values := make([]string, 0)
+	if len(raw) == 0 {
+		return values, nil
+	}
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, fmt.Errorf("decode string array: %w", err)
+	}
+	if values == nil {
+		values = make([]string, 0)
+	}
+	return values, nil
 }
 
 func normalizeTime(value *time.Time, fallback time.Time) time.Time {

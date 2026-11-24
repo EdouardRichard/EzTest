@@ -61,8 +61,8 @@ func (r *EntityRepository) UpsertFileEntities(ctx context.Context, runID, repoID
 
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM code_entity
-		WHERE repo_id = $1 AND commit_sha = $2 AND kind = 'file' AND source = 'git'
-	`, repoID, commitSHA); err != nil {
+		WHERE repo_id = $1 AND commit_sha = $2 AND kind = $3 AND source = 'git'
+	`, repoID, commitSHA, string(codeintel.EntityFile)); err != nil {
 		return wrapDB("delete file entities", err)
 	}
 	if len(entries) > 0 {
@@ -79,10 +79,11 @@ func (r *EntityRepository) UpsertFileEntities(ctx context.Context, runID, repoID
 				INSERT INTO code_entity (id, repo_id, commit_sha, index_run_id, kind, path, name,
 					blob_hash, source, confidence, evidence, meta, fact_key, fact_version,
 					created_at, updated_at)
-				VALUES ($1, $2, $3, $4, 'file', $5, $6, $7, 'git', 'high', '[]'::jsonb, $8::jsonb,
+				VALUES ($1, $2, $3, $4, $10, $5, $6, $7, 'git', $11, '[]'::jsonb, $8::jsonb,
 					'', 1, $9, $9)
 			`, r.ids.Next(), repoID, commitSHA, nullableInt64(indexRunIDPtr(runID)), entry.Path,
-				path.Base(entry.Path), blobHash, meta, now)
+				path.Base(entry.Path), blobHash, meta, now, string(codeintel.EntityFile),
+				string(codeintel.ConfidenceHigh))
 		}
 		results := tx.SendBatch(ctx, batch)
 		for range entries {
@@ -103,8 +104,8 @@ func (r *EntityRepository) UpsertFileEntities(ctx context.Context, runID, repoID
 
 // ListTree pages the indexed file projection by path cursor.
 func (r *EntityRepository) ListTree(ctx context.Context, repoID int64, commitSHA, pathPrefix, cursor string, limit int) ([]codeintel.Entity, string, bool, error) {
-	args := []any{repoID, commitSHA}
-	where := `repo_id = $1 AND commit_sha = $2 AND kind = 'file' AND source = 'git'`
+	args := []any{repoID, commitSHA, string(codeintel.EntityFile)}
+	where := `repo_id = $1 AND commit_sha = $2 AND kind = $3 AND source = 'git'`
 	if pathPrefix != "" {
 		args = append(args, pathPrefix)
 		where += fmt.Sprintf(` AND (path = $%d OR path LIKE $%d || '/%%')`, len(args), len(args))

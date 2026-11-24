@@ -68,6 +68,7 @@ export const AUDIT_ACTIONS: AuditAction[] = [
   { name: "version.updated", label: "更新版本", aliases: [] },
   { name: "version.reopened", label: "重开版本", aliases: [] },
   { name: "version.closed", label: "关闭版本", aliases: [] },
+  { name: "version.waived", label: "豁免关闭版本", aliases: [] },
   { name: "version.binding.changed", label: "变更版本绑定", aliases: [] },
   { name: "version.code_baseline_unresolved", label: "代码基线未解析", aliases: [] },
   { name: "version.stage_decision", label: "阶段决策", aliases: [] },
@@ -85,6 +86,7 @@ export const AUDIT_ACTIONS: AuditAction[] = [
   { name: "requirement.relation_created", label: "创建需求关系", aliases: [] },
   { name: "requirement.closed", label: "关闭需求", aliases: [] },
   { name: "requirement.reopened", label: "重开需求", aliases: [] },
+  { name: "requirement.waived", label: "豁免需求闭环", aliases: [] },
 
   { name: "agent.profile.updated", label: "更新 Agent Profile", aliases: [] },
   { name: "agent.profile.tool_denied", label: "Profile 工具调用被拒", aliases: [] },
@@ -101,6 +103,8 @@ export const AUDIT_ACTIONS: AuditAction[] = [
   { name: "quality.eval_recorded", label: "记录质量评估", aliases: [] },
   { name: "case.updated", label: "更新用例", aliases: [] },
   { name: "execution.credentials_read", label: "读取执行凭证", aliases: [] },
-  { name: "visual.diff.create", label: "创建视觉差异", aliases: [] },
   { name: "content.uploaded", label: "上传内容", aliases: [] },
+  { name: "skill.created", label: "创建技能", aliases: [] },
+  { name: "skill.updated", label: "更新技能", aliases: [] },
+  { name: "skill.deleted", label: "删除技能", aliases: [] },
 ]

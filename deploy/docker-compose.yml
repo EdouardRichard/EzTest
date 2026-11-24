@@ -68,7 +68,6 @@ services:
       dockerfile: deploy/Dockerfile.api
       args:
         VERSION: ${EZTEST_VERSION:-dev}
-        COMMIT: ${EZTEST_COMMIT:-}
     restart: unless-stopped
     env_file:
       - ../.env
@@ -102,7 +101,6 @@ services:
       dockerfile: deploy/Dockerfile.api
       args:
         VERSION: ${EZTEST_VERSION:-dev}
-        COMMIT: ${EZTEST_COMMIT:-}
     restart: unless-stopped
     env_file:
       - ../.env
@@ -163,7 +161,7 @@ services:
     environment:
       EZTEST_EXECUTOR_ADDR: 0.0.0.0:13336
       EZTEST_EXECUTOR_TOKEN: ${EZTEST_EXECUTOR_TOKEN:?set EZTEST_EXECUTOR_TOKEN in the environment or ../.env}
-      EZTEST_EXECUTOR_MAX_CONTEXTS: ${EZTEST_EXECUTOR_MAX_CONTEXTS:-8}
+      EZTEST_EXECUTOR_MAX_SESSIONS: ${EZTEST_EXECUTOR_MAX_SESSIONS:-8}
     shm_size: 1gb
     expose:
       - "13336"

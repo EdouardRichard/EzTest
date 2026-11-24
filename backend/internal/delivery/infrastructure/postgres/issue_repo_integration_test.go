@@ -29,7 +29,7 @@ type issueRepoTestCandidate struct {
 	category      string
 	severity      string
 	waveID        *int64
-	versionSUTID  *int64
+	sutID         *int64
 	requirementID int64
 }
 
@@ -84,7 +84,7 @@ func issueRepoBuildCandidate(t *testing.T, in issueRepoTestCandidate) (delivery.
 		Severity:       in.severity,
 		FailedExpected: "order confirmation visible",
 		FailedActual:   "order confirmation missing",
-		VersionSUTID:   in.versionSUTID,
+		SUTID:          in.sutID,
 		WaveID:         in.waveID,
 	})
 	if err != nil {
@@ -126,7 +126,7 @@ func TestIssueRepoCreateCandidate(t *testing.T) {
 
 	first := issueRepoTestCandidate{
 		waveID:        issueRepoNum(700),
-		versionSUTID:  issueRepoNum(9001),
+		sutID:         issueRepoNum(9001),
 		requirementID: 1200,
 	}
 	issue, refs := issueRepoBuildCandidate(t, first)
@@ -197,7 +197,7 @@ func TestIssueRepoCreateCandidate(t *testing.T) {
 	second, secondRefs := issueRepoBuildCandidate(t, issueRepoTestCandidate{
 		caseRunID:     3002,
 		waveID:        issueRepoNum(700),
-		versionSUTID:  issueRepoNum(9001),
+		sutID:         issueRepoNum(9001),
 		requirementID: 1200,
 	})
 	existing, isNew, err := repo.CreateCandidate(ctx, second, secondRefs)
@@ -787,19 +787,19 @@ func TestIssueRepoList(t *testing.T) {
 
 	first := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{
 		caseRunID: 3301, caseVersionID: 4301, category: "ui", severity: "major",
-		versionSUTID: issueRepoNum(9001),
+		sutID: issueRepoNum(9001),
 	})
 	second := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{
 		caseRunID: 3302, caseVersionID: 4302, category: "api", severity: "minor",
-		versionSUTID: issueRepoNum(9002),
+		sutID: issueRepoNum(9002),
 	})
 	third := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{
 		caseRunID: 3303, caseVersionID: 4303, category: "api", severity: "major",
-		versionSUTID: issueRepoNum(9002),
+		sutID: issueRepoNum(9002),
 	})
 	otherVersion := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{
 		versionID: 200, caseRunID: 3304, caseVersionID: 4304, category: "api", severity: "major",
-		versionSUTID: issueRepoNum(9001),
+		sutID: issueRepoNum(9001),
 	})
 
 	for _, item := range []struct {
@@ -887,11 +887,11 @@ func TestIssueRepoList(t *testing.T) {
 	}
 	assertIDs("api", api, third.ID, second.ID)
 
-	bySUT, err := repo.List(ctx, 100, deliveryapp.IssueFilter{VersionSUTID: issueRepoNum(9001), Limit: 10})
+	bySUT, err := repo.List(ctx, 100, deliveryapp.IssueFilter{SUTID: issueRepoNum(9001), Limit: 10})
 	if err != nil {
-		t.Fatalf("List version SUT: %v", err)
+		t.Fatalf("List SUT: %v", err)
 	}
-	assertIDs("version SUT", bySUT, first.ID)
+	assertIDs("SUT", bySUT, first.ID)
 
 	combined, err := repo.List(ctx, 100, deliveryapp.IssueFilter{
 		Status: "confirmed", Category: "api", Severity: "minor", Limit: 10,
@@ -1263,7 +1263,7 @@ func TestIssueRepoForeignKeyCascade(t *testing.T) {
 	ctx := context.Background()
 	issue := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{
 		waveID:        issueRepoNum(700),
-		versionSUTID:  issueRepoNum(9001),
+		sutID:         issueRepoNum(9001),
 		requirementID: 1200,
 	})
 

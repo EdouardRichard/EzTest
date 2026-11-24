@@ -1,14 +1,27 @@
 package designapp
 
 // Case-author discovery facts. The case author designs cases from the current
-// requirements; the exploration layer's page/API/gap/login facts are its
-// evidence for what the SUT actually exposes (spec §11, D25). This projection
-// is bounded, credential-free and read-only: it never mutates a requirement, a
-// case or a fact.
+// requirements; discovery page/API/gap/login facts are its evidence for what the
+// SUT actually exposes (spec §11, D25). This projection is bounded,
+// credential-free and read-only: it never mutates a requirement, a case or a
+// fact.
 //
 // The reader port is declared over a neutral record so the design context does
-// not import the version context; the composition root adapts
-// versionapp.FactService.Current onto it.
+// not import the version context.
+//
+// GD-21 (v0.2.4-C T3) deleted the deterministic explore/login pipeline that
+// originally produced these facts; v0.2.4-F T14 (SC-F10, R-E7 — owner
+// 2026-11-18 routed the producer E->F because it depends on the execution-side
+// exploration facts) lands the replacement producer: discovery_facts_reader.go
+// projects the P17 asset_registration facts (page/api) and the P18 session
+// fixture library (login_session), and the composition root wires it via
+// SetDiscoveryFacts. The read face stays bounded, credential-free and
+// best effort: a nil reader (partial assembly) still serves an empty,
+// error-free projection (TestCaseAuthorFactsNilDiscoveryWiring).
+//
+// gap 仍 reserved，到期版本 0.3（宪法三.7 第三路处置，spec SC-E7/SC-F10）：
+// design §6.6 事实集无 gap，本版本不臆造 gap 生产者（controller ruling
+// P3/SC-F10）。0.3 到期时裁定转正或删除；未处置则升级阻断级缺陷（宪法五.6）。
 
 import (
 	"context"
@@ -20,7 +33,15 @@ import (
 )
 
 // Discovery fact kinds read by the case author. They mirror the version_fact
-// kinds written by the exploration capabilities (page/api/gap/login_session).
+// kinds formerly written by the deterministic explore capabilities
+// (page/api/gap/login_session). Since v0.2.4-F T14 (SC-F10, R-E7) page/api and
+// login_session have a producer again: the execution-side P17 proven asset
+// registrations and the P18 session fixture library, projected by
+// discovery_facts_reader.go.
+//
+// gap 仍 reserved，到期版本 0.3（宪法三.7，spec SC-E7/SC-F10）：本版本无 gap
+// 生产者（design §6.6 事实集无 gap，不臆造）；TestGapKindReserved 钉住。
+// 0.3 到期未处置则升级阻断级缺陷（宪法五.6）。
 const (
 	DiscoveryFactKindPage         = "page"
 	DiscoveryFactKindAPI          = "api"

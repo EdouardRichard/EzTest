@@ -7,6 +7,7 @@ import (
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -43,6 +44,19 @@ func NewQueryReader(pool *pgxpool.Pool, pendingDesign PendingDesignCounter) (*Qu
 	return &QueryReader{pool: pool, pendingDesign: pendingDesign}, nil
 }
 
+// countableRequirementStatuses adapts the DOMAIN closure-denominator rule
+// (version.CountableRequirementStatuses) to the []string query parameter pgx binds.
+// The business rule — which statuses count — lives in the domain (T11e-5 Part A5 /
+// H-A22⑤); this is only the wire adaptation, never a second status set.
+func countableRequirementStatuses() []string {
+	statuses := version.CountableRequirementStatuses()
+	out := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		out = append(out, string(status))
+	}
+	return out
+}
+
 // CountRequirementClosure returns closed requirements over the countable
 // requirements (draft+clarified+closed; obsolete excluded), for one version when
 // versionID is non-nil and globally otherwise.
@@ -50,11 +64,11 @@ func (r *QueryReader) CountRequirementClosure(ctx context.Context, versionID *in
 	var num, denom int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
-			count(*) FILTER (WHERE status = 'closed'),
-			count(*) FILTER (WHERE status IN ('draft', 'clarified', 'closed'))
+			count(*) FILTER (WHERE status = $2),
+			count(*) FILTER (WHERE status = ANY($3))
 		FROM requirement
 		WHERE $1::bigint IS NULL OR version_id = $1
-	`, versionID).Scan(&num, &denom); err != nil {
+	`, versionID, version.RequirementClosed, countableRequirementStatuses()).Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("count requirement closure: %w", err)
 	}
 	return num, denom, nil
@@ -211,10 +225,10 @@ func (r *QueryReader) ListDraftRequirements(ctx context.Context, limit int) ([]v
 		FROM requirement r
 		JOIN version v ON v.id = r.version_id
 		JOIN requirement_version rv ON rv.id = r.current_version_id
-		WHERE r.status = 'draft'
+		WHERE r.status = $2
 		ORDER BY r.created_at DESC, r.id DESC
 		LIMIT $1
-	`, limit)
+	`, limit, version.RequirementDraft)
 	if err != nil {
 		return nil, fmt.Errorf("list draft requirements: %w", err)
 	}

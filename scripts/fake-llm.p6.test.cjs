@@ -1,14 +1,33 @@
 #!/usr/bin/env node
 "use strict";
 
-// Deterministic tests for the P6 execution scenarios of scripts/fake-llm.cjs and
-// the P6 fixture pages of scripts/fixture-target.cjs (design spec §10.2).
+// Deterministic tests for the case-executor execution scenario of
+// scripts/fake-llm.cjs (v0.2.4-C T13 tool surface, v0.2.4-F T15 NL/sut_id/fixture
+// contract) and the P6 fixture pages of scripts/fixture-target.cjs.
 //
 // Both servers are spawned on process-unique ports. The fake LLM is driven
 // through the same POST /v1/chat/completions wire shape the real provider uses
 // (streaming and non-streaming), so these tests exercise the actual system
-// prompt detection, per-run step counting, mode switch and the underscore tool
-// call names the P1 gateway emits (`ReplaceAll(name, ".", "_")`).
+// prompt detection, per-run step counting and mode switch.
+//
+// Contract (current agent tool surface, NOT the retired 0.2.0 underscore names):
+//   * the scenario is selected by the seeded case_executor prompt marker
+//     "[profile:case_executor]" (backend/internal/agent/application/execution_profiles.go);
+//   * tool names are the dotted registry names (sut.read / exec.run / http.request /
+//     execution.step_record / ...); the 13 browser.* atomic actions are retired;
+//   * the case snapshot comes from context.task_pack -> result.execution
+//     (steps[].seq / assertions[].step_seq+assertion_seq), not the retired
+//     execution_case_context remaining_steps/assertion_id shape;
+//   * v0.2.4-F NL contract: the design supplies sut_description / covered_acs /
+//     per-step target_description (no design-target SUT/page/API id columns); the
+//     scenario resolves the SUT via sut.read and carries sut_id as FACTUAL
+//     attribution on http.request / step_record / assertion_record;
+//   * recording carries seq/status/observed and step_seq/assertion_seq/verdict/
+//     actual; evidence is settled automatically by the execution tools, so no
+//     evidence_ids travel on the recording arguments;
+//   * the "fixture" mode exercises the P18 chain (fixture.download -> state-save ->
+//     fixture.upload);
+//   * case_finish submits a candidate verdict/summary/failure_class.
 //
 // Run:
 //   node scripts/fake-llm.p6.test.cjs
@@ -19,6 +38,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { after, before, test } = require("node:test");
+const { parseSse } = require("./fake-llm-sse-test-helper.cjs");
 
 const repoRoot = path.resolve(__dirname, "..");
 const fakeLlmScript = path.join(__dirname, "fake-llm.cjs");
@@ -26,44 +46,97 @@ const fixtureScript = path.join(__dirname, "fixture-target.cjs");
 const serverLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "eztest-p6-servers-"));
 
 const MODEL = "deepseek-flash";
-const P6_MARKER = "EzTest 的执行 Agent";
+const P6_MARKER = "[profile:case_executor]";
 const FIXTURE_BASE = "http://127.0.0.1:13335";
 
-const CASE_CONTEXT = {
-  case_run_id: "9101",
-  batch_id: "9102",
+// The context.task_pack result shape of an execute.case run
+// (runner.go taskPackResult/executionTaskResult, v0.2.4-F T12/T15 NL contract).
+// The scenario reads result.execution.steps / result.execution.assertions and
+// resolves the SUT from result.execution.suts[].sut_id. The design supplies
+// natural-language targets (sut_description / covered_acs / per-step
+// target_description); the retired design-target SUT/page/API id columns are
+// gone (steps[].target_sut_id no longer exists). assertions[].target_sut_id and
+// prior_*[].target_sut_id are FACTUAL attribution and stay.
+const TASK_PACK = {
   version_id: "9103",
-  case_node_id: "9104",
-  title: "P6 登录后创建订单",
-  status: "running",
-  attempt: 1,
-  steps: [
-    { seq: 1, action: "打开订单创建页并填写订单号", expected: "订单表单可见" },
-    { seq: 2, action: "提交新建订单", expected: "订单创建成功" },
-  ],
-  remaining_steps: [
-    { seq: 1, action: "打开订单创建页并填写订单号", expected: "订单表单可见" },
-    { seq: 2, action: "提交新建订单", expected: "订单创建成功" },
-  ],
-  assertions: [
-    {
-      assertion_id: "7101",
-      step_seq: 2,
-      kind: "ui",
-      target: "#result",
-      expression: "text contains 订单创建成功",
-      expected: "订单创建成功",
-    },
-  ],
-  completed_seqs: [],
-  cleanup_required: false,
-  base_url: FIXTURE_BASE,
-  allowed_hosts: ["127.0.0.1:13335"],
+  conversation_id: "0",
+  agent_run_id: "9105",
+  type: "execute.case",
+  goal: "严格按任务上下文中的用例步骤顺序执行。",
+  constraints: ["不得虚构 passed"],
+  acceptance_criteria: ["每个执行过的 step 都有 execution.step_record"],
+  scope: { version_id: "9103" },
+  execution: {
+    case_run_id: "9101",
+    wave_id: "9102",
+    intent_id: "9106",
+    case_version_id: "9104",
+    environment_id: "3",
+    case_title: "P6 登录后创建订单",
+    description: "用户使用账号密码登录后创建订单",
+    sut_description: "订单管理系统（orders），提供订单创建与查询的 Web UI。",
+    preconditions: "已创建测试账号",
+    covered_acs: ["AC-1", "AC-2"],
+    priority: "P2",
+    suts: [
+      {
+        sut_id: "7",
+        sut_name: "orders",
+        intro: "订单管理系统",
+        environment_id: "3",
+        environment_name: "test",
+        base_url: FIXTURE_BASE,
+        page_urls: [FIXTURE_BASE + "/p6/orders/new"],
+        api_endpoints: [],
+        account_roles: ["admin"],
+      },
+    ],
+    steps: [
+      { seq: 1, action: "打开订单创建页并填写订单号", expected: "订单表单可见", account_role: "admin", target_description: "订单创建页的订单号输入框" },
+      { seq: 2, action: "提交新建订单", expected: "订单创建成功", account_role: "admin", target_description: "订单创建页的提交按钮" },
+    ],
+    assertions: [
+      { step_seq: 2, assertion_seq: 1, kind: "ui", expected: "订单创建成功", target_sut_id: "7" },
+    ],
+    prior_steps: [],
+    prior_assertions: [],
+  },
 };
 
-const EVIDENCE = { evidence_id: "8101", sha256: "a".repeat(64), size: 1234 };
-const GOTO_RESULT = { url: FIXTURE_BASE + "/p6/orders/new", status: 200 };
-const SNAPSHOT_RESULT = { url: FIXTURE_BASE + "/p6/orders/new", title: "New order", aria: "- heading" };
+// sut.read detail result (sut_tools.go sutRead.Execute): identity/registration
+// labels + effective asset summary. The scenario confirms the catalog match.
+const SUT_READ_RESULT = {
+  version_id: "9103",
+  sut_id: "7",
+  name: "orders",
+  intro: "订单管理系统",
+  base_url: FIXTURE_BASE,
+  source: "admin",
+  status: "approved",
+  environment: "test",
+  environment_id: "3",
+  pages: [{ id: "71", name: "订单创建页", path: "/p6/orders/new" }],
+  apis: [],
+  databases: [],
+  asset_counts: { pages: 1, apis: 0, databases: 0 },
+};
+// fixture.download on a first run: no fixture yet (the scenario then logs in and
+// saves one). fixture.upload stores the saved state (P18 append-only fact).
+const FIXTURE_DOWNLOAD_NOT_FOUND = { error: "not_found", message: "no session fixture for this reuse key" };
+const FIXTURE_UPLOAD_RESULT = {
+  version_id: "9103",
+  case_run_id: "9101",
+  fixture_id: "8501",
+  sut_id: "7",
+  environment_id: "3",
+  role: "admin",
+  storage_state_ref: "a".repeat(64),
+  bytes: 128,
+};
+const BROWSER_CLI_RESULT = { ok: true, exit_code: 0, stdout: "", stderr: "" };
+
+const EXEC_RUN_RESULT = { ok: true, exit_code: 0, stdout: "p6-step-prep\n", stderr: "", evidence_ids: ["8101"] };
+const HTTP_RESULT = { status: 200, truncated: false, evidence_ids: ["8102"] };
 const OK_RESULT = { ok: true };
 
 let serverCounter = 0;
@@ -112,7 +185,7 @@ async function startServer(script, envOverrides, healthPath, label) {
       throw new Error(label + " did not start on " + base + ":\n" + lastError);
     }
   }
-  throw new Error("could not find a free port for " + label + ":\n" + lastError);
+  throw new Error("could not find a free port for " + label);
 }
 
 async function withFakeLlm(mode, fn) {
@@ -128,15 +201,21 @@ async function withFakeLlm(mode, fn) {
 
 function agentTools() {
   return [
-    "execution_case_context",
-    "browser_goto",
-    "browser_snapshot",
-    "browser_fill",
-    "browser_click",
-    "browser_screenshot",
-    "execution_step_record",
-    "execution_assertion_record",
-    "execution_case_finish",
+    "context.task_pack",
+    "sut.list",
+    "sut.read",
+    "exec.run",
+    "browser.cli",
+    "http.request",
+    "db.query",
+    "fixture.upload",
+    "fixture.download",
+    "execution.step_record",
+    "execution.assertion_record",
+    "execution.evidence",
+    "execution.wait",
+    "execution.case_finish",
+    "human.request",
   ].map((name) => ({
     type: "function",
     function: {
@@ -148,13 +227,12 @@ function agentTools() {
 }
 
 function p6SystemPrompt() {
-  return P6_MARKER + "\n\n你是执行 Agent，只执行给定用例快照。";
+  return "你是 EzTest 的用例执行器（Case Executor）。\n" + P6_MARKER;
 }
 
 function p6Instruction() {
   return [
     "## 执行任务",
-    "batchId=9102",
     "caseRunId=9101",
     "baseUrl=" + FIXTURE_BASE,
     "请按步骤执行并提交结构化结果。",
@@ -197,39 +275,14 @@ async function streamChat(base, messages) {
   return parseSse(text);
 }
 
-function parseSse(text) {
-  const result = { content: "", toolCalls: [], finishReason: null };
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice("data: ".length).trim();
-    if (data === "" || data === "[DONE]") continue;
-    let chunk;
-    try {
-      chunk = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    const choice = chunk && Array.isArray(chunk.choices) ? chunk.choices[0] : null;
-    if (!choice) continue;
-    const delta = choice.delta || {};
-    if (typeof delta.content === "string") result.content += delta.content;
-    if (Array.isArray(delta.tool_calls)) {
-      for (const fragment of delta.tool_calls) {
-        const index = typeof fragment.index === "number" ? fragment.index : 0;
-        const slot =
-          result.toolCalls[index] || (result.toolCalls[index] = { id: "", name: "", arguments: "" });
-        if (fragment.id) slot.id = fragment.id;
-        if (fragment.function) {
-          if (fragment.function.name) slot.name = fragment.function.name;
-          if (typeof fragment.function.arguments === "string") {
-            slot.arguments += fragment.function.arguments;
-          }
-        }
-      }
-    }
-    if (choice.finish_reason) result.finishReason = choice.finish_reason;
-  }
-  return result;
+// The current registry names are dotted (namespace.tool); the retired 0.2.0
+// gateway underscore conversion no longer exists. browser.cli is the CURRENT
+// browser capability-domain passthrough (v0.2.4-C T15), not a retired atomic
+// action — the 13 browser.* atomic actions stay forbidden.
+function assertDottedToolName(name) {
+  assert.equal(typeof name, "string");
+  assert.match(name, /^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/, "tool name " + JSON.stringify(name) + " must be a dotted registry name");
+  assert.ok(!name.startsWith("browser.") || name === "browser.cli", "retired browser.* action emitted: " + name);
 }
 
 function assertToolCall(choice, expectedName) {
@@ -237,15 +290,9 @@ function assertToolCall(choice, expectedName) {
   assert.equal(calls.length, 1, "expected exactly one tool call, got " + calls.length);
   const call = calls[0];
   assert.equal(call.function.name, expectedName);
-  assertUnderscoreToolName(call.function.name);
+  assertDottedToolName(call.function.name);
   assert.equal(choice.finish_reason, "tool_calls");
   return JSON.parse(call.function.arguments);
-}
-
-function assertUnderscoreToolName(name) {
-  assert.equal(typeof name, "string");
-  assert.ok(!name.includes("."), "tool name " + JSON.stringify(name) + " must not contain a dot");
-  assert.match(name, /^[a-z][a-z0-9_]*$/, "tool name " + JSON.stringify(name) + " must be snake_case");
 }
 
 function appendToolResult(messages, choice, content) {
@@ -266,22 +313,26 @@ function assertTextTurn(choice, label) {
   return choice.message.content;
 }
 
-/** Appends the canonical tool result for a planned P6 call. */
+/** Appends the canonical tool result for a planned execution call. */
 function resultFor(name) {
   switch (name) {
-    case "execution_case_context":
-      return CASE_CONTEXT;
-    case "browser_goto":
-      return GOTO_RESULT;
-    case "browser_snapshot":
-      return SNAPSHOT_RESULT;
-    case "browser_screenshot":
-      return EVIDENCE;
-    case "execution_step_record":
-      return { step_result_id: "8201", seq: 1, status: "passed", evidence_count: 1 };
-    case "execution_assertion_record":
-      return { assertion_result_id: "8301", assertion_id: "7101", verdict: "passed" };
-    case "execution_case_finish":
+    case "context.task_pack":
+      return TASK_PACK;
+    case "sut.read":
+      return SUT_READ_RESULT;
+    case "exec.run":
+      return EXEC_RUN_RESULT;
+    case "browser.cli":
+      return BROWSER_CLI_RESULT;
+    case "http.request":
+      return HTTP_RESULT;
+    case "fixture.download":
+      return FIXTURE_DOWNLOAD_NOT_FOUND;
+    case "fixture.upload":
+      return FIXTURE_UPLOAD_RESULT;
+    case "human.request":
+      return { status: "resolved", human_request_id: "8401" };
+    case "execution.case_finish":
       return { case_run_id: "9101", status: "passed" };
     default:
       return OK_RESULT;
@@ -289,10 +340,9 @@ function resultFor(name) {
 }
 
 /**
- * Drives one P6 run: requests `count` tool turns, appends a matching result and
- * finally asks for the terminal turn. Returns every call plus the final text.
- * `options.toolResults` overrides the canonical result of individual tool calls
- * (the visual contract tests feed the server-owned visual result this way).
+ * Drives one execution run: requests `count` tool turns, appends a matching
+ * result and finally asks for the terminal turn. `options.toolResults`
+ * overrides the canonical result of individual tool calls.
  */
 async function driveToolTurns(base, count, options = {}) {
   const messages = [
@@ -304,7 +354,7 @@ async function driveToolTurns(base, count, options = {}) {
   for (let index = 0; index < count; index += 1) {
     const choice = await chat(base, messages);
     const name = choice.message.tool_calls[0].function.name;
-    assertUnderscoreToolName(name);
+    assertDottedToolName(name);
     calls.push({ name, args: JSON.parse(choice.message.tool_calls[0].function.arguments) });
     const result = Object.prototype.hasOwnProperty.call(overrides, name)
       ? overrides[name]
@@ -317,16 +367,16 @@ async function driveToolTurns(base, count, options = {}) {
 
 // --- detection -------------------------------------------------------------
 
-test("the execution-agent system marker selects the P6 scenario", async () => {
+test("the case_executor prompt marker selects the execution scenario", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
   const choice = await chat(sharedLlm.base, [
     { role: "system", content: p6SystemPrompt() },
     { role: "user", content: p6Instruction() },
   ]);
-  assertToolCall(choice, "execution_case_context");
+  assertToolCall(choice, "context.task_pack");
 });
 
-test("P1 and P5 keep their behavior while the P6 scenario is registered", async () => {
+test("P1 and P5 keep their behavior while the execution scenario is registered", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
 
   const p1 = await postChat(sharedLlm.base, {
@@ -336,7 +386,7 @@ test("P1 and P5 keep their behavior while the P6 scenario is registered", async 
     tools: agentTools(),
   });
   assert.equal(p1.status, 200, p1.text);
-  assert.equal(p1.json.choices[0].message.tool_calls[0].function.name, "file_read");
+  assert.equal(p1.json.choices[0].message.tool_calls[0].function.name, "file.read");
 
   const p5 = await postChat(sharedLlm.base, {
     model: MODEL,
@@ -348,49 +398,65 @@ test("P1 and P5 keep their behavior while the P6 scenario is registered", async 
     tools: agentTools(),
   });
   assert.equal(p5.status, 200, p5.text);
-  assert.equal(p5.json.choices[0].message.tool_calls[0].function.name, "case_graph_read");
+  assert.equal(p5.json.choices[0].message.tool_calls[0].function.name, "design_graph_read");
 });
 
 // --- normal ----------------------------------------------------------------
 
-test("normal mode drives case_context -> browser form -> records -> passed finish", async () => {
+test("normal mode drives task_pack -> sut.read -> exec/http -> records -> passed finish", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
-  const { calls, finalChoice } = await driveToolTurns(sharedLlm.base, 10);
+  const { calls, finalChoice } = await driveToolTurns(sharedLlm.base, 8);
 
   assert.deepEqual(
     calls.map((call) => call.name),
     [
-      "execution_case_context",
-      "browser_goto",
-      "browser_snapshot",
-      "browser_fill",
-      "browser_click",
-      "browser_screenshot",
-      "execution_step_record",
-      "execution_step_record",
-      "execution_assertion_record",
-      "execution_case_finish",
+      "context.task_pack",
+      "sut.read",
+      "exec.run",
+      "http.request",
+      "execution.step_record",
+      "execution.step_record",
+      "execution.assertion_record",
+      "execution.case_finish",
     ],
   );
 
   assert.deepEqual(calls[0].args, {});
-  assert.equal(calls[1].args.url, FIXTURE_BASE + "/p6/orders/new");
-  assert.deepEqual(calls[3].args, { target: { selector: "#order-number" }, value: "P6-E2E-ORDER" });
-  assert.deepEqual(calls[4].args, { target: { role: "button", name: "Create order" } });
-  assert.deepEqual(calls[5].args, {});
+  // Resolution: sut.read carries the catalog sut_id (the single value source).
+  assert.equal(calls[1].args.sut_id, "7");
+  // exec.run carries an argv command (general-execution domain), never a
+  // retired browser action.
+  assert.ok(Array.isArray(calls[2].args.argv) && calls[2].args.argv.length > 0, "exec.run needs argv");
+  // http.request uses a relative SUT path; the server prepends the base URL.
+  // The resolved sut_id travels as factual attribution.
+  assert.equal(calls[3].args.path, "/p6/orders/new");
+  assert.equal(calls[3].args.method, "GET");
+  assert.equal(calls[3].args.sut_id, "7");
 
-  assert.equal(calls[6].args.seq, 1);
-  assert.equal(calls[6].args.status, "passed");
-  assert.deepEqual(calls[6].args.evidence_ids, [EVIDENCE.evidence_id]);
-  assert.equal(calls[7].args.seq, 2);
-  assert.deepEqual(calls[7].args.evidence_ids, [EVIDENCE.evidence_id]);
+  assert.equal(calls[4].args.seq, 1);
+  assert.equal(calls[4].args.status, "passed");
+  assert.ok(String(calls[4].args.observed).length > 0, "a step record needs observed");
+  // The recording consumes the natural-language design target (NL contract).
+  assert.match(String(calls[4].args.observed), /订单创建页的订单号输入框/);
+  assert.equal(calls[4].args.sut_id, "7", "step record carries factual sut_id attribution");
+  assert.equal(calls[5].args.seq, 2);
+  assert.equal(calls[5].args.sut_id, "7");
+  // Evidence is settled automatically by the execution tools: the recording
+  // arguments carry no evidence_ids.
+  assert.equal(Object.prototype.hasOwnProperty.call(calls[4].args, "evidence_ids"), false);
+  // The design no longer supplies target SUT/page/API ids on steps: the scenario
+  // never emits a design-target id column (factual sut_id attribution is distinct).
+  assert.equal(Object.prototype.hasOwnProperty.call(calls[4].args, "target_sut_id"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(calls[4].args, "target_page_id"), false);
 
-  assert.equal(calls[8].args.assertion_id, "7101");
-  assert.equal(calls[8].args.verdict, "passed");
-  assert.deepEqual(calls[8].args.evidence_ids, [EVIDENCE.evidence_id]);
+  assert.equal(calls[6].args.step_seq, 2);
+  assert.equal(calls[6].args.assertion_seq, 1);
+  assert.equal(calls[6].args.verdict, "passed");
+  assert.ok(String(calls[6].args.actual).length > 0, "an assertion record needs actual");
+  assert.equal(calls[6].args.sut_id, "7", "assertion record carries factual sut_id attribution");
 
-  assert.equal(calls[9].args.verdict, "passed");
-  assert.equal(calls[9].args.failure_class, undefined);
+  assert.equal(calls[7].args.verdict, "passed");
+  assert.equal(calls[7].args.failure_class, undefined);
 
   const text = assertTextTurn(finalChoice, "normal final");
   assert.match(text, /P6/);
@@ -403,93 +469,28 @@ test("normal mode streams the same tool turns", async () => {
     { role: "user", content: p6Instruction() },
   ];
   const first = await streamChat(sharedLlm.base, messages);
-  assert.equal(first.toolCalls[0].name, "execution_case_context");
+  assert.equal(first.toolCalls[0].name, "context.task_pack");
   assert.equal(first.finishReason, "tool_calls");
   assert.deepEqual(JSON.parse(first.toolCalls[0].arguments), {});
 });
 
-// --- visual assertions (P8 §9.3) -------------------------------------------
-
-const VISUAL_ASSERTION = {
-  assertion_id: "7102",
-  step_seq: 2,
-  kind: "visual",
-  target: "订单详情全页",
-  expression: "pixelmatch",
-  expected: "视觉一致",
-};
-
-/** The P6 case context with its single ui assertion replaced by one visual one. */
-function visualCaseContext() {
-  return { ...CASE_CONTEXT, assertions: [VISUAL_ASSERTION] };
-}
-
-test("visual assertions map the server result onto all four finish verdicts", async () => {
+test("identical requests stay deterministic", async () => {
   assert.ok(sharedLlm, "shared fake LLM server was not started");
-
-  const outcomes = [
-    {
-      label: "missing baseline",
-      result: { error: "missing_visual_baseline" },
-      verdict: "inconclusive",
-      failureClass: "case",
-      reason: "missing_visual_baseline",
-    },
-    {
-      label: "environment mismatch",
-      result: { classification: "inconclusive", reason: "visual_environment_mismatch" },
-      verdict: "inconclusive",
-      failureClass: "environment",
-      reason: "visual_environment_mismatch",
-    },
-    {
-      label: "pixel mismatch",
-      result: { classification: "failed", reason: "visual_mismatch" },
-      verdict: "failed",
-      failureClass: "application",
-      reason: "visual_mismatch",
-    },
-    {
-      label: "pixel match",
-      result: { classification: "passed" },
-      verdict: "passed",
-      failureClass: undefined,
-      reason: "视觉断言通过",
-    },
-  ];
-
-  for (const outcome of outcomes) {
-    const { calls, finalChoice } = await driveToolTurns(sharedLlm.base, 10, {
-      toolResults: {
-        execution_case_context: visualCaseContext(),
-        execution_visual_assert: JSON.stringify(outcome.result),
-      },
-    });
-
-    assert.deepEqual(
-      calls.map((call) => call.name),
-      [
-        "execution_case_context",
-        "browser_goto",
-        "browser_snapshot",
-        "browser_fill",
-        "browser_click",
-        "browser_screenshot",
-        "execution_step_record",
-        "execution_step_record",
-        "execution_visual_assert",
-        "execution_case_finish",
-      ],
-      outcome.label,
-    );
-    // The agent must delegate the comparison to the server-owned tool: only the
-    // assertion id travels on the wire.
-    assert.deepEqual(calls[8].args, { assertionId: VISUAL_ASSERTION.assertion_id });
-    assert.equal(calls[9].args.verdict, outcome.verdict, outcome.label);
-    assert.equal(calls[9].args.failure_class, outcome.failureClass, outcome.label);
-    assert.equal(calls[9].args.reason, outcome.reason, outcome.label);
-    assertTextTurn(finalChoice, outcome.label);
-  }
+  const body = {
+    model: MODEL,
+    stream: false,
+    messages: [
+      { role: "system", content: p6SystemPrompt() },
+      { role: "user", content: p6Instruction() },
+    ],
+    tools: agentTools(),
+  };
+  const first = await postChat(sharedLlm.base, body);
+  const second = await postChat(sharedLlm.base, body);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(first.json.id, second.json.id, "same body must produce the same completion id");
+  assert.equal(first.text, second.text, "same body must produce a byte-identical response");
 });
 
 // --- fail ------------------------------------------------------------------
@@ -500,20 +501,20 @@ test("fail mode records a failed assertion and finishes failed(application)", as
     assert.deepEqual(
       calls.map((call) => call.name),
       [
-        "execution_case_context",
-        "browser_goto",
-        "browser_snapshot",
-        "browser_screenshot",
-        "execution_step_record",
-        "execution_step_record",
-        "execution_assertion_record",
-        "execution_case_finish",
+        "context.task_pack",
+        "sut.read",
+        "exec.run",
+        "http.request",
+        "execution.step_record",
+        "execution.step_record",
+        "execution.assertion_record",
+        "execution.case_finish",
       ],
     );
-    assert.equal(calls[1].args.url, FIXTURE_BASE + "/p6/assert-fail");
+    assert.equal(calls[3].args.path, "/p6/assert-fail");
     assert.equal(calls[6].args.verdict, "failed");
     assert.ok(String(calls[6].args.actual).length > 0, "a failed assertion needs actual");
-    assert.deepEqual(calls[6].args.evidence_ids, [EVIDENCE.evidence_id]);
+    assert.equal(calls[6].args.sut_id, "7");
     assert.equal(calls[7].args.verdict, "failed");
     assert.equal(calls[7].args.failure_class, "application");
     assertTextTurn(finalChoice, "fail final");
@@ -522,61 +523,135 @@ test("fail mode records a failed assertion and finishes failed(application)", as
 
 // --- blocked ---------------------------------------------------------------
 
-test("blocked mode finishes blocked(environment)", async () => {
+test("blocked mode records the blocked step and finishes blocked(environment)", async () => {
   await withFakeLlm("blocked", async (server) => {
-    const { calls, finalChoice } = await driveToolTurns(server.base, 8);
+    const { calls, finalChoice } = await driveToolTurns(server.base, 6);
     assert.deepEqual(
       calls.map((call) => call.name),
       [
-        "execution_case_context",
-        "browser_goto",
-        "browser_snapshot",
-        "browser_screenshot",
-        "execution_step_record",
-        "execution_step_record",
-        "execution_assertion_record",
-        "execution_case_finish",
+        "context.task_pack",
+        "sut.read",
+        "exec.run",
+        "http.request",
+        "execution.step_record",
+        "execution.case_finish",
       ],
     );
-    assert.equal(calls[7].args.verdict, "blocked");
-    assert.equal(calls[7].args.failure_class, "environment");
-    assert.ok(String(calls[7].args.reason).length > 0, "blocked needs a reason");
+    assert.equal(calls[3].args.path, "/p6/requires-auth");
+    assert.equal(calls[4].args.seq, 1);
+    assert.equal(calls[4].args.status, "blocked");
+    assert.ok(String(calls[4].args.observed).length > 0, "a blocked step needs observed");
+    assert.equal(calls[4].args.sut_id, "7");
+    // An environment-blocked run cannot execute assertions: none are recorded.
+    assert.equal(calls.filter((call) => call.name === "execution.assertion_record").length, 0);
+    assert.equal(calls[5].args.verdict, "blocked");
+    assert.equal(calls[5].args.failure_class, "environment");
+    assert.ok(String(calls[5].args.summary).length > 0, "blocked needs a summary");
     assertTextTurn(finalChoice, "blocked final");
   });
 });
 
 // --- takeover --------------------------------------------------------------
 
-test("takeover mode visits the MFA fixture and finishes blocked(session)", async () => {
+test("takeover mode requests a login takeover, then records and finishes", async () => {
   await withFakeLlm("takeover", async (server) => {
-    const { calls, finalChoice } = await driveToolTurns(server.base, 8);
-    assert.equal(calls[1].name, "browser_goto");
-    assert.match(calls[1].args.url, /\/p6\/login\?mfa=1$/);
-    assert.equal(calls[7].name, "execution_case_finish");
-    assert.equal(calls[7].args.verdict, "blocked");
-    assert.equal(calls[7].args.failure_class, "session");
-    assert.match(String(calls[7].args.reason), /mfa/i);
+    const { calls, finalChoice } = await driveToolTurns(server.base, 9);
+    assert.deepEqual(
+      calls.map((call) => call.name),
+      [
+        "context.task_pack",
+        "sut.read",
+        "exec.run",
+        "http.request",
+        "human.request",
+        "execution.step_record",
+        "execution.step_record",
+        "execution.assertion_record",
+        "execution.case_finish",
+      ],
+    );
+    assert.equal(calls[3].args.path, "/p6/login?mfa=1");
+    assert.equal(calls[4].args.kind, "login_takeover");
+    assert.match(String(calls[4].args.reason), /mfa/i);
+    assert.equal(calls[4].args.account_role, "admin");
+    assert.equal(calls[8].args.verdict, "passed");
     assertTextTurn(finalChoice, "takeover final");
+  });
+});
+
+// --- fixture (P18 cross-case login-state chain) ----------------------------
+
+test("fixture mode reuses-or-saves a session fixture via the P18 tool chain", async () => {
+  await withFakeLlm("fixture", async (server) => {
+    const { calls, finalChoice } = await driveToolTurns(server.base, 11);
+    assert.deepEqual(
+      calls.map((call) => call.name),
+      [
+        "context.task_pack",
+        "sut.read",
+        "fixture.download",
+        "exec.run",
+        "http.request",
+        "browser.cli",
+        "fixture.upload",
+        "execution.step_record",
+        "execution.step_record",
+        "execution.assertion_record",
+        "execution.case_finish",
+      ],
+    );
+    // First run tries to reuse a fixture (not_found), then logs in and saves one.
+    assert.equal(calls[2].args.sut_id, "7");
+    assert.equal(calls[2].args.account_role, "admin");
+    // CLI state-save writes the workspace state file; upload stores it server-side.
+    assert.equal(calls[5].args.subcommand, "state-save");
+    assert.equal(calls[5].args.sut_id, "7");
+    assert.equal(calls[6].args.sut_id, "7");
+    assert.equal(calls[6].args.path, "state.json");
+    assert.equal(calls[10].args.verdict, "passed");
+    assertTextTurn(finalChoice, "fixture final");
   });
 });
 
 // --- budget ----------------------------------------------------------------
 
-test("budget mode never finishes and keeps calling tools until the budget is gone", async () => {
+test("budget mode never finishes and keeps calling exec.run until the budget is gone", async () => {
   await withFakeLlm("budget", async (server) => {
     const { calls, finalChoice } = await driveToolTurns(server.base, 12);
-    assert.equal(calls[0].name, "execution_case_context");
+    assert.equal(calls[0].name, "context.task_pack");
     assert.ok(
-      calls.slice(1).every((call) => call.name !== "execution_case_finish"),
+      calls.slice(1).every((call) => call.name !== "execution.case_finish"),
       "budget mode must never submit case_finish",
     );
     assert.ok(
-      calls.slice(1).some((call) => call.name === "browser_snapshot"),
-      "budget mode must keep calling tools",
+      calls.slice(1).every((call) => call.name === "exec.run"),
+      "budget mode must keep calling the general-execution tool",
     );
-    const choice = finalChoice;
-    assert.equal(choice.finish_reason, "tool_calls", "budget mode never answers with final text");
+    assert.equal(finalChoice.finish_reason, "tool_calls", "budget mode never answers with final text");
   });
+});
+
+// --- context guards --------------------------------------------------------
+
+test("a task pack without an execution snapshot ends with text, no records", async () => {
+  assert.ok(sharedLlm, "shared fake LLM server was not started");
+  const messages = [
+    { role: "system", content: p6SystemPrompt() },
+    { role: "user", content: p6Instruction() },
+  ];
+  const first = await chat(sharedLlm.base, messages);
+  assertToolCall(first, "context.task_pack");
+  appendToolResult(messages, first, { version_id: "9103", type: "execute.case" });
+  const second = await chat(sharedLlm.base, messages);
+  assertTextTurn(second, "empty context");
+});
+
+test("a finished run answers with final text instead of more tools", async () => {
+  assert.ok(sharedLlm, "shared fake LLM server was not started");
+  const { calls, messages } = await driveToolTurns(sharedLlm.base, 8);
+  assert.equal(calls[calls.length - 1].name, "execution.case_finish");
+  const again = await chat(sharedLlm.base, messages);
+  assertTextTurn(again, "finished run");
 });
 
 // --- mode control ----------------------------------------------------------
@@ -601,7 +676,7 @@ test("the runtime P6 mode control switches, rejects unknown modes and resets", a
 
   try {
     assert.equal(await getMode(), "normal", "the default P6 mode must be normal");
-    for (const mode of ["fail", "blocked", "takeover", "budget", "normal"]) {
+    for (const mode of ["fail", "blocked", "takeover", "fixture", "budget", "normal"]) {
       assert.equal(await setMode(mode), mode);
       assert.equal(await getMode(), mode);
     }

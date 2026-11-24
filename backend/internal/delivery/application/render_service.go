@@ -33,7 +33,7 @@ const (
 // by a competing write). The claimed work item is completed without rendering.
 var errRenderSettled = errors.New("delivery: report PDF is already settled")
 
-// RenderJobEnsurer is the P7 reconciler rule (agentapp.P7Ensurer): it ensures a
+// RenderJobEnsurer is the P7 reconciler rule (agentapp.ReportEnsurer): it ensures a
 // report.render_pdf work item for every published revision whose PDF is still
 // pending/failed, and marks pending revisions disabled when the
 // report.render_pdf setting is off (spec §4.2).
@@ -49,9 +49,9 @@ func NewRenderJobEnsurer(jobs RenderJobRepository, settings SettingsReader) *Ren
 	return &RenderJobEnsurer{jobs: jobs, settings: settings, limit: renderEnsureLimit}
 }
 
-// ReconcileP7 implements the P7 reconciler hook. It is idempotent: every
+// ReconcileReportRenders implements the P7 reconciler hook. It is idempotent: every
 // ensure is deduplicated by report:{reportID}:rev:{revision}.
-func (e *RenderJobEnsurer) ReconcileP7(ctx context.Context) error {
+func (e *RenderJobEnsurer) ReconcileReportRenders(ctx context.Context) error {
 	if e == nil || e.jobs == nil {
 		return nil
 	}

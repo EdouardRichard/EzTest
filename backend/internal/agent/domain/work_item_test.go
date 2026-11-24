@@ -133,10 +133,10 @@ func TestStageEntryWorkItemClaimDefaults(t *testing.T) {
 	explicit := agent.CreateWorkItemParams{
 		VersionID: 7,
 		Kind:      agent.WorkItemKindDesignCases,
-		Team:      agent.TeamSteward,
+		Team:      agent.TeamDelivery,
 		Type:      "design.round",
 	}.Normalize()
-	if explicit.Team != agent.TeamSteward || explicit.Type != "design.round" {
+	if explicit.Team != agent.TeamDelivery || explicit.Type != "design.round" {
 		t.Fatalf("explicit overrides = %q/%q", explicit.Team, explicit.Type)
 	}
 

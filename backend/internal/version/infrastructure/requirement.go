@@ -13,13 +13,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const requirementColumns = `id, version_id, current_version_id, status, target_version_sut_ids,
+const requirementColumns = `id, version_id, current_version_id, status,
 	closed_at, closed_by_run_id, created_by, created_by_run_id, source_conversation_id,
-	created_at, updated_at, source_key`
+	created_at, updated_at, source_key, waived`
 
-const requirementVersionColumns = `id, requirement_id, revision, title, description,
-	acceptance_criteria, priority, constraints, target_version_suts, target_pages,
-	target_apis, content_hash, created_by, created_by_run_id, created_at`
+// requirementVersionColumns is the design v1.3.1 §5.1 contract in storage
+// order: the flat description and the three target arrays are gone, replaced by
+// user_story / rules / sut_description / scope_out / account_roles_hint and a
+// structured acceptance_criteria JSONB array of {id, given, when, then}.
+const requirementVersionColumns = `id, requirement_id, revision, title, user_story, rules,
+	acceptance_criteria, priority, constraints, sut_description, scope_out,
+	account_roles_hint, content_hash, created_by, created_by_run_id, created_at`
 
 const requirementConfirmationColumns = `id, requirement_version_id, scope, batch_id,
 	actor_id, confirmed_at, affected_requirement_ids`
@@ -55,7 +59,11 @@ func (r *RequirementRepository) Create(ctx context.Context, requirement version.
 		}
 		return wrapDB("insert requirement", err)
 	}
-	if _, err := tx.Exec(ctx, insertRequirementVersionSQL, requirementVersionArgs(revision)...); err != nil {
+	versionArgs, err := requirementVersionArgs(revision)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, insertRequirementVersionSQL, versionArgs...); err != nil {
 		return wrapDB("insert requirement version", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -151,9 +159,9 @@ func (r *RequirementRepository) GetBySourceKey(ctx context.Context, versionID in
 	var requirementID int64
 	err := r.pool.QueryRow(ctx, `
 		SELECT id FROM requirement
-		WHERE version_id = $1 AND source_key = $2 AND status <> 'obsolete'
+		WHERE version_id = $1 AND source_key = $2 AND status <> $3
 		LIMIT 1
-	`, versionID, sourceKey).Scan(&requirementID)
+	`, versionID, sourceKey, version.RequirementObsolete).Scan(&requirementID)
 	if err != nil {
 		return version.RequirementAggregate{}, wrapRequirementLookup("get requirement by source key", err)
 	}
@@ -239,11 +247,11 @@ func (r *RequirementRepository) AddRevision(ctx context.Context, requirement ver
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE requirement
-		SET status = $3, current_version_id = $4, target_version_sut_ids = $5::jsonb, updated_at = $6,
-			source_key = $7
+		SET status = $3, current_version_id = $4, updated_at = $5,
+			source_key = $6
 		WHERE id = $1 AND version_id = $2
 	`, requirement.ID, requirement.VersionID, string(requirement.Status),
-		requirement.CurrentVersionID, encodeStringSlice(requirement.TargetVersionSUTIDs), requirement.UpdatedAt,
+		requirement.CurrentVersionID, requirement.UpdatedAt,
 		requirement.SourceKey)
 	if err != nil {
 		if isSourceKeyUniqueViolation(err) {
@@ -254,7 +262,11 @@ func (r *RequirementRepository) AddRevision(ctx context.Context, requirement ver
 	if tag.RowsAffected() == 0 {
 		return version.ErrRequirementNotFound
 	}
-	if _, err := tx.Exec(ctx, insertRequirementVersionSQL, requirementVersionArgs(revision)...); err != nil {
+	versionArgs, err := requirementVersionArgs(revision)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, insertRequirementVersionSQL, versionArgs...); err != nil {
 		if isUniqueViolation(err) {
 			return version.ErrStateConflict
 		}
@@ -277,21 +289,25 @@ func (r *RequirementRepository) Confirm(ctx context.Context, requirement version
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx, `
-		UPDATE requirement SET status = 'clarified', updated_at = $4
-		WHERE id = $1 AND version_id = $2 AND status = 'draft' AND current_version_id = $3
-	`, requirement.ID, requirement.VersionID, confirmation.RequirementVersionID, requirement.UpdatedAt)
+		UPDATE requirement SET status = $5, updated_at = $4
+		WHERE id = $1 AND version_id = $2 AND status = $6 AND current_version_id = $3
+	`, requirement.ID, requirement.VersionID, confirmation.RequirementVersionID, requirement.UpdatedAt, version.RequirementClarified, version.RequirementDraft)
 	if err != nil {
 		return wrapDB("update requirement status", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return version.ErrStateConflict
 	}
+	affected, err := encodeStringSlice(confirmation.AffectedRequirementIDs)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
 		ON CONFLICT (requirement_version_id) DO NOTHING
 	`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
-		confirmation.ActorID, confirmation.ConfirmedAt, encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {
+		confirmation.ActorID, confirmation.ConfirmedAt, affected); err != nil {
 		if isUniqueViolation(err) {
 			return version.ErrStateConflict
 		}
@@ -326,14 +342,18 @@ func (r *RequirementRepository) BatchConfirm(ctx context.Context, requirements [
 			return fmt.Errorf("batch confirm: confirmation missing for requirement %d", requirement.ID)
 		}
 		tag, err := tx.Exec(ctx, `
-			UPDATE requirement SET status = 'clarified', updated_at = $4
-			WHERE id = $1 AND version_id = $2 AND status = 'draft' AND current_version_id = $3
-		`, requirement.ID, requirement.VersionID, *requirement.CurrentVersionID, requirement.UpdatedAt)
+			UPDATE requirement SET status = $5, updated_at = $4
+			WHERE id = $1 AND version_id = $2 AND status = $6 AND current_version_id = $3
+		`, requirement.ID, requirement.VersionID, *requirement.CurrentVersionID, requirement.UpdatedAt, version.RequirementClarified, version.RequirementDraft)
 		if err != nil {
 			return wrapDB("update requirement status", err)
 		}
 		if tag.RowsAffected() == 0 {
 			return version.ErrStateConflict
+		}
+		affected, err := encodeStringSlice(confirmation.AffectedRequirementIDs)
+		if err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO requirement_confirmation (`+requirementConfirmationColumns+`)
@@ -341,7 +361,7 @@ func (r *RequirementRepository) BatchConfirm(ctx context.Context, requirements [
 			ON CONFLICT (requirement_version_id) DO NOTHING
 		`, confirmation.ID, confirmation.RequirementVersionID, confirmation.Scope, confirmation.BatchID,
 			confirmation.ActorID, confirmation.ConfirmedAt,
-			encodeStringSlice(confirmation.AffectedRequirementIDs)); err != nil {
+			affected); err != nil {
 			if isUniqueViolation(err) {
 				return version.ErrStateConflict
 			}
@@ -384,6 +404,28 @@ func (r *RequirementRepository) SetStatus(ctx context.Context, versionID, requir
 	}
 	if tag.RowsAffected() == 0 {
 		return version.ErrRequirementNotFound
+	}
+	return nil
+}
+
+// MarkWaived marks one clarified requirement as admin-waived (v0.2.4-G SC-G11).
+// It only ever sets the flag true; clearing happens exclusively through the
+// reopen paths (requirement reopen and the version reopen's waiver undo), which
+// is why the clarified status guard is correct here — a closed waived
+// requirement is cleared by reopen, not by this writer. The status guard is a
+// query parameter derived from the domain constant (no inline status literal);
+// a requirement that is not clarified rejects the write with ErrStateConflict
+// so a concurrent confirm/close/reopen can never be silently overwritten.
+func (r *RequirementRepository) MarkWaived(ctx context.Context, requirementID int64, updatedAt time.Time) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE requirement SET waived = true, updated_at = $2
+		WHERE id = $1 AND status = $3
+	`, requirementID, updatedAt, string(version.RequirementClarified))
+	if err != nil {
+		return wrapDB("mark requirement waived", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrStateConflict
 	}
 	return nil
 }
@@ -445,43 +487,57 @@ func (r *RequirementRepository) ListAttachments(ctx context.Context, versionID, 
 
 const insertRequirementSQL = `
 	INSERT INTO requirement (` + requirementColumns + `)
-	VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 `
 
 const insertRequirementVersionSQL = `
 	INSERT INTO requirement_version (` + requirementVersionColumns + `)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13, $14, $15)
+	VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb,
+	        $13, $14, $15, $16)
 `
 
 func requirementArgs(requirement version.Requirement) []any {
 	return []any{
 		requirement.ID, requirement.VersionID, requirement.CurrentVersionID, string(requirement.Status),
-		encodeStringSlice(requirement.TargetVersionSUTIDs), requirement.ClosedAt, requirement.ClosedByRunID,
+		requirement.ClosedAt, requirement.ClosedByRunID,
 		requirement.CreatedBy, requirement.CreatedByRunID, requirement.SourceConversationID,
-		requirement.CreatedAt, requirement.UpdatedAt, requirement.SourceKey,
+		requirement.CreatedAt, requirement.UpdatedAt, requirement.SourceKey, requirement.Waived,
 	}
 }
 
-func requirementVersionArgs(revision version.RequirementVersion) []any {
-	return []any{
-		revision.ID, revision.RequirementID, revision.Revision, revision.Title, revision.Description,
-		revision.AcceptanceCriteria, revision.Priority, encodeConstraints(revision.Constraints),
-		encodeStringSlice(revision.TargetVersionSUTs), encodeStringSlice(revision.TargetPages),
-		encodeStringSlice(revision.TargetAPIs), revision.ContentHash,
-		revision.CreatedBy, revision.CreatedByRunID, revision.CreatedAt,
+func requirementVersionArgs(revision version.RequirementVersion) ([]any, error) {
+	story, err := encodeUserStory(revision.UserStory)
+	if err != nil {
+		return nil, err
 	}
+	criteria, err := encodeAcceptanceCriteria(revision.AcceptanceCriteria)
+	if err != nil {
+		return nil, err
+	}
+	roles, err := encodeStringSlice(revision.AccountRolesHint)
+	if err != nil {
+		return nil, err
+	}
+	return []any{
+		revision.ID, revision.RequirementID, revision.Revision, revision.Title,
+		story, revision.Rules,
+		criteria, revision.Priority,
+		encodeConstraints(revision.Constraints), revision.SutDescription, revision.ScopeOut,
+		roles, revision.ContentHash,
+		revision.CreatedBy, revision.CreatedByRunID, revision.CreatedAt,
+	}, nil
 }
 
 func prefixedRequirementColumns(alias string) string {
-	return `r.id, r.version_id, r.current_version_id, r.status, r.target_version_sut_ids,
+	return `r.id, r.version_id, r.current_version_id, r.status,
 		r.closed_at, r.closed_by_run_id, r.created_by, r.created_by_run_id, r.source_conversation_id,
-		r.created_at, r.updated_at, r.source_key`
+		r.created_at, r.updated_at, r.source_key, r.waived`
 }
 
 func prefixedVersionColumns(alias string) string {
-	return `v.id, v.requirement_id, v.revision, v.title, v.description,
-		v.acceptance_criteria, v.priority, v.constraints, v.target_version_suts, v.target_pages,
-		v.target_apis, v.content_hash, v.created_by, v.created_by_run_id, v.created_at`
+	return `v.id, v.requirement_id, v.revision, v.title, v.user_story, v.rules,
+		v.acceptance_criteria, v.priority, v.constraints, v.sut_description, v.scope_out,
+		v.account_roles_hint, v.content_hash, v.created_by, v.created_by_run_id, v.created_at`
 }
 
 func prefixedConfirmationColumns(alias string) string {
@@ -494,31 +550,39 @@ func prefixedConfirmationColumns(alias string) string {
 func scanRequirement(row rowScanner) (version.Requirement, error) {
 	var requirement version.Requirement
 	var status string
-	var targetSUTs []byte
 	if err := row.Scan(&requirement.ID, &requirement.VersionID, &requirement.CurrentVersionID, &status,
-		&targetSUTs, &requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
+		&requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
 		&requirement.CreatedByRunID, &requirement.SourceConversationID, &requirement.CreatedAt,
-		&requirement.UpdatedAt, &requirement.SourceKey); err != nil {
+		&requirement.UpdatedAt, &requirement.SourceKey, &requirement.Waived); err != nil {
 		return version.Requirement{}, err
 	}
 	requirement.Status = version.RequirementStatus(status)
-	requirement.TargetVersionSUTIDs = decodeStringSlice(targetSUTs)
 	return requirement, nil
 }
 
 func scanRequirementVersion(row rowScanner) (version.RequirementVersion, error) {
 	var revision version.RequirementVersion
-	var constraints, targetSUTs, targetPages, targetAPIs []byte
+	var constraints, userStory, criteria, accountRoles []byte
 	if err := row.Scan(&revision.ID, &revision.RequirementID, &revision.Revision, &revision.Title,
-		&revision.Description, &revision.AcceptanceCriteria, &revision.Priority, &constraints,
-		&targetSUTs, &targetPages, &targetAPIs, &revision.ContentHash, &revision.CreatedBy,
-		&revision.CreatedByRunID, &revision.CreatedAt); err != nil {
+		&userStory, &revision.Rules, &criteria, &revision.Priority, &constraints,
+		&revision.SutDescription, &revision.ScopeOut, &accountRoles, &revision.ContentHash,
+		&revision.CreatedBy, &revision.CreatedByRunID, &revision.CreatedAt); err != nil {
+		return version.RequirementVersion{}, err
+	}
+	var err error
+	revision.UserStory, err = decodeUserStory(userStory)
+	if err != nil {
+		return version.RequirementVersion{}, err
+	}
+	revision.AcceptanceCriteria, err = decodeAcceptanceCriteria(criteria)
+	if err != nil {
 		return version.RequirementVersion{}, err
 	}
 	revision.Constraints = decodeConstraints(constraints)
-	revision.TargetVersionSUTs = decodeStringSlice(targetSUTs)
-	revision.TargetPages = decodeStringSlice(targetPages)
-	revision.TargetAPIs = decodeStringSlice(targetAPIs)
+	revision.AccountRolesHint, err = decodeStringSlice(accountRoles)
+	if err != nil {
+		return version.RequirementVersion{}, err
+	}
 	return revision, nil
 }
 
@@ -529,7 +593,11 @@ func scanConfirmation(row rowScanner) (version.Confirmation, error) {
 		&confirmation.BatchID, &confirmation.ActorID, &confirmation.ConfirmedAt, &affected); err != nil {
 		return version.Confirmation{}, err
 	}
-	confirmation.AffectedRequirementIDs = decodeStringSlice(affected)
+	affectedIDs, err := decodeStringSlice(affected)
+	if err != nil {
+		return version.Confirmation{}, err
+	}
+	confirmation.AffectedRequirementIDs = affectedIDs
 	return confirmation, nil
 }
 
@@ -548,57 +616,125 @@ func scanRelation(row rowScanner) (version.Relation, error) {
 func scanRequirementWithVersion(row rowScanner, extra ...any) (version.Requirement, version.RequirementVersion, error) {
 	var requirement version.Requirement
 	var status string
-	var requirementTargetSUTs []byte
 	var revision version.RequirementVersion
-	var constraints, versionTargetSUTs, targetPages, targetAPIs []byte
+	var constraints, userStory, criteria, accountRoles []byte
 	dest := []any{
 		&requirement.ID, &requirement.VersionID, &requirement.CurrentVersionID, &status,
-		&requirementTargetSUTs, &requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
+		&requirement.ClosedAt, &requirement.ClosedByRunID, &requirement.CreatedBy,
 		&requirement.CreatedByRunID, &requirement.SourceConversationID, &requirement.CreatedAt,
-		&requirement.UpdatedAt, &requirement.SourceKey,
+		&requirement.UpdatedAt, &requirement.SourceKey, &requirement.Waived,
 		&revision.ID, &revision.RequirementID, &revision.Revision, &revision.Title,
-		&revision.Description, &revision.AcceptanceCriteria, &revision.Priority, &constraints,
-		&versionTargetSUTs, &targetPages,
-		&targetAPIs, &revision.ContentHash, &revision.CreatedBy,
-		&revision.CreatedByRunID, &revision.CreatedAt,
+		&userStory, &revision.Rules, &criteria, &revision.Priority, &constraints,
+		&revision.SutDescription, &revision.ScopeOut, &accountRoles, &revision.ContentHash,
+		&revision.CreatedBy, &revision.CreatedByRunID, &revision.CreatedAt,
 	}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return version.Requirement{}, version.RequirementVersion{}, err
 	}
 	requirement.Status = version.RequirementStatus(status)
-	requirement.TargetVersionSUTIDs = decodeStringSlice(requirementTargetSUTs)
+	var err error
+	revision.UserStory, err = decodeUserStory(userStory)
+	if err != nil {
+		return version.Requirement{}, version.RequirementVersion{}, err
+	}
+	revision.AcceptanceCriteria, err = decodeAcceptanceCriteria(criteria)
+	if err != nil {
+		return version.Requirement{}, version.RequirementVersion{}, err
+	}
 	revision.Constraints = decodeConstraints(constraints)
-	revision.TargetVersionSUTs = decodeStringSlice(versionTargetSUTs)
-	revision.TargetPages = decodeStringSlice(targetPages)
-	revision.TargetAPIs = decodeStringSlice(targetAPIs)
+	revision.AccountRolesHint, err = decodeStringSlice(accountRoles)
+	if err != nil {
+		return version.Requirement{}, version.RequirementVersion{}, err
+	}
 	return requirement, revision, nil
 }
 
 // ---------- JSON codecs ----------
-func encodeStringSlice(values []string) string {
+
+// encodeUserStory / decodeUserStory and encodeAcceptanceCriteria /
+// decodeAcceptanceCriteria marshal the two JSONB documents of the §5.1
+// contract. They reuse the domain structs' own JSON tags, so the stored document
+// and the Go value cannot drift apart. The ContentHash payload deliberately
+// keeps its own separate shapes: the hash is a wire contract of its own and must
+// not move just because a column encoding did.
+//
+// Every codec propagates its error instead of silently substituting an empty
+// document (constitution 七.6). A marshal failure on the write path would
+// otherwise persist `{}`/`[]` and lose the revision's content without a signal;
+// an unmarshal failure on the read path would otherwise hide a corrupt row as an
+// empty requirement. The design context's decodeACIDs already fails closed on a
+// corrupt acceptance_criteria document -- these codecs match that behaviour so
+// the same corruption class has one semantics across contexts. Empty/absent
+// bytes still decode to the empty value: that is a valid stored state, not an
+// error.
+func encodeUserStory(story version.UserStory) (string, error) {
+	raw, err := json.Marshal(story)
+	if err != nil {
+		return "", fmt.Errorf("encode user story: %w", err)
+	}
+	return string(raw), nil
+}
+
+func decodeUserStory(raw []byte) (version.UserStory, error) {
+	if len(raw) == 0 {
+		return version.UserStory{}, nil
+	}
+	var story version.UserStory
+	if err := json.Unmarshal(raw, &story); err != nil {
+		return version.UserStory{}, fmt.Errorf("decode user story: %w", err)
+	}
+	return story, nil
+}
+
+func encodeAcceptanceCriteria(criteria []version.AcceptanceCriterion) (string, error) {
+	if criteria == nil {
+		criteria = []version.AcceptanceCriterion{}
+	}
+	raw, err := json.Marshal(criteria)
+	if err != nil {
+		return "", fmt.Errorf("encode acceptance criteria: %w", err)
+	}
+	return string(raw), nil
+}
+
+func decodeAcceptanceCriteria(raw []byte) ([]version.AcceptanceCriterion, error) {
+	if len(raw) == 0 {
+		return []version.AcceptanceCriterion{}, nil
+	}
+	var criteria []version.AcceptanceCriterion
+	if err := json.Unmarshal(raw, &criteria); err != nil {
+		return nil, fmt.Errorf("decode acceptance criteria: %w", err)
+	}
+	if criteria == nil {
+		return []version.AcceptanceCriterion{}, nil
+	}
+	return criteria, nil
+}
+
+func encodeStringSlice(values []string) (string, error) {
 	if values == nil {
 		values = []string{}
 	}
 	raw, err := json.Marshal(values)
 	if err != nil {
-		return "[]"
+		return "", fmt.Errorf("encode string slice: %w", err)
 	}
-	return string(raw)
+	return string(raw), nil
 }
 
-func decodeStringSlice(raw []byte) []string {
+func decodeStringSlice(raw []byte) ([]string, error) {
 	if len(raw) == 0 {
-		return []string{}
+		return []string{}, nil
 	}
 	var values []string
 	if err := json.Unmarshal(raw, &values); err != nil {
-		return []string{}
+		return nil, fmt.Errorf("decode string slice: %w", err)
 	}
 	if values == nil {
-		return []string{}
+		return []string{}, nil
 	}
-	return values
+	return values, nil
 }
 
 func encodeConstraints(raw json.RawMessage) string {

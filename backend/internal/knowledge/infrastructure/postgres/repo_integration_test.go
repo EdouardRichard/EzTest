@@ -519,4 +519,57 @@ func TestRepositoryUsageInsert(t *testing.T) {
 	}
 }
 
+func TestUsageStatsByItem(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := knowledgepg.NewRepository(pool)
+	usageRepo := knowledgepg.NewUsageRepository(pool)
+	ctx := context.Background()
+
+	mustInsert(t, repo, itemFixture(1701, knowledge.ScopeGlobal, "", knowledge.StatusApproved, "Used", "Body", nil), 9701)
+	mustInsert(t, repo, itemFixture(1702, knowledge.ScopeGlobal, "", knowledge.StatusApproved, "Other", "Body", nil), 9702)
+	mustInsert(t, repo, itemFixture(1703, knowledge.ScopeGlobal, "", knowledge.StatusApproved, "Unused", "Body", nil), 9703)
+
+	t1 := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Hour)
+	t3 := t2.Add(time.Hour)
+	// Rows are appended out of chronological order (t1, t3, t2) so the test
+	// pins MAX(created_at) semantics, not "the last inserted row".
+	err := usageRepo.Insert(ctx, []knowledge.Usage{
+		{ID: 9711, KnowledgeID: 1701, TokenEstimate: 5, InjectedAt: t1, CreatedAt: t1, UpdatedAt: t1},
+		{ID: 9712, KnowledgeID: 1701, TokenEstimate: 5, InjectedAt: t3, CreatedAt: t3, UpdatedAt: t3},
+		{ID: 9713, KnowledgeID: 1701, TokenEstimate: 5, InjectedAt: t2, CreatedAt: t2, UpdatedAt: t2},
+		{ID: 9714, KnowledgeID: 1702, TokenEstimate: 5, InjectedAt: t2, CreatedAt: t2, UpdatedAt: t2},
+	})
+	if err != nil {
+		t.Fatalf("insert usage: %v", err)
+	}
+
+	stats, err := usageRepo.StatsByItem(ctx, 1701)
+	if err != nil {
+		t.Fatalf("StatsByItem: %v", err)
+	}
+	if stats.InjectionCount != 3 {
+		t.Fatalf("InjectionCount = %d, want 3", stats.InjectionCount)
+	}
+	if stats.LastUsedAt == nil || !stats.LastUsedAt.Equal(t3) {
+		t.Fatalf("LastUsedAt = %v, want MAX(created_at) = %v", stats.LastUsedAt, t3)
+	}
+
+	other, err := usageRepo.StatsByItem(ctx, 1702)
+	if err != nil {
+		t.Fatalf("StatsByItem other: %v", err)
+	}
+	if other.InjectionCount != 1 || other.LastUsedAt == nil || !other.LastUsedAt.Equal(t2) {
+		t.Fatalf("other stats = %+v, want {1, %v} (per-item isolation)", other, t2)
+	}
+
+	unused, err := usageRepo.StatsByItem(ctx, 1703)
+	if err != nil {
+		t.Fatalf("StatsByItem unused: %v", err)
+	}
+	if unused.InjectionCount != 0 || unused.LastUsedAt != nil {
+		t.Fatalf("unused stats = %+v, want {0, nil}", unused)
+	}
+}
+
 func ptr[T any](value T) *T { return &value }

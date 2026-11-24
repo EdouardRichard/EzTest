@@ -30,13 +30,12 @@ v0.22 additive 策略见下）。身份分两层：
   `## v0.22 W2-7 增量（report artifact export，additive）`、
   `## v0.22 W2-11 增量（discovery case rollback，additive）` 与
   `## v0.22 W2-14 增量（snapshot eval + trends，additive）` 中说明。
-- 公开端点 `GET /api/openapi.yaml` 原样返回本文件。
 
 ## 单一事实源与整文件 port（0.2.1 基线）
 
-权威 0.2.1 契约是 [`docs/version-V0.2/contracts/openapi.yaml`](../version-V0.2/contracts/openapi.yaml)
-（0.2.1 increment 亦见 [`contracts/README.md`](../version-V0.2/contracts/README.md) 的 0.2.1 状态行）。
-本文件的 0.2.1 基线由 **Task 85（Release-T1）** 对该权威契约执行**整体 port** 生成，
+**现行权威即本文件 `docs/openapi/api.yaml`**：`docs/version-V0.2/contracts/openapi.yaml` 旧契约树已于
+v0.2.4 退役（R-H3r，属文档位置迁移；契约在 api.yaml + `docs/contracts/` 延续）。
+本文件的 0.2.1 基线历史上由 **Task 85（Release-T1）** 对那份 0.2.1 权威契约执行**整体 port** 生成，
 不是对 `0.2.0-p8` 快照的局部拼接：逐条路由/字段打补丁会把快照半更新并破坏 P8 身份，因此禁止。
 P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 **162 paths / 200 operations / 264 schemas**）保留在 `info.description` 中，不被改写。
@@ -46,16 +45,17 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 从 Task 37 起，本文件不再要求与 0.2.1 权威契约逐字节一致，改为**基线子集 + additive 扩展**：
 
 1. 0.2.1 基线的每一条 path / method / schema **必须仍然存在且语义不变**；
-   不允许删除、重命名或改写 0.2.1 条目（`scripts/v021-contract-check.cjs` 断言“无缺失”）。
+   不允许删除、重命名或改写 0.2.1 条目（由现行 `scripts/v024-openapi-*.cjs` 五守卫 +
+   `scripts/check-docs.ps1` 的 v0.2.4 契约门校验；原 `v021/v022-contract-check.cjs` 已随 R-H3r 删除）。
 2. v0.22 additive 增量只允许**追加**新的 path item、operation、schema 和可选字段；
    追加内容可新增 path item，也可在既有 path item 下新增 operation
    （如 W1-7/D1 的 `POST /api/versions/{id}/waves`），并在本 README 记录。
-3. v0.22 增量本身由 `scripts/v022-contract-check.cjs` 断言：W0 的 23 个 path item /
-   29 个 operation 与关键 schema 必须存在，另有 W1 的新 path/operation（W1-7 复用
-   既有 `waves` path item 的 operation；W1-8、W1-13、W1-14A 合计新增 path 与
-   operation），且文件仍保留 0.2.1 基线身份。
+3. v0.22 及后续增量由现行 **`scripts/v024-openapi-*.cjs` 五守卫**（contract-check / deep-check /
+   validate / oneof-test / mutants）+ `scripts/check-docs.ps1` 的 v0.2.4 契约门断言：新增
+   path/operation/schema 与 Go json tag 派生一致，且文件仍保留 0.2.1 基线身份
+   （`v021/v022-contract-check.cjs` 已随 R-H3r 退役）。
 4. 基线计数 `181/222/281` 保留为本 README/历史的**基线口径**；当前文件实际计数
-   允许为 `181+extras / 222+extras / 281+extras`，两个 gate 各自报告 extras。
+   允许为 `181+extras / 222+extras / 281+extras`，现行五守卫各自报告 extras/一致性。
 
 当前 v0.22 追加的契约面（详见 `api.yaml` 的 W0/W1 段）：
 
@@ -86,9 +86,16 @@ P0–P8 历史段落与 P8 冻结快照身份（P8 历史计数
 ## 验证
 
 ```bash
-node scripts/v021-contract-check.cjs   # 0.2.1 基线子集（无缺失；extras 允许并报告）
-node scripts/v022-contract-check.cjs   # v0.22 additive 路径/operation/schema
+node scripts/v024-openapi-contract-check.cjs  # 契约门（required/properties 由 Go json tag 派生）
+node scripts/v024-openapi-deep-check.cjs       # 多源投影一致性（投影分歧即失败）
+node scripts/v024-openapi-validate.cjs         # $ref / operationId 校验
+node scripts/v024-openapi-oneof-test.cjs       # oneOf 判别
+node scripts/v024-openapi-mutants.cjs          # 变异门（5 类回归全捕获）
 ```
+
+CI 中由 `.github/workflows/ci.yml` 的 node-only `openapi-contract` job 跑上述五守卫；本地亦经
+`scripts/check-docs.ps1` 的 v0.2.4 契约门调用。原 `v021/v022-contract-check.cjs` 已随 R-H3r 退役
+（它们对已不存在的 `docs/version-V0.2/` 契约树断言，属第二份真相）。
 
 0.2.1 release gate（Task 85 扩展，不弱化 frozen 检查）断言：0.2.1 基线身份仍为
 0.2.1；`181/222/281` 基线计数只作为基线口径；22 个 0.2.1 operation 与 17 个

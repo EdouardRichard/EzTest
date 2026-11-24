@@ -95,13 +95,25 @@ export const requirementVersionFixture: RequirementVersionView = {
   requirement_id: "6001",
   revision: 1,
   title: "退款到账时效",
-  description: "退款审核通过后 T+1 个工作日原路退回；节假日顺延。",
-  acceptance_criteria: "审核通过后 T+1 个工作日到账；金额与订单实付一致。",
+  user_story: {
+    as_a: "买家",
+    i_want: "退款审核通过后 T+1 个工作日原路退回",
+    so_that: "我能及时收到退款",
+  },
+  rules: "节假日顺延。",
+  acceptance_criteria: [
+    {
+      id: "AC-1",
+      given: "退款审核通过",
+      when: "T+1 个工作日",
+      then: "金额与订单实付一致原路到账",
+    },
+  ],
   priority: "P1",
   constraints: {},
-  target_version_suts: ["1002"],
-  target_pages: ["2301"],
-  target_apis: [],
+  sut_description: "支付网关退款链路",
+  scope_out: "",
+  account_roles_hint: ["buyer"],
   content_hash: "b".repeat(64),
   created_at: TIMESTAMP,
 }
@@ -113,13 +125,10 @@ export const requirementFixture: Requirement = {
   title: "退款到账时效",
   status: "draft",
   priority: "P1",
-  targets: {
-    version_suts: ["1002"],
-    pages: ["2301"],
-    apis: [],
-  },
   updated_at: TIMESTAMP,
   confirmed_at: null,
+  closed_at: null,
+  closure: null,
 }
 
 export const requirementSecondFixture: Requirement = {
@@ -129,7 +138,6 @@ export const requirementSecondFixture: Requirement = {
   title: "大额订单人工审核",
   status: "clarified",
   priority: "P0",
-  targets: { version_suts: ["1001"], pages: ["1301"], apis: [] },
   confirmed_at: TIMESTAMP,
 }
 

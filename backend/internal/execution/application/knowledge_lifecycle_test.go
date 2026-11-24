@@ -36,15 +36,20 @@ func (h *fakeCaseFailureHook) OnCaseRunFailed(_ context.Context, fact executiona
 func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 	recordFailedAssertion := func(t *testing.T, fixture *caseRunnerFixture) {
 		t.Helper()
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 			Seq: 1, Status: "passed",
 		}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "mismatch",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
+		}
+		if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+			Kind: "text", Text: "failure evidence",
+		}); err != nil {
+			t.Fatalf("EvidenceText: %v", err)
 		}
 	}
 
@@ -53,7 +58,7 @@ func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 		prepareCaseRun(t, fixture)
 		recordFailedAssertion(t, fixture)
 
-		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+		finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 			Verdict: execution.CaseRunPassed,
 		})
 		if err != nil {
@@ -72,8 +77,11 @@ func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 		if fact.FailureClass != execution.FailureClassApplication {
 			t.Fatalf("failure class = %q, want application", fact.FailureClass)
 		}
-		if len(fact.PageIDs) != 1 || fact.PageIDs[0] != 71 {
-			t.Fatalf("page ids = %#v, want the targeted page 71", fact.PageIDs)
+		// v0.2.4-B (T9 design contract): the step's target_page_id is gone with
+		// the design column, so the failure fact carries no page back-reference.
+		// Restoring it needs a new source and belongs to C/F (T11 report).
+		if len(fact.PageIDs) != 0 {
+			t.Fatalf("page ids = %#v, want none (a step no longer carries target_page_id)", fact.PageIDs)
 		}
 		if len(fact.AccountRoles) != 1 || fact.AccountRoles[0] != "admin" {
 			t.Fatalf("account roles = %#v, want [admin]", fact.AccountRoles)
@@ -85,17 +93,17 @@ func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 	t.Run("a passed verdict never notifies the failure hook", func(t *testing.T) {
 		fixture := newCaseRunnerFixture(t)
 		prepareCaseRun(t, fixture)
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 			Seq: 1, Status: "passed",
 		}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
 		}
-		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+		finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 			Verdict: execution.CaseRunPassed,
 		})
 		if err != nil {
@@ -122,7 +130,7 @@ func TestCaseRunFailureNotifiesKnowledgeFailureHook(t *testing.T) {
 				tc.apply(fixture.knowledgeFailure)
 				prepareCaseRun(t, fixture)
 				recordFailedAssertion(t, fixture)
-				finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+				finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 					Verdict: execution.CaseRunPassed,
 				})
 				if err != nil {

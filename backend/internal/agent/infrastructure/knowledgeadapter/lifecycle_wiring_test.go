@@ -202,7 +202,7 @@ func newLifecycleKnowledgeService(t *testing.T, firstID int64) (*memoryKnowledge
 	t.Helper()
 	repo := newMemoryKnowledgeRepository()
 	service := knowledgeapp.NewService(
-		repo, nil, nil, nil, nil, nil,
+		repo, nil, reviewNotRequiredSettings{}, nil, nil, nil,
 		fixedKnowledgeClock{}, &sequenceKnowledgeIDs{next: firstID},
 	)
 	return repo, service

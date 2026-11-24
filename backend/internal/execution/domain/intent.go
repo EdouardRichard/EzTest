@@ -81,7 +81,7 @@ type ExecutionIntent struct {
 	ID                     int64
 	VersionID              int64
 	CaseVersionID          int64
-	VersionSUTIDs          []int64
+	SUTIDs                 []int64
 	EnvironmentFingerprint string
 	CodeBaseline           string
 	Purpose                Purpose

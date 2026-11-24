@@ -965,18 +965,6 @@
       "channel": "version:N"
     },
     {
-      "type": "visual.baseline_approved",
-      "consumer": "ui",
-      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:272",
-      "channel": "version:N"
-    },
-    {
-      "type": "visual.diff_created",
-      "consumer": "ui",
-      "evidence": "frontend/src/features/clarification/useVersionEvents.ts:273",
-      "channel": "version:N"
-    },
-    {
       "type": "wave.created",
       "consumer": "ui",
       "evidence": "frontend/src/features/clarification/useVersionEvents.ts:228",

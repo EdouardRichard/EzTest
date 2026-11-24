@@ -34,6 +34,9 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("GET /api/versions/{id}/case-runs/{caseRunId}", authenticated(http.HandlerFunc(h.GetCaseRun)))
 	mux.Handle("POST /api/versions/{id}/case-runs/{caseRunId}/pause", authenticated(http.HandlerFunc(h.PauseCaseRun)))
 	mux.Handle("POST /api/versions/{id}/case-runs/{caseRunId}/resume", authenticated(http.HandlerFunc(h.ResumeCaseRun)))
+	// Command-log replay verification (v0.2.4-C EV-006): server-side same-fingerprint
+	// replay with server-validated assertions. Replay is a verification, not a retest.
+	mux.Handle("POST /api/versions/{id}/case-runs/{caseRunId}/replay", authenticated(http.HandlerFunc(h.ReplayCaseRun)))
 
 	// Evidence (read-only; no update/delete endpoints by design).
 	mux.Handle("GET /api/versions/{id}/evidence", authenticated(http.HandlerFunc(h.ListEvidence)))
@@ -61,6 +64,10 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("POST /api/admin/executors/{executorId}/drain", admin(http.HandlerFunc(h.DrainExecutor)))
 	mux.Handle("POST /api/admin/executors/{executorId}/activate", admin(http.HandlerFunc(h.ActivateExecutor)))
 	mux.Handle("POST /api/admin/executors/{id}/check", admin(http.HandlerFunc(h.CheckExecutor)))
+
+	// Admin session fixture visibility (v0.2.4-F P18, SC-F5): metadata listing
+	// of the version's saved login-state fixtures (never the state bytes).
+	mux.Handle("GET /api/versions/{id}/session-fixtures", admin(http.HandlerFunc(h.SessionFixtures)))
 }
 
 // RegisterInternalRoutes mounts the P7 internal executor push endpoints

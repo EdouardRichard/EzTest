@@ -50,18 +50,18 @@ func (r *GCRepository) CreateRun(ctx context.Context, run storage.GCRun) (storag
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `
 		UPDATE gc_run
-		SET status = 'failed',
+		SET status = $3,
 		    error = 'gc run lease expired (previous process stopped)',
 		    finished_at = $1,
 		    lease_owner = NULL,
 		    lease_until = NULL,
 		    updated_at = $1
-		WHERE status = 'running'
+		WHERE status = $4
 		  AND (
 		        (lease_until IS NOT NULL AND lease_until < $1)
 		     OR (lease_until IS NULL AND started_at < $2)
 		  )
-	`, now, now.Add(-storageapp.GCLease)); err != nil {
+	`, now, now.Add(-storageapp.GCLease), string(storage.GCRunFailed), string(storage.GCRunRunning)); err != nil {
 		return storage.GCRun{}, fmt.Errorf("reclaim stale gc run: %w", err)
 	}
 
@@ -422,7 +422,7 @@ func (r *GCRepository) ListSupersededExports(ctx context.Context, olderThan time
 		JOIN content_object o ON o.sha256 = a.content_object_id
 		LEFT JOIN content_ref r
 		       ON r.object_id = a.content_object_id
-		      AND r.owner_kind = 'export'
+		      AND r.owner_kind = $3
 		      AND r.owner_id = a.id
 		      AND r.deleted_at IS NULL
 		WHERE a.created_at < $1
@@ -435,7 +435,7 @@ func (r *GCRepository) ListSupersededExports(ctx context.Context, olderThan time
 		  )
 		ORDER BY a.created_at ASC, a.id ASC
 		LIMIT $2
-	`, olderThan, limit)
+	`, olderThan, limit, storage.OwnerKindExport)
 	if err != nil {
 		return nil, fmt.Errorf("list superseded exports: %w", err)
 	}

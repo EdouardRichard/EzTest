@@ -7,6 +7,7 @@ import (
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 )
 
 // DesignReader is the design application surface consumed by the chain design
@@ -71,16 +72,18 @@ func (p *DesignProvider) scenariosFromGraph(graph designapp.GraphView) []chain.N
 			if requirementID > 0 {
 				meta["requirement_id"] = strconv.FormatInt(requirementID, 10)
 			}
+			// v0.2.4-B (T9 minimal adaptation; the chain re-key itself is T13):
+			// a scenario no longer carries version_sut/page/api ids, so the node
+			// has no SUTIDs and no page list to attach. Nothing replaces them --
+			// a scenario is a pure grouping node now.
 			node := chain.Node{
 				ID:            chain.NodeID(chain.NodeScenario, scenario.ID),
 				Kind:          chain.NodeScenario,
 				RefID:         strconv.FormatInt(scenario.ID, 10),
 				Label:         scenario.Name,
 				RequirementID: optionalInt64Ptr(requirementID),
-				VersionSUTIDs: sortUniqueIDs(scenario.VersionSUTIDs),
 				Meta:          meta,
 			}
-			attachPageIDs(&node, scenario.PageIDs)
 			nodes = append(nodes, node)
 		}
 	}
@@ -117,25 +120,27 @@ func (p *DesignProvider) casesFromGraph(graph designapp.GraphView) []chain.Node 
 				if scenario.ID > 0 {
 					meta["scenario_id"] = strconv.FormatInt(scenario.ID, 10)
 				}
+				// v0.2.4-B: the case card no longer carries version_sut/page/api
+				// ids, so node.SUTIDs/SUTID/PageID stay unset. The natural-language
+				// contract that replaced them is projected onto the typed
+				// SutDescription/CoveredACs fields (T27 promoted them out of the
+				// untyped Meta map), so the chain view can still say what a case
+				// tests without parsing Meta.
 				node := chain.Node{
-					ID:            chain.NodeID(chain.NodeCaseVersion, caseVersionID),
-					Kind:          chain.NodeCaseVersion,
-					RefID:         strconv.FormatInt(caseVersionID, 10),
-					Label:         card.Title,
-					Status:        card.Status,
-					ScenarioID:    optionalInt64Ptr(scenario.ID),
-					RequirementID: optionalInt64Ptr(requirement.RequirementID),
-					CaseVersionID: int64Ptr(caseVersionID),
-					PageID:        singlePageID(card.PageIDs),
-					VersionSUTIDs: sortUniqueIDs(card.VersionSUTIDs),
-					CreatedAt:     card.CreatedAt,
-					UpdatedAt:     card.CreatedAt,
-					Meta:          meta,
+					ID:             chain.NodeID(chain.NodeCaseVersion, caseVersionID),
+					Kind:           chain.NodeCaseVersion,
+					RefID:          strconv.FormatInt(caseVersionID, 10),
+					Label:          card.Title,
+					Status:         card.Status,
+					ScenarioID:     optionalInt64Ptr(scenario.ID),
+					RequirementID:  optionalInt64Ptr(requirement.RequirementID),
+					CaseVersionID:  int64Ptr(caseVersionID),
+					CreatedAt:      card.CreatedAt,
+					UpdatedAt:      card.CreatedAt,
+					SutDescription: card.SutDescription,
+					CoveredACs:     append([]string(nil), card.CoveredACs...),
+					Meta:           meta,
 				}
-				if card.DefaultVersionSUTID != nil && *card.DefaultVersionSUTID > 0 {
-					node.VersionSUTID = int64Ptr(*card.DefaultVersionSUTID)
-				}
-				attachPageIDs(&node, card.PageIDs)
 				nodes = append(nodes, node)
 			}
 		}
@@ -146,7 +151,7 @@ func (p *DesignProvider) casesFromGraph(graph designapp.GraphView) []chain.Node 
 // caseVersionStale marks the design statuses that let a chain reader warn that
 // the case version is stale/superseded before opening it.
 func caseVersionStale(status string) bool {
-	return status == "stale" || status == "superseded"
+	return status == design.CaseStatusStale || status == design.CaseStatusSuperseded
 }
 
 // CaseVersionsByIDs is the historical reader. It returns any status (including
@@ -179,29 +184,7 @@ func (p *DesignProvider) CaseVersionsByIDs(ctx context.Context, versionID int64,
 	return nodes, nil
 }
 
-// attachPageIDs stores the multi-page target list in node meta (the domain
-// node only has one typed PageID) and mirrors a single page into the typed
-// field so page filters match both representations.
-func attachPageIDs(node *chain.Node, pageIDs []int64) {
-	pages := sortUniqueIDs(pageIDs)
-	if len(pages) == 0 {
-		return
-	}
-	if node.Meta == nil {
-		node.Meta = map[string]any{}
-	}
-	node.Meta["page_ids"] = pages
-	if node.PageID == nil && len(pages) == 1 {
-		node.PageID = int64Ptr(pages[0])
-	}
-}
-
-// singlePageID returns the typed page id when the case targets exactly one
-// page; multi-page targets stay in node meta.
-func singlePageID(pageIDs []int64) *int64 {
-	pages := sortUniqueIDs(pageIDs)
-	if len(pages) != 1 {
-		return nil
-	}
-	return int64Ptr(pages[0])
-}
+// attachPageIDs / singlePageID were removed with the design case card's page_ids
+// (v0.2.4-B, T9): a design case no longer names catalog pages, so there is no
+// page list to mirror into chain.Node.PageID or into node meta. The other
+// providers (delivery/execution/version) never used them.

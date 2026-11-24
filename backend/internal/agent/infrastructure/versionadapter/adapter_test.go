@@ -162,16 +162,23 @@ func TestRequirementPortMapping(t *testing.T) {
 	requirement := versionapp.RequirementView{
 		ID: 501, CurrentVersionID: 601, Revision: 2, Title: "Login",
 		Status: "draft", Priority: "P1",
-		TargetVersionSUTs: []string{"1001"}, TargetPages: []string{"1301"}, TargetAPIs: []string{"1401"},
 		UpdatedAt: testTime,
 	}
 	detail := versionapp.RequirementDetail{
 		RequirementView: requirement,
 		CurrentVersion: versionapp.RequirementVersionView{
-			ID: 601, RequirementID: 501, Revision: 2, Title: "Login", Description: "desc",
-			AcceptanceCriteria: "accept", Priority: "P1",
-			Constraints:       []byte(`{"business_rules":["x"]}`),
-			TargetVersionSUTs: []string{"1001"}, TargetPages: []string{"1301"}, TargetAPIs: []string{"1401"},
+			ID: 601, RequirementID: 501, Revision: 2, Title: "Login",
+			UserStory: versionapp.RequirementUserStoryView{
+				AsA: "a user", IWant: "to sign in with a phone number", SoThat: "I skip the password",
+			},
+			Rules: "one session per phone",
+			AcceptanceCriteria: []versionapp.RequirementAcceptanceCriterionView{
+				{ID: "AC-1", Given: "a registered phone", When: "the code is submitted", Then: "the user is signed in"},
+			},
+			Priority:       "P1",
+			Constraints:    []byte(`{"business_rules":["x"]}`),
+			SutDescription: "the login page",
+			ScopeOut:       "social login",
 		},
 	}
 	fake := &fakeRequirements{
@@ -212,19 +219,43 @@ func TestRequirementPortMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRequirement: %v", err)
 	}
-	if loaded.Description != "desc" || loaded.AcceptanceCriteria != "accept" || string(loaded.Constraints) != `{"business_rules":["x"]}` {
+	if loaded.UserStory.AsA != "a user" || loaded.UserStory.IWant != "to sign in with a phone number" ||
+		loaded.UserStory.SoThat != "I skip the password" {
+		t.Fatalf("user_story = %#v", loaded.UserStory)
+	}
+	if loaded.Rules != "one session per phone" || loaded.SutDescription != "the login page" ||
+		loaded.ScopeOut != "social login" {
 		t.Fatalf("detail = %#v", loaded)
+	}
+	if len(loaded.AcceptanceCriteria) != 1 || loaded.AcceptanceCriteria[0].ID != "AC-1" ||
+		loaded.AcceptanceCriteria[0].Given != "a registered phone" ||
+		loaded.AcceptanceCriteria[0].Then != "the user is signed in" {
+		t.Fatalf("acceptance_criteria = %#v", loaded.AcceptanceCriteria)
+	}
+	if string(loaded.Constraints) != `{"business_rules":["x"]}` {
+		t.Fatalf("constraints = %s", loaded.Constraints)
 	}
 
 	summary, err := adapter.CreateDraft(ctx, 10, tools.RequirementDraft{
-		Title: "T", Description: "D", AcceptanceCriteria: "A", Priority: "P1",
-		TargetVersionSUTs: []string{"1001"},
+		Title:     "T",
+		UserStory: tools.RequirementUserStory{AsA: "a", IWant: "b", SoThat: "c"},
+		AcceptanceCriteria: []tools.RequirementAcceptanceCriterionInput{
+			{Given: "g", When: "w", Then: "t"},
+		},
+		Priority:       "P1",
+		SutDescription: "the sut",
 	})
 	if err != nil || summary.ID != 501 {
 		t.Fatalf("CreateDraft = %#v, %v", summary, err)
 	}
-	if createActor != 0 || createdDraft.Title != "T" || len(createdDraft.TargetVersionSUTs) != 1 {
+	if createActor != 0 || createdDraft.Title != "T" {
 		t.Fatalf("created draft = %#v actor=%d", createdDraft, createActor)
+	}
+	if createdDraft.UserStory.AsA != "a" || createdDraft.SutDescription != "the sut" {
+		t.Fatalf("created draft = %#v", createdDraft)
+	}
+	if len(createdDraft.AcceptanceCriteria) != 1 || createdDraft.AcceptanceCriteria[0].Given != "g" {
+		t.Fatalf("created draft criteria = %#v", createdDraft.AcceptanceCriteria)
 	}
 	if string(createdDraft.Constraints) != `{}` {
 		t.Fatalf("default constraints = %s", createdDraft.Constraints)
@@ -417,18 +448,23 @@ func TestVersionReaderBuildsPack(t *testing.T) {
 	ctx := context.Background()
 	versions := &fakeVersions{getFn: func(_ context.Context, id int64) (versionapp.VersionView, error) {
 		return versionapp.VersionView{
-			ID: 10, Title: "Orders", Status: "running",
-			Bindings: []versionapp.BindingView{{
-				ID:          1001,
-				SUT:         resourceapp.SUTView{ID: "1001", Name: "Orders"},
-				Environment: resourceapp.EnvironmentView{ID: "1101", SUTID: "1001", Name: "prod", BaseURL: "https://example.test"},
-				Pages: []resourceapp.PageView{
-					{ID: "1301", SUTID: "1001", EnvironmentID: "1101", Name: "Login", RouteTemplate: "/login"},
+			ID: 10, Title: "Orders", Status: "running", EnvironmentID: 1101,
+			Binding: versionapp.EnvironmentSUTCatalog{
+				VersionID: 10, EnvironmentID: 1101,
+				Environment: resourceapp.EnvironmentView{
+					ID: "1101", Name: "prod",
+					SUTs: []resourceapp.SUTView{{
+						ID: "1001", EnvironmentID: "1101", Name: "Orders",
+						BaseURL: "https://example.test",
+						Pages: []resourceapp.PageView{
+							{ID: "1301", SUTID: "1001", Name: "Login", RouteTemplate: "/login", Status: "approved"},
+						},
+						APIs: []resourceapp.APIView{
+							{ID: "1401", SUTID: "1001", Method: "GET", PathTemplate: "/api/login", Name: "Login API", Status: "approved"},
+						},
+					}},
 				},
-				APIs: []resourceapp.APIView{
-					{ID: "1401", SUTID: "1001", EnvironmentID: "1101", Method: "GET", PathTemplate: "/api/login", Name: "Login API"},
-				},
-			}},
+			},
 		}, nil
 	}}
 	requirements := &fakeRequirements{
@@ -470,18 +506,24 @@ func TestResourcePortMapping(t *testing.T) {
 	ctx := context.Background()
 	versions := &fakeVersions{getFn: func(_ context.Context, id int64) (versionapp.VersionView, error) {
 		return versionapp.VersionView{
-			ID: 10,
-			Bindings: []versionapp.BindingView{
-				{ID: 1001, SUT: resourceapp.SUTView{ID: "1001", Name: "Orders"}, Environment: resourceapp.EnvironmentView{ID: "1101", Name: "prod"},
-					Pages: []resourceapp.PageView{{ID: "1301", Name: "Login", RouteTemplate: "/login"}}},
-				{ID: 1002, SUT: resourceapp.SUTView{ID: "1002", Name: "Admin"}, Environment: resourceapp.EnvironmentView{ID: "1102", Name: "staging"},
-					APIs: []resourceapp.APIView{{ID: "1401", Method: "GET", PathTemplate: "/api/admin"}}},
+			ID: 10, EnvironmentID: 1101,
+			Binding: versionapp.EnvironmentSUTCatalog{
+				VersionID: 10, EnvironmentID: 1101,
+				Environment: resourceapp.EnvironmentView{
+					ID: "1101", Name: "prod",
+					SUTs: []resourceapp.SUTView{
+						{ID: "1001", EnvironmentID: "1101", Name: "Orders",
+							Pages: []resourceapp.PageView{{ID: "1301", SUTID: "1001", Name: "Login", RouteTemplate: "/login", Status: "approved"}}},
+						{ID: "1002", EnvironmentID: "1101", Name: "Admin",
+							APIs: []resourceapp.APIView{{ID: "1401", SUTID: "1002", Method: "GET", PathTemplate: "/api/admin", Status: "approved"}}},
+					},
+				},
 			},
 		}, nil
 	}}
 	adapter := versionadapter.New(nil, nil, versions, nil, nil)
 	suts, err := adapter.ListSUTs(ctx, 10)
-	if err != nil || len(suts) != 2 || suts[0].VersionSUTID != 1001 || suts[0].Environment != "prod" {
+	if err != nil || len(suts) != 2 || suts[0].SUTID != 1001 || suts[0].Environment != "prod" {
 		t.Fatalf("ListSUTs = %#v, %v", suts, err)
 	}
 	pages, err := adapter.ListPages(ctx, 10, 1001)

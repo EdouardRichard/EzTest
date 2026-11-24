@@ -577,9 +577,9 @@ func (s *PauseService) cleanupContexts(ctx context.Context, caseRunID int64) {
 		if item.ExecutorID != nil {
 			executorID = *item.ExecutorID
 		}
-		if item.BrowserContextID != "" && s.executor != nil {
-			_ = s.executor.CancelContext(ctx, executorID, item.BrowserContextID)
-			_ = s.executor.DeleteContext(ctx, executorID, item.BrowserContextID)
+		if item.SessionID != "" && s.executor != nil {
+			_ = s.executor.CancelSession(ctx, executorID, item.SessionID)
+			_ = s.executor.DeleteSession(ctx, executorID, item.SessionID)
 		}
 		if item.Status == execution.SUTContextClosed {
 			continue

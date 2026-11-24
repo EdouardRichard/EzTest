@@ -14,7 +14,7 @@ type DiscoveryDeltaObservation struct {
 	VersionID        int64
 	WaveID           int64
 	CaseRunID        int64
-	VersionSUTID     int64
+	SUTID            int64
 	EnvironmentID    int64
 	Kind             string
 	Method           string

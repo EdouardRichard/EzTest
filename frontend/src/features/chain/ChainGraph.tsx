@@ -201,9 +201,9 @@ function ChainNodeCard({ data }: NodeProps) {
             步骤 {stepCount} · 断言 {assertionCount ?? 0}
           </span>
         ) : null}
-        {node.version_sut_id !== null && node.version_sut_id !== undefined ? (
+        {node.sut_id !== null && node.sut_id !== undefined ? (
           <span className="rounded-full bg-accent px-1.5 py-0.5 text-[10px] text-accent-foreground">
-            SUT {node.version_sut_id}
+            SUT {node.sut_id}
           </span>
         ) : null}
       </div>

@@ -220,7 +220,7 @@ func sampleIssueRefs(issueID int64) []delivery.IssueRef {
 	return []delivery.IssueRef{
 		{
 			ID: 1, IssueID: issueID, Kind: delivery.IssueRefKindCaseRun, RefID: 900,
-			VersionSUTID: int64Ptr(9), Role: delivery.IssueRefRoleSource,
+			SUTID: int64Ptr(9), Role: delivery.IssueRefRoleSource,
 			CreatedAt: deliveryTestTime, UpdatedAt: deliveryTestTime,
 		},
 		{
@@ -487,7 +487,7 @@ func TestIssueHandlerListParsesFiltersAndProjectsViews(t *testing.T) {
 	mux := newDeliveryMux(t, New(service))
 
 	recorder := deliveryCall(t, mux, http.MethodGet,
-		"/api/versions/42/issues?status=open&category=api&severity=major&version_sut_id=9&before=5000&limit=10",
+		"/api/versions/42/issues?status=open&category=api&severity=major&sut_id=9&before=5000&limit=10",
 		"", nil)
 	requireStatus(t, recorder, http.StatusOK)
 
@@ -498,19 +498,19 @@ func TestIssueHandlerListParsesFiltersAndProjectsViews(t *testing.T) {
 		t.Errorf("List version = %d, want 42", service.versionID)
 	}
 	wantFilter := deliveryapp.IssueFilter{
-		Status:       "open",
-		Category:     "api",
-		Severity:     "major",
-		VersionSUTID: int64Ptr(9),
-		Before:       5000,
-		Limit:        11, // requested limit+1 so has_more is exact
+		Status:   "open",
+		Category: "api",
+		Severity: "major",
+		SUTID:    int64Ptr(9),
+		Before:   5000,
+		Limit:    11, // requested limit+1 so has_more is exact
 	}
 	if service.filter.Status != wantFilter.Status ||
 		service.filter.Category != wantFilter.Category ||
 		service.filter.Severity != wantFilter.Severity ||
 		service.filter.Before != wantFilter.Before ||
 		service.filter.Limit != wantFilter.Limit ||
-		service.filter.VersionSUTID == nil || *service.filter.VersionSUTID != 9 {
+		service.filter.SUTID == nil || *service.filter.SUTID != 9 {
 		t.Errorf("List filter = %+v, want %+v", service.filter, wantFilter)
 	}
 
@@ -554,12 +554,12 @@ func TestIssueHandlerListParsesFiltersAndProjectsViews(t *testing.T) {
 		t.Fatalf("refs = %#v, want 2", first["refs"])
 	}
 	ref, _ := refs[0].(map[string]any)
-	if ref["kind"] != "case_run" || ref["ref_id"] != "900" || ref["version_sut_id"] != "9" || ref["role"] != "source" {
+	if ref["kind"] != "case_run" || ref["ref_id"] != "900" || ref["sut_id"] != "9" || ref["role"] != "source" {
 		t.Errorf("ref = %v", ref)
 	}
 	evidenceRef, _ := refs[1].(map[string]any)
-	if evidenceRef["version_sut_id"] != nil {
-		t.Errorf("evidence ref version_sut_id = %v, want null", evidenceRef["version_sut_id"])
+	if evidenceRef["sut_id"] != nil {
+		t.Errorf("evidence ref sut_id = %v, want null", evidenceRef["sut_id"])
 	}
 
 	triage, ok := first["triage"].(map[string]any)
@@ -602,8 +602,8 @@ func TestIssueHandlerListRejectsInvalidQueries(t *testing.T) {
 		{name: "status", query: "?status=broken", field: "status"},
 		{name: "category", query: "?category=unknown", field: "category"},
 		{name: "severity", query: "?severity=urgent", field: "severity"},
-		{name: "version_sut_id zero", query: "?version_sut_id=0", field: "version_sut_id"},
-		{name: "version_sut_id text", query: "?version_sut_id=abc", field: "version_sut_id"},
+		{name: "sut_id zero", query: "?sut_id=0", field: "sut_id"},
+		{name: "sut_id text", query: "?sut_id=abc", field: "sut_id"},
 		{name: "before zero", query: "?before=0", field: "before"},
 		{name: "before text", query: "?before=soon", field: "before"},
 	}

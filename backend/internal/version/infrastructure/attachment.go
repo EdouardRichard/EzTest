@@ -272,18 +272,20 @@ func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit i
 	if _, err := r.pool.Exec(ctx, `
 		WITH stale AS (
 			SELECT id FROM requirement_attachment
-			WHERE extraction_status = 'processing'
+			WHERE extraction_status = $2
 			  AND updated_at < now() - make_interval(secs => $1::double precision)
 		), reset_images AS (
 			UPDATE attachment_image
-			SET status = 'extracted', caption = '', error = '', updated_at = now()
+			SET status = $3, caption = '', error = '', updated_at = now()
 			WHERE attachment_id IN (SELECT id FROM stale)
-			  AND status = 'analyzing'
+			  AND status = $4
 		)
 		UPDATE requirement_attachment
-		SET extraction_status = 'pending', extraction_error = NULL, updated_at = now()
+		SET extraction_status = $5, extraction_error = NULL, updated_at = now()
 		WHERE id IN (SELECT id FROM stale)
-	`, int64(staleProcessingTimeout.Seconds())); err != nil {
+	`, int64(staleProcessingTimeout.Seconds()),
+		version.AttachmentProcessing, version.AttachmentImageExtracted,
+		version.AttachmentImageAnalyzing, version.AttachmentPending); err != nil {
 		return nil, fmt.Errorf("reset stale processing attachments: %w", err)
 	}
 	rows, err := r.pool.Query(ctx, `
@@ -292,10 +294,10 @@ func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit i
 			COALESCE(a.conversation_message_id, 0)
 		FROM requirement_attachment a
 		LEFT JOIN conversation_message m ON m.id = a.conversation_message_id
-		WHERE a.extraction_status = 'pending'
+		WHERE a.extraction_status = $2
 		ORDER BY a.id
 		LIMIT $1
-	`, limit)
+	`, limit, version.AttachmentPending)
 	if err != nil {
 		return nil, fmt.Errorf("list pending attachments: %w", err)
 	}
@@ -318,9 +320,9 @@ func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit i
 // changed the row.
 func (r *AttachmentRepository) MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE requirement_attachment SET extraction_status = 'processing', updated_at = $2
-		WHERE id = $1 AND extraction_status = 'pending'
-	`, attachmentID, updatedAt)
+		UPDATE requirement_attachment SET extraction_status = $3, updated_at = $2
+		WHERE id = $1 AND extraction_status = $4
+	`, attachmentID, updatedAt, version.AttachmentProcessing, version.AttachmentPending)
 	if err != nil {
 		return false, fmt.Errorf("mark attachment processing: %w", err)
 	}
@@ -335,10 +337,10 @@ func (r *AttachmentRepository) MarkProcessing(ctx context.Context, attachmentID 
 func (r *AttachmentRepository) MarkDone(ctx context.Context, attachmentID int64, extractedContentRefID int64, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE requirement_attachment
-		SET extraction_status = 'done', extracted_content_ref_id = $2,
+		SET extraction_status = $4, extracted_content_ref_id = $2,
 		    extraction_error = NULL, updated_at = $3
-		WHERE id = $1 AND extraction_status <> 'done'
-	`, attachmentID, extractedContentRefID, updatedAt)
+		WHERE id = $1 AND extraction_status <> $4
+	`, attachmentID, extractedContentRefID, updatedAt, version.AttachmentDone)
 	if err != nil {
 		return fmt.Errorf("mark attachment done: %w", err)
 	}
@@ -414,9 +416,10 @@ func (r *AttachmentRepository) ListImages(ctx context.Context, attachmentID int6
 // reports whether this call changed it. A done/analyzing row is untouched.
 func (r *AttachmentRepository) MarkImageAnalyzing(ctx context.Context, imageID int64, updatedAt time.Time) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE attachment_image SET status = 'analyzing', updated_at = $2
-		WHERE id = $1 AND status IN ('extracted', 'skipped', 'failed')
-	`, imageID, updatedAt)
+		UPDATE attachment_image SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = ANY($4)
+	`, imageID, updatedAt, version.AttachmentImageAnalyzing,
+		[]string{version.AttachmentImageExtracted, version.AttachmentImageSkipped, version.AttachmentImageFailed})
 	if err != nil {
 		return false, fmt.Errorf("mark attachment image analyzing: %w", err)
 	}
@@ -430,9 +433,9 @@ func (r *AttachmentRepository) MarkImageAnalyzing(ctx context.Context, imageID i
 func (r *AttachmentRepository) MarkImageDone(ctx context.Context, imageID int64, caption string, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE attachment_image
-		SET status = 'done', caption = $2, error = '', updated_at = $3
+		SET status = $4, caption = $2, error = '', updated_at = $3
 		WHERE id = $1
-	`, imageID, caption, updatedAt)
+	`, imageID, caption, updatedAt, version.AttachmentImageDone)
 	if err != nil {
 		return fmt.Errorf("mark attachment image done: %w", err)
 	}
@@ -448,9 +451,9 @@ func (r *AttachmentRepository) MarkImageDone(ctx context.Context, imageID int64,
 func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int64, message string, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE attachment_image
-		SET status = 'failed', caption = '', error = $2, updated_at = $3
+		SET status = $4, caption = '', error = $2, updated_at = $3
 		WHERE id = $1
-	`, imageID, message, updatedAt)
+	`, imageID, message, updatedAt, version.AttachmentImageFailed)
 	if err != nil {
 		return fmt.Errorf("mark attachment image failed: %w", err)
 	}
@@ -467,9 +470,9 @@ func (r *AttachmentRepository) MarkImageFailed(ctx context.Context, imageID int6
 func (r *AttachmentRepository) MarkImageSkipped(ctx context.Context, imageID int64, reason string, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE attachment_image
-		SET status = 'skipped', caption = '', error = $2, updated_at = $3
+		SET status = $4, caption = '', error = $2, updated_at = $3
 		WHERE id = $1
-	`, imageID, reason, updatedAt)
+	`, imageID, reason, updatedAt, version.AttachmentImageSkipped)
 	if err != nil {
 		return fmt.Errorf("mark attachment image skipped: %w", err)
 	}
@@ -485,9 +488,10 @@ func (r *AttachmentRepository) MarkImageSkipped(ctx context.Context, imageID int
 func (r *AttachmentRepository) ResetImagesForReanalysis(ctx context.Context, attachmentID int64, updatedAt time.Time) (int64, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE attachment_image
-		SET status = 'extracted', caption = '', error = '', updated_at = $2
-		WHERE attachment_id = $1 AND status IN ('failed', 'skipped')
-	`, attachmentID, updatedAt)
+		SET status = $3, caption = '', error = '', updated_at = $2
+		WHERE attachment_id = $1 AND status = ANY($4)
+	`, attachmentID, updatedAt, version.AttachmentImageExtracted,
+		[]string{version.AttachmentImageFailed, version.AttachmentImageSkipped})
 	if err != nil {
 		return 0, fmt.Errorf("reset attachment images for reanalysis: %w", err)
 	}
@@ -551,9 +555,9 @@ func scanAttachmentImage(row rowScanner) (version.AttachmentImageRecord, error) 
 func (r *AttachmentRepository) MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE requirement_attachment
-		SET extraction_status = 'failed', extraction_error = $2, updated_at = $3
-		WHERE id = $1 AND extraction_status <> 'done'
-	`, attachmentID, encodeExtractionError(code, message), updatedAt)
+		SET extraction_status = $4, extraction_error = $2, updated_at = $3
+		WHERE id = $1 AND extraction_status <> $5
+	`, attachmentID, encodeExtractionError(code, message), updatedAt, version.AttachmentFailed, version.AttachmentDone)
 	if err != nil {
 		return fmt.Errorf("mark attachment failed: %w", err)
 	}

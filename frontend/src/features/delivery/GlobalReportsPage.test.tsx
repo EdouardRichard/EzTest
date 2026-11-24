@@ -215,7 +215,7 @@ describe("GlobalReportsPage", () => {
     expect(api.getReport).toHaveBeenCalledWith("2001", "8101")
     const panel = screen.getByTestId("report-detail")
     expect(within(panel).getByRole("button", { name: "打开报告 HTML" })).toBeInTheDocument()
-    for (const label of ["下载 HTML", "重新生成", "PDF（P7）"]) {
+    for (const label of ["下载 HTML", "重新生成", "下载 PDF"]) {
       expect(within(panel).queryByRole("button", { name: label })).not.toBeInTheDocument()
     }
   })

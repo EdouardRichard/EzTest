@@ -6,86 +6,79 @@ import (
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
-	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// CodeBaselineResolver resolves the current HEAD commit of a bound code
-// repository (P5 §5.5). It is implemented by the codeintel context's read-only
-// Git layer and keeps the version context free of Git/exec imports.
+// CodeBaselineResolver resolves the current HEAD commit of a code repository
+// (P5 §5.5). It is implemented by the codeintel context's read-only Git layer
+// and keeps the version context free of Git/exec imports.
 type CodeBaselineResolver interface {
 	ResolveHeadCommit(ctx context.Context, repo resourceapp.CodeRepositoryView) (string, error)
 }
 
-// codeBaselineAuditWarning is the audit action recorded when a binding with a
-// repository cannot be resolved. Resolution failures never block version
-// creation (spec §5.5).
+// codeBaselineAuditWarning is the audit action recorded when a repository of the
+// environment code pool cannot be resolved. Resolution failures never block
+// version creation (spec §5.5).
 const codeBaselineAuditWarning = "version.code_baseline_unresolved"
 
-// codeBaselineWarning is one binding whose baseline could not be resolved.
+// codeBaselineWarning is one (SUT, repository) pair of the environment code pool
+// whose baseline could not be resolved. The pair is the key the baseline is
+// stored under (sut_repository.code_baseline_commit, v0.2.4-B).
 type codeBaselineWarning struct {
-	versionSUTID int64
-	repoID       int64
+	sutID  int64
+	repoID int64
 }
 
-// resolveCodeBaselines fills Binding.CodeBaselineCommit for every binding's
-// deterministic baseline repository: the lowest effective repository ID among
-// the SUT inheritance plus the version overrides. A resolver error or a
-// malformed SHA leaves the column empty and is returned as a warning so Create
-// can record the audit entry after the version is persisted.
-func (s *Service) resolveCodeBaselines(ctx context.Context, bindings []version.Binding) []codeBaselineWarning {
+// resolveEnvironmentBaselines resolves the code baseline of the environment code
+// pool's deterministic baseline repository — the lowest repository ID, which is
+// what the version pins and what execution fingerprints (P5 §5.5).
+//
+// v0.2.4-B: the baseline lives on sut_repository (one row per (SUT, repository)
+// pair) instead of the dropped version_sut row. A repository that already carries
+// a pinned commit is left untouched, so a version created later never moves the
+// baseline an earlier version or a completed code index pinned; the remaining
+// repositories of the pool are backfilled by the code index after a successful
+// run. A resolver error or a malformed SHA leaves the commit empty and is
+// returned as a warning so the caller can record the audit entry; it never fails
+// the version write.
+func (s *Service) resolveEnvironmentBaselines(ctx context.Context, environmentID int64) []codeBaselineWarning {
 	if s.resolver == nil {
 		return nil
 	}
-	var warnings []codeBaselineWarning
-	for index := range bindings {
-		repositories, err := s.bindingRepositories(ctx, bindings[index].SUTID, bindings[index].RepositoryOverrides)
-		if err != nil {
-			continue
-		}
-		commit, warning := s.resolveBaseline(ctx, bindings[index].ID, repositories)
-		bindings[index].CodeBaselineCommit = commit
-		if warning != nil {
-			warnings = append(warnings, *warning)
-		}
-	}
-	return warnings
-}
-
-// resolveBaseline resolves the HEAD commit of the first (lowest-ID) effective
-// repository of one binding. It returns an empty commit and a warning when the
-// resolver fails or returns a malformed SHA.
-func (s *Service) resolveBaseline(
-	ctx context.Context, versionSUTID int64, repositories []BindingRepository,
-) (string, *codeBaselineWarning) {
-	if s.resolver == nil {
-		return "", nil
-	}
-	var baseline *resourceapp.CodeRepositoryView
-	for _, repository := range repositories {
-		if repository.Included {
-			repositoryCopy := repository.Repository
-			baseline = &repositoryCopy
-			break
-		}
-	}
-	if baseline == nil {
-		return "", nil
-	}
-	repoID, err := parseCatalogID(baseline.ID)
+	repositories, err := s.environmentRepositories(ctx, environmentID)
 	if err != nil {
-		return "", &codeBaselineWarning{versionSUTID: versionSUTID}
+		return nil
 	}
-	commit, err := s.resolver.ResolveHeadCommit(ctx, *baseline)
-	if err != nil || !version.IsValidCodeBaselineCommit(commit) {
-		return "", &codeBaselineWarning{versionSUTID: versionSUTID, repoID: repoID}
+	if len(repositories) == 0 {
+		return nil
 	}
-	return commit, nil
+	baseline := repositories[0]
+	repoID, err := parseCatalogID(baseline.Repository.ID)
+	if err != nil {
+		return []codeBaselineWarning{{sutID: baseline.SUTID}}
+	}
+	if baseline.CodeBaselineCommit != "" {
+		// Already pinned by an earlier version or by the code index backfill.
+		return nil
+	}
+	commit, err := s.resolver.ResolveHeadCommit(ctx, baseline.Repository)
+	if err != nil || validation.GitCommitSHA("code_baseline_commit", commit) != nil {
+		return []codeBaselineWarning{{sutID: baseline.SUTID, repoID: repoID}}
+	}
+	if s.baselines == nil {
+		return nil
+	}
+	if err := s.baselines.SetSUTRepositoryBaselineCommit(ctx, baseline.SUTID, repoID, commit); err != nil {
+		return []codeBaselineWarning{{sutID: baseline.SUTID, repoID: repoID}}
+	}
+	return nil
 }
 
-// recordCodeBaselineWarnings records one audit entry per unresolved binding.
-// The metadata deliberately carries only IDs: a resolver error may contain a
-// filesystem path, and audit entries must not leak repository paths.
+// recordCodeBaselineWarnings records one audit entry per unresolved repository
+// of the environment code pool. The metadata deliberately carries only IDs: a
+// resolver error may contain a filesystem path, and audit entries must not leak
+// repository paths.
 func (s *Service) recordCodeBaselineWarnings(ctx context.Context, versionID int64, warnings []codeBaselineWarning, actorID int64) {
 	if s.audit == nil {
 		return
@@ -103,8 +96,8 @@ func (s *Service) recordCodeBaselineWarnings(ctx context.Context, versionID int6
 			TargetID:   targetID,
 			RequestID:  requestid.From(ctx),
 			Metadata: map[string]any{
-				"version_sut_id": platformid.Format(warning.versionSUTID),
-				"repo_id":        platformid.Format(warning.repoID),
+				"sut_id":  platformid.Format(warning.sutID),
+				"repo_id": platformid.Format(warning.repoID),
 			},
 		})
 	}

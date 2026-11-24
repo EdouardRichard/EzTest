@@ -21,6 +21,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Completion write contract constants.
@@ -29,8 +30,10 @@ const (
 	// completion targets a plan item (R-A3-4).
 	CompletionPlanStatusDone = "done"
 	// CompletionFactKindProgress is the version_fact kind of the progress fact
-	// written on completion (R-A8-3).
-	CompletionFactKindProgress = "progress"
+	// written on completion (R-A8-3). It aliases the VERSION domain's fact
+	// vocabulary so the briefing's agent-narrative exclusion reads the same
+	// authority (no second copy of the literal).
+	CompletionFactKindProgress = version.FactKindProgress
 	// CompletionFactSource is the version_fact.source recorded for completion
 	// progress facts.
 	CompletionFactSource = "task.complete"

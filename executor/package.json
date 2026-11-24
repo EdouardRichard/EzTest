@@ -3,17 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "EzTest Playwright execution service (executor protocol A')",
+  "description": "EzTest execution service (executor protocol v2, general workstation)",
   "engines": {
-    "node": ">=20.11"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\""
+    "test": "node --test --test-concurrency=1 --test-force-exit \"test/*.test.mjs\""
   },
   "dependencies": {
-    "pixelmatch": "^8.0.0",
-    "playwright": "1.64.1",
-    "pngjs": "^7.0.0"
+    "@homebridge/node-pty-prebuilt-multiarch": "0.15.0"
   }
 }

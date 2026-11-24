@@ -54,8 +54,13 @@ func handoffReadDocument() versionapp.Handoff {
 		GeneratedAt: testTime,
 		Requirements: []versionapp.HandoffRequirement{{
 			ID: 101, CurrentVersionID: 201, Revision: 1,
-			Title: "退款到账时效", Description: "退款后约定时效到账",
-			AcceptanceCriteria: "T+1 到账", Priority: "P1", Status: "clarified",
+			Title:     "退款到账时效",
+			UserStory: versionapp.HandoffUserStory{AsA: "买家", IWant: "退款后按时到账", SoThat: "确认退款完成"},
+			Rules:     "退款后约定时效到账",
+			AcceptanceCriteria: []versionapp.HandoffAcceptanceCriterion{
+				{ID: "AC-1", Given: "已申请退款", When: "退款成功", Then: "T+1 到账"},
+			},
+			Priority: "P1", SutDescription: "订单中心退款", Status: "clarified",
 			SourceQuote: "退款到账时间按 T+1 验收",
 		}},
 		QA: []versionapp.HandoffQAItem{{
@@ -77,16 +82,14 @@ func handoffReadDocument() versionapp.Handoff {
 			Next:    &versionapp.HandoffPlanItem{ID: 702, Phase: "designing", Title: "评审退款用例", Status: "pending"},
 		},
 		Resources: versionapp.HandoffResources{
+			Environment: versionapp.HandoffEnvironment{ID: 1001, Name: "staging", Status: "active"},
 			SUTs: []versionapp.HandoffSUT{{
-				VersionSUTID: 801, SUTID: 901, Name: "订单中心",
-				EnvironmentID: 1001, Environment: "staging", BaseURL: "https://orders.example.test",
+				SUTID: 901, Name: "订单中心", BaseURL: "https://orders.example.test",
+				Pages:     []versionapp.HandoffPage{{ID: 1101, Name: "退款页", URL: "https://orders.example.test/refund"}},
+				APIs:      []versionapp.HandoffAPI{{ID: 1201, Name: "创建退款", Method: "POST", Path: "/api/refunds"}},
+				Databases: []versionapp.HandoffDatabase{{ID: 1401, SUTID: 901, Name: "orders", Kind: "postgres", ReadOnly: true}},
 			}},
-			Pages:    []versionapp.HandoffPage{{ID: 1101, VersionSUTID: 801, Name: "退款页", URL: "https://orders.example.test/refund"}},
-			APIs:     []versionapp.HandoffAPI{{ID: 1201, VersionSUTID: 801, Name: "创建退款", Method: "POST", Path: "/api/refunds"}},
 			Accounts: []versionapp.HandoffAccount{{ID: 1301, Username: "qa-refund", Roles: []string{"admin"}}},
-			Databases: []versionapp.HandoffDatabase{
-				{ID: 1401, Name: "orders", Kind: "postgres", ReadOnly: true},
-			},
 		},
 	}
 }
@@ -117,8 +120,24 @@ func TestHandoffHandlerGet(t *testing.T) {
 	}
 	requirement := data["requirements"].([]any)[0].(map[string]any)
 	if requirement["id"] != "101" || requirement["current_version_id"] != "201" ||
-		requirement["acceptance_criteria"] != "T+1 到账" || requirement["source_quote"] == "" {
+		requirement["source_quote"] == "" || requirement["sut_description"] != "订单中心退款" {
 		t.Fatalf("requirement DTO = %#v", requirement)
+	}
+	story, ok := requirement["user_story"].(map[string]any)
+	if !ok || story["as_a"] != "买家" || story["i_want"] != "退款后按时到账" || story["so_that"] != "确认退款完成" {
+		t.Fatalf("user_story DTO = %#v", requirement["user_story"])
+	}
+	criteria, ok := requirement["acceptance_criteria"].([]any)
+	if !ok || len(criteria) != 1 {
+		t.Fatalf("acceptance_criteria DTO = %#v", requirement["acceptance_criteria"])
+	}
+	criterion := criteria[0].(map[string]any)
+	if criterion["id"] != "AC-1" || criterion["given"] != "已申请退款" ||
+		criterion["when"] != "退款成功" || criterion["then"] != "T+1 到账" {
+		t.Fatalf("acceptance criterion DTO = %#v", criterion)
+	}
+	if _, leaked := requirement["description"]; leaked {
+		t.Fatalf("requirement DTO still carries the flat description: %#v", requirement)
 	}
 	qa := data["qa"].([]any)[0].(map[string]any)
 	if qa["question_id"] != "501" || qa["message_id"] != "9001" || qa["status"] != "answered" {
@@ -134,10 +153,39 @@ func TestHandoffHandlerGet(t *testing.T) {
 		t.Fatalf("open DTO = %#v", openItem)
 	}
 	resources := data["resources"].(map[string]any)
-	if len(resources["pages"].([]any)) != 1 || len(resources["apis"].([]any)) != 1 ||
-		len(resources["suts"].([]any)) != 1 || len(resources["accounts"].([]any)) != 1 ||
-		len(resources["databases"].([]any)) != 1 {
+	environment, ok := resources["environment"].(map[string]any)
+	if !ok || environment["id"] != "1001" || environment["name"] != "staging" {
+		t.Fatalf("environment DTO = %#v", resources["environment"])
+	}
+	suts, ok := resources["suts"].([]any)
+	if !ok || len(suts) != 1 {
+		t.Fatalf("suts DTO = %#v", resources["suts"])
+	}
+	sut := suts[0].(map[string]any)
+	if sut["sut_id"] != "901" {
+		t.Fatalf("sut DTO = %#v", sut)
+	}
+	if _, leaked := sut["version_sut_id"]; leaked {
+		t.Fatalf("sut DTO carries version_sut_id: %#v", sut)
+	}
+	if len(sut["pages"].([]any)) != 1 || len(sut["apis"].([]any)) != 1 ||
+		len(sut["databases"].([]any)) != 1 || len(resources["accounts"].([]any)) != 1 {
 		t.Fatalf("resources DTO = %#v", resources)
+	}
+	page := sut["pages"].([]any)[0].(map[string]any)
+	if _, leaked := page["version_sut_id"]; leaked {
+		t.Fatalf("page DTO carries version_sut_id: %#v", page)
+	}
+	api := sut["apis"].([]any)[0].(map[string]any)
+	if _, leaked := api["version_sut_id"]; leaked {
+		t.Fatalf("api DTO carries version_sut_id: %#v", api)
+	}
+	database := sut["databases"].([]any)[0].(map[string]any)
+	if database["sut_id"] != "901" {
+		t.Fatalf("database DTO sut_id = %#v, want the owning SUT 901 (a design db assertion takes sut_id)", database["sut_id"])
+	}
+	if truncated, ok := resources["truncated"].(bool); !ok || truncated {
+		t.Fatalf("resources truncated = %#v, want false for the under-budget fixture", resources["truncated"])
 	}
 }
 

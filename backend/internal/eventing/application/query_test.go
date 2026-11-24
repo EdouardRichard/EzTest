@@ -9,9 +9,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// fakeP6EventCounter is the eventing-context P6 count source used by the query
+// fakeEventCounter is the eventing-context P6 count source used by the query
 // port tests.
-type fakeP6EventCounter struct {
+type fakeEventCounter struct {
 	count     int
 	err       error
 	calls     int
@@ -19,15 +19,15 @@ type fakeP6EventCounter struct {
 	channel   string
 }
 
-func (f *fakeP6EventCounter) CountEvents(_ context.Context, eventType, channel string) (int, error) {
+func (f *fakeEventCounter) CountEvents(_ context.Context, eventType, channel string) (int, error) {
 	f.calls++
 	f.eventType, f.channel = eventType, channel
 	return f.count, f.err
 }
 
-func TestP6CountEvents(t *testing.T) {
+func TestCountEvents(t *testing.T) {
 	t.Run("empty event log returns zero", func(t *testing.T) {
-		reader := &fakeP6EventCounter{}
+		reader := &fakeEventCounter{}
 		service := eventingapp.NewQueryService(reader)
 
 		count, err := service.CountEvents(context.Background(), "context.compacted", "")
@@ -43,7 +43,7 @@ func TestP6CountEvents(t *testing.T) {
 	})
 
 	t.Run("type and channel filters are trimmed and forwarded", func(t *testing.T) {
-		reader := &fakeP6EventCounter{count: 3}
+		reader := &fakeEventCounter{count: 3}
 		service := eventingapp.NewQueryService(reader)
 
 		count, err := service.CountEvents(context.Background(), "  context.compacted ", " version:7 ")
@@ -59,7 +59,7 @@ func TestP6CountEvents(t *testing.T) {
 	})
 
 	t.Run("unknown channel is rejected before the read", func(t *testing.T) {
-		reader := &fakeP6EventCounter{}
+		reader := &fakeEventCounter{}
 		service := eventingapp.NewQueryService(reader)
 
 		if _, err := service.CountEvents(context.Background(), "context.compacted", "bogus"); err == nil {
@@ -71,7 +71,7 @@ func TestP6CountEvents(t *testing.T) {
 	})
 
 	t.Run("empty event type is rejected before the read", func(t *testing.T) {
-		reader := &fakeP6EventCounter{}
+		reader := &fakeEventCounter{}
 		service := eventingapp.NewQueryService(reader)
 
 		if _, err := service.CountEvents(context.Background(), "  ", ""); err == nil {
@@ -84,7 +84,7 @@ func TestP6CountEvents(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := eventingapp.NewQueryService(&fakeP6EventCounter{err: want})
+		service := eventingapp.NewQueryService(&fakeEventCounter{err: want})
 
 		if _, err := service.CountEvents(context.Background(), "context.compacted", ""); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)

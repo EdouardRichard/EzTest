@@ -75,6 +75,7 @@ const approvedItem: KnowledgeItemView = {
 
 const draftDetail: KnowledgeDetailView = {
   ...draftItem,
+  usage: { injection_count: 0, last_used_at: null },
   revisions: [
     {
       id: "8002",

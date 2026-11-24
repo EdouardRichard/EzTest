@@ -17,6 +17,7 @@ import (
 	"time"
 
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 const (
@@ -27,6 +28,13 @@ const (
 	// TemplateVersionV2 is the P7 built-in template: v1 plus the optional
 	// appendix section (report.section_appendix).
 	TemplateVersionV2 = "2"
+
+	// TemplateVersionV3 is the v0.2.4-G human-useful fixed template (SC-G1/G2):
+	// overview + five-element defect cards + non-issue failure explanations +
+	// traceability chain + evidence appendix + AC verification matrix + waived
+	// content. Its core sections are non-omittable and its bytes are frozen
+	// (TestTemplateV3Golden). v1/v2 stay byte-identical.
+	TemplateVersionV3 = "3"
 
 	// MaxHTMLBytes is the hard upper bound of one rendered report (spec
 	// §6.1/§6.2). Rendering truncates issues, waves and case runs in that order
@@ -45,9 +53,9 @@ type HTMLRenderer struct {
 var _ delivery.ReportRenderer = (*HTMLRenderer)(nil)
 
 // NewHTMLRenderer parses one built-in report template. templateVersion accepts
-// "1" (the frozen P4 five-section layout) and "2" (P7: v1 plus the optional
-// appendix section); any other value is an error because EzTest only ships
-// built-in templates.
+// "1" (the frozen P4 five-section layout), "2" (P7: v1 plus the optional appendix
+// section) and "3" (v0.2.4-G: the human-useful fixed five-element-card layout);
+// any other value is an error because EzTest only ships built-in templates.
 func NewHTMLRenderer(templateVersion string) (*HTMLRenderer, error) {
 	var source string
 	switch templateVersion {
@@ -55,13 +63,26 @@ func NewHTMLRenderer(templateVersion string) (*HTMLRenderer, error) {
 		source = reportTemplateV1
 	case TemplateVersionV2:
 		source = reportTemplateV2
+	case TemplateVersionV3:
+		source = reportTemplateV3
 	default:
-		return nil, fmt.Errorf("render: unsupported report template version %q, only %q and %q are built in", templateVersion, TemplateVersionV1, TemplateVersionV2)
+		return nil, fmt.Errorf("render: unsupported report template version %q, only %q, %q and %q are built in", templateVersion, TemplateVersionV1, TemplateVersionV2, TemplateVersionV3)
 	}
 	parsed, err := template.New("report").Funcs(template.FuncMap{
-		"int64ptr": formatInt64Ptr,
-		"intptr":   formatIntPtr,
-		"timeptr":  formatTimePtr,
+		"int64ptr":           formatInt64Ptr,
+		"intptr":             formatIntPtr,
+		"timeptr":            formatTimePtr,
+		"joinInt64s":         joinInt64s,
+		"joinStrings":        joinStrings,
+		"acStateLabel":       acStateLabel,
+		"issueStatusLabel":   issueStatusLabel,
+		"issueCategoryLabel": issueCategoryLabel,
+		"severityLabel":      severityLabel,
+		"closureKindLabel":   closureKindLabel,
+		"runStatusLabel":     runStatusLabel,
+		"failureClassLabel":  failureClassLabel,
+		"reviewStateLabel":   reviewStateLabel,
+		"verdictLabel":       verdictLabel,
 	}).Parse(source)
 	if err != nil {
 		return nil, fmt.Errorf("render: parse report template: %w", err)
@@ -93,8 +114,25 @@ func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnaps
 	if r == nil || r.template == nil {
 		return nil, errors.New("render: report renderer is not initialized")
 	}
+	// v3 is the fixed-format user report (SC-G1 I3): its core sections (概览/缺陷/
+	// 覆盖/追溯/证据) are non-omittable. SectionOptions cannot drop them, so force
+	// them on before building the view. The traceability section is always rendered
+	// by the v3 template itself (it has no section switch).
+	if r.templateVersion == TemplateVersionV3 {
+		opts.Summary = true
+		opts.Issues = true
+		opts.Coverage = true
+		opts.Evidence = true
+	}
 	data := newRenderData(snapshot, narrative, opts)
 	data.TemplateVersion = r.templateVersion
+	// v3-only stable projections (judge/failure/AC/waiver carriers, conclusion,
+	// terms, AC rate) are built only for the v3 template. v1/v2 never reference
+	// them, so gating here is output-neutral for the frozen v1/v2 bytes (T19b #24;
+	// v1 golden hash + v2 tests pin the byte-identical guarantee).
+	if r.templateVersion == TemplateVersionV3 {
+		data.initV3Stable(snapshot)
+	}
 	output, err := r.render(data)
 	if err != nil {
 		return nil, err
@@ -107,12 +145,16 @@ func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnaps
 	// truncated once it is actually sliced. Otherwise untouched lists would be
 	// reported as reduced to zero.
 	state := &truncationState{
-		issuesTotal:   len(data.Issues),
-		issuesKept:    len(data.Issues),
-		wavesTotal:    len(data.Waves),
-		wavesKept:     len(data.Waves),
-		caseRunsTotal: len(data.CaseRuns),
-		caseRunsKept:  len(data.CaseRuns),
+		issuesTotal:       len(data.Issues),
+		issuesKept:        len(data.Issues),
+		wavesTotal:        len(data.Waves),
+		wavesKept:         len(data.Waves),
+		caseRunsTotal:     len(data.CaseRuns),
+		caseRunsKept:      len(data.CaseRuns),
+		explanationsTotal: len(data.FailureExplanations),
+		explanationsKept:  len(data.FailureExplanations),
+		judgmentsTotal:    len(data.Judgments),
+		judgmentsKept:     len(data.Judgments),
 	}
 	// A list that its section does not render cannot shrink the document, so a
 	// disabled section's list is neither halved nor reported.
@@ -154,6 +196,33 @@ func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnaps
 			}
 		}
 	}
+	// v3-only carriers (fix minor): the failure-explanation and judge sections
+	// derive from lists the loops above never shrink, so a large version could
+	// otherwise fail to render outright. Halve them too, with the same explicit
+	// no-silent-drop note. The AC matrix is bounded by its render-side display cap
+	// (buildV3Display) and the waived scope by the AC cap, so they need no halving.
+	if r.templateVersion == TemplateVersionV3 {
+		for len(data.FailureExplanations) > 0 {
+			data.FailureExplanations = data.FailureExplanations[:len(data.FailureExplanations)/2]
+			state.explanationsKept = len(data.FailureExplanations)
+			if output, err = r.renderTruncated(data, state); err != nil {
+				return nil, err
+			}
+			if len(output) <= MaxHTMLBytes {
+				return output, nil
+			}
+		}
+		for len(data.Judgments) > 0 {
+			data.Judgments = data.Judgments[:len(data.Judgments)/2]
+			state.judgmentsKept = len(data.Judgments)
+			if output, err = r.renderTruncated(data, state); err != nil {
+				return nil, err
+			}
+			if len(output) <= MaxHTMLBytes {
+				return output, nil
+			}
+		}
+	}
 	return nil, fmt.Errorf("render: report HTML is %d bytes, still above the %d-byte limit after truncating the rendered lists", len(output), MaxHTMLBytes)
 }
 
@@ -169,8 +238,11 @@ func (r *HTMLRenderer) render(data *renderData) ([]byte, error) {
 	for index := len(data.Issues) - 1; index >= 0; index-- {
 		view.Issues = append(view.Issues, data.Issues[index])
 	}
-	view.SUTRows = buildSUTRows(data.Waves, data.VersionSUTs)
+	view.SUTRows = buildSUTRows(data.Waves, data.SUTs)
 	view.EvidenceRows = buildEvidenceRows(data.CaseRuns)
+	if r.templateVersion == TemplateVersionV3 {
+		view.buildV3Display()
+	}
 
 	var buffer bytes.Buffer
 	if err := r.template.Execute(&buffer, &view); err != nil {
@@ -202,7 +274,7 @@ type renderData struct {
 	Waves            []delivery.WaveSnapshot
 	CaseRuns         []delivery.CaseRunSnapshot
 	Issues           []delivery.IssueSnapshot
-	VersionSUTs      []delivery.VersionSUTSnapshot
+	SUTs             []delivery.SUTSnapshot
 	Coverage         delivery.CoverageSnapshot
 	SUTRows          []sutRow
 	EvidenceRows     []delivery.EvidenceSnapshot
@@ -214,6 +286,35 @@ type renderData struct {
 	// SnapshotTruncationNote is the §6.1 cap note derived from the snapshot's
 	// TruncatedSections. The 2 MiB truncation pass appends its own note to it.
 	SnapshotTruncationNote string
+
+	// v3 human-useful fixed-template projections (v0.2.4-G T10). Only the v3
+	// template consumes them; v1/v2 never reference these fields so their bytes
+	// stay frozen. The raw carriers and the stable views (conclusion/terms/AC
+	// rate/waived scope) are set once in newRenderData; the display views (cards/
+	// traceability/AC matrix/evidence links/judge rows) are rebuilt on every render
+	// so they stay consistent with the truncatable lists.
+	Judgments               []delivery.JudgmentSnapshot
+	FailureExplanations     []delivery.FailureExplanationSnapshot
+	ACVerification          delivery.ACCoverageSnapshot
+	ClosureKind             string
+	Unverified              bool
+	WaiverReason            string
+	WaiverOperator          string
+	WaivedAt                string
+	Conclusion              conclusionView
+	Terms                   []termDef
+	ACRate                  string
+	EvidenceTotalCount      int
+	HasWaived               bool
+	VersionWaived           bool
+	Waived                  waivedView
+	DefectCards             []defectCard
+	Traceability            []traceRow
+	ACMatrix                []acMatrixRow
+	ACMatrixRenderTruncated bool
+	ACMatrixRenderTotal     int
+	EvidenceLinks           []evidenceLink
+	JudgeRows               []judgeRow
 }
 
 // sectionSwitch is one row of the v2 appendix section-switch list.
@@ -241,10 +342,10 @@ type summaryView struct {
 	RequirementsClosed int
 }
 
-// sutRow is one wave × version SUT result row.
+// sutRow is one wave × SUT result row.
 type sutRow struct {
 	WaveID       int64
-	VersionSUTID int64
+	SUTID        int64
 	Label        string
 	Total        int
 	Passed       int
@@ -291,22 +392,22 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 	data.Waves = make([]delivery.WaveSnapshot, len(snapshot.Waves))
 	copy(data.Waves, snapshot.Waves)
 	for index := range data.Waves {
-		byVersionSUT := make([]delivery.SUTCountsSnapshot, len(data.Waves[index].ByVersionSUT))
-		copy(byVersionSUT, data.Waves[index].ByVersionSUT)
-		sort.SliceStable(byVersionSUT, func(i, j int) bool {
-			return byVersionSUT[i].VersionSUTID < byVersionSUT[j].VersionSUTID
+		bySUT := make([]delivery.SUTCountsSnapshot, len(data.Waves[index].BySUT))
+		copy(bySUT, data.Waves[index].BySUT)
+		sort.SliceStable(bySUT, func(i, j int) bool {
+			return bySUT[i].SUTID < bySUT[j].SUTID
 		})
-		data.Waves[index].ByVersionSUT = byVersionSUT
+		data.Waves[index].BySUT = bySUT
 	}
 	sort.SliceStable(data.Waves, func(i, j int) bool { return data.Waves[i].ID < data.Waves[j].ID })
 
 	data.CaseRuns = make([]delivery.CaseRunSnapshot, len(snapshot.CaseRuns))
 	copy(data.CaseRuns, snapshot.CaseRuns)
 	for index := range data.CaseRuns {
-		versionSUTIDs := make([]int64, len(data.CaseRuns[index].VersionSUTIDs))
-		copy(versionSUTIDs, data.CaseRuns[index].VersionSUTIDs)
-		sort.Slice(versionSUTIDs, func(i, j int) bool { return versionSUTIDs[i] < versionSUTIDs[j] })
-		data.CaseRuns[index].VersionSUTIDs = versionSUTIDs
+		sutIDs := make([]int64, len(data.CaseRuns[index].SUTIDs))
+		copy(sutIDs, data.CaseRuns[index].SUTIDs)
+		sort.Slice(sutIDs, func(i, j int) bool { return sutIDs[i] < sutIDs[j] })
+		data.CaseRuns[index].SUTIDs = sutIDs
 
 		evidence := make([]delivery.EvidenceSnapshot, len(data.CaseRuns[index].Evidence))
 		copy(evidence, data.CaseRuns[index].Evidence)
@@ -335,8 +436,8 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 	}
 	sort.SliceStable(data.Issues, func(i, j int) bool { return data.Issues[i].ID < data.Issues[j].ID })
 
-	data.VersionSUTs = append([]delivery.VersionSUTSnapshot(nil), snapshot.VersionSUTs...)
-	sort.SliceStable(data.VersionSUTs, func(i, j int) bool { return data.VersionSUTs[i].ID < data.VersionSUTs[j].ID })
+	data.SUTs = append([]delivery.SUTSnapshot(nil), snapshot.SUTs...)
+	sort.SliceStable(data.SUTs, func(i, j int) bool { return data.SUTs[i].ID < data.SUTs[j].ID })
 
 	data.Coverage = snapshot.Coverage
 	data.Coverage.Gaps = append([]delivery.CoverageGapSnapshot(nil), snapshot.Coverage.Gaps...)
@@ -386,15 +487,15 @@ func summarize(snapshot delivery.ReportSnapshot) summaryView {
 	for _, run := range snapshot.CaseRuns {
 		summary.Total++
 		switch run.Status {
-		case "passed":
+		case delivery.ReportRunStatusPassed:
 			summary.Passed++
-		case "failed":
+		case delivery.ReportRunStatusFailed:
 			summary.Failed++
-		case "blocked":
+		case delivery.ReportRunStatusBlocked:
 			summary.Blocked++
-		case "inconclusive":
+		case delivery.ReportRunStatusInconclusive:
 			summary.Inconclusive++
-		case "skipped":
+		case delivery.ReportRunStatusSkipped:
 			summary.Skipped++
 		default:
 			summary.Other++
@@ -407,28 +508,28 @@ func summarize(snapshot delivery.ReportSnapshot) summaryView {
 		}
 	}
 	for _, requirement := range snapshot.Requirements {
-		if requirement.Status == "closed" {
+		if requirement.Status == string(version.RequirementClosed) {
 			summary.RequirementsClosed++
 		}
 	}
 	return summary
 }
 
-func buildSUTRows(waves []delivery.WaveSnapshot, versionSUTs []delivery.VersionSUTSnapshot) []sutRow {
-	labels := make(map[int64]string, len(versionSUTs))
-	for _, sut := range versionSUTs {
-		labels[sut.ID] = labelVersionSUT(sut)
+func buildSUTRows(waves []delivery.WaveSnapshot, suts []delivery.SUTSnapshot) []sutRow {
+	labels := make(map[int64]string, len(suts))
+	for _, sut := range suts {
+		labels[sut.ID] = labelSUT(sut)
 	}
 	var rows []sutRow
 	for _, wave := range waves {
-		for _, counts := range wave.ByVersionSUT {
-			label := labels[counts.VersionSUTID]
+		for _, counts := range wave.BySUT {
+			label := labels[counts.SUTID]
 			if label == "" {
-				label = fmt.Sprintf("版本 SUT #%d", counts.VersionSUTID)
+				label = fmt.Sprintf("版本 SUT #%d", counts.SUTID)
 			}
 			rows = append(rows, sutRow{
 				WaveID:       wave.ID,
-				VersionSUTID: counts.VersionSUTID,
+				SUTID:        counts.SUTID,
 				Label:        label,
 				Total:        counts.Total,
 				Passed:       counts.Passed,
@@ -441,7 +542,7 @@ func buildSUTRows(waves []delivery.WaveSnapshot, versionSUTs []delivery.VersionS
 	return rows
 }
 
-func labelVersionSUT(sut delivery.VersionSUTSnapshot) string {
+func labelSUT(sut delivery.SUTSnapshot) string {
 	switch {
 	case sut.SUTName != "" && sut.EnvironmentName != "":
 		return sut.SUTName + " @ " + sut.EnvironmentName
@@ -475,16 +576,20 @@ func narrativeLines(narrative string) []string {
 // silent drop). Kept starts at the full size and decreases only for a list that
 // was actually sliced, so the note never mentions untouched or disabled lists.
 type truncationState struct {
-	issuesTotal   int
-	issuesKept    int
-	wavesTotal    int
-	wavesKept     int
-	caseRunsTotal int
-	caseRunsKept  int
+	issuesTotal       int
+	issuesKept        int
+	wavesTotal        int
+	wavesKept         int
+	caseRunsTotal     int
+	caseRunsKept      int
+	explanationsTotal int
+	explanationsKept  int
+	judgmentsTotal    int
+	judgmentsKept     int
 }
 
 func (s *truncationState) note() string {
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 5)
 	if s.issuesKept < s.issuesTotal {
 		parts = append(parts, fmt.Sprintf("问题 %d → %d", s.issuesTotal, s.issuesKept))
 	}
@@ -494,10 +599,16 @@ func (s *truncationState) note() string {
 	if s.caseRunsKept < s.caseRunsTotal {
 		parts = append(parts, fmt.Sprintf("执行结果 %d → %d", s.caseRunsTotal, s.caseRunsKept))
 	}
+	if s.explanationsKept < s.explanationsTotal {
+		parts = append(parts, fmt.Sprintf("失败说明 %d → %d", s.explanationsTotal, s.explanationsKept))
+	}
+	if s.judgmentsKept < s.judgmentsTotal {
+		parts = append(parts, fmt.Sprintf("裁判事实 %d → %d", s.judgmentsTotal, s.judgmentsKept))
+	}
 	if len(parts) == 0 {
 		return ""
 	}
-	return "为满足 2 MiB 上限，已按 issues → waves → case_runs 顺序逐步减半并保留 ID 较小的条目。当前保留：" +
+	return "为满足 2 MiB 上限，已逐步减半并保留 ID 较小的条目。当前保留：" +
 		strings.Join(parts, "；") + "。"
 }
 

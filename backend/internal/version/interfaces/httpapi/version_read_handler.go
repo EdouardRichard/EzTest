@@ -28,6 +28,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/pagination"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // VersionReadService is the version-context read surface of the facts and
@@ -135,7 +136,7 @@ func (h *VersionReadHandler) Gaps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views, hasMore, err := h.versions.Facts(r.Context(), versionID, versionapp.FactReadFilter{
-		Kind:  "gap",
+		Kind:  version.FactKindGap,
 		Limit: maxGapReadLimit,
 	})
 	if err != nil {

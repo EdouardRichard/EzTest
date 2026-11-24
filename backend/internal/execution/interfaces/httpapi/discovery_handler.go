@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
@@ -35,20 +36,19 @@ const (
 	maxUncoveredTemplates = 200
 )
 
-// Discovery decision values (DB-29 CHECK).
+// Discovery decision values (DB-29 CHECK). T11e-4: compile-time aliases of the
+// execution domain authority -- the handler keeps its short local names, the
+// values have exactly one definition (constitution 五.1/五.3).
 const (
-	discoveryDecisionNew        = "new"
-	discoveryDecisionProposed   = "proposed"
-	discoveryDecisionApproved   = "approved"
-	discoveryDecisionRejected   = "rejected"
-	discoveryDecisionOutOfScope = "out_of_scope"
+	discoveryDecisionNew        = execution.ObservationDecisionNew
+	discoveryDecisionProposed   = execution.ObservationDecisionProposed
+	discoveryDecisionApproved   = execution.ObservationDecisionApproved
+	discoveryDecisionRejected   = execution.ObservationDecisionRejected
+	discoveryDecisionOutOfScope = execution.ObservationDecisionOutOfScope
 )
 
 func discoveryDecisions() []string {
-	return []string{
-		discoveryDecisionNew, discoveryDecisionProposed, discoveryDecisionApproved,
-		discoveryDecisionRejected, discoveryDecisionOutOfScope,
-	}
+	return execution.ObservationDecisions()
 }
 
 // DiscoveryObservationView is one DB-29 row of
@@ -66,7 +66,7 @@ type DiscoveryObservationView struct {
 	Decision         string  `json:"decision"`
 	WaveID           *string `json:"wave_id"`
 	CaseRunID        *string `json:"case_run_id"`
-	VersionSUTID     string  `json:"version_sut_id"`
+	SUTID            string  `json:"sut_id"`
 	EnvironmentID    *string `json:"environment_id"`
 	ResourceID       *string `json:"resource_id"`
 	FactID           *string `json:"fact_id"`
@@ -315,7 +315,7 @@ type discoveryFilters struct {
 // optional decimal integer clamped to 1..200 (non-numeric is a 400).
 func parseDiscoveryFilters(r *http.Request) (discoveryFilters, error) {
 	query := r.URL.Query()
-	kind, err := requireEnum("kind", query.Get("kind"), "page", "api")
+	kind, err := requireEnum("kind", query.Get("kind"), execution.ObservationKinds()...)
 	if err != nil {
 		return discoveryFilters{}, err
 	}
@@ -400,7 +400,7 @@ func toDiscoveryObservationView(row executionapp.DiscoveryObservationRow) Discov
 		Decision:         row.Decision,
 		WaveID:           formatOptionalRowID(row.WaveID),
 		CaseRunID:        formatOptionalRowID(row.CaseRunID),
-		VersionSUTID:     platformid.Format(row.VersionSUTID),
+		SUTID:            platformid.Format(row.SUTID),
 		EnvironmentID:    formatOptionalRowID(row.EnvironmentID),
 		ResourceID:       formatOptionalRowID(row.ResourceID),
 		FactID:           formatOptionalRowID(row.FactID),

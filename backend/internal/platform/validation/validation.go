@@ -3,6 +3,7 @@ package validation
 
 import (
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -66,4 +67,23 @@ func NonEmptyID(field, raw string) (int64, error) {
 		return 0, platform.Invalid(field, "must be a positive decimal ID")
 	}
 	return value, nil
+}
+
+// gitCommitSHAPattern matches a lowercase 40-hex Git commit SHA. It is the one
+// authority for the shape stored by the sut_repository.code_baseline_commit
+// CHECK constraint, so the application validators and the database cannot
+// disagree.
+var gitCommitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// GitCommitSHA validates a resolved Git commit SHA. An empty value is accepted
+// and means "not resolved yet", matching the nullable database column; any
+// other value must be a lowercase 40-hex SHA.
+func GitCommitSHA(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	if !gitCommitSHAPattern.MatchString(value) {
+		return platform.Invalid(field, "must be empty or a lowercase 40-hex commit SHA")
+	}
+	return nil
 }

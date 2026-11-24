@@ -13,7 +13,6 @@ import { useIsAdmin } from "@/features/auth/useIsAdmin"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { getVersion, listVersions } from "@/features/versions/api"
 import type { VersionSummary } from "@/features/versions/types"
-import { QualityMetricsPanel } from "@/features/visual/QualityMetricsPanel"
 import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
@@ -53,10 +52,10 @@ type VersionCheck = "idle" | "pending" | "valid" | "invalid" | "unknown"
 /**
  * P6 quality centre (spec §5.5/P6-D-02).
  *
- * Every logged-in user sees the seven server-derived operational metrics and
- * the P5 visual quality panel. The evaluation board (runs, thresholds,
- * baselines, history) is admin-only: normal users never issue the admin
- * requests. Unavailable denominators render "不可用", never a fabricated zero.
+ * Every logged-in user sees the seven server-derived operational metrics. The
+ * evaluation board (runs, thresholds, baselines, history) is admin-only: normal
+ * users never issue the admin requests. Unavailable denominators render
+ * "不可用", never a fabricated zero.
  */
 export function QualityPage({ initialVersionId }: QualityPageProps) {
   const router = useRouter()
@@ -294,7 +293,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             {isAdmin ? <Badge tone="info">管理员</Badge> : null}
           </div>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            运营指标由服务端按只读口径派生；视觉质量沿用 P5。快照评测（4 项指标）、真实 LLM run
+            运营指标由服务端按只读口径派生。快照评测（3 项指标）、真实 LLM run
             与趋势看板仅管理员可见，阈值与基线是报告轨，不阻断阶段验收。
           </p>
         </div>
@@ -341,7 +340,9 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
             7 项指标由服务端聚合；分母为 0 时显示“不可用”，不展示 0 假数据。
           </p>
         </header>
-        {overviewLoading && overview === null ? (
+        {pendingVersionResolution ? (
+          <LoadingCard label="正在确认版本…" />
+        ) : overviewLoading && overview === null ? (
           <LoadingCard label="正在加载运营指标…" />
         ) : overviewError !== null ? (
           <ErrorState error={overviewError} title="质量概览加载失败" onRetry={refresh} />
@@ -362,22 +363,6 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
         ) : null}
       </section>
 
-      <section aria-label="视觉质量指标" className="surface-card space-y-3 p-4">
-        <header>
-          <h2 className="text-sm font-semibold text-foreground">视觉断言质量</h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            P5 视觉指标语义不变；未执行或未配置视觉断言时保持空态。
-          </p>
-        </header>
-        {pendingVersionResolution ? (
-          <LoadingCard label="正在确认版本…" />
-        ) : (
-          <QualityMetricsPanel
-            versionId={effectiveVersionId.length > 0 ? effectiveVersionId : undefined}
-          />
-        )}
-      </section>
-
       <section
         data-testid="quality-eval-board"
         aria-label="评测看板"
@@ -387,7 +372,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div>
             <h2 className="text-sm font-semibold text-foreground">评测看板</h2>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              快照评测 run（服务端从版本真实数据派生 4 项指标）与历史真实 LLM
+              快照评测 run（服务端从版本真实数据派生 3 项指标）与历史真实 LLM
               run；阈值、基线与趋势由服务端派生，客户端 verdict 不生效。
             </p>
           </div>
@@ -425,7 +410,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           >
             <p className="text-sm font-medium text-foreground">评测看板仅管理员可见</p>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              普通用户可查看运营与视觉质量；评测 run 列表与样本不返回。
+              普通用户可查看运营指标；评测 run 列表与样本不返回。
             </p>
           </div>
         ) : evalLoading && evalRuns === null ? (
@@ -436,7 +421,7 @@ export function QualityPage({ initialVersionId }: QualityPageProps) {
           <div data-testid="quality-eval-empty">
             <EmptyState
               title="尚未运行评测"
-              description="管理员触发快照评测（4 项指标）或执行真实 LLM 评测 runner 后，这里会展示指标、阈值、基线与历史。"
+              description="管理员触发快照评测（3 项指标）或执行真实 LLM 评测 runner 后，这里会展示指标、阈值、基线与历史。"
             />
           </div>
         ) : (

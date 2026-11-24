@@ -73,12 +73,12 @@ export function validateSutForm(values: SutFormValues): FormErrors<SutFormValues
   else if (name.length > SUT_NAME_MAX) errors.name = "SUT 名称不能超过 100 个字符"
   if (intro.length > SUT_INTRO_MAX) errors.intro = "简介不能超过 2000 个字符"
   checkSutFamily((values.family ?? "").trim(), errors)
-  if (environmentName.length === 0) errors.environmentName = "请输入默认环境名称"
+  if (environmentName.length === 0) errors.environmentName = "请输入环境名称"
   else if (environmentName.length > ENVIRONMENT_NAME_MAX) {
-    errors.environmentName = "默认环境名称不能超过 100 个字符"
+    errors.environmentName = "环境名称不能超过 100 个字符"
   }
-  if (baseUrl.length === 0) errors.baseUrl = "请输入环境地址"
-  else if (!isHttpUrl(baseUrl)) errors.baseUrl = "环境地址必须是完整的 http(s) 地址"
+  if (baseUrl.length === 0) errors.baseUrl = "请输入 SUT 地址"
+  else if (!isHttpUrl(baseUrl)) errors.baseUrl = "SUT 地址必须是完整的 http(s) 地址"
 
   return errors
 }
@@ -104,12 +104,9 @@ export function validateEnvironmentForm(
 ): FormErrors<EnvironmentFormValues> {
   const errors: FormErrors<EnvironmentFormValues> = {}
   const name = values.name.trim()
-  const baseUrl = values.baseUrl.trim()
 
   if (name.length === 0) errors.name = "请输入环境名称"
   else if (name.length > ENVIRONMENT_NAME_MAX) errors.name = "环境名称不能超过 100 个字符"
-  if (baseUrl.length === 0) errors.baseUrl = "请输入环境地址"
-  else if (!isHttpUrl(baseUrl)) errors.baseUrl = "环境地址必须是完整的 http(s) 地址"
   return errors
 }
 
@@ -148,7 +145,6 @@ export function validateDatabaseForm(values: DatabaseFormValues): FormErrors<Dat
   const dsn = values.dsn.trim()
   const username = values.username.trim()
 
-  if (values.environmentId.trim().length === 0) errors.environmentId = "请选择环境"
   if (name.length === 0) errors.name = "请输入目标库名称"
   else if (name.length > DATABASE_NAME_MAX) errors.name = "目标库名称不能超过 100 个字符"
   if (dsn.length === 0) errors.dsn = "请输入 DSN"
@@ -169,7 +165,6 @@ export function validateAccountForm(
   const username = values.username.trim()
   const roles = splitList(values.roles)
 
-  if (values.environmentId.trim().length === 0) errors.environmentId = "请选择环境"
   if (username.length === 0) errors.username = "请输入账号用户名"
   else if (username.length > USERNAME_MAX) errors.username = "用户名不能超过 100 个字符"
   if (options.requirePassword === true && values.password.length === 0) {

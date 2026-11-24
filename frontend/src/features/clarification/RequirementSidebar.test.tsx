@@ -8,24 +8,14 @@ import {
   requirementFixture,
   requirementSecondFixture,
 } from "./test-fixtures"
-import type { TargetOptions } from "./types"
 
-const TARGET_OPTIONS: TargetOptions = {
-  suts: [
-    { id: "1001", label: "订单中心" },
-    { id: "1002", label: "支付网关" },
-  ],
-  pages: [
-    { id: "1301", label: "订单列表" },
-    { id: "2301", label: "退款详情" },
-  ],
-  apis: [],
-}
+// v0.2.4-B (T21): target selection was deleted from the backend and the
+// Requirement summary carries no target/sut field, so a requirement row no
+// longer renders target chips. It summarizes title/status/revision/priority.
 
 function renderSidebar(overrides: Partial<Parameters<typeof RequirementSidebar>[0]> = {}) {
   const props = {
     requirements: [requirementFixture, requirementSecondFixture, requirementClosedFixture],
-    targetOptions: TARGET_OPTIONS,
     filter: "all" as const,
     onFilterChange: vi.fn(),
     selectedIds: [],
@@ -78,13 +68,11 @@ describe("RequirementSidebar", () => {
     expect(onSelectRequirement).toHaveBeenCalledWith("6001")
   })
 
-  it("marks the active requirement and shows its target chips", () => {
+  it("marks the active requirement and summarizes its revision and priority", () => {
     renderSidebar({ activeRequirementId: "6001" })
 
     const item = screen.getByTestId("requirement-item-6001")
     expect(item).toHaveAttribute("data-active", "true")
-    expect(item).toHaveTextContent("支付网关")
-    expect(item).toHaveTextContent("退款详情")
     expect(item).toHaveTextContent("v1")
     expect(item).toHaveTextContent("P1")
   })

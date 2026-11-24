@@ -2,21 +2,47 @@ package resourceapp
 
 import "context"
 
-// CatalogReader is the read port consumed by the version context. The resource
-// application Service implements it.
+// CatalogReader is the read port consumed by the version context (v0.2.4-B
+// hierarchy: environment -> SUT -> assets). The resource application Service
+// implements it.
 type CatalogReader interface {
-	GetSUT(context.Context, int64) (SUTView, error)
+	// GetEnvironment returns one top-level environment with its whole SUT
+	// catalog nested (each SUT carrying the pages, APIs and target databases it
+	// owns).
 	GetEnvironment(context.Context, int64) (EnvironmentView, error)
+	// ListSUTsByEnvironment returns the SUTs of one environment with their
+	// assets, in SUT ID order.
+	ListSUTsByEnvironment(context.Context, int64) ([]SUTView, error)
+	// GetSUT returns one SUT with the assets it owns.
+	GetSUT(context.Context, int64) (SUTView, error)
+	// ListAssetsBySUT returns the pages, APIs and target databases of one SUT.
+	ListAssetsBySUT(context.Context, int64) (SUTAssets, error)
 	GetPage(context.Context, int64) (PageView, error)
 	GetAPI(context.Context, int64) (APIView, error)
 	GetDatabase(context.Context, int64) (DatabaseView, error)
 	GetAccount(context.Context, int64) (AccountView, error)
 	GetRepository(context.Context, int64) (CodeRepositoryView, error)
 	// ListSUTRepositories returns the SUT-level multi-repository associations
-	// (v0.22 R-C2). A version inherits the enabled rows.
+	// (v0.22 R-C2) with their resolved code baseline.
 	ListSUTRepositories(context.Context, int64) ([]SUTRepositoryView, error)
+	// ListEnvironmentRepositories returns the environment code pool: the union of
+	// the repositories of every SUT in the environment (v0.2.4-B GD-03),
+	// de-duplicated by repository ID and ordered by repository ID so the
+	// deterministic baseline repository (the lowest ID) is stable. A repository
+	// associated with two SUTs of the same environment appears once, keeping the
+	// resolved baseline of the first association.
+	ListEnvironmentRepositories(context.Context, int64) ([]SUTRepositoryView, error)
 	// ListAllAccounts returns the global test-account pool (v0.22 DB-15).
 	ListAllAccounts(context.Context) ([]AccountView, error)
+}
+
+// SUTRepositoryBaselineWriter pins the resolved code baseline of one
+// (SUT, repository) pair. The version context resolves the commit at binding
+// time and writes it through this port; the code index backfills it through the
+// same path after a successful run. The resource application Service implements
+// it.
+type SUTRepositoryBaselineWriter interface {
+	SetSUTRepositoryBaselineCommit(ctx context.Context, sutID, repoID int64, commitSHA string) error
 }
 
 // VersionRef identifies one version whose binding references a resource. The

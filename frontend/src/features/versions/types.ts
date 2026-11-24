@@ -1,5 +1,10 @@
 /** Wire types shared by the versions feature (contracts/openapi.yaml). */
 
+import type { VersionClosureKind } from "@/features/reports/types"
+
+// Single-source (V-0017): validated against the Go authority version/domain
+// Statuses() by backend/internal/version/domain/enum_authority_test.go. Do not
+// add/remove a member here without updating the domain enum.
 export type VersionStatus = "initial" | "running" | "completed"
 
 export type ResourceStatus = "active" | "disabled"
@@ -17,7 +22,6 @@ export type VersionTab =
 export type PageResource = {
   id: string
   sut_id: string
-  environment_id: string
   name: string
   url: string
   route_template: string
@@ -33,7 +37,6 @@ export type PageResource = {
 export type ApiResource = {
   id: string
   sut_id: string
-  environment_id: string
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
   path_template: string
   name: string
@@ -48,7 +51,6 @@ export type ApiResource = {
 export type DatabaseResource = {
   id: string
   sut_id: string
-  environment_id: string
   name: string
   dsn: string
   username: string
@@ -61,8 +63,8 @@ export type DatabaseResource = {
 
 export type AccountResource = {
   id: string
-  sut_id: string
-  environment_id: string
+  /** Optional SUT affinity hint; omitted by the global account pool when absent. */
+  sut_id?: string
   username: string
   roles: string[]
   notes: string
@@ -72,26 +74,35 @@ export type AccountResource = {
   updated_at: string
 }
 
+/**
+ * One top-level environment (v0.2.4-B hierarchy inversion). It owns SUTs and no
+ * longer carries base_url or assets directly; assets live on each SUT.
+ */
 export type EnvironmentResource = {
   id: string
-  sut_id: string
   name: string
-  base_url: string
-  is_default: boolean
+  description: string
   status: ResourceStatus
-  pages: PageResource[]
-  apis: ApiResource[]
-  databases: DatabaseResource[]
-  accounts: AccountResource[]
+  suts: SutResource[]
   created_at: string
   updated_at: string
 }
 
+/**
+ * One SUT nested under a version's bound environment (version-side `sutDTO`).
+ * Unlike the resource-console SUT it carries no `source`/`status` registration
+ * fields (version/interfaces/httpapi/dto.go).
+ */
 export type SutResource = {
   id: string
+  environment_id: string
   name: string
   intro: string
-  environments: EnvironmentResource[]
+  base_url: string
+  family?: string | null
+  pages: PageResource[]
+  apis: ApiResource[]
+  databases: DatabaseResource[]
   created_at: string
   updated_at: string
 }
@@ -109,9 +120,11 @@ export type CodeRepositoryResource = {
   updated_at: string
 }
 
+/** `GET /api/resources/catalog` (v0.2.4-B): environments, code repositories, accounts. */
 export type Catalog = {
-  suts: SutResource[]
+  environments: EnvironmentResource[]
   repositories: CodeRepositoryResource[]
+  accounts: AccountResource[]
 }
 
 export type VersionSummary = {
@@ -130,17 +143,21 @@ export type VersionCaseCounts = {
   stale: number
 }
 
+/**
+ * The resolved environment catalog of one version (v0.2.4-B `bindingDTO`). The
+ * version binds one environment directly; the flattened asset unions, the
+ * version account subset, the environment code pool and the pinned baseline
+ * commit replace the old per-SUT bindings array.
+ */
 export type VersionBinding = {
-  id: string
-  sut: SutResource
   environment: EnvironmentResource
-  repository?: CodeRepositoryResource | null
-  /** P5: resolved code baseline commit; null until the repo branch resolves/indexes. */
-  code_baseline_commit?: string | null
   pages: PageResource[]
   apis: ApiResource[]
   databases: DatabaseResource[]
   accounts: AccountResource[]
+  repositories: BindingRepositoryRow[]
+  /** Resolved code baseline commit; null/omitted until the repo branch resolves. */
+  code_baseline_commit?: string | null
 }
 
 export type Version = {
@@ -148,7 +165,9 @@ export type Version = {
   title: string
   status: VersionStatus
   auto_design_new_requirements: boolean
-  bindings: VersionBinding[]
+  /** v0.2.4-B: the version binds one environment directly (NOT NULL). */
+  environment_id: string
+  binding: VersionBinding
   /** P2: clarified requirements not activated into any design round yet. */
   pending_design_count?: number
   /** P2: current case versions by status; `superseded` history is excluded. */
@@ -169,6 +188,10 @@ export type Version = {
   closed_at?: string | null
   /** P4: close reason captured with `closed_at`; cleared on reopen. */
   close_reason?: string | null
+  /** v0.2.4-G T6: closure kind (normal vs admin waived); cleared on reopen. */
+  closure_kind?: VersionClosureKind | null
+  /** v0.2.4-G T6: waived closure marks the version unverified; cleared on reopen. */
+  unverified?: boolean | null
   created_by: string
   created_at: string
   updated_at: string
@@ -196,19 +219,14 @@ export type CreateVersionRequest = {
   environment_id: string
 }
 
-/** One environment-level exclusion document (`version_sut.scope_exclude`). */
-export type BindingScopeExclude = {
-  pages: string[]
-  apis: string[]
-  databases: string[]
-}
-
-/** Per-resource counts of one environment-owned kind (Task 29 binding DTO). */
+/**
+ * Per-resource counts of one asset kind (v0.2.4-B `bindingResourceCountsDTO`).
+ * Exclusions disappeared with the version_sut chain, so approved is also the
+ * included count.
+ */
 export type BindingResourceCounts = {
   approved: number
   proposed: number
-  excluded: number
-  included: number
 }
 
 export type BindingCounts = {
@@ -218,30 +236,34 @@ export type BindingCounts = {
 }
 
 /**
- * One effective repository of a version binding. `included` reports whether the
- * repository is effective for the version; `source` is `sut` (inherited) or
- * `override` (version-level include).
+ * One repository of the environment code pool (v0.2.4-B `bindingRepositoryDTO`).
+ * `sut_id` names the SUT whose association supplied the row, which is also the
+ * key the resolved code baseline is stored under.
  */
 export type BindingRepositoryRow = {
   repository: CodeRepositoryResource
+  sut_id: string
   role: string
-  included: boolean
-  source: string
+  code_baseline_commit: string | null
+}
+
+/** R-C4-1 scope snapshot projection of the binding overview (v0.2.4-B). */
+export type BindingSnapshot = {
+  scope_version: string
+  frozen_wave_id: string | null
 }
 
 /**
- * `GET /api/versions/{id}/binding` read model (v0.22 API-16, Task 29
- * `bindingOverviewDTO`). `pages`/`apis`/`databases` are the effective
- * (approved minus excluded) sets; `counts` carries approved/proposed/excluded/
- * included for every kind.
+ * `GET /api/versions/{id}/binding` read model (v0.2.4-B `bindingOverviewDTO`).
+ * `pages`/`apis`/`databases` are the effective approved sets of the bound
+ * environment; `counts` carries approved/proposed for every kind.
  */
 export type VersionBindingOverview = {
   version_id: string
+  environment_id: string
   stage: string
   editable: boolean
-  sut: SutResource
   environment: EnvironmentResource
-  scope_exclude: BindingScopeExclude
   counts: BindingCounts
   pages: PageResource[]
   apis: ApiResource[]
@@ -249,17 +271,18 @@ export type VersionBindingOverview = {
   accounts: AccountResource[]
   repositories: BindingRepositoryRow[]
   code_baseline_commit: string | null
+  snapshot: BindingSnapshot
 }
 
 /**
- * `PUT|PATCH /api/versions/{id}/binding` partial update (v0.22 API-16). Omitted
- * fields are untouched; an explicit empty list clears the selection.
+ * `PUT|PATCH /api/versions/{id}/binding` partial update (v0.2.4-B). The code pool
+ * is derived from the bound environment and every approved asset of its SUTs is
+ * in scope, so only `environment_id` and `account_ids` remain. Omitted fields are
+ * untouched; an explicit empty list clears the selection.
  */
 export type UpdateBindingRequest = {
   environment_id?: string
-  repository_ids?: string[]
   account_ids?: string[]
-  scope_exclude?: BindingScopeExclude
 }
 
 /**
@@ -309,7 +332,7 @@ export type DiscoveryObservation = {
   decision: DiscoveryDecision
   wave_id: string | null
   case_run_id: string | null
-  version_sut_id: string
+  sut_id: string
   environment_id: string | null
   resource_id: string | null
   fact_id: string | null

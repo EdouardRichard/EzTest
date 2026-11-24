@@ -19,15 +19,17 @@ const discoveryNetworkTimeout = 10 * time.Second
 // DiscoveryObservation is one execution-time discovery observation of a
 // terminal case_run (spec DB-29, R-EX-1). Kind is "page" (document navigation)
 // or "api" (xhr/fetch/eventsource/websocket/preflight/manifest). Host/Path are
-// already redacted: query values, fragments outside a hash route, userinfo,
-// headers, cookies and bodies are never carried. StatusCode is nil for a
+// normalized to the route identity (no query, no userinfo, no fragment outside a
+// hash route) for fact-key/route-template dedup — functional normalization, not
+// credential redaction; the network evidence row keeps the raw URL verbatim
+// (GD-01 Q05=B). StatusCode is nil for a
 // request whose response was lost. ResourceType is the executor's Playwright
 // resource_type; the empty string means the executor did not report one (the
 // MIME/extension fallback decided the kind). ResourceTemplate is the normalized
 // DB-29 template (page: route/path, api: path only; the method is carried by
-// Method). The transactional identity (VersionSUTID/WaveID/CaseRunID) is
+// Method). The transactional identity (SUTID/WaveID/CaseRunID) is
 // attached by the capture; VersionID and EnvironmentID may stay zero and are
-// resolved by the repository from run_wave/version_sut. Occurrences aggregates
+// resolved by the repository from run_wave/sut. Occurrences aggregates
 // same-batch duplicates.
 type DiscoveryObservation struct {
 	Kind             string
@@ -40,7 +42,7 @@ type DiscoveryObservation struct {
 	DurationMS       int
 	ResourceType     string
 	VersionID        int64
-	VersionSUTID     int64
+	SUTID            int64
 	EnvironmentID    int64
 	WaveID           int64
 	CaseRunID        int64
@@ -57,27 +59,15 @@ type networkObservationItem struct {
 	ResourceType string `json:"resource_type"`
 }
 
-// discoveryEvidenceItem is the redacted shape persisted as network evidence. It
-// deliberately has no URL/query/header/cookie/body fields.
-type discoveryEvidenceItem struct {
-	Method       string `json:"method"`
-	Host         string `json:"host"`
-	Path         string `json:"path"`
-	Status       *int   `json:"status"`
-	MIME         string `json:"mime"`
-	DurationMS   int    `json:"duration_ms"`
-	ResourceType string `json:"resource_type"`
-}
-
 // captureTerminalObservations implements R-EX-1: at every terminal state
 // (passed/failed/blocked/inconclusive), before the SUT contexts are closed,
-// read the network log of every active browser context directly from the
-// executor and persist the page/api observations plus one redacted network
-// evidence row per context. It never goes through CaseRunner.Browser, whose
-// running-scope guard would reject the terminal call, and every failure is
-// best effort: the verdict is already aggregated and is never touched.
+// read the recorded network log of every active executor session directly from
+// the executor's passive traffic recorder and persist the page/api observations
+// plus one verbatim network evidence row per context. The read is a best-effort
+// side channel (no running-scope guard): the verdict is already aggregated and
+// is never touched.
 func (s *CaseRunner) captureTerminalObservations(ctx context.Context, caseRun execution.CaseRun, status execution.CaseRunStatus) {
-	if s.browser == nil || s.sutContexts == nil {
+	if s.execution == nil || s.sutContexts == nil {
 		return
 	}
 	switch status {
@@ -93,19 +83,19 @@ func (s *CaseRunner) captureTerminalObservations(ctx context.Context, caseRun ex
 	}
 	for i := range rows {
 		row := rows[i]
-		if row.Status != execution.SUTContextActive || row.BrowserContextID == "" {
+		if row.Status != execution.SUTContextActive || row.SessionID == "" {
 			continue
 		}
-		observations, evidence, versionSUTID := s.captureContextObservations(row)
+		observations, evidence, sutID := s.captureContextObservations(row)
 		if len(observations) == 0 {
 			continue
 		}
 		// Attach the transactional identity the capture knows. VersionID and
 		// EnvironmentID stay zero: the ingest/repository layer resolves them from
-		// run_wave and version_sut without leaking a second lookup into the
+		// run_wave and sut without leaking a second lookup into the
 		// application layer.
 		for index := range observations {
-			observations[index].VersionSUTID = versionSUTID
+			observations[index].SUTID = sutID
 			observations[index].WaveID = caseRun.WaveID
 			observations[index].CaseRunID = caseRun.ID
 		}
@@ -115,49 +105,57 @@ func (s *CaseRunner) captureTerminalObservations(ctx context.Context, caseRun ex
 		if s.discovery != nil {
 			if err := s.discovery.WriteObservations(ctx, observations); err != nil {
 				slog.Warn("execution discovery: write observations failed",
-					"case_run_id", caseRun.ID, "version_sut_id", versionSUTID,
+					"case_run_id", caseRun.ID, "sut_id", sutID,
 					"observations", len(observations), "error", err)
 			}
 		}
-		s.storeDiscoveryNetworkEvidence(ctx, caseRun, versionSUTID, evidence)
+		s.storeDiscoveryNetworkEvidence(ctx, caseRun, sutID, evidence)
 	}
 }
 
-// captureContextObservations reads and redacts the network log of one browser
-// context. It returns the observations, the redacted evidence payload and the
-// context's version_sut_id. Any executor failure yields no observations.
+// captureContextObservations reads the recorded network log of one executor
+// session through the passive traffic recorder (T16, design §4.3 pure CDP
+// recording — the retired Playwright-library bridge's BrowserAction("network")
+// is replaced by the NetworkLog read surface). It returns the normalized
+// observations (DB-29 fact/route identity) and the raw recorder payload as
+// network evidence. GD-01 (Q05=B): evidence is plaintext by design, so the legacy
+// query/userinfo erasure on the evidence row is removed. Any read failure yields
+// no observations (best effort, never touches the verdict).
 func (s *CaseRunner) captureContextObservations(row execution.CaseRunSUTContext) ([]DiscoveryObservation, []byte, int64) {
 	executorID := int64(0)
 	if row.ExecutorID != nil {
 		executorID = *row.ExecutorID
 	}
+	// An executor without the traffic-recording surface simply has no network
+	// log to read; the capture skips best-effort (the GeneralExecutionPort
+	// type-assertion precedent).
+	reader, ok := s.execution.(NetworkLogReader)
+	if !ok {
+		return nil, nil, row.SUTID
+	}
 	// A terminal write may run on a canceled request context; the capture owns
 	// its own short-lived context like the terminal screenshot does.
 	actionCtx, cancel := context.WithTimeout(context.Background(), discoveryNetworkTimeout)
 	defer cancel()
-	// The executor's network action defaults to the last 50 items. A normal SPA
-	// page load puts the document request first (the W1 SUT home page makes 52
-	// requests), so the default window would silently lose the page observation.
-	// Ask for the 200-item maximum the executor supports; the executor still
-	// bounds memory with its 500-entry ring (W1-15 fix).
-	result, err := s.browser.Action(actionCtx, executorID, row.BrowserContextID, "network", json.RawMessage(`{"tail":200}`))
+	// Ask for the 200-item maximum the recorder's read tail supports. A normal
+	// SPA page load puts the document request first (the W1 SUT home page makes
+	// 52 requests), so a smaller default window would silently lose the page
+	// observation; the recorder still bounds memory with its 500-entry ring.
+	payload, err := reader.NetworkLog(actionCtx, executorID, row.SessionID, 200)
 	if err != nil {
-		slog.Warn("execution discovery: read browser network log failed",
-			"case_run_id", row.CaseRunID, "version_sut_id", row.VersionSUTID,
-			"browser_context_id", row.BrowserContextID, "error", err)
-		return nil, nil, row.VersionSUTID
+		slog.Warn("execution discovery: read recorded network log failed",
+			"case_run_id", row.CaseRunID, "sut_id", row.SUTID,
+			"session_id", row.SessionID, "error", err)
+		return nil, nil, row.SUTID
 	}
-	if result.Error != nil {
-		slog.Warn("execution discovery: executor rejected the network action",
-			"case_run_id", row.CaseRunID, "version_sut_id", row.VersionSUTID,
-			"browser_context_id", row.BrowserContextID, "code", result.Error.Code)
-		return nil, nil, row.VersionSUTID
-	}
-	observations := parseDiscoveryNetworkItems(result.Result)
+	observations := parseDiscoveryNetworkItems(payload)
 	if len(observations) == 0 {
-		return nil, nil, row.VersionSUTID
+		return nil, nil, row.SUTID
 	}
-	return observations, discoveryEvidencePayload(observations), row.VersionSUTID
+	// The evidence row carries the recorder payload verbatim (same contract as
+	// the retired browser.network evidence path); only the observation above is
+	// normalized for fact-key/route-template dedup.
+	return observations, payload, row.SUTID
 }
 
 // parseDiscoveryNetworkItems decodes the executor payload. The executor wraps
@@ -231,7 +229,7 @@ func discoveryObservationFromItem(item networkObservationItem) (DiscoveryObserva
 	if !ok {
 		return DiscoveryObservation{}, false
 	}
-	if kind == "page" {
+	if kind == execution.ObservationKindPage {
 		method = ""
 	}
 	return DiscoveryObservation{
@@ -247,9 +245,11 @@ func discoveryObservationFromItem(item networkObservationItem) (DiscoveryObserva
 	}, true
 }
 
-// discoveryPath returns the redacted path of a URL: no query, no userinfo, no
-// fragment except the path part of a hash route (SPA routes stay discoverable,
-// their query values do not).
+// discoveryPath returns the normalized path of a URL (the route identity): no
+// query, no userinfo, no fragment except the path part of a hash route (SPA
+// routes stay discoverable, their query values are not part of the route
+// identity). Functional normalization for fact-key dedup, not credential
+// redaction — the raw network evidence keeps the full URL verbatim (GD-01).
 func discoveryPath(parsed *url.URL) string {
 	path := parsed.EscapedPath()
 	if path == "" {
@@ -274,21 +274,21 @@ func discoveryPath(parsed *url.URL) string {
 func classifyDiscoveryResource(resourceType, mime string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(resourceType)) {
 	case "document":
-		return "page", true
+		return execution.ObservationKindPage, true
 	case "xhr", "fetch", "eventsource", "websocket", "preflight", "manifest":
-		return "api", true
+		return execution.ObservationKindAPI, true
 	case "stylesheet", "image", "media", "font", "script", "texttrack":
 		return "", false
 	case "", "other":
 		if isHTMLDiscoveryMIME(mime) {
-			return "page", true
+			return execution.ObservationKindPage, true
 		}
-		return "api", true
+		return execution.ObservationKindAPI, true
 	default:
 		if isHTMLDiscoveryMIME(mime) {
-			return "page", true
+			return execution.ObservationKindPage, true
 		}
-		return "api", true
+		return execution.ObservationKindAPI, true
 	}
 }
 
@@ -296,41 +296,22 @@ func isHTMLDiscoveryMIME(mime string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mime)), "text/html")
 }
 
-func discoveryEvidencePayload(observations []DiscoveryObservation) []byte {
-	items := make([]discoveryEvidenceItem, 0, len(observations))
-	for _, observation := range observations {
-		items = append(items, discoveryEvidenceItem{
-			Method:       observation.Method,
-			Host:         observation.Host,
-			Path:         observation.Path,
-			Status:       observation.StatusCode,
-			MIME:         observation.MIME,
-			DurationMS:   observation.DurationMS,
-			ResourceType: observation.ResourceType,
-		})
-	}
-	payload, err := json.Marshal(items)
-	if err != nil {
-		return nil
-	}
-	return payload
-}
-
-// storeDiscoveryNetworkEvidence stores the redacted network payload through the
-// existing evidence path. The evidence cap may drop the row; observations are
-// written independently, so a full evidence table never loses discovery data.
-func (s *CaseRunner) storeDiscoveryNetworkEvidence(ctx context.Context, caseRun execution.CaseRun, versionSUTID int64, payload []byte) {
+// storeDiscoveryNetworkEvidence stores the raw network payload verbatim through
+// the existing evidence path (GD-01 Q05=B: evidence is plaintext). The evidence
+// cap may drop the row; observations are written independently, so a full
+// evidence table never loses discovery data.
+func (s *CaseRunner) storeDiscoveryNetworkEvidence(ctx context.Context, caseRun execution.CaseRun, sutID int64, payload []byte) {
 	if s.evidence == nil || s.content == nil || len(payload) == 0 {
 		return
 	}
-	versionRef := versionSUTID
+	versionRef := sutID
 	if _, err := s.addEvidenceForRun(ctx, caseRun, 0, EvidenceInput{
-		Kind:         execution.EvidenceNetwork,
-		Data:         payload,
-		VersionSUTID: &versionRef,
-		Auto:         true,
+		Kind:  execution.EvidenceNetwork,
+		Data:  payload,
+		SUTID: &versionRef,
+		Auto:  true,
 	}); err != nil {
-		slog.Warn("execution discovery: store redacted network evidence failed",
-			"case_run_id", caseRun.ID, "version_sut_id", versionSUTID, "error", err)
+		slog.Warn("execution discovery: store network evidence failed",
+			"case_run_id", caseRun.ID, "sut_id", sutID, "error", err)
 	}
 }

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Version close input limits. The Steward tool accepts reason(1..500); the
+// Version close input limits. The close entry accepts reason(1..500); the
 // manual reopen API accepts reason(1..2000) (spec §4.2/§4.4).
 const (
 	VersionCloseReasonMax  = 500
@@ -44,7 +44,7 @@ const (
 // version may complete only when every field is true (spec §7.3).
 //
 // HasExecutionData and UnconfirmedCases are the §5.3 completion inputs. The
-// Steward version.close_read contract is frozen at eight checks, so they are
+// close predicate contract is frozen at eight checks, so they are
 // folded into VersionReportPublished (a report without execution data is not a
 // valid completion report) and NoInflightCaseRuns (a confirmed case that was
 // never executed or explicitly skipped is still pending work). They are kept
@@ -101,11 +101,11 @@ func VersionReportCurrent(report ReportStatus) bool {
 	return true
 }
 
-// VersionCloseInput is the server-recomputed projection of one version. The
-// service subtracts the version's own version.close work item from
-// BlockingWorkItems before evaluating, so the predicate only sees the effective
-// count. Paused waves and open human requests carry the waiting_human signal;
-// work items in waiting_human are not counted separately (P3-D-25).
+// VersionCloseInput is the server-recomputed projection of one version.
+// GD-17 removed the version.close work type, so BlockingWorkItems is the raw
+// blocking count — there is no closure self-task to subtract. Paused waves and
+// open human requests carry the waiting_human signal; work items in
+// waiting_human are not counted separately (P3-D-25).
 type VersionCloseInput struct {
 	Version           Version
 	BlockingWorkItems int
@@ -128,8 +128,8 @@ type VersionCloseInput struct {
 
 // EvaluateVersionClose recomputes the eight close conditions (spec §7.3). The
 // §5.3 execution inputs are folded into the frozen eight check fields so the
-// Steward contract stays stable: missing execution data fails the report check,
-// unexecuted confirmed cases fail the in-flight cases check.
+// eight-check contract stays stable: missing execution data fails the report
+// check, unexecuted confirmed cases fail the in-flight cases check.
 func EvaluateVersionClose(in VersionCloseInput) ClosePredicate {
 	requirementsClosed, _ := versionRequirementsClosed(in.Requirements)
 	return ClosePredicate{
@@ -144,6 +144,39 @@ func EvaluateVersionClose(in VersionCloseInput) ClosePredicate {
 		HasExecutionData:       in.HasExecutionData,
 		UnconfirmedCases:       in.UnconfirmedCases,
 	}
+}
+
+// EvaluateVersionCloseWaived is the admin-waiver close predicate (GD-06/P23,
+// R-G6/R-G8, SC-G11). The waiver overrides RequirementsClosed (requirement
+// closure completeness, including AC coverage / CasesVerified) and the
+// report-CURRENCY leg of check 8 — the unverified report is regenerated and
+// published synchronously AFTER the close, so a missing or stale report must
+// not block the waive. The six execution-settled checks (Running,
+// NoBlockingWorkItems, NoActiveIntents, NoOpenHumanRequests, NoActiveWaves,
+// NoInflightCaseRuns) still hold, and the version must have execution data:
+// the mandatory post-close unverified report has nothing to render otherwise,
+// so a version that never executed cannot be waived closed (fail-closed 409
+// before the terminal write, never a completed version without a report).
+func EvaluateVersionCloseWaived(in VersionCloseInput) ClosePredicate {
+	predicate := EvaluateVersionClose(in)
+	predicate.RequirementsClosed = true
+	predicate.VersionReportPublished = in.HasExecutionData
+	return predicate
+}
+
+// VersionCloseWaivedFailureCounts is the failure map of the waived predicate.
+// It derives from the full failure counts and removes only the overridden
+// legs: requirements_closed never reports, and version_report_published
+// reports only when the version has no execution data at all.
+func VersionCloseWaivedFailureCounts(in VersionCloseInput) map[string]int {
+	failed := VersionCloseFailureCounts(in)
+	delete(failed, VersionCloseCheckRequirementsClosed)
+	if in.HasExecutionData {
+		delete(failed, VersionCloseCheckVersionReportPublished)
+	} else {
+		failed[VersionCloseCheckVersionReportPublished] = 1
+	}
+	return failed
 }
 
 // VersionCloseFailureCounts returns the check-name to count map carried by
@@ -235,10 +268,16 @@ type canonicalCloseRequirement struct {
 }
 
 // VersionCloseFields is the projection written when a version completes.
+// ClosureKind/Unverified classify how the version closed (v0.2.4-G SC-G11):
+// a normal full-predicate close writes ClosureKindNormal/false; an admin
+// waiver close writes ClosureKindWaived/true through the SAME terminal Close
+// entry. Reopen clears them back to normal/false.
 type VersionCloseFields struct {
 	ClosedAt    time.Time
 	CloseReason string
 	CloseRunID  *int64
+	ClosureKind string
+	Unverified  bool
 }
 
 // ErrVersionClosePredicateFailed is the stable error returned when the

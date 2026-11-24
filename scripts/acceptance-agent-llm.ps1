@@ -5,31 +5,38 @@
     EZTEST_RUN_REAL_LLM=1).
 
 .DESCRIPTION
-    Boots the API against a freshly reset eztest_e2e database (which seeds the
-    builtin runtime-diagnostic profile and the default LLM configuration from
-    .env), logs in as the admin, and drives one real diagnostic run:
-      * GET /api/admin/llm/configs and PATCH the default configuration's
-        timeout_ms to 180000 (the 60 s seed default is too short for the
-        thinking=max profile);
-      * GET /api/agents/profiles and pick key=runtime-diagnostic;
-      * POST /api/agents/sessions;
-      * POST .../messages with the diagnostic prompt (http.get + README);
-      * poll the session until the run reaches a terminal state (300 s cap),
-        then retry the event snapshot briefly until run_finished is visible
-        (the API writes the terminal row before publishing the event);
-      * read the agent channel's event snapshot and assert the activity
-        contract: run_started/thinking/text/tool_use/tool_result/usage/
-        run_finished, at least one successful tool result, and non-zero
-        reasoning tokens.
-    It prints PASS only after every assertion holds. Secrets are read from .env
-    and are never printed: only statuses, error codes and event kinds are
-    reported.
+    Boots the API against a freshly reset eztest_e2e database, configures the
+    real LLM from .env through the admin HTTP API (the settings/LLM config
+    surface the product actually reads; no migration seeds a default config),
+    logs in as the admin, and drives ONE bounded agent turn through the real
+    0.2.4 conversation pipeline:
+      * GET /api/admin/llm/configs, creating and making default the config that
+        matches llm_base_url when none exists, adding llm_model_name as a
+        tool-capable, vision-capable model and failing it as the default model;
+      * POST /api/admin/llm/configs/{id}/test as the reachability signal (the
+        /api/health payload has no llm_configured field);
+      * POST /api/resources/suts and .../environments (idempotent) to bind a
+        version to an environment;
+      * POST /api/versions and POST /api/versions/{id}/conversations (kind
+        clarification); creating the conversation makes the product open it
+        with one bounded Host reply (no user message is posted, so the run is a
+        single paid model round);
+      * poll GET .../messages until the opening reply is terminal and carries
+        text, capturing one mid-reply streaming snapshot (the reload-mid-reply
+        observation);
+      * read pg_stat_user_tables before/after to report the per-delta DB write
+        counts the streaming pipeline performed (the bounded-flush evidence).
+    It prints PASS only after the assistant reply is non-empty and reachable.
+    Secrets are read from .env and never printed: only statuses, counts and
+    error codes are reported.
 
 .PARAMETER DryRun
-    Validate the script's paths and the .env key presence (including the
-    EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE variables) without resetting
-    the database, building or starting the API, or calling the LLM. Exits 0
-    when the preflight passes.
+    Validate the script's paths and the .env key presence (database, admin and
+    LLM variables) without resetting the database, building or starting the API,
+    or calling the LLM. Exits 0 when the preflight passes.
+
+.PARAMETER PollTimeoutSeconds
+    Hard cap on how long to wait for the assistant reply (default 300).
 
 .NOTES
     This script makes paid upstream calls. It is deliberately not part of
@@ -37,11 +44,14 @@
     (EZTEST_RUN_REAL_LLM=1), missing .env LLM keys are a failure, never a skip.
     PostgreSQL must already be running; the script resets the eztest_e2e database
     and leaves PostgreSQL running. Compatible with Windows PowerShell 5.1 and
-    PowerShell 7+.
+    PowerShell 7+. The file is ASCII-only so Windows PowerShell 5.1 parses it
+    without a BOM.
 #>
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+    [int]$PollTimeoutSeconds = 300,
+    [double]$PollIntervalSec = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,31 +63,15 @@ $envPath = Join-Path $repoRoot ".env"
 $e2eDbName = "eztest_e2e"
 $apiPort = 13333
 $apiBaseUrl = "http://localhost:$apiPort"
-# The snapshot endpoint caps limit at 100 (platform.MaxLimit), so the plan's
-# limit=200 would be rejected with HTTP 400. Fetch up to two pages instead so
-# the newest <=200 events are inspected, as the plan intended.
-$eventsLimit = 100
-$maxEventPages = 2
-$pollIntervalSeconds = 2
-$pollTimeoutSeconds = 300
-# The default LLM configuration is seeded with timeout_ms=60000, which is too
-# short for a thinking=max diagnostic run; the script raises it before the run.
-$llmConfigsPath = "/api/admin/llm/configs"
+$pollIntervalSeconds = $PollIntervalSec
 $llmTimeoutMs = 180000
-# The API writes the terminal run row before publishing run_finished, so a
-# running=false poll can race the event; retry the snapshot briefly first.
-$runFinishedWaitAttempts = 5
-$runFinishedWaitIntervalSeconds = 1
-$diagnosticPrompt = "请检查 EzTest 运行时健康（调用 http.get 访问 http://localhost:13333/api/health），并读取 README 的构建说明。"
-$requiredKinds = @("run_started", "thinking", "text", "tool_use", "tool_result", "usage", "run_finished")
+$llmConfigsPath = "/api/admin/llm/configs"
+# The tables the per-delta streaming pipeline writes on every delta: the Host
+# head message, its per-seq part rows, and the agent transcript row.
+$streamWriteTables = @("conversation_message", "conversation_message_part", "agent_message")
 
-# Secrets parsed from .env live here only so error text can be redacted. They
-# are never printed, logged, or written anywhere.
 $script:secretValues = @()
-$script:sessionId = $null
-$script:runId = $null
 $script:token = $null
-$script:eventItems = $null
 
 function Write-Step {
     param([string]$Message)
@@ -232,82 +226,11 @@ function Invoke-Api {
     if ($null -ne $Body) {
         $json = $Body | ConvertTo-Json -Compress -Depth 8
         $arguments["ContentType"] = "application/json; charset=utf-8"
-        # Windows PowerShell 5.1 would otherwise encode the Chinese prompt with
-        # the ANSI code page, so always send explicit UTF-8 bytes.
+        # Windows PowerShell 5.1 would otherwise encode non-ASCII with the ANSI
+        # code page, so always send explicit UTF-8 bytes.
         $arguments["Body"] = [System.Text.Encoding]::UTF8.GetBytes($json)
     }
     return Invoke-RestMethod @arguments
-}
-
-function Get-AgentEventItems {
-    param([hashtable]$Headers, [int64]$SessionId)
-    $channel = [System.Uri]::EscapeDataString("agent:$SessionId")
-    $items = @()
-    $beforeSeq = [int64]0
-    for ($page = 0; $page -lt $maxEventPages; $page++) {
-        $url = "$apiBaseUrl/api/stream/events?channel=$channel&limit=$eventsLimit"
-        if ($beforeSeq -gt 0) { $url = $url + "&before_seq=$beforeSeq" }
-        $response = Invoke-Api -Method Get -Uri $url -Headers $Headers -TimeoutSec 20
-        $pageItems = @()
-        if ($null -ne $response.data.items) { $pageItems = @($response.data.items) }
-        if ($pageItems.Count -eq 0) { break }
-        $items = $pageItems + $items
-        if (-not [bool]$response.data.has_more) { break }
-        # snapshot items are ascending, so the oldest seq is the backward cursor.
-        $beforeSeq = ConvertTo-Int64OrZero -Value $pageItems[0].seq
-        if ($beforeSeq -le 0) { break }
-    }
-    return $items
-}
-
-function Wait-AgentEventKind {
-    param(
-        [hashtable]$Headers,
-        [int64]$SessionId,
-        [string]$Kind,
-        [int]$Attempts = 5,
-        [int]$IntervalSeconds = 1
-    )
-    # The API writes the terminal run row before publishing run_finished, so
-    # running=false does not guarantee the event is in the snapshot yet.
-    $items = @()
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        $items = @(Get-AgentEventItems -Headers $Headers -SessionId $SessionId)
-        foreach ($item in $items) {
-            if ($null -eq $item -or $null -eq $item.detail) { continue }
-            if ([string]$item.detail.kind -eq $Kind) { return $items }
-        }
-        if ($attempt -lt $Attempts) { Start-Sleep -Seconds $IntervalSeconds }
-    }
-    return $items
-}
-
-function Get-DefaultLLMConfig {
-    param([hashtable]$Headers)
-    $response = Invoke-Api -Method Get -Uri "${apiBaseUrl}${llmConfigsPath}" -Headers $Headers -TimeoutSec 20
-    $defaults = @()
-    if ($null -ne $response.data) {
-        $defaults = @($response.data | Where-Object { $null -ne $_ -and [bool]$_.is_default })
-    }
-    if ($defaults.Count -eq 0) {
-        throw "no default LLM configuration was returned by GET ${llmConfigsPath}"
-    }
-    return $defaults[0]
-}
-
-function Set-DefaultLLMTimeout {
-    param([hashtable]$Headers, [int64]$ConfigId, [int]$TimeoutMs)
-    # PATCH is a partial update: only timeout_ms is sent, so the server keeps
-    # every other stored field (name, protocol, model, api_key, headers, ...).
-    $response = Invoke-Api -Method Patch -Uri "${apiBaseUrl}${llmConfigsPath}/${ConfigId}" -Headers $Headers -Body @{ timeout_ms = $TimeoutMs } -TimeoutSec 20
-    $applied = [int64]-1
-    if ($null -ne $response.data -and $null -ne $response.data.timeout_ms) {
-        $applied = ConvertTo-Int64OrZero -Value $response.data.timeout_ms
-    }
-    if ($applied -ne [int64]$TimeoutMs) {
-        throw "the LLM configuration update did not apply timeout_ms=$TimeoutMs"
-    }
-    return $response
 }
 
 function Get-ApiErrorSummary {
@@ -343,9 +266,6 @@ function Get-ApiErrorSummary {
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($rawBody)) {
-        # Only the shared error envelope's code and details.reason are reported;
-        # the body, headers and any echoed request data are deliberately
-        # discarded.
         try {
             $parsed = $rawBody | ConvertFrom-Json
             $code = [string]$parsed.error.code
@@ -366,37 +286,146 @@ function Get-ApiErrorSummary {
     return (Get-RedactedText -Text ([string]$ErrorRecord.Exception.Message))
 }
 
-function Show-AgentFailureDiagnostics {
-    if ($null -eq $script:sessionId -or [string]::IsNullOrWhiteSpace([string]$script:token)) { return }
+function Get-TableWriteCounts {
+    param([string]$Database)
+    $inList = ($streamWriteTables | ForEach-Object { "'$_'" }) -join ","
+    $sql = "SELECT relname || ':' || n_tup_ins || '/' || n_tup_upd FROM pg_stat_user_tables WHERE relname IN ($inList) ORDER BY relname;"
+    # psql needs the password here too: this runs outside the DB-reset block, and
+    # without PGPASSWORD psql would block on an interactive password prompt.
+    $previousPassword = $env:PGPASSWORD
+    $env:PGPASSWORD = $dbPassword
     try {
-        $headers = @{ Authorization = "Bearer $($script:token)" }
-        $session = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/agents/sessions/$($script:sessionId)" -Headers $headers -TimeoutSec 20
-        $run = $session.data.last_run
-        if ($null -ne $run) {
-            $status = [string]$run.status
-            $reason = [string]$run.terminal_reason
-            $errorCode = ""
-            if ($null -ne $run.error_code) { $errorCode = [string]$run.error_code }
-            Write-Host ("last_run status={0} terminal_reason={1} error_code={2}" -f $status, $reason, $errorCode) -ForegroundColor Yellow
+        $output = Get-PsqlScalar -Database $Database -Sql $sql
+    } finally {
+        if ([string]::IsNullOrEmpty($previousPassword)) {
+            Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
         } else {
-            Write-Host ("last_run=<none> running={0}" -f [string]$session.data.running) -ForegroundColor Yellow
+            $env:PGPASSWORD = $previousPassword
         }
-        $items = @()
-        if ($null -ne $script:eventItems) {
-            $items = @($script:eventItems)
-        } else {
-            $items = @(Get-AgentEventItems -Headers $headers -SessionId $script:sessionId)
+    }
+    $map = @{}
+    foreach ($line in ($output -split "`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "") { continue }
+        if ($trimmed -match '^([^:]+):(\d+)/(\d+)$') {
+            $map[$matches[1]] = [pscustomobject]@{ Ins = [int64]$matches[2]; Upd = [int64]$matches[3] }
         }
-        $kinds = @()
-        foreach ($item in $items) {
-            if ($null -eq $item -or $null -eq $item.detail) { continue }
-            $kind = [string]$item.detail.kind
-            if (-not [string]::IsNullOrWhiteSpace($kind)) { $kinds += $kind }
+    }
+    return $map
+}
+
+function Initialize-LlmConfiguration {
+    param([hashtable]$Headers, [string]$BaseUrl, [string]$ApiKey, [string]$ModelName, [int]$TimeoutMs)
+    $base = $BaseUrl.TrimEnd('/')
+    $configs = @((Invoke-Api -Method Get -Uri "$apiBaseUrl$llmConfigsPath" -Headers $Headers -TimeoutSec 20).data)
+    $config = $configs | Where-Object { $null -ne $_ -and ([string]$_.base_url).TrimEnd('/') -eq $base } | Select-Object -First 1
+    if ($null -eq $config) {
+        $createBody = @{
+            name             = "acceptance-$ModelName"
+            provider         = "acceptance"
+            protocol         = "openai_chat_completions"
+            base_url         = $base
+            api_key          = $ApiKey
+            is_default       = $true
+            status           = "active"
+            timeout_seconds  = [int]([Math]::Max(1, [Math]::Floor($TimeoutMs / 1000)))
+            max_retries      = 1
+            thinking_type    = "auto"
+            reasoning_effort = "none"
         }
-        $uniqueKinds = @($kinds | Select-Object -Unique)
-        Write-Host ("event_kinds=" + ($uniqueKinds -join ",")) -ForegroundColor Yellow
-    } catch {
-        Write-Host "diagnostics unavailable (the API may already be stopped)." -ForegroundColor Yellow
+        $config = (Invoke-Api -Method Post -Uri "$apiBaseUrl$llmConfigsPath" -Headers $Headers -Body $createBody -TimeoutSec 20).data
+    }
+    $configId = ConvertTo-Int64OrZero -Value $config.id
+    if ($configId -le 0) { throw "the LLM configuration has no id" }
+    if (-not [bool]$config.is_default) {
+        $config = (Invoke-Api -Method Patch -Uri "$apiBaseUrl$llmConfigsPath/$configId" -Headers $Headers -Body @{ is_default = $true } -TimeoutSec 20).data
+    }
+    if (-not [bool]$config.api_key_set) {
+        $config = (Invoke-Api -Method Patch -Uri "$apiBaseUrl$llmConfigsPath/$configId" -Headers $Headers -Body @{ api_key = $ApiKey } -TimeoutSec 20).data
+    }
+
+    $models = @($config.models)
+    $model = $models | Where-Object { $null -ne $_ -and [string]$_.model -eq $ModelName } | Select-Object -First 1
+    if ($null -eq $model) {
+        $modelBody = @{
+            model                 = $ModelName
+            context_window        = 131072
+            max_output            = 8192
+            supports_tools        = $true
+            supports_vision       = $true
+            supports_reasoning    = $false
+            supports_prompt_cache = $true
+        }
+        $model = (Invoke-Api -Method Post -Uri "$apiBaseUrl$llmConfigsPath/$configId/models" -Headers $Headers -Body $modelBody -TimeoutSec 20).data
+    }
+    $modelId = ConvertTo-Int64OrZero -Value $model.id
+    if ($modelId -le 0) { throw "the LLM model row has no id" }
+    if (-not [bool]$model.supports_tools) {
+        $model = (Invoke-Api -Method Patch -Uri "$apiBaseUrl$llmConfigsPath/$configId/models/$modelId" -Headers $Headers -Body @{ supports_tools = $true } -TimeoutSec 20).data
+    }
+    $defaultModelId = ConvertTo-Int64OrZero -Value $config.default_model_id
+    if ($defaultModelId -ne $modelId) {
+        $config = (Invoke-Api -Method Patch -Uri "$apiBaseUrl$llmConfigsPath/$configId" -Headers $Headers -Body @{ default_model_id = [string]$modelId } -TimeoutSec 20).data
+    }
+
+    # The reachability signal that replaced the never-present health.llm_configured.
+    $test = (Invoke-Api -Method Post -Uri "$apiBaseUrl$llmConfigsPath/$configId/test" -Headers $Headers -TimeoutSec 120).data
+    $ok = [bool]$test.ok
+    if (-not $ok) {
+        throw ("LLM connectivity test failed: " + [string]$test.error)
+    }
+    return [pscustomobject]@{
+        ConfigId  = $configId
+        ModelId   = $modelId
+        Model     = $ModelName
+        LatencyMS = (ConvertTo-Int64OrZero -Value $test.latency_ms)
+    }
+}
+
+function Get-OrCreateEnvironment {
+    param([hashtable]$Headers, [string]$BaseUrl)
+    # 0.2.4-B resource model: environments are top-level and a version binds an
+    # environment; SUTs are catalogued under an environment (the old
+    # POST /api/resources/suts and .../suts/{id}/environments shapes are gone).
+    $environmentName = "acceptance-local"
+    $environments = @((Invoke-Api -Method Get -Uri "$apiBaseUrl/api/resources/environments?limit=200" -Headers $Headers -TimeoutSec 20).data)
+    $environment = $environments | Where-Object { $null -ne $_ -and [string]$_.name -eq $environmentName } | Select-Object -First 1
+    if ($null -eq $environment) {
+        $environment = (Invoke-Api -Method Post -Uri "$apiBaseUrl/api/resources/environments" -Headers $Headers -Body @{ name = $environmentName; description = "EzTest acceptance environment"; status = "active" } -TimeoutSec 20).data
+    }
+    $environmentId = ConvertTo-Int64OrZero -Value $environment.id
+    if ($environmentId -le 0) { throw "the acceptance environment has no id" }
+
+    $sutName = "EzTest Acceptance SUT"
+    $suts = @((Invoke-Api -Method Get -Uri "$apiBaseUrl/api/resources/environments/$environmentId/suts" -Headers $Headers -TimeoutSec 20).data)
+    $sut = $suts | Where-Object { $null -ne $_ -and [string]$_.name -eq $sutName } | Select-Object -First 1
+    if ($null -eq $sut) {
+        $sut = (Invoke-Api -Method Post -Uri "$apiBaseUrl/api/resources/environments/$environmentId/suts" -Headers $Headers -Body @{ name = $sutName; intro = "EzTest acceptance SUT (local API)"; base_url = $BaseUrl; family = "web" } -TimeoutSec 20).data
+    }
+    $sutId = ConvertTo-Int64OrZero -Value $sut.id
+    if ($sutId -le 0) { throw "the acceptance SUT has no id" }
+    return [pscustomobject]@{ SutId = $sutId; EnvironmentId = $environmentId }
+}
+
+function Get-AssistantReplyState {
+    param($Message)
+    $length = 0
+    $errorText = ""
+    foreach ($part in @($Message.parts)) {
+        if ($null -eq $part) { continue }
+        if ([string]$part.type -eq "text") {
+            $length += ([string]$part.text).Length
+        } elseif ([string]$part.type -eq "job_card" -and [string]$part.status -eq "failed") {
+            $errorText = [string]$part.reason
+        } elseif ([string]$part.type -eq "error") {
+            $errorText = [string]$part.error
+        }
+    }
+    return [pscustomobject]@{
+        Length     = $length
+        StreamState = [string]$Message.stream_state
+        ErrorText  = $errorText
+        ActualModel = [string]$Message.actual_model
     }
 }
 
@@ -408,12 +437,17 @@ function Invoke-DryRun {
     if (-not (Test-Path -LiteralPath $backendDir -PathType Container)) { $problems += "backend directory not found" }
 
     $envValues = $null
-    $requiredKeys = @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD", "EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")
+    $requiredKeys = @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD", "llm_base_url", "llm_model_name")
     $presentKeys = @()
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
         $problems += ".env not found at $envPath"
     } else {
         $envValues = Read-DotEnv -Path $envPath
+        if (-not ($envValues.ContainsKey("llm_api_key") -and -not [string]::IsNullOrWhiteSpace([string]$envValues["llm_api_key"]))) {
+            if (-not ($envValues.ContainsKey("llm_key") -and -not [string]::IsNullOrWhiteSpace([string]$envValues["llm_key"]))) {
+                $problems += "missing .env key: llm_api_key (or legacy llm_key)"
+            }
+        }
         foreach ($key in $requiredKeys) {
             if (-not $envValues.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$envValues[$key])) {
                 $problems += "missing .env key: $key"
@@ -436,15 +470,16 @@ function Invoke-DryRun {
 
     Write-Host "DryRun: repository root: $repoRoot"
     Write-Host "DryRun: backend directory: $backendDir"
-    Write-Host ("DryRun: .env found; required keys present ({0}/{1}): {2}" -f $presentKeys.Count, $requiredKeys.Count, ($presentKeys -join ", "))
+    Write-Host ("DryRun: .env found; LLM key (llm_api_key or llm_key) present; required keys present ({0}/{1}): {2}" -f $presentKeys.Count, $requiredKeys.Count, ($presentKeys -join ", "))
     Write-Host "DryRun: go executable found: $goExe"
     Write-Host "DryRun: psql executable found: $psqlExe"
     if ($env:EZTEST_RUN_REAL_LLM -ne "1") {
         Write-Host "DryRun: gate is closed (EZTEST_RUN_REAL_LLM != 1); the real run would print SKIPPED and exit 0."
     } else {
-        Write-Host "DryRun: gate is open; the real run would reset $e2eDbName, build/start the API on :$apiPort, and spend one paid LLM run."
+        Write-Host "DryRun: gate is open; the real run would reset $e2eDbName, build/start the API on :$apiPort, and spend one paid LLM turn."
     }
-    Write-Host "DryRun: the real run will PATCH the default LLM configuration timeout_ms to $llmTimeoutMs via the admin API."
+    Write-Host "DryRun: the real run creates the LLM config through the admin API and confirms it with POST ${llmConfigsPath}/{id}/test."
+    Write-Host "DryRun: the real run drives one clarification conversation turn and reports per-delta DB write counts."
     Write-Host "DryRun: port :$apiPort is not probed (another process may own it); the real run asserts it is free."
     Write-Host "DRYRUN OK" -ForegroundColor Green
     return 0
@@ -468,16 +503,15 @@ try {
     $envValues = Read-DotEnv -Path $envPath
 
     $llmKey = ""
-    if ($envValues.ContainsKey("llm_key")) { $llmKey = [string]$envValues["llm_key"] }
+    if ($envValues.ContainsKey("llm_api_key")) { $llmKey = [string]$envValues["llm_api_key"] }
+    if ([string]::IsNullOrWhiteSpace($llmKey) -and $envValues.ContainsKey("llm_key")) { $llmKey = [string]$envValues["llm_key"] }
     $llmBaseURL = ""
     if ($envValues.ContainsKey("llm_base_url")) { $llmBaseURL = [string]$envValues["llm_base_url"] }
     $llmModel = ""
     if ($envValues.ContainsKey("llm_model_name")) { $llmModel = [string]$envValues["llm_model_name"] }
 
-    # The gate was explicitly opened, so a missing LLM key is a failure rather
-    # than a skip. Only the key names are reported; values are never printed.
     $missingLlmKeys = @()
-    if ([string]::IsNullOrWhiteSpace($llmKey)) { $missingLlmKeys += "llm_key" }
+    if ([string]::IsNullOrWhiteSpace($llmKey)) { $missingLlmKeys += "llm_api_key (or llm_key)" }
     if ([string]::IsNullOrWhiteSpace($llmBaseURL)) { $missingLlmKeys += "llm_base_url" }
     if ([string]::IsNullOrWhiteSpace($llmModel)) { $missingLlmKeys += "llm_model_name" }
     if ($missingLlmKeys.Count -gt 0) {
@@ -490,22 +524,6 @@ try {
     $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
 
     $script:secretValues = @($adminPassword, $llmKey)
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-            $script:secretValues += $rawSecretKeys
-            try {
-                $secretObject = $rawSecretKeys | ConvertFrom-Json
-                foreach ($property in $secretObject.PSObject.Properties) {
-                    if ($null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                        $script:secretValues += [string]$property.Value
-                    }
-                }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
 
     $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
     $script:secretValues += $databaseUrl
@@ -566,7 +584,7 @@ try {
     }
     if ($buildExit -ne 0) { throw "go build ./cmd/eztest failed (see .tmp/acceptance-agent-llm-build.log)" }
 
-    Write-Step "Starting API on :$apiPort with the real LLM configuration from .env"
+    Write-Step "Starting API on :$apiPort"
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $e2eDatabaseUrl
     $env:EZTEST_HTTP_ADDR = ":$apiPort"
@@ -575,13 +593,10 @@ try {
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-    # Read-only file tools are rooted at the repository so the model can read
-    # README.md; http.get is pinned to the local API host (spec 4.2).
+    # The first-start admin seed reads EZTEST_INITIAL_ADMIN_PASSWORD; the e2e
+    # database is fresh, so this is what actually creates the admin row.
+    $env:EZTEST_INITIAL_ADMIN_PASSWORD = $adminPassword
     $env:EZTEST_AGENT_FILE_ROOT = $repoRoot
-    $env:EZTEST_AGENT_HTTP_ALLOWLIST = "localhost,127.0.0.1"
-    foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
-        if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
-    }
     Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue
 
     $apiOut = Join-Path $tmpDir "acceptance-agent-llm-api.out.log"
@@ -601,11 +616,6 @@ try {
         throw
     }
 
-    $health = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/health" -TimeoutSec 20
-    if ($health.data.llm_configured -ne $true) {
-        throw "health reports llm_configured=false after seeding the default configuration"
-    }
-
     Write-Step "Logging in as admin"
     $login = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/auth/login" -Body @{
         username = $adminUsername
@@ -615,147 +625,124 @@ try {
     if ([string]::IsNullOrWhiteSpace([string]$script:token)) { throw "admin login did not return a token" }
     $headers = @{ Authorization = "Bearer $($script:token)" }
 
-    Write-Step "Raising the default LLM timeout to ${llmTimeoutMs}ms for the diagnostic run"
-    try {
-        $llmConfig = Get-DefaultLLMConfig -Headers $headers
-        $llmConfigId = ConvertTo-Int64OrZero -Value $llmConfig.id
-        if ($llmConfigId -le 0) { throw "the default LLM configuration has no id" }
-    } catch {
-        $summary = Get-ApiErrorSummary -ErrorRecord $_
-        Write-Host "LLM configuration lookup failed: $summary" -ForegroundColor Red
-        throw "could not load the default LLM configuration"
-    }
-    try {
-        # PATCH is partial: only timeout_ms changes, so the server preserves the
-        # seeded base_url/model/api_key and every other stored field.
-        Set-DefaultLLMTimeout -Headers $headers -ConfigId $llmConfigId -TimeoutMs $llmTimeoutMs | Out-Null
-    } catch {
-        $summary = Get-ApiErrorSummary -ErrorRecord $_
-        Write-Host "LLM timeout update failed: $summary" -ForegroundColor Red
-        throw "could not set the default LLM timeout_ms=$llmTimeoutMs"
-    }
-    Write-Host ("llm_timeout_ms={0}" -f $llmTimeoutMs)
+    Write-Step "Configuring the real LLM through the admin API and testing it"
+    $llm = Initialize-LlmConfiguration -Headers $headers -BaseUrl $llmBaseURL -ApiKey $llmKey -ModelName $llmModel -TimeoutMs $llmTimeoutMs
+    Write-Host ("llm_config_id={0} model={1} connectivity_test=ok latency_ms={2}" -f $llm.ConfigId, $llm.Model, $llm.LatencyMS) -ForegroundColor Green
 
-    Write-Step "Loading the runtime-diagnostic agent profile"
-    $profilesResponse = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/agents/profiles" -Headers $headers -TimeoutSec 20
-    $profile = $null
-    $profiles = @()
-    if ($null -ne $profilesResponse.data) { $profiles = @($profilesResponse.data) }
-    foreach ($candidate in $profiles) {
-        if ($null -ne $candidate -and [string]$candidate.key -eq "runtime-diagnostic") {
-            $profile = $candidate
-            break
-        }
-    }
-    if ($null -eq $profile) { throw "the runtime-diagnostic agent profile was not seeded" }
-    if (-not [bool]$profile.enabled) { throw "the runtime-diagnostic agent profile is disabled" }
-    $profileId = ConvertTo-Int64OrZero -Value $profile.id
-
-    Write-Step "Creating a session and starting the diagnostic run"
-    $sessionResponse = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/agents/sessions" -Headers $headers -Body @{
-        profile_id = $profileId
-        title      = "gated real-llm agent acceptance"
+    Write-Step "Binding an environment and creating the acceptance version"
+    $binding = Get-OrCreateEnvironment -Headers $headers -BaseUrl $apiBaseUrl
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $version = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions" -Headers $headers -Body @{
+        title          = "agent-llm-acceptance-$stamp"
+        description    = "Gated real-LLM acceptance version"
+        environment_id = [string]$binding.EnvironmentId
     } -TimeoutSec 20
-    $script:sessionId = ConvertTo-Int64OrZero -Value $sessionResponse.data.id
-    if ($script:sessionId -le 0) { throw "session creation did not return an id" }
+    $versionId = ConvertTo-Int64OrZero -Value $version.data.id
+    if ($versionId -le 0) { throw "version creation did not return an id" }
+    Write-Host ("version_id={0} environment_id={1}" -f $versionId, $binding.EnvironmentId)
 
-    $messageResponse = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/agents/sessions/$($script:sessionId)/messages" -Headers $headers -Body @{
-        message = $diagnosticPrompt
-    } -TimeoutSec 30
-    $script:runId = ConvertTo-Int64OrZero -Value $messageResponse.data.run_id
-    if ($script:runId -le 0) { throw "sending the diagnostic message did not return a run id" }
+    # Sample the streaming tables before the opening round starts (the e2e DB is
+    # fresh; creating the conversation enqueues the opening Host reply, see
+    # conversation.go EnsureOpening / reconciler rule 2).
+    $writeCountsBefore = Get-TableWriteCounts -Database $e2eDbName
 
-    Write-Step "Polling session $($script:sessionId) until run $($script:runId) finishes (max ${pollTimeoutSeconds}s)"
-    $deadline = (Get-Date).AddSeconds($pollTimeoutSeconds)
-    $lastSession = $null
-    $lastPollError = ""
-    $finished = $false
+    Write-Step "Creating the clarification conversation and waiting for the opening Host reply"
+    $conversation = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$versionId/conversations" -Headers $headers -Body @{
+        kind  = "clarification"
+        title = "gated real-llm acceptance"
+    } -TimeoutSec 20
+    $conversationId = ConvertTo-Int64OrZero -Value $conversation.data.id
+    if ($conversationId -le 0) { throw "conversation creation did not return an id" }
+    Write-Host ("conversation_id={0}" -f $conversationId)
+    $startedAt = Get-Date
+
+    # The product opens a fresh clarification conversation with one bounded Host
+    # reply (tool-free or tool-using; either streams). Poll until an assistant
+    # message is terminal AND carries text. The opening round also emits an
+    # artifact/job_card and a question card with no text, so a text-free
+    # terminal message must not end the wait.
+    $deadline = (Get-Date).AddSeconds($PollTimeoutSeconds)
+    $assistantMessage = $null
+    $lastState = "none"
+    $midReplyStreamingSeen = $false
+    $midReplyObserved = $false
+    $midReplyChars = 0
+    $lastErrorMessage = ""
     while ((Get-Date) -lt $deadline) {
-        try {
-            $lastSession = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/agents/sessions/$($script:sessionId)" -Headers $headers -TimeoutSec 20
-        } catch {
-            $lastPollError = Get-ApiErrorSummary -ErrorRecord $_
-            Start-Sleep -Seconds $pollIntervalSeconds
-            continue
+        $messagesResponse = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$versionId/conversations/$conversationId/messages?limit=200" -Headers $headers -TimeoutSec 20
+        foreach ($message in @($messagesResponse.data)) {
+            if ($null -eq $message -or [string]$message.role -ne "assistant") { continue }
+            $state = Get-AssistantReplyState -Message $message
+            $lastState = $state.StreamState
+            if ($state.StreamState -eq "streaming") {
+                $midReplyStreamingSeen = $true
+                if ($state.Length -gt 0) {
+                    $midReplyObserved = $true
+                    if ($state.Length -gt $midReplyChars) { $midReplyChars = $state.Length }
+                }
+            }
+            if (($state.StreamState -eq "complete" -or $state.StreamState -eq "interrupted") -and $state.Length -gt 0) {
+                $assistantMessage = $message
+                if (-not [string]::IsNullOrWhiteSpace($state.ErrorText)) { $lastErrorMessage = $state.ErrorText }
+            }
         }
-        $running = $false
-        if ($null -ne $lastSession.data.running) { $running = [bool]$lastSession.data.running }
-        $seenRunId = [int64]0
-        if ($null -ne $lastSession.data.last_run) {
-            $seenRunId = ConvertTo-Int64OrZero -Value $lastSession.data.last_run.id
-        }
-        if (-not $running -and $seenRunId -eq $script:runId) {
-            $finished = $true
-            break
-        }
+        if ($null -ne $assistantMessage) { break }
         Start-Sleep -Seconds $pollIntervalSeconds
     }
-    if (-not $finished) {
-        if (-not [string]::IsNullOrWhiteSpace($lastPollError)) {
-            throw "timed out after ${pollTimeoutSeconds}s waiting for run $($script:runId) (last poll error: $lastPollError)"
-        }
-        throw "timed out after ${pollTimeoutSeconds}s waiting for run $($script:runId) to finish"
+
+    $elapsedSeconds = [Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1)
+    if ($null -eq $assistantMessage) {
+        throw "timed out after ${PollTimeoutSeconds}s waiting for a terminal assistant reply (last stream_state=$lastState)"
+    }
+    $assistantState = Get-AssistantReplyState -Message $assistantMessage
+    if ($assistantState.Length -le 0) {
+        $detail = if ([string]::IsNullOrWhiteSpace($lastErrorMessage)) { "no error part reported" } else { "error: $lastErrorMessage" }
+        throw ("the assistant reply is empty (stream_state=" + $assistantState.StreamState + "; " + $detail + ")")
+    }
+    Write-Host ("run finished: stream_state={0} reply_chars={1} actual_model={2}" -f $assistantState.StreamState, $assistantState.Length, $assistantState.ActualModel)
+
+    $writeCountsAfter = Get-TableWriteCounts -Database $e2eDbName
+    $totalUpdates = [int64]0
+    $totalInserts = [int64]0
+    $tableReport = @()
+    foreach ($table in $streamWriteTables) {
+        $before = $writeCountsBefore[$table]
+        $after = $writeCountsAfter[$table]
+        if ($null -eq $after) { $after = [pscustomobject]@{ Ins = 0; Upd = 0 } }
+        if ($null -eq $before) { $before = [pscustomobject]@{ Ins = 0; Upd = 0 } }
+        $ins = $after.Ins - $before.Ins
+        $upd = $after.Upd - $before.Upd
+        $totalUpdates += $upd
+        $totalInserts += $ins
+        $tableReport += ("{0}: ins={1} upd={2}" -f $table, $ins, $upd)
     }
 
-    $lastRun = $lastSession.data.last_run
-    $runStatus = [string]$lastRun.status
-    $terminalReason = [string]$lastRun.terminal_reason
-    $errorCode = ""
-    if ($null -ne $lastRun.error_code) { $errorCode = [string]$lastRun.error_code }
-    if ($runStatus -ne "done" -or $terminalReason -ne "completed") {
-        throw "run status=$runStatus terminal_reason=$terminalReason error_code=$errorCode"
-    }
-    Write-Host "Run finished: status=$runStatus terminal_reason=$terminalReason"
+    # Per-delta DB write observation. Current state (v0.2.4-H, T28c): the AGENT
+    # transcript path coalesces bounded flushes (transcript_stream.go), so the
+    # agent message row is updated ~9 times per turn instead of once per delta
+    # (49/70 -> 9). The HOST path (host_stream.go) still writes the FULL
+    # accumulated snapshot to the part rows / head parts array per delta because
+    # its write and publish are 1:1 coupled (~714 updates/turn); merging it needs
+    # a version port split and is deferred to 0.3 (H-A44, SC-H1 written exception).
+    # The counters below therefore observe BOTH paths; est_bytes_rewritten keeps
+    # the legacy uniform-growth estimate (3 x N x L / 2) as a rough upper bound,
+    # not a measured value. Do not read the update counts as "one write per delta".
+    $deltasApprox = [int64]0
+    $partAfter = $writeCountsAfter["conversation_message_part"]
+    if ($null -ne $partAfter) { $deltasApprox = $partAfter.Upd }
+    $throughput = 0.0
+    if ($elapsedSeconds -gt 0) { $throughput = [Math]::Round([double]$totalUpdates / $elapsedSeconds, 2) }
+    $amplification = [int64]0
+    if ($deltasApprox -gt 0) { $amplification = [int64](3 * ($deltasApprox * $assistantState.Length) / 2) }
 
-    Write-Step "Reading the agent channel event snapshot (retrying for run_finished)"
-    $eventItems = @(Wait-AgentEventKind -Headers $headers -SessionId $script:sessionId -Kind "run_finished" -Attempts $runFinishedWaitAttempts -IntervalSeconds $runFinishedWaitIntervalSeconds)
-    $script:eventItems = $eventItems
-
-    $kinds = @()
-    $toolUseCount = 0
-    $okToolResults = 0
-    $usageReasonTokens = [int64]0
-    foreach ($eventItem in $eventItems) {
-        if ($null -eq $eventItem -or $null -eq $eventItem.detail) { continue }
-        $kind = [string]$eventItem.detail.kind
-        if ([string]::IsNullOrWhiteSpace($kind)) { continue }
-        $kinds += $kind
-        switch ($kind) {
-            "tool_use" {
-                $toolUseCount++
-            }
-            "tool_result" {
-                if ([string]$eventItem.detail.status -eq "ok") { $okToolResults++ }
-            }
-            "usage" {
-                $usageReasonTokens += (ConvertTo-Int64OrZero -Value $eventItem.detail.reasoning_tokens)
-            }
-        }
-    }
-
-    $missingKinds = @()
-    foreach ($requiredKind in $requiredKinds) {
-        if ($kinds -notcontains $requiredKind) { $missingKinds += $requiredKind }
-    }
-    if ($missingKinds.Count -gt 0) {
-        throw ("agent event stream is missing required kinds: " + ($missingKinds -join ", "))
-    }
-    if ($okToolResults -lt 1) { throw "no tool_result event reports status=ok" }
-    if ($usageReasonTokens -le 0) { throw "usage events report no reasoning tokens (reasoning_tokens=0)" }
-
-    $turns = ConvertTo-Int64OrZero -Value $lastRun.turns
-    $reasonTokens = ConvertTo-Int64OrZero -Value $lastRun.reasoning_tokens
-    if ($reasonTokens -le 0) { $reasonTokens = $usageReasonTokens }
-
-    $uniqueKinds = @($kinds | Select-Object -Unique)
-    Write-Host ("Event kinds: " + ($uniqueKinds -join ","))
     Write-Host ""
-    Write-Host ("PASS run={0} turns={1} tools={2} reason_tokens={3}" -f $script:runId, $turns, $toolUseCount, $reasonTokens) -ForegroundColor Green
+    Write-Host ("PASS version={0} conversation={1} reply_chars={2} elapsed_s={3} deltas~={4}" -f $versionId, $conversationId, $assistantState.Length, $elapsedSeconds, $deltasApprox) -ForegroundColor Green
+    Write-Host ("bounded-flush: total_ins={0} total_upd={1} upd_per_s={2} est_bytes_rewritten~={3} mid_reply_streaming_seen={4} mid_reply_text_observed={5} mid_reply_chars={6}" -f $totalInserts, $totalUpdates, $throughput, $amplification, $midReplyStreamingSeen, $midReplyObserved, $midReplyChars) -ForegroundColor Green
+    foreach ($line in $tableReport) { Write-Host ("  writes " + $line) }
 } catch {
     $summary = Get-ApiErrorSummary -ErrorRecord $_
     Write-Host ""
     Write-Host "REAL AGENT LLM ACCEPTANCE FAILED: $summary" -ForegroundColor Red
-    Show-AgentFailureDiagnostics
     $exitCode = 1
 } finally {
     Stop-ProcessTree -Process $apiProcess

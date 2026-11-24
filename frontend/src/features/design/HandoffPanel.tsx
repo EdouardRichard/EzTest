@@ -110,9 +110,31 @@ export function HandoffPanel({ versionId, initialRevision }: HandoffPanelProps) 
                       <Badge tone="info">{requirement.priority}</Badge>
                       <span className="text-muted-foreground">{requirement.status}</span>
                     </div>
+                    {/* v0.2.4-B: the V1 handoff carries the three-part user story and
+                        structured {id,given,when,then} acceptance criteria. The id is
+                        server-assigned and shown read-only (this is a read-only doc). */}
                     <p className="mt-0.5 text-muted-foreground">
-                      {requirement.acceptance_criteria}
+                      作为{requirement.user_story.as_a}，我希望{requirement.user_story.i_want}
+                      ，以便{requirement.user_story.so_that}
                     </p>
+                    {requirement.sut_description !== "" ? (
+                      <p className="mt-0.5 text-muted-foreground">
+                        被测系统：{requirement.sut_description}
+                      </p>
+                    ) : null}
+                    {requirement.acceptance_criteria.length === 0 ? (
+                      <p className="mt-0.5 text-muted-foreground">暂无验收标准</p>
+                    ) : (
+                      <ul className="mt-0.5 space-y-0.5 text-muted-foreground">
+                        {requirement.acceptance_criteria.map((criterion) => (
+                          <li key={criterion.id}>
+                            <span className="font-medium text-foreground">{criterion.id}</span>
+                            ：Given {criterion.given} · When {criterion.when} · Then{" "}
+                            {criterion.then}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -202,9 +224,12 @@ export function HandoffPanel({ versionId, initialRevision }: HandoffPanelProps) 
           <section aria-label="交接资源" className="space-y-1.5">
             <h3 className="text-xs font-semibold text-foreground">资源</h3>
             <p className="text-[11px] text-muted-foreground">
-              SUT {handoff.resources.suts.length} · 页面 {handoff.resources.pages.length} · API{" "}
-              {handoff.resources.apis.length} · 账号 {handoff.resources.accounts.length} · 目标库{" "}
-              {handoff.resources.databases.length} · 代码仓 {handoff.resources.repositories.length}
+              SUT {handoff.resources.suts.length} · 页面{" "}
+              {handoff.resources.suts.reduce((total, sut) => total + sut.pages.length, 0)} · API{" "}
+              {handoff.resources.suts.reduce((total, sut) => total + sut.apis.length, 0)} · 账号{" "}
+              {handoff.resources.accounts.length} · 目标库{" "}
+              {handoff.resources.suts.reduce((total, sut) => total + sut.databases.length, 0)} ·
+              代码仓 {handoff.resources.repositories.length}
             </p>
           </section>
         </div>

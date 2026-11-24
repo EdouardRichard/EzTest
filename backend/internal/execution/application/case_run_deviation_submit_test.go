@@ -15,13 +15,18 @@ import (
 func TestFailureSubmitCannotDowngradeObservedDeviation(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "failed",
 		Observed: "弹窗内展示的提示文案为「登录已过期，请重新登录」，与需求要求的统一提示「账号或密码错误，请重试」不一致。",
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed})
+	if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+		Kind: "text", Text: "failure evidence",
+	}); err != nil {
+		t.Fatalf("EvidenceText: %v", err)
+	}
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
@@ -29,7 +34,7 @@ func TestFailureSubmitCannotDowngradeObservedDeviation(t *testing.T) {
 		t.Fatalf("finish class = %q, want application", finished.FailureClass)
 	}
 
-	if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+	if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 		CaseRunID: 3001, FailureClass: "automation", Category: "ui", Severity: "minor", Summary: "script bug",
 	}); err == nil {
 		t.Fatal("observed requirement deviation must not be downgraded to automation")
@@ -46,7 +51,7 @@ func TestFailureSubmitCannotDowngradeObservedDeviation(t *testing.T) {
 func TestFailureSubmitEscalatesObservedDeviation(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "failed",
 		Observed: "弹窗内展示的提示文案为「登录已过期，请重新登录」，与需求要求的统一提示「账号或密码错误，请重试」不一致。",
 	}); err != nil {
@@ -59,7 +64,7 @@ func TestFailureSubmitEscalatesObservedDeviation(t *testing.T) {
 	fixture.caseRuns.rows[3001] = run
 	fixture.caseRuns.mu.Unlock()
 
-	if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+	if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 		CaseRunID: 3001, FailureClass: "application", Category: "ui", Severity: "major", Summary: "login error text mismatch",
 	}); err != nil {
 		t.Fatalf("observed deviation escalation rejected: %v", err)

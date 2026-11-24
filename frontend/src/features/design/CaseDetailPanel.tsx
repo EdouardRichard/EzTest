@@ -4,12 +4,9 @@ import { useCallback, useEffect, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
-import { ErrorState, InlineError } from "@/components/ui/ErrorState"
+import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { AnchorPanel } from "@/features/anchors/AnchorPanel"
-import { listVisualAssertions } from "@/features/visual/api"
-import { VisualConfigEditor } from "@/features/visual/components/VisualConfigEditor"
-import type { VisualAssertion } from "@/features/visual/types"
 import { formatDateTime } from "@/lib/format"
 
 import { getDesignCase, rollbackCaseVersion } from "./api"
@@ -17,10 +14,10 @@ import {
   DiscoveryRevisionNotice,
   discoveryRevisionFromCaseVersion,
 } from "./DiscoveryRevisionNotice"
+import { JudgmentReport } from "./JudgmentReport"
 import { CASE_VERSION_STATUS_LABEL } from "./nodeActions"
 import type {
   CaseRevisionRollbackView,
-  DesignAssertion,
   DesignAssertionKind,
   DesignCaseDetail,
   DesignCaseVersionDetail,
@@ -39,176 +36,6 @@ const ASSERTION_KIND_LABEL: Record<DesignAssertionKind, string> = {
   api: "API",
   db: "DB",
   text: "文本",
-  visual: "视觉",
-}
-
-/**
- * Visual assertion config section (spec §7.1/§9.4). It maps the design
- * assertion to its P5 config by `(step_seq, assertion_seq)`, because the frozen
- * design DTO does not expose the P2 `case_assertion` id; when a config exists,
- * its `case_assertion_id` is reused for the upsert path. No P2 confirmation or
- * edit semantics are touched here.
- */
-function CaseVisualAssertions({
-  versionId,
-  selected,
-  previousCaseVersionId,
-  onRequestChange,
-}: {
-  versionId: string
-  selected: DesignCaseVersionDetail
-  previousCaseVersionId?: string
-  /** Fills the design chat draft; visual assertions are only created by design. */
-  onRequestChange: (draft: string) => void
-}) {
-  const visualAssertions = selected.assertions
-    .map((assertion, index) => {
-      let assertionSeq = 0
-      for (let cursor = 0; cursor <= index; cursor += 1) {
-        if (selected.assertions[cursor].step_seq === assertion.step_seq) assertionSeq += 1
-      }
-      return { assertion, assertionSeq }
-    })
-    .filter((item) => item.assertion.kind === "visual")
-
-  const [configs, setConfigs] = useState<VisualAssertion[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<unknown>(null)
-  const [editingKey, setEditingKey] = useState<string | null>(null)
-  const [reloadToken, setReloadToken] = useState(0)
-
-  const hasVisual = visualAssertions.length > 0
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken/revision refetch the configs
-  useEffect(() => {
-    if (!hasVisual) return undefined
-    let cancelled = false
-    setLoading(true)
-    setError(null)
-    void listVisualAssertions(versionId, { caseVersionId: selected.case_version_id })
-      .then((items) => {
-        if (!cancelled) setConfigs(items)
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled) setError(cause)
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [versionId, selected.case_version_id, hasVisual, reloadToken])
-
-  if (!hasVisual) {
-    // D-08: the frozen design spec only offers the visual config editor for an
-    // assertion the design already generated. Without one the section used to
-    // vanish, which read as "visual assertions do not exist". Keep it visible as
-    // a discoverable empty state and route the request through the design chat
-    // draft (no create API in this release).
-    return (
-      <section
-        aria-label="视觉断言配置"
-        data-testid="visual-assertions-empty"
-        className="space-y-2"
-      >
-        <header className="flex flex-wrap items-center gap-2">
-          <h3 className="text-xs font-semibold text-foreground">视觉断言配置</h3>
-          <Badge tone="neutral">暂无</Badge>
-        </header>
-        <p className="text-[11px] text-muted-foreground">
-          该用例暂无视觉断言。视觉断言由设计生成，可请求 AI 为某步增加视觉基线断言。
-        </p>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() =>
-            onRequestChange(
-              `请为用例「${selected.title}」增加视觉基线断言：说明要断言的页面/元素与步骤，并生成基线，便于执行时做视觉对比。`,
-            )
-          }
-        >
-          请求 AI 添加视觉断言
-        </Button>
-      </section>
-    )
-  }
-
-  function keyOf(assertion: DesignAssertion, assertionSeq: number): string {
-    return `${assertion.step_seq}-${assertionSeq}`
-  }
-
-  function configOf(assertion: DesignAssertion, assertionSeq: number): VisualAssertion | undefined {
-    return configs.find(
-      (config) => config.step_seq === assertion.step_seq && config.assertion_seq === assertionSeq,
-    )
-  }
-
-  return (
-    <section aria-label="视觉断言配置" className="space-y-2">
-      <header className="flex flex-wrap items-center gap-2">
-        <h3 className="text-xs font-semibold text-foreground">视觉断言配置</h3>
-        <Badge tone="info">{visualAssertions.length} 条</Badge>
-        <span className="text-[10px] text-muted-foreground">
-          配置走 P5 visual API；保存不改变 P2 断言确认语义。
-        </span>
-      </header>
-
-      {loading ? <p className="text-[11px] text-muted-foreground">正在加载视觉配置…</p> : null}
-      {error !== null ? <InlineError error={error} /> : null}
-
-      {visualAssertions.map(({ assertion, assertionSeq }) => {
-        const key = keyOf(assertion, assertionSeq)
-        const config = configOf(assertion, assertionSeq)
-        const caseAssertionId = assertion.case_assertion_id ?? config?.case_assertion_id
-        return (
-          <div key={key} className="space-y-1.5">
-            <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2.5 py-2 text-[11px]">
-              <span className="font-medium text-foreground">
-                视觉断言 {assertion.step_seq}.{assertionSeq}
-              </span>
-              <span className="text-muted-foreground">
-                {assertion.expected || assertion.target}
-              </span>
-              {config !== undefined ? (
-                <Badge tone={config.baseline ? "success" : "warning"}>
-                  {config.baseline ? `基线已批准 r${config.config_revision}` : "缺失基线"}
-                </Badge>
-              ) : (
-                <Badge tone="neutral">未配置</Badge>
-              )}
-              <Button
-                variant="secondary"
-                size="sm"
-                className="ml-auto"
-                aria-expanded={editingKey === key}
-                onClick={() => setEditingKey((current) => (current === key ? null : key))}
-              >
-                配置视觉断言
-              </Button>
-            </div>
-            {editingKey === key ? (
-              <VisualConfigEditor
-                versionId={versionId}
-                caseVersionId={selected.case_version_id}
-                caseAssertionId={caseAssertionId}
-                versionSutId={config?.version_sut_id ?? selected.default_version_sut_id}
-                assertion={{
-                  step_seq: assertion.step_seq,
-                  assertion_seq: assertionSeq,
-                  expected: assertion.expected,
-                  case_assertion_id: assertion.case_assertion_id,
-                }}
-                initial={config ?? null}
-                previousCaseVersionId={previousCaseVersionId}
-                onSaved={() => setReloadToken((token) => token + 1)}
-              />
-            ) : null}
-          </div>
-        )
-      })}
-    </section>
-  )
 }
 
 export type CaseDetailPanelProps = {
@@ -237,6 +64,12 @@ export type CaseDetailPanelProps = {
   readOnly?: boolean
   /** Called after a successful rollback so the page can refresh graph/detail. */
   onRolledBack?: (result?: CaseRevisionRollbackView) => void
+  /**
+   * Called after a successful case-level human override (spec SC-E5) so the page
+   * refetches the graph and this detail. The action itself is rendered by
+   * JudgmentReport's single-case mode and re-checked by the server.
+   */
+  onJudgmentOverridden?: () => void
 }
 
 function CaseDetailBody({
@@ -252,6 +85,7 @@ function CaseDetailBody({
   discoveryRevision,
   readOnly = false,
   onRolledBack,
+  onJudgmentOverridden,
 }: {
   versionId: string
   detail: DesignCaseDetail
@@ -265,17 +99,10 @@ function CaseDetailBody({
   discoveryRevision?: DiscoveryRevisionData | null
   readOnly?: boolean
   onRolledBack?: (result?: CaseRevisionRollbackView) => void
+  onJudgmentOverridden?: () => void
 }) {
   const selected = detail.selected
   const canConfirm = stageCanConfirm && detail.confirmable && selected.status === "draft"
-  const previousVersion = [...detail.versions]
-    .filter((version) => version.revision < selected.revision)
-    .sort((left, right) => right.revision - left.revision)[0]
-  const visualConfigTarget = {
-    versionId,
-    selected,
-    previousCaseVersionId: previousVersion?.case_version_id,
-  }
   const inferredDiscoveryRevision = discoveryRevisionFromCaseVersion(selected)
   const noticeRevision =
     discoveryRevision !== undefined &&
@@ -297,6 +124,16 @@ function CaseDetailBody({
         <Badge tone={statusTone(selected.status)}>
           {CASE_VERSION_STATUS_LABEL[selected.status]}
         </Badge>
+        {detail.review_state !== undefined ? (
+          <JudgmentReport
+            versionId={versionId}
+            caseId={detail.case_id}
+            reviewState={detail.review_state}
+            isAdmin={!readOnly}
+            badgeTestId="case-detail-review-state"
+            onOverridden={onJudgmentOverridden}
+          />
+        ) : null}
         <Button
           size="sm"
           variant="secondary"
@@ -339,19 +176,15 @@ function CaseDetailBody({
         />
       ) : null}
 
-      <dl className="grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+      <dl className="grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-3">
         <div>
           <dt className="text-muted-foreground">优先级</dt>
           <dd className="font-medium text-foreground">{selected.priority}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">默认 SUT</dt>
-          <dd className="font-medium text-foreground">{selected.default_version_sut_id}</dd>
-        </div>
-        <div>
-          <dt className="text-muted-foreground">页面</dt>
+          <dt className="text-muted-foreground">覆盖 AC</dt>
           <dd className="font-medium text-foreground">
-            {selected.page_ids.length > 0 ? selected.page_ids.join("、") : "—"}
+            {selected.covered_acs.length === 0 ? "—" : selected.covered_acs.join("、")}
           </dd>
         </div>
         <div>
@@ -363,6 +196,11 @@ function CaseDetailBody({
       {selected.description.length > 0 ? (
         <p className="text-xs leading-relaxed text-foreground">{selected.description}</p>
       ) : null}
+
+      <section aria-label="被测系统" className="space-y-1">
+        <h3 className="text-xs font-semibold text-foreground">被测系统</h3>
+        <p className="text-xs text-muted-foreground">{selected.sut_description || "—"}</p>
+      </section>
 
       <section aria-label="前置条件" className="space-y-1">
         <h3 className="text-xs font-semibold text-foreground">前置条件</h3>
@@ -378,9 +216,7 @@ function CaseDetailBody({
                 <th className="px-1.5 py-1 font-medium">序号</th>
                 <th className="px-1.5 py-1 font-medium">动作</th>
                 <th className="px-1.5 py-1 font-medium">预期</th>
-                <th className="px-1.5 py-1 font-medium">目标 SUT</th>
-                <th className="px-1.5 py-1 font-medium">页面</th>
-                <th className="px-1.5 py-1 font-medium">API</th>
+                <th className="px-1.5 py-1 font-medium">目标</th>
                 <th className="px-1.5 py-1 font-medium">账号角色</th>
               </tr>
             </thead>
@@ -390,14 +226,10 @@ function CaseDetailBody({
                   <td className="px-1.5 py-1">{step.seq}</td>
                   <td className="px-1.5 py-1 text-foreground">{step.action}</td>
                   <td className="px-1.5 py-1 text-muted-foreground">{step.expected || "—"}</td>
-                  <td className="px-1.5 py-1">
-                    {step.target_version_sut_id ? `SUT ${step.target_version_sut_id}` : "继承默认"}
-                  </td>
-                  <td className="px-1.5 py-1">
-                    {step.target_page_id ? `页面 ${step.target_page_id}` : "—"}
-                  </td>
-                  <td className="px-1.5 py-1">
-                    {step.target_api_id ? `API ${step.target_api_id}` : "—"}
+                  {/* v0.2.4-B: the per-step SUT/page/API id columns are replaced by
+                      the prose target_description (natural-language case contract). */}
+                  <td className="px-1.5 py-1 text-muted-foreground">
+                    {step.target_description || "—"}
                   </td>
                   <td className="px-1.5 py-1">{step.account_role || "—"}</td>
                 </tr>
@@ -422,19 +254,17 @@ function CaseDetailBody({
                   第 {assertion.step_seq} 步 · {ASSERTION_KIND_LABEL[assertion.kind]} ·{" "}
                   {assertion.target}
                 </span>
+                {/* v0.2.4-B: a db assertion names the SUT it reads (sut_id, a decimal
+                    string), not a database id. Other kinds carry no sut_id. */}
+                {assertion.kind === "db" && assertion.sut_id !== null ? (
+                  <span className="text-muted-foreground">SUT {assertion.sut_id}</span>
+                ) : null}
                 <span className="text-muted-foreground">{assertion.expected}</span>
               </li>
             ))}
           </ul>
         )}
       </section>
-
-      <CaseVisualAssertions
-        versionId={visualConfigTarget.versionId}
-        selected={visualConfigTarget.selected}
-        previousCaseVersionId={visualConfigTarget.previousCaseVersionId}
-        onRequestChange={onRequestChange}
-      />
 
       <section aria-label="来源" className="space-y-1">
         <h3 className="text-xs font-semibold text-foreground">来源</h3>
@@ -517,6 +347,7 @@ export function CaseDetailPanel({
   discoveryRevision = null,
   readOnly = false,
   onRolledBack,
+  onJudgmentOverridden,
 }: CaseDetailPanelProps) {
   const [detail, setDetail] = useState<DesignCaseDetail | null>(null)
   const [selectedVersionId, setSelectedVersionId] = useState<string | undefined>(undefined)
@@ -595,6 +426,7 @@ export function CaseDetailPanel({
           discoveryRevision={discoveryRevision}
           readOnly={readOnly}
           onRolledBack={handleRolledBack}
+          onJudgmentOverridden={onJudgmentOverridden}
         />
       )}
     </section>

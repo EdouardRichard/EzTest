@@ -66,17 +66,13 @@ const proposedApi: SutApi = {
 
 const detail: Sut = {
   ...sutFixture,
-  environments: [
-    {
-      ...environmentFixture,
-      pages: [pageFixture, proposedPage],
-      apis: [apiFixture, proposedApi],
-    },
-  ],
+  pages: [pageFixture, proposedPage],
+  apis: [apiFixture, proposedApi],
 }
 
 const baseScope: ResourceScope = {
   suts: [sutListItemFixture],
+  environments: [environmentFixture],
   sutId: "1001",
   environmentId: "1101",
   detail,

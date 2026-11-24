@@ -11,8 +11,13 @@ const (
 	// setting value can pass their own default in a later wiring task.
 	DefaultContextWindowTokens int64 = 128_000
 
-	// MaxRequestOutputTokens bounds what is actually sent to the provider as an
-	// output limit, so an upstream-reported 393K is never forwarded verbatim.
+	// MaxRequestOutputTokens is the request-side DEFAULT output bound used by
+	// EffectiveMaxOutput when a request leaves max_output unset (<=0). It is NOT a
+	// cap on a configured value: the runner forwards a model's configured positive
+	// max_output verbatim (never clamped — constitution II.7 / SC-H8, H-E12). The
+	// streaming reader budget floors at this default and scales up with the
+	// forwarded limit (llm/infrastructure.streamResponseBudget), so a configured
+	// long turn is not starved.
 	MaxRequestOutputTokens int64 = 16_000
 )
 
@@ -31,9 +36,12 @@ func EffectiveContextWindow(model llm.Model) int64 {
 	return window
 }
 
-// EffectiveMaxOutput returns the output limit actually used for a request:
-// O = min(max_output > 0 ? max_output : 4096, 16000) (A §4.1/§R-A1-5). The raw
-// max_output remains untouched in the model row and in the API response.
+// EffectiveMaxOutput resolves the request-side DEFAULT output limit for a request
+// that leaves max_output unset: O = min(max_output > 0 ? max_output : 4096, 16000)
+// (A §4.1/§R-A1-5). prepareChat uses it ONLY in the <=0 default branch; a positive
+// request limit (the runner forwards the model's configured max_output) is passed
+// through verbatim and is never clamped here (H-E12). The raw max_output remains
+// untouched in the model row and in the API response.
 func EffectiveMaxOutput(model llm.Model) int64 {
 	output := int64(model.MaxOutput)
 	if output <= 0 {

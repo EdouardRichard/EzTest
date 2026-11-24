@@ -34,18 +34,21 @@ func TestSUTValidate(t *testing.T) {
 		wantErr bool
 		field   string
 	}{
-		{name: "valid", sut: SUT{Name: "Order Center", Intro: "orders"}},
-		{name: "intro at limit", sut: SUT{Name: "S", Intro: strings.Repeat("x", 2000)}},
-		{name: "family set", sut: SUT{Name: "S", Family: strPtr("payments")}},
-		{name: "family at limit", sut: SUT{Name: "S", Family: strPtr(strings.Repeat("a", 64))}},
-		{name: "blank name", sut: SUT{Name: "   "}, wantErr: true, field: "name"},
-		{name: "name too long", sut: SUT{Name: strings.Repeat("x", 101)}, wantErr: true, field: "name"},
-		{name: "intro too long", sut: SUT{Name: "S", Intro: strings.Repeat("x", 2001)}, wantErr: true, field: "intro"},
-		{name: "empty family", sut: SUT{Name: "S", Family: strPtr("")}, wantErr: true, field: "family"},
-		{name: "blank family", sut: SUT{Name: "S", Family: strPtr("   ")}, wantErr: true, field: "family"},
-		{name: "uppercase family", sut: SUT{Name: "S", Family: strPtr("Payments")}, wantErr: true, field: "family"},
-		{name: "family too long", sut: SUT{Name: "S", Family: strPtr(strings.Repeat("a", 65))}, wantErr: true, field: "family"},
-		{name: "family with whitespace", sut: SUT{Name: "S", Family: strPtr("order center")}, wantErr: true, field: "family"},
+		{name: "valid", sut: SUT{EnvironmentID: 7, Name: "Order Center", Intro: "orders", BaseURL: "https://order.example.com", Source: SUTSourceAdmin, Status: SUTStatusApproved}},
+		{name: "intro at limit", sut: SUT{EnvironmentID: 7, Name: "S", Intro: strings.Repeat("x", 2000), BaseURL: "https://s.example.com", Source: SUTSourceAdmin, Status: SUTStatusApproved}},
+		{name: "family set", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr("payments"), Source: SUTSourceAdmin, Status: SUTStatusApproved}},
+		{name: "family at limit", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr(strings.Repeat("a", 64)), Source: SUTSourceAdmin, Status: SUTStatusApproved}},
+		{name: "missing environment", sut: SUT{Name: "S", BaseURL: "https://s.example.com"}, wantErr: true, field: "environment_id"},
+		{name: "blank name", sut: SUT{EnvironmentID: 7, Name: "   ", BaseURL: "https://s.example.com"}, wantErr: true, field: "name"},
+		{name: "name too long", sut: SUT{EnvironmentID: 7, Name: strings.Repeat("x", 101), BaseURL: "https://s.example.com"}, wantErr: true, field: "name"},
+		{name: "intro too long", sut: SUT{EnvironmentID: 7, Name: "S", Intro: strings.Repeat("x", 2001), BaseURL: "https://s.example.com"}, wantErr: true, field: "intro"},
+		{name: "missing base url", sut: SUT{EnvironmentID: 7, Name: "S"}, wantErr: true, field: "base_url"},
+		{name: "base url without scheme", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "s.example.com"}, wantErr: true, field: "base_url"},
+		{name: "empty family", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr("")}, wantErr: true, field: "family"},
+		{name: "blank family", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr("   ")}, wantErr: true, field: "family"},
+		{name: "uppercase family", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr("Payments")}, wantErr: true, field: "family"},
+		{name: "family too long", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr(strings.Repeat("a", 65))}, wantErr: true, field: "family"},
+		{name: "family with whitespace", sut: SUT{EnvironmentID: 7, Name: "S", BaseURL: "https://s.example.com", Family: strPtr("order center")}, wantErr: true, field: "family"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,12 +109,13 @@ func TestEnvironmentValidate(t *testing.T) {
 		wantErr bool
 		field   string
 	}{
-		{name: "valid https", env: Environment{Name: "prod", BaseURL: "https://app.example.com", Status: StatusActive}},
-		{name: "valid http", env: Environment{Name: "dev", BaseURL: "http://localhost:8080", Status: StatusDisabled}},
-		{name: "empty name", env: Environment{Name: "", BaseURL: "https://app.example.com", Status: StatusActive}, wantErr: true, field: "name"},
-		{name: "base url without scheme", env: Environment{Name: "prod", BaseURL: "app.example.com", Status: StatusActive}, wantErr: true, field: "base_url"},
-		{name: "ftp base url", env: Environment{Name: "prod", BaseURL: "ftp://app.example.com", Status: StatusActive}, wantErr: true, field: "base_url"},
-		{name: "unknown status", env: Environment{Name: "prod", BaseURL: "https://app.example.com", Status: "archived"}, wantErr: true, field: "status"},
+		{name: "valid active", env: Environment{Name: "prod", Description: "production", Status: StatusActive}},
+		{name: "valid disabled", env: Environment{Name: "dev", Status: StatusDisabled}},
+		{name: "description at limit", env: Environment{Name: "prod", Description: strings.Repeat("x", MaxEnvironmentDescriptionRunes), Status: StatusActive}},
+		{name: "empty name", env: Environment{Name: "", Status: StatusActive}, wantErr: true, field: "name"},
+		{name: "name too long", env: Environment{Name: strings.Repeat("x", 101), Status: StatusActive}, wantErr: true, field: "name"},
+		{name: "description too long", env: Environment{Name: "prod", Description: strings.Repeat("x", MaxEnvironmentDescriptionRunes+1), Status: StatusActive}, wantErr: true, field: "description"},
+		{name: "unknown status", env: Environment{Name: "prod", Status: "archived"}, wantErr: true, field: "status"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

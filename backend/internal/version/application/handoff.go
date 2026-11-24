@@ -16,10 +16,15 @@ package versionapp
 // deliberately does not register the handler route or call the service from the
 // stage machine.
 //
-// The read side is an injected port: HandoffReader is implemented over the
+// The read side is two injected ports: HandoffReader is implemented over the
 // version context's own stores (requirements/requirements_facts/plan) plus the
-// clarification conversation/question rows. The application layer never
-// touches SQL and never returns raw chat, credentials or secrets: every
+// clarification conversation/question rows, and resourceapp.HandoffResourceReader
+// supplies the resource-owned half of the resources block (H-B1: the resource
+// catalog is reached through the resource context's port, never by reading its
+// tables). The application layer never touches SQL. The pack is a FUNCTIONAL
+// PROJECTION, not credential scrubbing (GD-01 T5b-D ruling, A/B/C framework:
+// C-class scope summary): it carries requirement/resource summaries only — no raw
+// chat transcripts, and neither port carries password/DSN columns. Every
 // free-text field is bounded and slices are capped before persistence.
 
 import (
@@ -34,9 +39,12 @@ import (
 	"time"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Handoff artifact errors.
@@ -61,8 +69,16 @@ const (
 	HandoffMaxSourceRefs   = 10
 
 	HandoffTitleMax          = 500
-	HandoffDescriptionMax    = 4000
-	HandoffAcceptanceMax     = 4000
+	HandoffUserStoryPartMax  = 500
+	HandoffRulesMax          = 20000
+	HandoffSutDescriptionMax = 2000
+	HandoffScopeOutMax       = 2000
+	HandoffACPartMax         = 2000
+	// HandoffMaxAC mirrors the domain cap so the handoff can never silently
+	// truncate a criterion set the judge still scores in full (single source).
+	HandoffMaxAC             = version.MaxAcceptanceCriteria
+	HandoffAccountRoleMax    = 64
+	HandoffMaxAccountRoles   = 20
 	HandoffSourceQuoteMax    = 1000
 	HandoffQuestionMax       = 2000
 	HandoffOptionLabelMax    = 200
@@ -78,6 +94,25 @@ const (
 	handoffUpdatedEventType  = "handoff.updated"
 	handoffVersionChannelTag = "version:"
 )
+
+// Handoff source-reference schemes: the typed prefixes of the source refs in the
+// open/decisions blocks and the clarification.search hits. They live here in the
+// producer (versionapp) so the versionpg reader references the same single source
+// (versionpg imports versionapp, not the reverse). The requirement prefix is the
+// same requirement-reference vocabulary as the version_fact key, so it aliases
+// the version domain constant instead of repeating the literal (R-H9; the handoff
+// vocabulary lint gate enforces this).
+const (
+	HandoffSourceQA          = "human_request:"
+	HandoffSourceFact        = "version_fact:"
+	HandoffSourceMessage     = "conversation_message:"
+	HandoffSourceRequirement = version.RequirementFactKeyPrefix
+)
+
+// HandoffRepositorySourceSUT is the Source value of a handoff repository row: every
+// repository is SUT-inherited from the environment code pool (the version
+// repository overrides were removed with the version_sut chain).
+const HandoffRepositorySourceSUT = "sut"
 
 // Handoff is the version-level clarification handoff document (B §8.1, DB-22).
 // VersionID/Revision/GeneratedAt identify the artifact revision; the six blocks
@@ -96,19 +131,48 @@ type Handoff struct {
 	Resources    HandoffResources     `json:"resources"`
 }
 
-// HandoffRequirement is one confirmed/draft requirement of the handoff.
+// HandoffUserStory is the three-part user story of the requirement V1 contract
+// (design v1.3.1 §5.1). It is a TYPE ALIAS of the domain UserStory, so the handoff
+// projection is structurally the requirement contract itself (constitution
+// 五.1/五.2: single source, derived representation) — the JSON keys and field set
+// cannot drift from requirement_version because they are the same type.
+type HandoffUserStory = version.UserStory
+
+// HandoffAcceptanceCriterion is one Gherkin-shaped acceptance criterion of the
+// requirement V1 contract (§5.1), projected from requirement_version.acceptance_criteria.
+// It is a TYPE ALIAS of the domain AcceptanceCriterion for the same single-source
+// reason as HandoffUserStory.
+//
+// ID is the server-assigned "AC-<n>" carried verbatim from the stored revision.
+// It is NOT a durable identifier: completing an extraction stub's given/when is
+// an edit under §3.6, so the old id retires and a new one is appended (T8 §13).
+// The handoff carries whatever id the current revision holds and never treats it
+// as stable across revisions.
+type HandoffAcceptanceCriterion = version.AcceptanceCriterion
+
+// HandoffRequirement is one draft/clarified requirement of the handoff, as a V1
+// structural projection of requirement_version (R-B1, design §5.1). It replaces
+// the old flat Description/AcceptanceCriteria strings with the user story, the
+// structured acceptance-criteria array and the natural-language sut_description.
+// Rules/ScopeOut/AccountRolesHint carry the optional §5.1 contract fields the
+// Design Host briefs on (business rules, the over-coverage boundary and the
+// account-role hint); see the task-17 report for the field-by-field rationale.
 type HandoffRequirement struct {
-	ID                 int64      `json:"id"`
-	CurrentVersionID   int64      `json:"current_version_id"`
-	Revision           int        `json:"revision"`
-	Title              string     `json:"title"`
-	Description        string     `json:"description"`
-	AcceptanceCriteria string     `json:"acceptance_criteria"`
-	Priority           string     `json:"priority"`
-	Status             string     `json:"status"`
-	SourceQuote        string     `json:"source_quote"`
-	Confidence         *float64   `json:"confidence"`
-	ConfirmedAt        *time.Time `json:"confirmed_at"`
+	ID                 int64                        `json:"id"`
+	CurrentVersionID   int64                        `json:"current_version_id"`
+	Revision           int                          `json:"revision"`
+	Title              string                       `json:"title"`
+	UserStory          HandoffUserStory             `json:"user_story"`
+	Rules              string                       `json:"rules"`
+	AcceptanceCriteria []HandoffAcceptanceCriterion `json:"acceptance_criteria"`
+	Priority           string                       `json:"priority"`
+	SutDescription     string                       `json:"sut_description"`
+	ScopeOut           string                       `json:"scope_out"`
+	AccountRolesHint   []string                     `json:"account_roles_hint"`
+	Status             string                       `json:"status"`
+	SourceQuote        string                       `json:"source_quote"`
+	Confidence         *float64                     `json:"confidence"`
+	ConfirmedAt        *time.Time                   `json:"confirmed_at"`
 }
 
 // HandoffQAOption is one option of a structured question.
@@ -179,32 +243,46 @@ type HandoffPlan struct {
 	Next    *HandoffPlanItem `json:"next"`
 }
 
-// HandoffSUT is one version_sut binding summary.
-type HandoffSUT struct {
-	VersionSUTID  int64  `json:"version_sut_id"`
-	SUTID         int64  `json:"sut_id"`
-	Name          string `json:"name"`
-	EnvironmentID int64  `json:"environment_id"`
-	Environment   string `json:"environment"`
-	BaseURL       string `json:"base_url"`
+// HandoffEnvironment is the environment summary at the head of the resources
+// block (design §3.2 C-A1: "resources 块去 SUT ID→环境摘要，落到字段"). A version
+// binds one environment directly (version.environment_id); the block describes
+// that environment and its SUTs, never a version_sut binding-row id.
+type HandoffEnvironment struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
-// HandoffPage is one approved page of a bound environment.
+// HandoffSUT is one SUT of the bound environment, carrying its EFFECTIVE asset
+// scope (approved pages/APIs, active databases). It has no version_sut_id: the
+// version_sut chain was removed (design §3.1/§3.2) and the SUT is reached through
+// the environment, not a binding row. The nested assets are the effective
+// projection (the same rule as resourceapp.SUTView.EffectiveAssets), never the
+// raw catalog, so a proposed page or a disabled database can never enter the
+// design pack (the trust-boundary invariant of interfaces-w2-ports.md).
+type HandoffSUT struct {
+	SUTID     int64             `json:"sut_id"`
+	Name      string            `json:"name"`
+	BaseURL   string            `json:"base_url"`
+	Pages     []HandoffPage     `json:"pages"`
+	APIs      []HandoffAPI      `json:"apis"`
+	Databases []HandoffDatabase `json:"databases"`
+}
+
+// HandoffPage is one approved page of a SUT. It carries no version_sut_id.
 type HandoffPage struct {
 	ID            int64  `json:"id"`
-	VersionSUTID  int64  `json:"version_sut_id"`
 	Name          string `json:"name"`
 	URL           string `json:"url"`
 	RouteTemplate string `json:"route_template"`
 }
 
-// HandoffAPI is one approved API of a bound environment.
+// HandoffAPI is one approved API of a SUT. It carries no version_sut_id.
 type HandoffAPI struct {
-	ID           int64  `json:"id"`
-	VersionSUTID int64  `json:"version_sut_id"`
-	Name         string `json:"name"`
-	Method       string `json:"method"`
-	Path         string `json:"path"`
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
 }
 
 // HandoffAccount is one enabled version account. It never carries a password.
@@ -215,16 +293,23 @@ type HandoffAccount struct {
 	Role     string   `json:"role"`
 }
 
-// HandoffDatabase is one target database of a bound environment. It never
-// carries a DSN or credentials.
+// HandoffDatabase is one active target database of a SUT. It never carries a DSN
+// or credentials. SUTID is rendered per row because a design db assertion
+// (assertions[].kind=db) takes sut_id, not the database id: a row carrying only the
+// database id invites the model to send the wrong one under presence-only
+// validation (the same hazard T9 fixed on the pack in agent context.go).
 type HandoffDatabase struct {
 	ID       int64  `json:"id"`
+	SUTID    int64  `json:"sut_id"`
 	Name     string `json:"name"`
 	Kind     string `json:"kind"`
 	ReadOnly bool   `json:"read_only"`
 }
 
-// HandoffRepository is one code repository inherited or added for the version.
+// HandoffRepository is one repository of the environment code pool (GD-03): the
+// union of the enabled SUT repositories of the bound environment. The version
+// repository overrides were removed with the version_sut chain, so Source is
+// always "sut".
 type HandoffRepository struct {
 	ID     int64  `json:"id"`
 	Name   string `json:"name"`
@@ -233,14 +318,24 @@ type HandoffRepository struct {
 	Source string `json:"source"`
 }
 
-// HandoffResources is the resource summary block (C resources, spec R-B5-1).
+// HandoffResources is the environment summary block (C resources, spec R-B5-1;
+// design §3.2 C-A1). It is headed by the bound environment and its SUTs (each
+// with its effective pages/APIs/databases), plus the version's enabled accounts
+// and the environment code pool. There is no version_sut_id anywhere and no
+// password/DSN: the block is a scope summary for the Design Host, derived from
+// the effective projection of the bound environment, never the raw catalog.
+//
+// The SUT assets share ONE aggregate budget of HandoffMaxResources entries across
+// every SUT and kind, consumed in catalog order, so the JSONB document fed to the
+// Design Host prompt stays bounded. Truncated records that the budget (or a block
+// cap) dropped rows, so the Host knows the set is partial rather than silently
+// receiving a partial truth (constitution 七.1).
 type HandoffResources struct {
+	Environment  HandoffEnvironment  `json:"environment"`
 	SUTs         []HandoffSUT        `json:"suts"`
-	Pages        []HandoffPage       `json:"pages"`
-	APIs         []HandoffAPI        `json:"apis"`
 	Accounts     []HandoffAccount    `json:"accounts"`
-	Databases    []HandoffDatabase   `json:"databases"`
 	Repositories []HandoffRepository `json:"repositories"`
+	Truncated    bool                `json:"truncated"`
 }
 
 // HandoffFact is one current version_fact row of the handoff read port. The
@@ -277,8 +372,9 @@ type HandoffStore interface {
 
 // HandoffReader is the read-only source of the six handoff blocks. The
 // production adapter reads the version context's own stores and the
-// clarification question rows; it must never return raw chat transcripts,
-// passwords, DSNs or other secrets.
+// clarification question rows; it returns functional summaries only — never
+// raw chat transcripts, and never password/DSN columns (C-class projection,
+// GD-01 T5b-D; not a redaction mechanism).
 type HandoffReader interface {
 	VersionExists(ctx context.Context, versionID int64) (bool, error)
 	// Requirements returns the current draft/clarified requirement revisions
@@ -293,24 +389,34 @@ type HandoffReader interface {
 	Facts(ctx context.Context, versionID int64) ([]HandoffFact, error)
 	// Plan returns the current stage and the current/next plan items.
 	Plan(ctx context.Context, versionID int64) (HandoffPlan, error)
-	// Resources returns the bound SUT/page/API/account/database/repository
-	// summaries of the version.
-	Resources(ctx context.Context, versionID int64) (HandoffResources, error)
+	// ResourceScope returns the VERSION-OWNED input to the resources block: the
+	// bound environment id and the enabled account association ids. The resource
+	// catalog itself is read through resourceapp.HandoffResourceReader (H-B1), so
+	// this port never reads another context's tables.
+	ResourceScope(ctx context.Context, versionID int64) (HandoffResourceScope, error)
 }
 
 // HandoffService builds and reads the version-level clarification handoff.
 type HandoffService struct {
-	store  HandoffStore
-	reader HandoffReader
-	ids    platformid.Generator
-	events eventingapp.Publisher
+	store     HandoffStore
+	reader    HandoffReader
+	resources resourceapp.HandoffResourceReader
+	ids       platformid.Generator
+	events    eventingapp.Publisher
 }
 
-// NewHandoffService wires the handoff store and read port. ids assigns
-// clarification_handoff primary keys; events may be nil in degraded assemblies
-// (event delivery is best effort and never rolls back the stored revision).
-func NewHandoffService(store HandoffStore, reader HandoffReader, ids platformid.Generator, events eventingapp.Publisher) *HandoffService {
-	return &HandoffService{store: store, reader: reader, ids: ids, events: events}
+// NewHandoffService wires the handoff store, the version-owned read port and the
+// resource read port. ids assigns clarification_handoff primary keys; events may
+// be nil in degraded assemblies (event delivery is best effort and never rolls
+// back the stored revision).
+func NewHandoffService(
+	store HandoffStore,
+	reader HandoffReader,
+	resources resourceapp.HandoffResourceReader,
+	ids platformid.Generator,
+	events eventingapp.Publisher,
+) *HandoffService {
+	return &HandoffService{store: store, reader: reader, resources: resources, ids: ids, events: events}
 }
 
 // Generate builds the handoff document from the current clarification state,
@@ -327,6 +433,9 @@ func (s *HandoffService) Generate(ctx context.Context, versionID int64) (Handoff
 	}
 	if s.store == nil {
 		return Handoff{}, platform.Unavailable("clarification handoff store is not configured")
+	}
+	if s.resources == nil {
+		return Handoff{}, platform.Unavailable("clarification handoff resource reader is not configured")
 	}
 	document, err := s.build(ctx, versionID)
 	if err != nil {
@@ -425,7 +534,7 @@ func (s *HandoffService) build(ctx context.Context, versionID int64) (Handoff, e
 	if err != nil {
 		return Handoff{}, err
 	}
-	resources, err := s.reader.Resources(ctx, versionID)
+	resources, err := s.handoffResources(ctx, versionID)
 	if err != nil {
 		return Handoff{}, err
 	}
@@ -480,13 +589,17 @@ func normalizeHandoffRequirements(items []HandoffRequirement) []HandoffRequireme
 		item.Status = strings.ToLower(strings.TrimSpace(truncateHandoffText(item.Status, HandoffStatusMax)))
 		// B §8.1: the handoff carries confirmed and draft requirements only.
 		// Closed rows are historical and must not enter the design pack.
-		if !handoffRequirementStatusIncluded(item.Status) {
+		if !HandoffRequirementStatusIncluded(item.Status) {
 			continue
 		}
 		item.Title = truncateHandoffText(item.Title, HandoffTitleMax)
-		item.Description = truncateHandoffText(item.Description, HandoffDescriptionMax)
-		item.AcceptanceCriteria = truncateHandoffText(item.AcceptanceCriteria, HandoffAcceptanceMax)
+		item.UserStory = normalizeHandoffUserStory(item.UserStory)
+		item.Rules = truncateHandoffText(item.Rules, HandoffRulesMax)
+		item.AcceptanceCriteria = normalizeHandoffAcceptanceCriteria(item.AcceptanceCriteria)
 		item.Priority = truncateHandoffText(item.Priority, HandoffStatusMax)
+		item.SutDescription = truncateHandoffText(item.SutDescription, HandoffSutDescriptionMax)
+		item.ScopeOut = truncateHandoffText(item.ScopeOut, HandoffScopeOutMax)
+		item.AccountRolesHint = normalizeHandoffRefs(item.AccountRolesHint, HandoffMaxAccountRoles, HandoffAccountRoleMax)
 		item.SourceQuote = truncateHandoffText(item.SourceQuote, HandoffSourceQuoteMax)
 		item.Confidence = normalizeHandoffConfidence(item.Confidence)
 		normalized = append(normalized, item)
@@ -503,11 +616,51 @@ func normalizeHandoffRequirements(items []HandoffRequirement) []HandoffRequireme
 	return normalized
 }
 
-// handoffRequirementStatusIncluded reports whether a requirement status belongs
-// in the requirements block (confirmed/draft only, B §8.1).
-func handoffRequirementStatusIncluded(status string) bool {
+// normalizeHandoffUserStory bounds each part of the projected user story. The
+// values are carried verbatim from requirement_version (a derived projection);
+// the bound only defends the persisted document against a malformed read model.
+func normalizeHandoffUserStory(story HandoffUserStory) HandoffUserStory {
+	return HandoffUserStory{
+		AsA:    truncateHandoffText(story.AsA, HandoffUserStoryPartMax),
+		IWant:  truncateHandoffText(story.IWant, HandoffUserStoryPartMax),
+		SoThat: truncateHandoffText(story.SoThat, HandoffUserStoryPartMax),
+	}
+}
+
+// normalizeHandoffAcceptanceCriteria bounds each projected criterion and caps the
+// array. The server-assigned ids are carried verbatim in the stored order; the
+// handoff is a projection, not a numbering authority, and never re-assigns or
+// re-sorts ids (the stored revision is already id-sorted by the domain).
+func normalizeHandoffAcceptanceCriteria(criteria []HandoffAcceptanceCriterion) []HandoffAcceptanceCriterion {
+	normalized := make([]HandoffAcceptanceCriterion, 0, len(criteria))
+	for _, criterion := range criteria {
+		item := HandoffAcceptanceCriterion{
+			ID:    truncateHandoffText(criterion.ID, HandoffStatusMax),
+			Given: truncateHandoffText(criterion.Given, HandoffACPartMax),
+			When:  truncateHandoffText(criterion.When, HandoffACPartMax),
+			Then:  truncateHandoffText(criterion.Then, HandoffACPartMax),
+		}
+		if item.ID == "" && item.Given == "" && item.When == "" && item.Then == "" {
+			continue
+		}
+		normalized = append(normalized, item)
+		if len(normalized) == HandoffMaxAC {
+			break
+		}
+	}
+	if normalized == nil {
+		return []HandoffAcceptanceCriterion{}
+	}
+	return normalized
+}
+
+// HandoffRequirementStatusIncluded reports whether a requirement status belongs
+// in the requirements block (draft/clarified only, B §8.1). The statuses are the
+// version domain's own constants, the same source the reader's SQL filter uses.
+// Exported so tests assert the real inclusion rule rather than re-implementing it.
+func HandoffRequirementStatusIncluded(status string) bool {
 	switch status {
-	case "draft", "clarified":
+	case string(version.RequirementDraft), string(version.RequirementClarified):
 		return true
 	default:
 		return false
@@ -597,7 +750,7 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 	open := make([]HandoffOpenItem, 0, len(facts))
 	for _, fact := range facts {
 		switch fact.Kind {
-		case "decision", "constraint":
+		case version.FactKindDecision, version.FactKindConstraint:
 			decisions = append(decisions, HandoffDecision{
 				FactID:     fact.ID,
 				Kind:       fact.Kind,
@@ -608,13 +761,13 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 				SourceRef:  fact.SourceRef,
 				CreatedAt:  fact.CreatedAt,
 			})
-		case "gap", "assumption", "risk":
+		case version.FactKindGap, version.FactKindAssumption, version.FactKindRisk:
 			createdAt := fact.CreatedAt
 			open = append(open, HandoffOpenItem{
 				Kind:        fact.Kind,
 				Summary:     fact.Summary,
 				Status:      "open",
-				Source:      "version_fact:" + formatHandoffID(fact.ID),
+				Source:      HandoffSourceFact + formatHandoffID(fact.ID),
 				ReferenceID: fact.ID,
 				CreatedAt:   &createdAt,
 			})
@@ -633,7 +786,10 @@ func splitHandoffFacts(facts []HandoffFact) ([]HandoffDecision, []HandoffOpenIte
 func openHandoffQAItems(items []HandoffQAItem) []HandoffOpenItem {
 	open := make([]HandoffOpenItem, 0)
 	for _, item := range items {
-		if item.Status != "pending" && item.Status != "expired" {
+		// The question lifecycle statuses are the execution domain's own constants
+		// (the human_request state machine), not a handoff-local vocabulary: a
+		// rename there must move this predicate with it.
+		if item.Status != string(execution.HumanPending) && item.Status != string(execution.HumanExpired) {
 			continue
 		}
 		summary := item.Question
@@ -644,7 +800,7 @@ func openHandoffQAItems(items []HandoffQAItem) []HandoffOpenItem {
 		// key is part of the identity so every question of the batch becomes
 		// its own open item instead of collapsing on the request id.
 		questionKey := strings.TrimSpace(item.QuestionKey)
-		source := "human_request:" + formatHandoffID(item.RequestID)
+		source := HandoffSourceQA + formatHandoffID(item.RequestID)
 		if questionKey != "" {
 			source += ":" + questionKey
 		}
@@ -668,15 +824,15 @@ func openHandoffQAItems(items []HandoffQAItem) []HandoffOpenItem {
 func openHandoffDraftRequirements(items []HandoffRequirement) []HandoffOpenItem {
 	open := make([]HandoffOpenItem, 0)
 	for _, item := range items {
-		if item.Status != "draft" {
+		if item.Status != string(version.RequirementDraft) {
 			continue
 		}
 		summary := "待确认需求：" + item.Title
 		open = append(open, HandoffOpenItem{
 			Kind:        "requirement",
 			Summary:     truncateHandoffText(summary, HandoffFactSummaryMax),
-			Status:      "draft",
-			Source:      "requirement:" + formatHandoffID(item.ID),
+			Status:      string(version.RequirementDraft),
+			Source:      HandoffSourceRequirement + formatHandoffID(item.ID),
 			ReferenceID: item.ID,
 		})
 		if len(open) == HandoffMaxOpen {
@@ -735,39 +891,21 @@ func normalizeHandoffPlanItem(item *HandoffPlanItem) *HandoffPlanItem {
 
 func normalizeHandoffResources(resources HandoffResources) HandoffResources {
 	normalized := HandoffResources{
+		Environment:  normalizeHandoffEnvironment(resources.Environment),
 		SUTs:         make([]HandoffSUT, 0, len(resources.SUTs)),
-		Pages:        make([]HandoffPage, 0, len(resources.Pages)),
-		APIs:         make([]HandoffAPI, 0, len(resources.APIs)),
 		Accounts:     make([]HandoffAccount, 0, len(resources.Accounts)),
-		Databases:    make([]HandoffDatabase, 0, len(resources.Databases)),
 		Repositories: make([]HandoffRepository, 0, len(resources.Repositories)),
 	}
-	for _, item := range resources.SUTs {
-		if item.VersionSUTID <= 0 {
+	for _, sut := range resources.SUTs {
+		if sut.SUTID <= 0 {
 			continue
 		}
-		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
-		item.Environment = truncateHandoffText(item.Environment, HandoffEnvironmentMax)
-		item.BaseURL = truncateHandoffText(item.BaseURL, HandoffResourceURLMax)
-		normalized.SUTs = append(normalized.SUTs, item)
-	}
-	for _, item := range resources.Pages {
-		if item.ID <= 0 {
-			continue
-		}
-		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
-		item.URL = truncateHandoffText(item.URL, HandoffResourceURLMax)
-		item.RouteTemplate = truncateHandoffText(item.RouteTemplate, HandoffResourceURLMax)
-		normalized.Pages = append(normalized.Pages, item)
-	}
-	for _, item := range resources.APIs {
-		if item.ID <= 0 {
-			continue
-		}
-		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
-		item.Method = truncateHandoffText(item.Method, 16)
-		item.Path = truncateHandoffText(item.Path, HandoffResourceURLMax)
-		normalized.APIs = append(normalized.APIs, item)
+		sut.Name = truncateHandoffText(sut.Name, HandoffResourceNameMax)
+		sut.BaseURL = truncateHandoffText(sut.BaseURL, HandoffResourceURLMax)
+		sut.Pages = normalizeHandoffPages(sut.Pages)
+		sut.APIs = normalizeHandoffAPIs(sut.APIs)
+		sut.Databases = normalizeHandoffDatabases(sut.Databases)
+		normalized.SUTs = append(normalized.SUTs, sut)
 	}
 	for _, item := range resources.Accounts {
 		if item.ID <= 0 {
@@ -777,14 +915,6 @@ func normalizeHandoffResources(resources HandoffResources) HandoffResources {
 		item.Role = truncateHandoffText(item.Role, HandoffSourceMax)
 		item.Roles = normalizeHandoffRefs(item.Roles, 20, 100)
 		normalized.Accounts = append(normalized.Accounts, item)
-	}
-	for _, item := range resources.Databases {
-		if item.ID <= 0 {
-			continue
-		}
-		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
-		item.Kind = truncateHandoffText(item.Kind, HandoffStatusMax)
-		normalized.Databases = append(normalized.Databases, item)
 	}
 	for _, item := range resources.Repositories {
 		if item.ID <= 0 {
@@ -796,61 +926,109 @@ func normalizeHandoffResources(resources HandoffResources) HandoffResources {
 		item.Source = truncateHandoffText(item.Source, HandoffStatusMax)
 		normalized.Repositories = append(normalized.Repositories, item)
 	}
-	sort.SliceStable(normalized.SUTs, func(i, j int) bool { return normalized.SUTs[i].VersionSUTID < normalized.SUTs[j].VersionSUTID })
-	sort.SliceStable(normalized.Pages, func(i, j int) bool { return normalized.Pages[i].ID < normalized.Pages[j].ID })
-	sort.SliceStable(normalized.APIs, func(i, j int) bool { return normalized.APIs[i].ID < normalized.APIs[j].ID })
+	sort.SliceStable(normalized.SUTs, func(i, j int) bool { return normalized.SUTs[i].SUTID < normalized.SUTs[j].SUTID })
 	sort.SliceStable(normalized.Accounts, func(i, j int) bool { return normalized.Accounts[i].ID < normalized.Accounts[j].ID })
-	sort.SliceStable(normalized.Databases, func(i, j int) bool { return normalized.Databases[i].ID < normalized.Databases[j].ID })
 	sort.SliceStable(normalized.Repositories, func(i, j int) bool { return normalized.Repositories[i].ID < normalized.Repositories[j].ID })
-	normalized.SUTs = capHandoffSUTs(normalized.SUTs)
-	normalized.Pages = capHandoffPages(normalized.Pages)
-	normalized.APIs = capHandoffAPIs(normalized.APIs)
-	normalized.Accounts = capHandoffAccounts(normalized.Accounts)
-	normalized.Databases = capHandoffDatabases(normalized.Databases)
-	normalized.Repositories = capHandoffRepositories(normalized.Repositories)
+
+	truncated := false
+	if len(normalized.SUTs) > HandoffMaxResources {
+		normalized.SUTs = normalized.SUTs[:HandoffMaxResources]
+		truncated = true
+	}
+	// ONE aggregate asset budget shared across every SUT and kind, consumed in
+	// catalog order (SUT id, then pages -> APIs -> databases, each already sorted
+	// by id). This bounds the whole resources block — not each SUT independently —
+	// so the JSONB document fed to the Design Host prompt cannot grow with the
+	// catalog. Once the budget is spent the remaining assets are dropped and
+	// Truncated records the partial set (constitution 七.1: no silent partial truth).
+	budget := HandoffMaxResources
+	for index := range normalized.SUTs {
+		sut := &normalized.SUTs[index]
+		keep, remaining := takeHandoffBudget(len(sut.Pages), budget)
+		if keep < len(sut.Pages) {
+			truncated = true
+		}
+		sut.Pages, budget = sut.Pages[:keep], remaining
+		keep, remaining = takeHandoffBudget(len(sut.APIs), budget)
+		if keep < len(sut.APIs) {
+			truncated = true
+		}
+		sut.APIs, budget = sut.APIs[:keep], remaining
+		keep, remaining = takeHandoffBudget(len(sut.Databases), budget)
+		if keep < len(sut.Databases) {
+			truncated = true
+		}
+		sut.Databases, budget = sut.Databases[:keep], remaining
+	}
+	if len(normalized.Accounts) > HandoffMaxResources {
+		normalized.Accounts = normalized.Accounts[:HandoffMaxResources]
+		truncated = true
+	}
+	if len(normalized.Repositories) > HandoffMaxResources {
+		normalized.Repositories = normalized.Repositories[:HandoffMaxResources]
+		truncated = true
+	}
+	normalized.Truncated = truncated
 	return normalized
 }
 
-func capHandoffSUTs(items []HandoffSUT) []HandoffSUT {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
+// takeHandoffBudget reports how many of n items fit in the remaining shared
+// budget and the budget left after taking them.
+func takeHandoffBudget(n, budget int) (keep, remaining int) {
+	if n <= budget {
+		return n, budget - n
 	}
-	return items
+	return budget, 0
 }
 
-func capHandoffPages(items []HandoffPage) []HandoffPage {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
-	}
-	return items
+func normalizeHandoffEnvironment(env HandoffEnvironment) HandoffEnvironment {
+	env.Name = truncateHandoffText(env.Name, HandoffEnvironmentMax)
+	env.Status = truncateHandoffText(env.Status, HandoffStatusMax)
+	return env
 }
 
-func capHandoffAPIs(items []HandoffAPI) []HandoffAPI {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
+func normalizeHandoffPages(items []HandoffPage) []HandoffPage {
+	normalized := make([]HandoffPage, 0, len(items))
+	for _, item := range items {
+		if item.ID <= 0 {
+			continue
+		}
+		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
+		item.URL = truncateHandoffText(item.URL, HandoffResourceURLMax)
+		item.RouteTemplate = truncateHandoffText(item.RouteTemplate, HandoffResourceURLMax)
+		normalized = append(normalized, item)
 	}
-	return items
+	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].ID < normalized[j].ID })
+	return normalized
 }
 
-func capHandoffAccounts(items []HandoffAccount) []HandoffAccount {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
+func normalizeHandoffAPIs(items []HandoffAPI) []HandoffAPI {
+	normalized := make([]HandoffAPI, 0, len(items))
+	for _, item := range items {
+		if item.ID <= 0 {
+			continue
+		}
+		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
+		item.Method = truncateHandoffText(item.Method, 16)
+		item.Path = truncateHandoffText(item.Path, HandoffResourceURLMax)
+		normalized = append(normalized, item)
 	}
-	return items
+	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].ID < normalized[j].ID })
+	return normalized
 }
 
-func capHandoffDatabases(items []HandoffDatabase) []HandoffDatabase {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
+func normalizeHandoffDatabases(items []HandoffDatabase) []HandoffDatabase {
+	normalized := make([]HandoffDatabase, 0, len(items))
+	for _, item := range items {
+		if item.ID <= 0 {
+			continue
+		}
+		item.Name = truncateHandoffText(item.Name, HandoffResourceNameMax)
+		item.Kind = truncateHandoffText(item.Kind, HandoffStatusMax)
+		normalized = append(normalized, item)
 	}
-	return items
-}
-
-func capHandoffRepositories(items []HandoffRepository) []HandoffRepository {
-	if len(items) > HandoffMaxResources {
-		return items[:HandoffMaxResources]
-	}
-	return items
+	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].ID < normalized[j].ID })
+	return normalized
 }
 
 // ---------- helpers ----------

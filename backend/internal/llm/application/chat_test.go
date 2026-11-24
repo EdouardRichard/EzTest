@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,10 +19,13 @@ type chatCall struct {
 }
 
 type fakeChatGateway struct {
-	mu       sync.Mutex
-	calls    []chatCall
-	response ChatResponse
-	err      error
+	mu           sync.Mutex
+	calls        []chatCall
+	response     ChatResponse
+	err          error
+	streamCalls  []chatCall
+	streamDeltas []Delta
+	streamErr    error
 }
 
 func (f *fakeChatGateway) Chat(_ context.Context, cfg llm.Config, req ChatRequest) (ChatResponse, error) {
@@ -48,6 +52,34 @@ func (f *fakeChatGateway) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+func (f *fakeChatGateway) Stream(_ context.Context, cfg llm.Config, req ChatRequest, onDelta func(Delta)) error {
+	f.mu.Lock()
+	f.streamCalls = append(f.streamCalls, chatCall{cfg: cfg, req: req})
+	deltas := f.streamDeltas
+	streamErr := f.streamErr
+	f.mu.Unlock()
+	for _, delta := range deltas {
+		onDelta(delta)
+	}
+	return streamErr
+}
+
+func (f *fakeChatGateway) lastStreamCall(t *testing.T) chatCall {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.streamCalls) == 0 {
+		t.Fatal("chat gateway stream was not called")
+	}
+	return f.streamCalls[len(f.streamCalls)-1]
+}
+
+func (f *fakeChatGateway) streamCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.streamCalls)
 }
 
 type fakeChatSettings struct {
@@ -326,7 +358,7 @@ func TestChatMapsContextOverflowError(t *testing.T) {
 	}
 }
 
-func TestChatGatewayFailureIsRedactedAIUnavailable(t *testing.T) {
+func TestChatGatewayFailureIsAIUnavailableWithPlaintextMessage(t *testing.T) {
 	gateway := &fakeChatGateway{err: errors.New("provider rejected " + chatTestKey)}
 	svc, repo := newChatTestService(t, gateway, nil)
 	seedSingleConfig(t, repo)
@@ -336,7 +368,10 @@ func TestChatGatewayFailureIsRedactedAIUnavailable(t *testing.T) {
 	if apiErr.Code != "ai_unavailable" || !apiErr.Retryable {
 		t.Fatalf("error = %#v", apiErr)
 	}
-	assertNoSecret(t, apiErr, chatTestKey)
+	// GD-01 (Q05=B): the gateway failure message keeps the key verbatim.
+	if !strings.Contains(apiErr.Message, chatTestKey) {
+		t.Fatalf("api key must appear verbatim in message (GD-01 plaintext): %q", apiErr.Message)
+	}
 	if IsContextOverflow(err) {
 		t.Fatal("generic failure classified as context overflow")
 	}
@@ -356,5 +391,125 @@ func TestChatDefaultMaxOutputWhenCatalogOmitsIt(t *testing.T) {
 	call := gateway.lastCall(t)
 	if call.req.MaxOutputTokens != DefaultChatMaxOutputTokens {
 		t.Fatalf("max output tokens = %d, want %d", call.req.MaxOutputTokens, DefaultChatMaxOutputTokens)
+	}
+}
+
+// TestStreamSelectsDefaultConfigAndDefaultModel pins the streaming port on the
+// same resolution contract as Chat: the default config's explicit default model
+// is selected, the request-side output limit is filled from the catalog, and
+// every delta reaches the caller in order.
+func TestStreamSelectsDefaultConfigAndDefaultModel(t *testing.T) {
+	gateway := &fakeChatGateway{streamDeltas: []Delta{
+		{Content: "你好"},
+		{FinishReason: "stop", Usage: map[string]int{"total_tokens": 3}},
+	}}
+	svc, repo := newChatTestService(t, gateway, nil)
+	seedSingleConfig(t, repo)
+	repo.configs[9] = chatTestConfig(9, false)
+
+	var got []Delta
+	err := svc.Stream(context.Background(), ChatRequest{
+		Messages: []ChatMessage{{Role: "user", Content: "帮我做一个登录"}},
+	}, func(delta Delta) { got = append(got, delta) })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	call := gateway.lastStreamCall(t)
+	if call.cfg.ID != 7 {
+		t.Fatalf("config = %d, want the default config 7", call.cfg.ID)
+	}
+	if call.req.Model != "fake-llm" {
+		t.Fatalf("model = %q, want the default model fake-llm", call.req.Model)
+	}
+	if call.req.MaxOutputTokens != 8192 {
+		t.Fatalf("max output tokens = %d, want the catalog value 8192", call.req.MaxOutputTokens)
+	}
+	if len(got) != 2 || got[0].Content != "你好" || got[1].FinishReason != "stop" || got[1].Usage["total_tokens"] != 3 {
+		t.Fatalf("deltas = %#v, want the scripted sequence in order", got)
+	}
+	if gateway.callCount() != 0 {
+		t.Fatalf("Chat called %d times during a Stream request", gateway.callCount())
+	}
+}
+
+func TestStreamAppliesSettingsTimeoutAndRetries(t *testing.T) {
+	gateway := &fakeChatGateway{}
+	settings := &fakeChatSettings{values: map[string]int64{
+		"llm.request_timeout_seconds": 25,
+		"llm.max_retries":             4,
+	}}
+	svc, repo := newChatTestService(t, gateway, settings)
+	seedSingleConfig(t, repo)
+
+	if err := svc.Stream(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(Delta) {}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	call := gateway.lastStreamCall(t)
+	if call.cfg.TimeoutSeconds != 25 || call.cfg.MaxRetries != 4 {
+		t.Fatalf("timeout/retries = %d/%d, want settings values", call.cfg.TimeoutSeconds, call.cfg.MaxRetries)
+	}
+}
+
+// TestStreamRejectsReasoningWithoutCapability pins R42 on the streaming path:
+// the same capability gate that backs Chat and ResolveModel must reject a
+// reasoning config on a non-reasoning model before any transport call.
+func TestStreamRejectsReasoningWithoutCapability(t *testing.T) {
+	gateway := &fakeChatGateway{}
+	svc, repo := newChatTestService(t, gateway, nil)
+	seedSingleConfig(t, repo)
+	cfg := repo.configs[7]
+	cfg.ThinkingType = llm.ThinkingTypeAuto
+	cfg.ReasoningEffort = llm.ReasoningEffortHigh
+	repo.configs[7] = cfg
+	model := repo.models[11]
+	model.Capabilities = llm.Capabilities{ContextWindow: 64000, SupportsReasoning: false}
+	repo.models[11] = model
+
+	err := svc.Stream(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(Delta) {})
+	apiErr := apiError(t, err)
+	if apiErr.Code != CodeLLMCapabilityMismatch {
+		t.Fatalf("error = %#v, want %q", apiErr, CodeLLMCapabilityMismatch)
+	}
+	if gateway.streamCallCount() != 0 || gateway.callCount() != 0 {
+		t.Fatalf("transport called despite the capability gate: stream=%d chat=%d",
+			gateway.streamCallCount(), gateway.callCount())
+	}
+}
+
+func TestStreamMapsContextOverflowError(t *testing.T) {
+	gateway := &fakeChatGateway{streamErr: fmt.Errorf("upstream 400: %w", ErrContextOverflow)}
+	svc, repo := newChatTestService(t, gateway, nil)
+	seedSingleConfig(t, repo)
+
+	err := svc.Stream(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(Delta) {})
+	apiErr := apiError(t, err)
+	if apiErr.Code != "context_overflow" || apiErr.Status != 503 {
+		t.Fatalf("error = %#v", apiErr)
+	}
+	if !IsContextOverflow(err) {
+		t.Fatal("IsContextOverflow = false")
+	}
+}
+
+// TestStreamFailureNeverFallsBackToChat pins constitution VII.6 on the port: a
+// streaming failure surfaces as an error; the gateway must not silently retry
+// the request through the non-streaming Chat path even when Chat would succeed.
+func TestStreamFailureNeverFallsBackToChat(t *testing.T) {
+	gateway := &fakeChatGateway{
+		response:  ChatResponse{Content: "non-stream fallback would succeed"},
+		streamErr: errors.New("stream broke"),
+	}
+	svc, repo := newChatTestService(t, gateway, nil)
+	seedSingleConfig(t, repo)
+
+	err := svc.Stream(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}, func(Delta) {})
+	if err == nil {
+		t.Fatal("Stream succeeded despite the scripted stream failure")
+	}
+	if gateway.callCount() != 0 {
+		t.Fatalf("Chat called %d times as a silent fallback", gateway.callCount())
+	}
+	if gateway.streamCallCount() != 1 {
+		t.Fatalf("stream calls = %d, want exactly 1", gateway.streamCallCount())
 	}
 }

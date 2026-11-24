@@ -1,7 +1,17 @@
+// v0.2.4-B: the wizard binds an environment directly; accounts are a global pool.
+// Scope-exclusion / version-level repository-override assertions were deleted with
+// the version_sut chain (see task-20-report.md). The account-pool fixtures below
+// exercise real filtering/dedup against the re-signed activeAccounts(accounts[]).
 import { describe, expect, it } from "vitest"
 
 import { catalogFixture } from "./test-fixtures"
-import type { AccountResource, DatabaseResource, PageResource } from "./types"
+import type {
+  AccountResource,
+  DatabaseResource,
+  EnvironmentResource,
+  PageResource,
+  SutResource,
+} from "./types"
 import {
   activeAccounts,
   approvedAPIs,
@@ -13,17 +23,23 @@ import {
   resourceCounts,
   scopeDatabases,
   stepForBindingField,
-  toggleExclude,
   toggleSelection,
 } from "./wizard"
 
 const TIMESTAMP = "2026-10-31T10:00:00Z"
 
+// v0.2.4-B: assets are per-SUT; the catalog exposes top-level environments.
+const environment = catalogFixture.environments[0] as EnvironmentResource
+const firstSut = environment.suts[0] as SutResource
+// Item 4 (T19b review): the shared environment owns two SUTs; the status-filtering
+// behaviour under test is per-SUT, so pin a single-SUT fixture and keep the
+// assertions byte-identical.
+const singleSutEnvironment: EnvironmentResource = { ...environment, suts: [firstSut] }
+
 function proposedPage(): PageResource {
   return {
     id: "1309",
     sut_id: "1001",
-    environment_id: "1101",
     name: "探索发现页",
     url: "https://order.test/discovered",
     route_template: "/discovered",
@@ -38,82 +54,74 @@ function proposedPage(): PageResource {
 }
 
 describe("environment options and derived SUT", () => {
-  it("flattens every environment of every SUT and derives the SUT from the environment", () => {
+  it("yields one option per top-level environment with a representative SUT", () => {
     const options = environmentOptions(catalogFixture)
-    expect(options.map((option) => option.environment.id)).toEqual(["1101", "1102", "2101"])
+    expect(options.map((option) => option.environment.id)).toEqual(["1101"])
 
-    const option = findEnvironmentOption(catalogFixture, "2101")
-    expect(option?.sut.id).toBe("1002")
-    expect(option?.sut.name).toBe("支付网关")
+    const option = findEnvironmentOption(catalogFixture, "1101")
+    expect(option?.sut.id).toBe("1001")
+    expect(option?.sut.name).toBe("订单中心")
+    expect(option?.environment.suts.map((sut) => sut.id)).toEqual(["1001", "1002"])
     expect(findEnvironmentOption(catalogFixture, "missing")).toBeUndefined()
   })
 })
 
 describe("effective resources and counts", () => {
   it("keeps only approved pages/APIs and active databases", () => {
-    const environment = catalogFixture.suts[0]?.environments[0]
-    expect(environment).toBeDefined()
-    if (environment === undefined) return
+    expect(approvedPages(singleSutEnvironment).map((page) => page.id)).toEqual(["1301", "1302"])
+    expect(approvedAPIs(singleSutEnvironment).map((item) => item.id)).toEqual(["1401"])
+    expect(scopeDatabases(singleSutEnvironment).map((item) => item.id)).toEqual(["1501"])
 
-    expect(approvedPages(environment).map((page) => page.id)).toEqual(["1301", "1302"])
-    expect(approvedAPIs(environment).map((item) => item.id)).toEqual(["1401"])
-    expect(scopeDatabases(environment).map((item) => item.id)).toEqual(["1501"])
-
-    const withProposed = { ...environment, pages: [...environment.pages, proposedPage()] }
+    const withProposed: EnvironmentResource = {
+      ...singleSutEnvironment,
+      suts: [{ ...firstSut, pages: [...firstSut.pages, proposedPage()] }],
+    }
     expect(approvedPages(withProposed).map((page) => page.id)).toEqual(["1301", "1302"])
-    expect(resourceCounts(withProposed.pages, []).proposed).toBe(1)
+    expect(resourceCounts(withProposed.suts.flatMap((sut) => sut.pages)).proposed).toBe(1)
   })
 
-  it("counts approved/proposed/excluded/included like the binding API", () => {
-    const resources = [proposedPage(), ...(catalogFixture.suts[0]?.environments[0]?.pages ?? [])]
-    expect(resourceCounts(resources, ["1302"])).toEqual({
-      approved: 2,
-      proposed: 1,
-      excluded: 1,
-      included: 1,
-    })
+  it("aggregates approved assets across every SUT of the environment", () => {
+    // The full two-SUT environment flattens both SUTs' approved assets.
+    expect(approvedPages(environment).map((page) => page.id)).toEqual(["1301", "1302", "2301"])
+    expect(approvedAPIs(environment).map((item) => item.id)).toEqual(["1401", "2401"])
   })
 
-  it("filters the global account pool to active accounts compatible with the environment", () => {
-    const environment = catalogFixture.suts[0]?.environments[0]
-    expect(environment).toBeDefined()
-    if (environment === undefined) return
+  it("counts approved/proposed like the binding API (no exclusion buckets)", () => {
+    const resources = [proposedPage(), ...firstSut.pages]
+    expect(resourceCounts(resources)).toEqual({ approved: 2, proposed: 1 })
+  })
 
+  it("filters the global account pool to active accounts", () => {
+    const baseAccount = catalogFixture.accounts[0] as AccountResource
     const disabled: AccountResource = {
-      ...(environment.accounts[0] as AccountResource),
+      ...baseAccount,
       id: "1609",
       username: "disabled",
       status: "disabled",
     }
-    const foreign: AccountResource = {
-      ...(environment.accounts[0] as AccountResource),
-      id: "1610",
-      username: "foreign",
-      environment_id: "1102",
-    }
-    const custom = { ...environment, accounts: [...environment.accounts, disabled, foreign] }
-    expect(activeAccounts(custom).map((item) => item.id)).toEqual(["1601", "1602"])
+    // A real pool: two active accounts plus one disabled one that must be dropped.
+    const pool = [...catalogFixture.accounts, disabled]
+    expect(activeAccounts(pool).map((item) => item.id)).toEqual(["1601", "1602"])
   })
 
-  it("deduplicates global accounts shared by the catalog environments", () => {
-    const environment = catalogFixture.suts[0]?.environments[0]
-    expect(environment).toBeDefined()
-    if (environment === undefined) return
-    const duplicated = {
-      ...environment,
-      accounts: [
-        environment.accounts[0] as AccountResource,
-        environment.accounts[0] as AccountResource,
-      ],
-    }
-    expect(activeAccounts(duplicated)).toHaveLength(1)
+  it("deduplicates global accounts shared across the pool", () => {
+    const baseAccount = catalogFixture.accounts[0] as AccountResource
+    const duplicated = [
+      baseAccount,
+      { ...baseAccount },
+      catalogFixture.accounts[1] as AccountResource,
+    ]
+    expect(activeAccounts(duplicated)).toHaveLength(2)
+    expect(activeAccounts(duplicated).map((item) => item.id)).toEqual(["1601", "1602"])
   })
 
   it("filters disabled databases out of the version scope", () => {
-    const database = catalogFixture.suts[0]?.environments[0]?.databases[0] as DatabaseResource
-    expect(
-      scopeDatabases({ databases: [{ ...database, status: "disabled" }] } as never),
-    ).toHaveLength(0)
+    const database = firstSut.databases[0] as DatabaseResource
+    const disabledSut: SutResource = {
+      ...firstSut,
+      databases: [{ ...database, status: "disabled" }],
+    }
+    expect(scopeDatabases({ ...environment, suts: [disabledSut] })).toHaveLength(0)
   })
 })
 
@@ -134,46 +142,23 @@ describe("wizard payload builders", () => {
     })
   })
 
-  it("omits unknown repository/account selections but keeps explicit empty lists", () => {
-    expect(
-      buildBindingUpdate({
-        includedRepositoryIds: null,
-        accountIds: null,
-        scopeExclude: { pages: [], apis: [], databases: [] },
-      }),
-    ).toEqual({ scope_exclude: { pages: [], apis: [], databases: [] } })
-
-    expect(
-      buildBindingUpdate({
-        includedRepositoryIds: [],
-        accountIds: ["1601"],
-        scopeExclude: { pages: ["1302"], apis: [], databases: [] },
-      }),
-    ).toEqual({
-      repository_ids: [],
-      account_ids: ["1601"],
-      scope_exclude: { pages: ["1302"], apis: [], databases: [] },
-    })
+  it("builds the account_ids-only binding update and keeps explicit empty lists", () => {
+    // null means the pool could not be read: omit account_ids entirely.
+    expect(buildBindingUpdate({ accountIds: null })).toEqual({})
+    expect(buildBindingUpdate({ accountIds: ["1601"] })).toEqual({ account_ids: ["1601"] })
+    // An explicit empty list clears the selection.
+    expect(buildBindingUpdate({ accountIds: [] })).toEqual({ account_ids: [] })
   })
 
-  it("toggles selections and scope exclusions without reordering", () => {
+  it("toggles selections without reordering", () => {
     expect(toggleSelection(["1", "2"], "3")).toEqual(["1", "2", "3"])
     expect(toggleSelection(["1", "2"], "1")).toEqual(["2"])
-
-    const excluded = toggleExclude({ pages: ["1"], apis: [], databases: [] }, "pages", "2")
-    expect(excluded).toEqual({ pages: ["1", "2"], apis: [], databases: [] })
-    expect(toggleExclude(excluded, "pages", "1")).toEqual({
-      pages: ["2"],
-      apis: [],
-      databases: [],
-    })
   })
 
   it("maps typed binding fields back to the wizard steps", () => {
     expect(stepForBindingField("environment_id")).toBe(1)
-    expect(stepForBindingField("repository_ids[0]")).toBe(2)
     expect(stepForBindingField("account_ids")).toBe(2)
-    expect(stepForBindingField("scope_exclude.pages")).toBe(3)
+    expect(stepForBindingField("account_ids[0]")).toBe(2)
     expect(stepForBindingField("title")).toBe(1)
     expect(stepForBindingField("")).toBe(4)
   })

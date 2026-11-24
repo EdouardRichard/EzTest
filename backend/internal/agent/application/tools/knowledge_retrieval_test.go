@@ -49,8 +49,8 @@ func (f *fakeKnowledgeRetrieval) ReadKnowledge(_ context.Context, scope Scope, i
 
 func executeKnowledgeTool(t *testing.T, port KnowledgeRetrievalPort, scope Scope, name, payload string) (any, error) {
 	t.Helper()
-	deps := Deps{P7: P7Deps{Retrieval: port}}
-	registry := NewP7Registry(deps)
+	deps := Deps{Knowledge: KnowledgeDeps{Retrieval: port}}
+	registry := NewKnowledgeRegistry(deps)
 	return registry.Execute(context.Background(), scope, name, json.RawMessage(payload))
 }
 
@@ -191,7 +191,7 @@ func TestKnowledgeSearchTool(t *testing.T) {
 			t.Fatalf("missing version error = %v, want invalid_argument scope", err)
 		}
 
-		registry := NewP7Registry(Deps{})
+		registry := NewKnowledgeRegistry(Deps{})
 		if _, err := registry.Execute(context.Background(), Scope{VersionID: 42}, ToolKnowledgeSearch, json.RawMessage(`{}`)); err == nil {
 			t.Fatal("unwired retrieval service must fail as an internal configuration error")
 		} else if errors.As(err, &toolErr) {
@@ -291,7 +291,7 @@ func TestKnowledgeReadTool(t *testing.T) {
 			t.Fatalf("missing version error = %v, want invalid_argument scope", err)
 		}
 
-		registry := NewP7Registry(Deps{})
+		registry := NewKnowledgeRegistry(Deps{})
 		if _, err := registry.Execute(context.Background(), Scope{VersionID: 42}, ToolKnowledgeRead, json.RawMessage(`{"id":"9001"}`)); err == nil {
 			t.Fatal("unwired retrieval service must fail as an internal configuration error")
 		} else if errors.As(err, &toolErr) {

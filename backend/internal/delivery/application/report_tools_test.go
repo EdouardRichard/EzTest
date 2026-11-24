@@ -86,7 +86,7 @@ func reportToolWaveSnapshot(waveID int64) delivery.ReportSnapshot {
 		Issues: []delivery.IssueSnapshot{
 			{ID: 900, VersionID: 7, Title: "Checkout issue", Status: delivery.IssueStatusOpen, Category: "ui", Severity: "major", Source: "failure_candidate"},
 		},
-		VersionSUTs: []delivery.VersionSUTSnapshot{
+		SUTs: []delivery.SUTSnapshot{
 			{ID: 9001, SUTID: 51, SUTName: "Shop", EnvironmentID: 61, EnvironmentName: "staging"},
 		},
 		Coverage: delivery.CoverageSnapshot{
@@ -216,8 +216,8 @@ func TestReportToolDataReadReturnsOnlyCountsAndIDs(t *testing.T) {
 	if !ok || len(gaps) != 1 || gaps[0]["requirement_id"] != "2" || gaps[0]["reason"] != "execution_not_run" {
 		t.Fatalf("coverage gaps = %#v", coverage["gaps"])
 	}
-	if ids := payload["version_sut_ids"].([]string); len(ids) != 1 || ids[0] != "9001" {
-		t.Fatalf("version_sut_ids = %#v", payload["version_sut_ids"])
+	if ids := payload["sut_ids"].([]string); len(ids) != 1 || ids[0] != "9001" {
+		t.Fatalf("sut_ids = %#v", payload["sut_ids"])
 	}
 	if evidence := payload["evidence"].(map[string]any); evidence["count"] != 1 {
 		t.Fatalf("evidence = %#v", evidence)

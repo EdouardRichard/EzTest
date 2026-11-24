@@ -20,11 +20,12 @@ func v022Profile(t *testing.T, profiles []agent.AgentProfile, key string) agent.
 // TestProfileBudgetsV022 pins the R-A2-2 seeded profile envelopes: the
 // clarification Host gets 12 turns / 600s soft / 900s hard, the design team
 // keeps its turn counts with the same 600/900 wall-clock envelope, and the case
-// executor keeps its 60/780/900 guards. Token accounting is telemetry only, so
+// executor seeds the unlimited turn budget (MaxTurns 0, v0.2.4-C T13) with its
+// 1200/2400 wall-clock envelope. Token accounting is telemetry only, so
 // every conversation/design profile and the case executor run with
 // MaxTokens=0 + UnlimitedTokens=true (R-A2-1/R-A2-4).
 func TestProfileBudgetsV022(t *testing.T) {
-	host := v022Profile(t, P1Profiles(), ProfileKeyClarificationHost)
+	host := v022Profile(t, BaseProfiles(), ProfileKeyClarificationHost)
 	wantHost := agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 600, HardSeconds: 900}
 	if host.Budgets != wantHost {
 		t.Fatalf("clarification_host budgets = %+v, want %+v", host.Budgets, wantHost)
@@ -38,7 +39,7 @@ func TestProfileBudgetsV022(t *testing.T) {
 		{ProfileKeyDesignAuthor, 16},
 		{ProfileKeyDesignCritic, 4},
 	}
-	designProfiles := P2Profiles()
+	designProfiles := DesignProfiles()
 	for _, want := range design {
 		profile := v022Profile(t, designProfiles, want.key)
 		if profile.Budgets.MaxTurns != want.turns ||
@@ -48,8 +49,11 @@ func TestProfileBudgetsV022(t *testing.T) {
 		}
 	}
 
-	executor := v022Profile(t, P3Profiles(), ProfileKeyCaseExecutor)
-	wantExecutor := agent.ProfileBudgets{MaxTurns: 150, SoftSeconds: 1200, HardSeconds: 2400}
+	executor := v022Profile(t, ExecutionProfiles(), ProfileKeyCaseExecutor)
+	// v0.2.4-C T13/R-C5: the case executor seeds MaxTurns 0 (unlimited; the turn
+	// budget is governed by execution.max_case_turns), keeping the 1200/2400
+	// wall-clock envelope.
+	wantExecutor := agent.ProfileBudgets{MaxTurns: 0, SoftSeconds: 1200, HardSeconds: 2400}
 	if executor.Budgets != wantExecutor {
 		t.Fatalf("case_executor budgets = %+v, want %+v", executor.Budgets, wantExecutor)
 	}
@@ -69,7 +73,7 @@ func TestProfileBudgetsV022(t *testing.T) {
 		t.Fatalf("case_executor cause at 50M tokens = %q, want none", cause)
 	}
 
-	conversation := append(append([]agent.AgentProfile{}, P1Profiles()...), P2Profiles()...)
+	conversation := append(append([]agent.AgentProfile{}, BaseProfiles()...), DesignProfiles()...)
 	for _, profile := range conversation {
 		budget := runner.resourceBudget(
 			agent.WorkItem{VersionID: 1, Type: WorkTypeChatTurn}, profile)

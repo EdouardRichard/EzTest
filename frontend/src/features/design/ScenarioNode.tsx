@@ -14,7 +14,7 @@ type ScenarioData = Extract<DesignNodeData, { kind: "scenario" }> & {
   destructiveActionsDisabled?: boolean
 }
 
-/** Scenario node: name, case count, target SUTs and "确认场景". */
+/** Scenario node: name, case count, description and "确认场景". */
 export function ScenarioNode({ data }: NodeProps) {
   const node = data as unknown as ScenarioData
   const { scenario } = node
@@ -33,9 +33,12 @@ export function ScenarioNode({ data }: NodeProps) {
         </span>
         <Badge tone="neutral">用例 {scenario.cases.length}</Badge>
       </div>
-      <p className="mt-1 text-[11px] text-muted-foreground">
-        SUT {scenario.version_sut_ids.length} 个 · 页面 {scenario.page_ids.length} 个
-      </p>
+      {/* v0.2.4-B: the SUT/page count line read the removed version_sut_ids/page_ids
+          arrays. Under the natural-language contract a scenario summarizes its
+          prose description instead. */}
+      {scenario.description !== "" ? (
+        <p className="mt-1 text-[11px] text-muted-foreground">{scenario.description}</p>
+      ) : null}
       {node.actions.caseReviewEnabled === false ||
       node.destructiveActionsDisabled === true ? null : (
         <Button

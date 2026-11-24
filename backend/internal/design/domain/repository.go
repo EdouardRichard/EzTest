@@ -14,31 +14,38 @@ type RequirementRef struct {
 	CurrentVersionID int64
 	Revision         int
 	Title            string
-	// Description and AcceptanceCriteria are the current requirement version
-	// text. Task 120: design generation uses the requirement/AC text to decide
-	// whether a visual baseline comparison was explicitly requested, so an
-	// ordinary functional AC never auto-generates a kind=visual assertion.
-	Description        string
-	AcceptanceCriteria string
-	Status             string
+	Status           string
 	// Priority is the current requirement version priority (P0-P3). Task 79:
 	// the design planner derives the work-item claim priority from it so the
 	// 67-requirement authoring wave cannot starve P0 behind P1/P2 FIFO order.
-	Priority            string
-	TargetVersionSUTIDs []int64
+	Priority string
+	// SutDescription is the requirement's natural-language description of the
+	// system under test (design v1.3.1 §5.1). v0.2.4-B: it replaces the
+	// TargetVersionSUTIDs this projection used to carry -- a requirement no
+	// longer selects resource IDs, so a generated case derives its own
+	// sut_description from this text instead of inheriting a SUT binding.
+	SutDescription string
+	// ACIDs is the requirement's acceptance-criterion id set ("AC-<n>",
+	// server-assigned by the version context and stable across revisions,
+	// §3.6), in id order. It is the set a case's covered_acs must be drawn
+	// from (§5.2), and it reaches proposal validation through the existing
+	// GraphRepository.RequirementContext read -- no extra port.
+	ACIDs []string
 }
 
-// VersionContext is the design-relevant slice of a version's binding set. The
-// target maps answer "which version_sut does this page/api/database belong
-// to?" for proposal validation.
+// VersionContext is the design-relevant slice of a version: its existence.
+//
+// v0.2.4-B (Lead ruling 9): the four resource maps this type used to carry
+// (AllowedVersionSUTs / PageToSUT / APIToSUT / DBTOSUT) were deleted with their
+// only consumer, the proposal ownership group. T27 then removed the leftover
+// Status / AutoDesignNewRequirements fields: the only production caller
+// (GraphService.Propose, application/graph.go) discards the value and uses the
+// read purely as a version-existence gate, so those fields had a writer (the
+// repository Scan) but no reader. The type and the repository method stay --
+// deleting them would break that existence gate -- but the projection is now
+// just the version id.
 type VersionContext struct {
-	VersionID                 int64
-	Status                    string
-	AutoDesignNewRequirements bool
-	AllowedVersionSUTs        []int64
-	PageToSUT                 map[int64]int64
-	APIToSUT                  map[int64]int64
-	DBTOSUT                   map[int64]int64
+	VersionID int64
 }
 
 // CaseWithCurrent pairs a logical case with its current immutable version. A
@@ -60,6 +67,16 @@ type CaseVersionSummary struct {
 	Title       string
 	CreatedAt   time.Time
 	ConfirmedAt *time.Time
+	// Natural-language context of the immutable case-version row (v0.2.4-G
+	// R-G8b). A report card of a run referencing a historical (superseded/stale)
+	// version must keep the full NL context — the versioned row DOES carry
+	// description/preconditions/sut_description/steps; the gap was read-port
+	// width, not data absence. Populated by ReadCaseVersionsByIDs; other summary
+	// reads leave these zero (they do not need the NL context).
+	Description    string
+	Preconditions  string
+	SutDescription string
+	Steps          []CaseStep
 }
 
 // CaseData is the repository read model behind GET /design/cases/{caseId}.
@@ -84,6 +101,18 @@ type ScenarioGraph struct {
 	Scenario Scenario
 	Cases    []CaseGraph
 }
+
+// Design-node projection statuses (the graph designStatus projection). A
+// requirement node whose current version has no cases is pending until its
+// design scope is activated, then in_design; once cases exist the projection
+// reuses the case statuses (draft/confirmed/stale). These two constants are the
+// single authority for the projection-only vocabulary (V-0030 / H-A9): the graph
+// projection reads them instead of spelling the literals, so a rename or a new
+// projection status cannot leave the SQL/handler and its tests silently green.
+const (
+	DesignStatusPending  = "pending"
+	DesignStatusInDesign = "in_design"
+)
 
 // RequirementGraph is one requirement node of the version design graph.
 type RequirementGraph struct {
@@ -304,7 +333,6 @@ type RollbackTx interface {
 	InsertCaseVersion(ctx context.Context, version CaseVersion) (CaseVersion, error)
 	SupersedeCaseVersion(ctx context.Context, caseVersionID int64, at time.Time) error
 	SetCurrentVersion(ctx context.Context, caseID, caseVersionID int64, status string, at time.Time) error
-	InsertConfirmation(ctx context.Context, confirmation Confirmation) error
 }
 
 // RollbackRepository runs the discovery auto-confirm rollback and its

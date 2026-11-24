@@ -24,6 +24,7 @@ type AnalysisService struct {
 	waves        WaveRepository
 	caseRuns     CaseRunRepository
 	results      ResultRepository
+	evidence     EvidenceRepository
 	cases        CaseReader
 	requirements CoverageReader
 	gaps         GapEnsurer
@@ -45,6 +46,7 @@ type AnalysisServiceDeps struct {
 	Waves        WaveRepository
 	CaseRuns     CaseRunRepository
 	Results      ResultRepository
+	Evidence     EvidenceRepository
 	Cases        CaseReader
 	Requirements CoverageReader
 	Gaps         GapEnsurer
@@ -62,6 +64,7 @@ func NewAnalysisService(deps AnalysisServiceDeps) *AnalysisService {
 		waves:        deps.Waves,
 		caseRuns:     deps.CaseRuns,
 		results:      deps.Results,
+		evidence:     deps.Evidence,
 		cases:        deps.Cases,
 		requirements: deps.Requirements,
 		gaps:         deps.Gaps,
@@ -176,8 +179,14 @@ func (s *AnalysisService) EnsureTasks(ctx context.Context, waveID int64) error {
 	return nil
 }
 
-// classifyRun persists the deterministic failure class/summary of one finished
-// failed/blocked/inconclusive case_run.
+// classifyRun re-judges the persisted terminal failure verdict of one
+// failed/blocked/inconclusive case_run through the single terminal entry's
+// guarded terminal->terminal reclassification mode (V-0022). The verdict comes
+// from the single domain authority execution.Aggregate (Prior input): the
+// hand-written deterministicResult second truth is gone, and the evidence gate
+// applies — a failed verdict with zero persisted evidence degrades inconclusive
+// and never produces an issue candidate. The settlement CAS invariant is
+// untouched: reclassification is a distinct sanctioned mode, not a settlement.
 func (s *AnalysisService) classifyRun(ctx context.Context, wave execution.RunWave, run execution.CaseRun) error {
 	steps, err := s.results.ListSteps(ctx, run.ID)
 	if err != nil {
@@ -187,197 +196,34 @@ func (s *AnalysisService) classifyRun(ctx context.Context, wave execution.RunWav
 	if err != nil {
 		return mapExecutionError(err, "assertion result")
 	}
-	status, class, summary := deterministicResult(run, steps, assertions)
+	status, class, summary, err := aggregateWithEvidenceFacts(ctx, s.evidence, run, execution.VerdictInput{
+		Prior: &execution.PriorVerdict{
+			Status:       run.Status,
+			FailureClass: run.FailureClass,
+			Summary:      run.Summary,
+		},
+		Steps:      steps,
+		Assertions: assertions,
+	})
+	if err != nil {
+		return mapExecutionError(err, "case run")
+	}
 	changed := status != run.Status || class != run.FailureClass || !summaryEqual(summary, run.Summary)
 	if changed {
-		run.Status = status
-		run.FailureClass = class
-		run.Summary = summary
-		if run.FinishedAt == nil {
-			now := s.now()
-			run.FinishedAt = &now
+		reclassified, _, err := reclassifyTerminalVerdict(ctx, s.caseRuns, s.now(), run, status, class, summary)
+		if err != nil {
+			return err
 		}
-		run.UpdatedAt = s.now()
-		if _, err := s.caseRuns.Update(ctx, run); err != nil {
-			return mapExecutionError(err, "case run")
-		}
+		run = reclassified
 	}
 	// Emit the deterministic issue candidate even when the executor already
 	// persisted the same class: the wave-completion analysis is the handoff to
-	// P4 and must not depend on who classified the run first (P3 §8.1). The
-	// hint set keeps repeat analysis in this process idempotent.
-	if class.IsIssueCandidate() {
+	// the issue pipeline and must not depend on who classified the run first
+	// (P3 §8.1). The hint set keeps repeat analysis in this process idempotent.
+	if run.FailureClass.IsIssueCandidate() {
 		return s.emitFailureCandidate(ctx, wave, run)
 	}
 	return nil
-}
-
-// deterministicResult is the §4.3/§4.5 server-side classification. The agent
-// candidate may only refine within the deterministic result.
-func deterministicResult(run execution.CaseRun, steps []execution.StepResult, assertions []execution.AssertionResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
-	summary := run.Summary
-	summary.StepTotal = len(steps)
-	summary.AssertionTotal = len(assertions)
-	summary.StepFailed = 0
-	summary.AssertionFailed = 0
-	var failedAssertion *execution.AssertionResult
-	var failedStep *execution.StepResult
-	var blockedStep *execution.StepResult
-	for index := range steps {
-		switch steps[index].Status {
-		case execution.StepFailed:
-			summary.StepFailed++
-			if failedStep == nil {
-				failedStep = &steps[index]
-			}
-		case execution.StepBlocked:
-			if blockedStep == nil {
-				blockedStep = &steps[index]
-			}
-		}
-	}
-	for index := range assertions {
-		if assertions[index].Verdict == execution.AssertionFailed {
-			summary.AssertionFailed++
-			if failedAssertion == nil {
-				failedAssertion = &assertions[index]
-			}
-		}
-	}
-
-	// v0.2.3 X-02: the structured executor capability limitation marker wins over
-	// every text heuristic and over failed-assertion evidence. The executor could
-	// not perform the action, so the run is blocked (never a SUT application
-	// defect) and carries the stable terminal cause for the report/UI.
-	if limitationStep, code, limited := execution.ExecutorLimitationStep(steps); limited {
-		summary.VerdictReason = execution.VerdictReasonBlocked
-		summary.TerminalCause = execution.TerminalCauseExecutorCapability
-		summary.NextAction = execution.NextActionResolveBlocker
-		reason := "the executor could not perform the action"
-		if code != "" {
-			reason = "executor capability limitation " + code
-		}
-		summary.LastError = fmt.Sprintf("%s (step %d)", reason, limitationStep.Seq)
-		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
-	}
-
-	// Recorded application evidence is authoritative over a blocked state (Task
-	// 107, PO trap E2E FR-113): the run observed a missing like control/count,
-	// missing like fields and a 404 like endpoint, recorded one failed ui
-	// assertion and 14 evidence rows, yet a later blocked step used to rewrite
-	// the whole run to blocked and drop the issue candidate. A blocked later
-	// step only says the remaining steps could not run; it does not erase the
-	// product deviation already observed. The failed assertion keeps the
-	// Aggregate precedence (assertions are authoritative); the observed
-	// requirement deviation deliberately outranks blocked here because the
-	// analysis fallback is the deterministic source of truth for the report and
-	// P4 issue projection, and there the recorded product deviation must win.
-	if failedAssertion != nil {
-		class := execution.FailureClassApplication
-		if run.FailureClass == execution.FailureClassAutomation {
-			class = execution.FailureClassAutomation
-		}
-		summary.VerdictReason = execution.VerdictReasonAssertionFailed
-		return execution.CaseRunFailed, class, summary
-	}
-	// Recorded application evidence is authoritative over a blocked state.
-	// Task 107 (PO trap E2E FR-113) covers the failed assertion and the failed
-	// step that observed a product deviation; Task 110 (PO trap E2E FR-106-02)
-	// covers the observed missing UI/API control itself: the editor had no
-	// publish-time/schedule control, so the remaining steps could not run and
-	// no assertion was ever executed. The observation sits on the failed step
-	// that tried to set the time (with its explanatory error) or on a blocked
-	// step that could not even start; both name the absent product capability
-	// and are application evidence. A run whose blocked steps only record their
-	// downstream consequences (no control/feature) carries no such observation
-	// and still falls through to blocked.
-	if evidenceStep := firstApplicationDeviationStep(steps); evidenceStep != nil {
-		return applicationDeviationResult(run, summary, assertions)
-	}
-	if blockedStep != nil || run.Status == execution.CaseRunBlocked {
-		if status, class, overridden := execution.ApplyVisualOutcome(execution.CaseRunBlocked, execution.FailureClassBlocked, summary, assertions); status != execution.CaseRunBlocked {
-			return status, class, overridden
-		}
-		summary.VerdictReason = execution.VerdictReasonBlocked
-		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
-	}
-	if failedStep != nil {
-		return failedStepResult(run, *failedStep, summary, assertions)
-	}
-	if run.Status == execution.CaseRunInconclusive || run.Status == execution.CaseRunFailed {
-		// No failing result: a claimed application failure has no evidence and
-		// must not produce an issue candidate (P3-D-12).
-		if run.FailureClass == execution.FailureClassApplication || run.Status == execution.CaseRunInconclusive {
-			summary.VerdictReason = execution.VerdictReasonIncomplete
-			return execution.CaseRunInconclusive, "", summary
-		}
-		if run.FailureClass.Valid() && run.FailureClass != "" {
-			return execution.CaseRunFailed, run.FailureClass, summary
-		}
-		summary.VerdictReason = execution.VerdictReasonIncomplete
-		return execution.CaseRunInconclusive, "", summary
-	}
-	summary.VerdictReason = execution.VerdictReasonIncomplete
-	return execution.CaseRunInconclusive, "", summary
-}
-
-// firstApplicationDeviationStep returns the first step whose recorded
-// observation is application evidence: a failed step with an observed
-// requirement deviation (QA Q1) or a failed/blocked step that observed a
-// required control/feature as absent (Task 110).
-func firstApplicationDeviationStep(steps []execution.StepResult) *execution.StepResult {
-	for index := range steps {
-		if execution.StepShowsApplicationDeviation(steps[index]) {
-			return &steps[index]
-		}
-	}
-	return nil
-}
-
-// applicationDeviationResult maps recorded application evidence onto the
-// deterministic verdict. A blocked run is normalized to application because the
-// blocked steps only explain why the remaining steps could not run; an explicit
-// environment/model/timeout/session class is preserved because it describes a
-// separate infrastructure failure.
-func applicationDeviationResult(run execution.CaseRun, summary execution.CaseRunSummary, assertions []execution.AssertionResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
-	class := execution.FailureClassApplication
-	switch run.FailureClass {
-	case "", execution.FailureClassApplication, execution.FailureClassAutomation, execution.FailureClassBlocked:
-		// Recorded product evidence wins over blocked/automation.
-	default:
-		if run.FailureClass.Valid() {
-			class = run.FailureClass
-		}
-	}
-	if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
-		return status, overriddenClass, overridden
-	}
-	summary.VerdictReason = execution.VerdictReasonStepFailed
-	return execution.CaseRunFailed, class, summary
-}
-
-// failedStepResult maps one failed step onto the deterministic verdict. A
-// failed step that recorded an observed product behavior (and no
-// automation/tool error) is a requirement deviation, not an automation failure
-// (QA Q1). An environment/model/timeout/unknown class is a separate agent-level
-// failure and is preserved.
-func failedStepResult(run execution.CaseRun, step execution.StepResult, summary execution.CaseRunSummary, assertions []execution.AssertionResult) (execution.CaseRunStatus, execution.FailureClass, execution.CaseRunSummary) {
-	class := execution.FailureClassAutomation
-	switch run.FailureClass {
-	case "", execution.FailureClassAutomation, execution.FailureClassApplication:
-		if execution.FailedStepShowsRequirementDeviation(step) {
-			class = execution.FailureClassApplication
-		}
-	default:
-		if run.FailureClass.Valid() {
-			class = run.FailureClass
-		}
-	}
-	if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
-		return status, overriddenClass, overridden
-	}
-	summary.VerdictReason = execution.VerdictReasonStepFailed
-	return execution.CaseRunFailed, class, summary
 }
 
 // emitFailureCandidate publishes the application failure candidate event and
@@ -394,7 +240,7 @@ func (s *AnalysisService) emitFailureCandidate(ctx context.Context, wave executi
 			break
 		}
 	}
-	evidenceStep := firstApplicationDeviationStep(steps)
+	evidenceStep := execution.FirstApplicationDeviationStep(steps)
 	if failedAssertion == nil && evidenceStep == nil {
 		return nil
 	}
@@ -583,10 +429,14 @@ func (s *AnalysisService) SubmitFailure(ctx context.Context, scope tools.Scope, 
 		}
 		run.Summary.LastError = summary
 	}
-	run.UpdatedAt = s.now()
-	if _, err := s.caseRuns.Update(ctx, run); err != nil {
-		return nil, mapExecutionError(err, "case run")
+	// The analyst refinement is a terminal->terminal class change: it goes
+	// through the single terminal entry's reclassification mode (V-0022), never
+	// a direct Update. The status is unchanged; only the validated class moves.
+	reclassified, _, err := reclassifyTerminalVerdict(ctx, s.caseRuns, s.now(), run, run.Status, run.FailureClass, run.Summary)
+	if err != nil {
+		return nil, err
 	}
+	run = reclassified
 	wave, err := s.waves.Get(ctx, run.WaveID)
 	if err != nil {
 		return nil, mapExecutionError(err, "wave")
@@ -618,7 +468,8 @@ func summaryEqual(left, right execution.CaseRunSummary) bool {
 		left.AssertionFailed == right.AssertionFailed &&
 		left.StepTotal == right.StepTotal &&
 		left.StepFailed == right.StepFailed &&
-		left.VisualSkipped == right.VisualSkipped &&
+		left.EvidenceCount == right.EvidenceCount &&
+		left.EvidenceDropped == right.EvidenceDropped &&
 		left.LastError == right.LastError &&
 		left.TerminalCause == right.TerminalCause &&
 		left.NextAction == right.NextAction

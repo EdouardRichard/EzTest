@@ -23,11 +23,16 @@ const (
 
 // Case version/confirmation triggers (spec DB-28/DB-30). A case version is
 // normally proposed by design; discovery auto-confirmation and a rollback
-// replacement record their own trigger so the revision stays traceable.
+// replacement record their own trigger so the revision stays traceable. A
+// human case_confirmation row carries CaseTriggerManual — the confirmation
+// column's DB default (chk_case_confirmation_trigger, design_0002/0003), where
+// the version column defaults to CaseTriggerNormal. The two CHECK sets are
+// pinned against these constants by TestTriggerVocabularyMatchesSchema.
 const (
 	CaseTriggerNormal         = "normal"
 	CaseTriggerDiscoveryDelta = "discovery_delta"
 	CaseTriggerRollback       = "rollback"
+	CaseTriggerManual         = "manual"
 )
 
 // AutoConfirmationActor is the auto_confirmed_by value of a discovery/rollback
@@ -44,11 +49,10 @@ const (
 
 // Assertion kinds (spec §4.4).
 const (
-	AssertionUI     = "ui"
-	AssertionAPI    = "api"
-	AssertionDB     = "db"
-	AssertionText   = "text"
-	AssertionVisual = "visual"
+	AssertionUI   = "ui"
+	AssertionAPI  = "api"
+	AssertionDB   = "db"
+	AssertionText = "text"
 )
 
 // Source kinds (spec §4.4).
@@ -60,18 +64,24 @@ const (
 	SourceKnowledge   = "knowledge"
 )
 
-// Content limits from spec §3/§5.3 and P2-D-18.
+// Content limits from spec §3/§5.3 and P2-D-18, plus the v0.2.4-B case
+// contract (design v1.3.1 §5.2).
 const (
 	CaseTitleMax       = 200
 	CaseDescriptionMax = 20000
-	ScenarioNameMax    = 200
-	StepActionMax      = 2000
-	AssertionTargetMax = 2000
-	AssertionExpectMax = 2000
-	SourceRefIDMax     = 200
-	SourcePathMax      = 1000
-	AccountRoleMax     = 64
-	GraphHashLength    = 64
+	// CaseSutDescriptionMax bounds case_version.sut_description (§5.2:
+	// 1..2000). It is deliberately its own constant rather than a reuse of
+	// CaseDescriptionMax: the SUT description is a short natural-language
+	// locator for the execution team (§3.3), not a free-form case narrative.
+	CaseSutDescriptionMax = 2000
+	ScenarioNameMax       = 200
+	StepActionMax         = 2000
+	AssertionTargetMax    = 2000
+	AssertionExpectMax    = 2000
+	SourceRefIDMax        = 200
+	SourcePathMax         = 1000
+	AccountRoleMax        = 64
+	GraphHashLength       = 64
 )
 
 // DefaultLimits are the P2-D-18 proposal/requirement limits.
@@ -123,6 +133,11 @@ func (l Limits) Effective() Limits {
 }
 
 // Scenario is one requirement-version-scoped grouping node in the design graph.
+//
+// v0.2.4-B (§3.2): a scenario no longer carries resource ID arrays. The version
+// binds an environment and the case says what it covers in prose
+// (sut_description) and by acceptance-criterion id (covered_acs), so there is
+// nothing left for a grouping node to select.
 type Scenario struct {
 	ID                   int64
 	VersionID            int64
@@ -130,9 +145,6 @@ type Scenario struct {
 	RequirementVersionID int64
 	Name                 string
 	Description          string
-	VersionSUTIDs        []int64
-	PageIDs              []int64
-	APIIDs               []int64
 	SortOrder            int
 	CreatedBy            *int64
 	CreatedByRunID       *int64
@@ -143,14 +155,11 @@ type Scenario struct {
 // ScenarioProposal is one submitted scenario node. ID is set when updating an
 // existing scenario; new scenarios omit it.
 type ScenarioProposal struct {
-	Ref           string
-	ID            *int64
-	Name          string
-	Description   string
-	VersionSUTIDs []int64
-	PageIDs       []int64
-	APIIDs        []int64
-	SortOrder     int
+	Ref         string
+	ID          *int64
+	Name        string
+	Description string
+	SortOrder   int
 }
 
 // ScenarioNaturalKey is the natural key used to reuse/update an existing
@@ -179,33 +188,39 @@ type CaseEntity struct {
 }
 
 // CaseStep is one ordered step of an immutable case version.
+//
+// v0.2.4-B (§3.2): the step target is free text. target_version_sut_id /
+// target_page_id / target_api_id are gone -- the execution team resolves where a
+// step happens from the case's sut_description plus the environment SUT catalog
+// (§3.3), so design records the intent ("订单列表页的搜索框") rather than a
+// catalog row id.
 type CaseStep struct {
-	ID                 int64
-	CaseVersionID      int64
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetPageID       *int64
-	TargetAPIID        *int64
-	AccountRole        string
-	Data               json.RawMessage
-	CreatedAt          time.Time
+	ID                int64
+	CaseVersionID     int64
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              json.RawMessage
+	CreatedAt         time.Time
 }
 
 // CaseAssertion is one assertion attached to a step sequence number.
+//
+// v0.2.4-B (§3.2, M-B4): SUTID replaces database_id. A kind=db assertion names
+// the SUT whose data it reads; design only checks that one is present, never
+// that it belongs to anything (there is no resource scope left to belong to).
 type CaseAssertion struct {
-	ID                 int64
-	CaseVersionID      int64
-	StepSeq            int
-	AssertionSeq       int
-	Kind               string
-	Target             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetAPIID        *int64
-	DatabaseID         *int64
-	CreatedAt          time.Time
+	ID            int64
+	CaseVersionID int64
+	StepSeq       int
+	AssertionSeq  int
+	Kind          string
+	Target        string
+	Expected      string
+	SUTID         *int64
+	CreatedAt     time.Time
 }
 
 // CaseSource is one provenance row of an immutable case version.
@@ -222,21 +237,30 @@ type CaseSource struct {
 
 // CaseVersion is one immutable snapshot of a logical case. Steps, assertions
 // and sources belong to exactly one version and are never updated in place.
+//
+// v0.2.4-B (§3.2/§5.2) replaces the resource-ID target set with the
+// natural-language case contract:
+//
+//	SutDescription  required, 1..2000 -- the system under test, in prose
+//	CoveredACs      required, >= 1 and a subset of the requirement's AC id
+//	                set -- which acceptance criteria this case implements
+//	Preconditions   required, >= 1 -- the scenario-level Given; an explicit
+//	                "无" satisfies it (there is nothing to set up)
+//
+// default_version_sut_id / version_sut_ids / page_ids / api_ids are gone.
 type CaseVersion struct {
-	ID                  int64
-	CaseID              int64
-	Revision            int
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	Status              string
-	ContentHash         string
+	ID             int64
+	CaseID         int64
+	Revision       int
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Status         string
+	ContentHash    string
 	// Trigger records how the version was produced. The DB column defaults to
 	// "normal" (a manual propose); discovery auto-confirmation writes
 	// "discovery_delta" and a rollback replacement writes "rollback" (spec
@@ -251,14 +275,14 @@ type CaseVersion struct {
 	AutoConfirmedBy string
 	// RollbackOf is the auto-confirmed revision a rollback replacement replaces
 	// (set on the replacement, never on the original).
-	RollbackOf        *int64
-	CreatedBy         *int64
-	CreatedByRunID    *int64
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	Steps             []CaseStep
-	Assertions        []CaseAssertion
-	Sources           []CaseSource
+	RollbackOf     *int64
+	CreatedBy      *int64
+	CreatedByRunID *int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	Steps          []CaseStep
+	Assertions     []CaseAssertion
+	Sources        []CaseSource
 	// StepCount/AssertionCount/SourceCount are projection-only counts loaded
 	// by list/confirmation queries that do not need the full child rows.
 	StepCount      int
@@ -301,25 +325,22 @@ func CaseVersionComplete(version CaseVersion) bool {
 
 // StepProposal is one submitted step.
 type StepProposal struct {
-	Seq                int
-	Action             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetPageID       *int64
-	TargetAPIID        *int64
-	AccountRole        string
-	Data               json.RawMessage
+	Seq               int
+	Action            string
+	Expected          string
+	TargetDescription string
+	AccountRole       string
+	Data              json.RawMessage
 }
 
-// AssertionProposal is one submitted assertion.
+// AssertionProposal is one submitted assertion. SUTID is the SUT a kind=db
+// assertion reads; it is ignored for every other kind.
 type AssertionProposal struct {
-	StepSeq            int
-	Kind               string
-	Target             string
-	Expected           string
-	TargetVersionSUTID *int64
-	TargetAPIID        *int64
-	DatabaseID         *int64
+	StepSeq  int
+	Kind     string
+	Target   string
+	Expected string
+	SUTID    *int64
 }
 
 // SourceProposal is one submitted provenance row.
@@ -333,21 +354,19 @@ type SourceProposal struct {
 
 // CaseProposal is one submitted logical case with its draft content.
 type CaseProposal struct {
-	Ref                 string
-	ID                  *int64
-	ScenarioRef         string
-	Title               string
-	Description         string
-	Preconditions       string
-	TestData            json.RawMessage
-	Priority            string
-	DefaultVersionSUTID *int64
-	VersionSUTIDs       []int64
-	PageIDs             []int64
-	APIIDs              []int64
-	Steps               []StepProposal
-	Assertions          []AssertionProposal
-	Sources             []SourceProposal
+	Ref            string
+	ID             *int64
+	ScenarioRef    string
+	Title          string
+	Description    string
+	SutDescription string
+	Preconditions  string
+	CoveredACs     []string
+	TestData       json.RawMessage
+	Priority       string
+	Steps          []StepProposal
+	Assertions     []AssertionProposal
+	Sources        []SourceProposal
 }
 
 // Proposal is one case.graph_propose payload: a batch of scenario and case
@@ -361,24 +380,44 @@ type Proposal struct {
 }
 
 // ProposalContext is the server-resolved validation context for one proposal.
-// The maps are target -> version_sut_id bindings of the version.
+//
+// v0.2.4-B: the four resource maps (AllowedVersionSUTs / PageToSUT / APIToSUT /
+// DBTOSUT) are gone together with the ownership rules they served (§5.2 "删 SUT
+// 归属组后保留集"). What replaces them is RequirementACIDs -- the requirement's
+// acceptance-criterion id set, read by GraphRepository.RequirementContext and
+// the only thing a case's covered_acs is still checked against (linkage, not
+// ownership).
 type ProposalContext struct {
-	VersionID             int64
-	RequirementID         int64
-	RequirementVersionID  int64
-	CurrentHash           string
-	AllowedVersionSUTs    []int64
-	PageToSUT             map[int64]int64
-	APIToSUT              map[int64]int64
-	DBTOSUT               map[int64]int64
+	VersionID            int64
+	RequirementID        int64
+	RequirementVersionID int64
+	CurrentHash          string
+	// RequirementACIDs is the requirement version's AC id set ("AC-<n>"), in
+	// id order. covered_acs must be a non-empty subset of it (§5.2).
+	RequirementACIDs      []string
 	ExistingScenarioCount int
 	ExistingCaseCount     int
 	Limits                Limits
 }
 
-// ValidateProposal applies the structural and target-ownership rules of spec
-// §4.3/§4.4/§5.3. Existence and natural-key resolution against already-stored
-// rows is performed by the application service before calling this function.
+// ValidateProposal applies the structural rules of the v0.2.4-B case contract
+// (design v1.3.1 §5.2 "删 SUT 归属组后保留集").
+//
+// RETAINED: base_graph_hash CAS, the per-proposal and per-requirement limits,
+// scenario/case ref uniqueness, the scenario-name and case-title natural keys,
+// positive-ID checks, every field length/enum rule, contiguous step seq,
+// assertion step_seq back-reference, source kind/length and the requirement
+// source revision binding, and source deduplication.
+//
+// RETIRED (not silently dropped): the whole SUT/page/api/database ownership
+// group. A version binds an environment and a case now says what it covers in
+// prose (sut_description) and by acceptance-criterion id (covered_acs), so
+// there is no resource scope left for a proposal to be checked against. What
+// replaces it is the covered_acs linkage rule below: every id must exist in the
+// requirement's AC set. Scope validation as such no longer exists in design.
+//
+// Existence and natural-key resolution against already-stored rows is performed
+// by the application service before calling this function.
 func ValidateProposal(in Proposal, ctx ProposalContext) error {
 	if in.RequirementID <= 0 || in.RequirementVersionID <= 0 || ctx.VersionID <= 0 {
 		return platform.Invalid("requirement_id", "requirement, requirement version and version are required")
@@ -417,13 +456,6 @@ func ValidateProposal(in Proposal, ctx ProposalContext) error {
 		return platform.Invalid("cases", "the requirement version exceeds the case limit")
 	}
 
-	allowedSUTs := make(map[int64]struct{}, len(ctx.AllowedVersionSUTs))
-	for _, id := range ctx.AllowedVersionSUTs {
-		if id > 0 {
-			allowedSUTs[id] = struct{}{}
-		}
-	}
-
 	scenarioRefs, scenarioNames := make(map[string]struct{}, len(in.Scenarios)), make(map[string]struct{}, len(in.Scenarios))
 	for index, scenario := range in.Scenarios {
 		field := proposalField("scenarios", index)
@@ -452,22 +484,6 @@ func ValidateProposal(in Proposal, ctx ProposalContext) error {
 		if scenario.SortOrder < 0 {
 			return platform.Invalid(field+".sort_order", "must be zero or positive")
 		}
-		if err := validateTargetSet(field+".version_sut_ids", scenario.VersionSUTIDs, allowedSUTs, true); err != nil {
-			return err
-		}
-		if err := validateTargetSet(field+".page_ids", scenario.PageIDs, nil, false); err != nil {
-			return err
-		}
-		for _, pageID := range scenario.PageIDs {
-			if _, ok := ctx.PageToSUT[pageID]; !ok {
-				return platform.Invalid(field+".page_ids", "page does not belong to a version SUT")
-			}
-		}
-		for _, apiID := range scenario.APIIDs {
-			if _, ok := ctx.APIToSUT[apiID]; !ok {
-				return platform.Invalid(field+".api_ids", "api does not belong to a version SUT")
-			}
-		}
 	}
 
 	caseRefs := make(map[string]struct{}, len(in.Cases))
@@ -493,21 +509,36 @@ func ValidateProposal(in Proposal, ctx ProposalContext) error {
 		if item.ID != nil && *item.ID <= 0 {
 			return platform.Invalid(field+".id", "must be a positive decimal ID")
 		}
-		if err := validateCaseProposal(item, field, ctx, allowedSUTs, limits); err != nil {
+		if err := validateCaseProposal(item, field, ctx, limits); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, allowedSUTs map[int64]struct{}, limits Limits) error {
+// validateCaseProposal applies the §5.2 case contract to one proposed case.
+//
+// The ownership group is gone (see ValidateProposal). What is added in its
+// place: sut_description required (1..2000), preconditions required (>= 1, an
+// explicit "无" counts as a stated precondition), and covered_acs required
+// (>= 1) with every id present in the requirement's AC set.
+func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, limits Limits) error {
 	if err := validation.String(field+".title", strings.TrimSpace(item.Title), 1, CaseTitleMax); err != nil {
 		return err
 	}
 	if err := validation.String(field+".description", item.Description, 0, CaseDescriptionMax); err != nil {
 		return err
 	}
-	if err := validation.String(field+".preconditions", item.Preconditions, 0, CaseDescriptionMax); err != nil {
+	if err := validation.String(field+".sut_description", strings.TrimSpace(item.SutDescription), 1, CaseSutDescriptionMax); err != nil {
+		return err
+	}
+	// §5.2: preconditions is the scenario-level Given and is required. An
+	// explicit "无" satisfies it -- the author states there is nothing to set
+	// up, which is information; a blank value states nothing at all.
+	if err := validation.String(field+".preconditions", strings.TrimSpace(item.Preconditions), 1, CaseDescriptionMax); err != nil {
+		return err
+	}
+	if err := validateCoveredACs(field+".covered_acs", item.CoveredACs, ctx.RequirementACIDs); err != nil {
 		return err
 	}
 	if _, err := NormalizePriority(item.Priority); err != nil {
@@ -517,30 +548,6 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		return platform.Invalid(field+".test_data", "must be a JSON object")
 	}
 
-	if len(item.VersionSUTIDs) == 0 {
-		return platform.Invalid(field+".version_sut_ids", "at least one version SUT is required")
-	}
-	if err := validateTargetSet(field+".version_sut_ids", item.VersionSUTIDs, allowedSUTs, false); err != nil {
-		return err
-	}
-	caseSUTs := make(map[int64]struct{}, len(item.VersionSUTIDs))
-	for _, id := range item.VersionSUTIDs {
-		caseSUTs[id] = struct{}{}
-	}
-	if item.DefaultVersionSUTID == nil {
-		return platform.Invalid(field+".default_version_sut_id", "a default version SUT is required")
-	}
-	if _, ok := caseSUTs[*item.DefaultVersionSUTID]; !ok {
-		return platform.Invalid(field+".default_version_sut_id", "must be one of the case version SUTs")
-	}
-
-	if err := validateBoundResourceIDs(field+".page_ids", item.PageIDs, ctx.PageToSUT, caseSUTs); err != nil {
-		return err
-	}
-	if err := validateBoundResourceIDs(field+".api_ids", item.APIIDs, ctx.APIToSUT, caseSUTs); err != nil {
-		return err
-	}
-
 	if len(item.Steps) == 0 {
 		return platform.Invalid(field+".steps", "at least one step is required")
 	}
@@ -548,7 +555,6 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		return platform.Invalid(field+".steps", "a case may have at most 50 steps")
 	}
 	stepSeqs := make(map[int]int, len(item.Steps))
-	stepSUTs := make(map[int]int64, len(item.Steps))
 	for index, step := range item.Steps {
 		stepField := field + ".steps[" + platformid.Format(int64(index)) + "]"
 		if step.Seq != index+1 {
@@ -561,22 +567,17 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(stepField+".expected", step.Expected, 1, CaseDescriptionMax); err != nil {
 			return err
 		}
+		// target_description is optional (§5.2) but bounded like the other step
+		// text: it is a locator for the execution team, not a narrative.
+		if err := validation.String(stepField+".target_description", step.TargetDescription, 0, StepActionMax); err != nil {
+			return err
+		}
 		if err := validation.String(stepField+".account_role", step.AccountRole, 0, AccountRoleMax); err != nil {
 			return err
 		}
 		if _, err := NormalizeJSONObject(step.Data); err != nil {
 			return platform.Invalid(stepField+".data", "must be a JSON object")
 		}
-		if step.TargetVersionSUTID != nil {
-			if _, ok := caseSUTs[*step.TargetVersionSUTID]; !ok {
-				return platform.Invalid(stepField+".target_version_sut_id", "must be one of the case version SUTs")
-			}
-		}
-		targetSUT, err := stepTargetSUT(stepField, step.TargetVersionSUTID, step.TargetPageID, step.TargetAPIID, ctx, caseSUTs, *item.DefaultVersionSUTID)
-		if err != nil {
-			return err
-		}
-		stepSUTs[step.Seq] = *targetSUT
 	}
 
 	if len(item.Assertions) > limits.MaxAssertionsPerCase {
@@ -588,7 +589,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 			return platform.Invalid(assertionField+".step_seq", "must reference a step seq of the same case")
 		}
 		if !ValidAssertionKind(assertion.Kind) {
-			return platform.Invalid(assertionField+".kind", "must be one of ui, api, db, text, visual")
+			return platform.Invalid(assertionField+".kind", "must be one of ui, api, db, text")
 		}
 		if err := validation.String(assertionField+".target", assertion.Target, 1, AssertionTargetMax); err != nil {
 			return err
@@ -596,26 +597,12 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(assertionField+".expected", assertion.Expected, 1, AssertionExpectMax); err != nil {
 			return err
 		}
-		targetSUT, err := assertionTargetSUT(assertionField, assertion, caseSUTs, ctx, stepSUTs[assertion.StepSeq])
-		if err != nil {
-			return err
-		}
-		if assertion.Kind == AssertionDB {
-			if assertion.DatabaseID == nil {
-				return platform.Invalid(assertionField+".database_id", "db assertions require a database")
-			}
-			databaseSUT, ok := ctx.DBTOSUT[*assertion.DatabaseID]
-			if !ok {
-				return platform.Invalid(assertionField+".database_id", "database does not belong to a version SUT")
-			}
-			if targetSUT != nil && databaseSUT != *targetSUT {
-				return platform.Invalid(assertionField+".database_id", "database does not belong to the assertion target SUT")
-			}
-			if targetSUT == nil {
-				if _, ok := caseSUTs[databaseSUT]; !ok {
-					return platform.Invalid(assertionField+".database_id", "database does not belong to the case version SUTs")
-				}
-			}
+		// §5.2 / Lead ruling 6: a db assertion must name the SUT it reads.
+		// Presence only -- there is no resource scope left to check ownership
+		// against, and inventing one would re-introduce exactly the coupling
+		// v0.2.4-B removes.
+		if assertion.Kind == AssertionDB && (assertion.SUTID == nil || *assertion.SUTID <= 0) {
+			return platform.Invalid(assertionField+".sut_id", "db assertions require a sut_id")
 		}
 	}
 
@@ -637,27 +624,14 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if source.Line != nil && *source.Line <= 0 {
 			return platform.Invalid(sourceField+".line", "must be a positive line number")
 		}
-		switch source.Kind {
-		case SourceRequirement:
-			if source.RefID != platformid.Format(ctx.RequirementVersionID) {
-				return platform.Invalid(sourceField+".ref_id", "requirement source must reference the current requirement version")
-			}
-		case SourcePage:
-			pageID, err := platformid.Parse(source.RefID)
-			if err != nil {
-				return platform.Invalid(sourceField+".ref_id", "must be a decimal page ID")
-			}
-			if _, ok := ctx.PageToSUT[pageID]; !ok {
-				return platform.Invalid(sourceField+".ref_id", "page source does not belong to a version SUT")
-			}
-		case SourceAPI:
-			apiID, err := platformid.Parse(source.RefID)
-			if err != nil {
-				return platform.Invalid(sourceField+".ref_id", "must be a decimal API ID")
-			}
-			if _, ok := ctx.APIToSUT[apiID]; !ok {
-				return platform.Invalid(sourceField+".ref_id", "api source does not belong to a version SUT")
-			}
+		// Only the requirement source keeps a binding rule: it must point at the
+		// requirement version being designed, which is what makes a case stale
+		// when the requirement moves. The page/api sources keep their kind and
+		// shape but lost the ownership lookup (§5.2 "page/api/knowledge 可选引用
+		// 校验"): with no resource scope in design there is nothing to resolve a
+		// page/api ref_id against, so they are recorded as provenance text.
+		if source.Kind == SourceRequirement && source.RefID != platformid.Format(ctx.RequirementVersionID) {
+			return platform.Invalid(sourceField+".ref_id", "requirement source must reference the current requirement version")
 		}
 		key := source.Kind + "|" + source.RefID + "|" + source.Path + "|" + formatOptionalInt(source.Line)
 		if _, duplicate := sourceKeys[key]; duplicate {
@@ -668,90 +642,64 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 	return nil
 }
 
-// stepTargetSUT validates a step target and returns the explicit target SUT
-// when set.
-func stepTargetSUT(field string, explicit *int64, pageID, apiID *int64, ctx ProposalContext, caseSUTs map[int64]struct{}, defaultSUT int64) (*int64, error) {
-	target := defaultSUT
-	if explicit != nil {
-		target = *explicit
-	}
-	if pageID != nil {
-		sut, ok := ctx.PageToSUT[*pageID]
-		if !ok {
-			return nil, platform.Invalid(field+".target_page_id", "page does not belong to a version SUT")
-		}
-		if sut != target {
-			return nil, platform.Invalid(field+".target_page_id", "page does not belong to the resolved step target SUT")
-		}
-	}
-	if apiID != nil {
-		sut, ok := ctx.APIToSUT[*apiID]
-		if !ok {
-			return nil, platform.Invalid(field+".target_api_id", "api does not belong to a version SUT")
-		}
-		if sut != target {
-			return nil, platform.Invalid(field+".target_api_id", "api does not belong to the resolved step target SUT")
-		}
-	}
-	_ = caseSUTs
-	return &target, nil
-}
-
-// assertionTargetSUT validates an assertion's optional explicit target SUT and
-// API binding and returns the explicit target when set.
-func assertionTargetSUT(field string, assertion AssertionProposal, caseSUTs map[int64]struct{}, ctx ProposalContext, stepSUT int64) (*int64, error) {
-	target := stepSUT
-	if assertion.TargetVersionSUTID != nil {
-		if _, ok := caseSUTs[*assertion.TargetVersionSUTID]; !ok {
-			return nil, platform.Invalid(field+".target_version_sut_id", "must be one of the case version SUTs")
-		}
-		if *assertion.TargetVersionSUTID != stepSUT {
-			return nil, platform.Invalid(field+".target_version_sut_id", "must equal the referenced step target SUT")
-		}
-		target = *assertion.TargetVersionSUTID
-	}
-	if assertion.TargetAPIID != nil {
-		sut, ok := ctx.APIToSUT[*assertion.TargetAPIID]
-		if !ok {
-			return nil, platform.Invalid(field+".target_api_id", "api does not belong to a version SUT")
-		}
-		if sut != target {
-			return nil, platform.Invalid(field+".target_api_id", "api does not belong to the assertion target SUT")
+// validateCoveredACs enforces the §5.2 covered_acs linkage rule: at least one
+// id, and every id present in the requirement's acceptance-criterion set.
+//
+// Both sides go through NormalizeACIDSet -- the SAME function the content hash
+// (hash.go) and the propose write path (graph.go buildCaseVersion) use. That is
+// deliberate and load-bearing: if the gate validated a differently-normalized set
+// than the one that gets hashed and stored, a proposal could pass the gate and
+// then hash to something else. Normalization is not re-implemented here.
+//
+// Blanks are rejected BEFORE normalizing, because NormalizeACIDSet drops them as
+// noise -- correct for canonicalization, wrong for a gate, where an empty element
+// is a caller error that must be reported rather than silently discarded.
+//
+// This is the only thing that replaced the retired ownership group, and it
+// fails closed in both directions. An empty requirementACIDs rejects every
+// proposal rather than vacuously accepting one: a case that claims to cover an
+// acceptance criterion of a requirement that has none is not a case this
+// contract can describe, and silently accepting it would hide a requirement that
+// was never clarified into structured criteria.
+//
+// DANGLING IDS FAIL LOUDLY, NEVER SILENTLY. AC ids are server-assigned and
+// stable across revisions by identical content (§3.6), but two paths can still
+// retire an id a case points at: editing a criterion's g/w/t holes the old id and
+// mints a new one, and version-side Merge re-numbers an absorbed requirement's
+// criteria against the target's set. Both move the requirement's current
+// revision, so the affected cases are already refused by the confirmation gate
+// ("bound to an older requirement version") and marked stale; this check is what
+// stops the redesign from silently re-proposing the dead id. A dangling link is
+// therefore a 400 naming the id, not a dropped element.
+//
+// Duplicates are not an error. covered_acs is a set (§3.6 normalizes it
+// sorted-unique for the content hash), so a repeated id carries no extra
+// meaning and rejecting it would make the gate stricter than the value it
+// guards. This is NOT a workaround for requirement-side AC id churn: deduping
+// duplicate identical criteria belongs to the requirement write path
+// (version/domain/acceptance_criteria.go), which is the single source of that
+// rule.
+func validateCoveredACs(field string, coveredACs, requirementACIDs []string) error {
+	for _, raw := range coveredACs {
+		if strings.TrimSpace(raw) == "" {
+			return platform.Invalid(field, "must not contain an empty acceptance-criterion id")
 		}
 	}
-	return &target, nil
-}
-
-func validateTargetSet(field string, ids []int64, allowed map[int64]struct{}, checkAllowed bool) error {
-	seen := make(map[int64]struct{}, len(ids))
-	for _, id := range ids {
-		if id <= 0 {
-			return platform.Invalid(field, "must contain positive decimal IDs")
-		}
-		if _, duplicate := seen[id]; duplicate {
-			return platform.Invalid(field, "must not contain duplicate IDs")
-		}
-		seen[id] = struct{}{}
-		if checkAllowed {
-			if _, ok := allowed[id]; !ok {
-				return platform.Invalid(field, "must reference version SUTs bound to this version")
-			}
-		}
+	normalized := NormalizeACIDSet(coveredACs)
+	if len(normalized) == 0 {
+		return platform.Invalid(field, "at least one covered acceptance criterion is required")
 	}
-	return nil
-}
-
-func validateBoundResourceIDs(field string, ids []int64, sutByResource map[int64]int64, caseSUTs map[int64]struct{}) error {
-	if err := validateTargetSet(field, ids, nil, false); err != nil {
-		return err
+	allowed := make(map[string]struct{}, len(requirementACIDs))
+	for _, acID := range NormalizeACIDSet(requirementACIDs) {
+		allowed[acID] = struct{}{}
 	}
-	for _, id := range ids {
-		sut, ok := sutByResource[id]
-		if !ok {
-			return platform.Invalid(field, "resource does not belong to a version SUT")
-		}
-		if _, ok := caseSUTs[sut]; !ok {
-			return platform.Invalid(field, "resource does not belong to the case version SUTs")
+	if len(allowed) == 0 {
+		return platform.Invalid(field, "the requirement has no acceptance criteria to cover; clarify the requirement first")
+	}
+	for _, acID := range normalized {
+		if _, ok := allowed[acID]; !ok {
+			return platform.Invalid(field, "acceptance criterion "+acID+
+				" is not in this requirement version's acceptance criteria; it was retired by an edit or renumbered by a merge -- re-read the requirement and set covered_acs to current ids")
 		}
 	}
 	return nil
@@ -774,7 +722,7 @@ func NormalizePriority(raw string) (string, error) {
 // ValidAssertionKind reports whether kind is a P2 assertion kind.
 func ValidAssertionKind(kind string) bool {
 	switch kind {
-	case AssertionUI, AssertionAPI, AssertionDB, AssertionText, AssertionVisual:
+	case AssertionUI, AssertionAPI, AssertionDB, AssertionText:
 		return true
 	default:
 		return false
@@ -837,13 +785,41 @@ func NormalizeJSONObject(raw json.RawMessage) (json.RawMessage, error) {
 	return normalized, nil
 }
 
-// NormalizeIDSet validates a list of positive IDs and returns it sorted unique.
-func NormalizeIDSet(ids []int64) ([]int64, error) {
-	seen := make(map[int64]struct{}, len(ids))
-	normalized := make([]int64, 0, len(ids))
-	for _, id := range ids {
-		if id <= 0 {
-			return nil, platform.Invalid("ids", "must contain positive decimal IDs")
+// NormalizeACIDSet canonicalizes a covered_acs value: each id trimmed, blanks
+// dropped, duplicates removed, result sorted.
+//
+// It is THE single normalization for AC id sets, and all three consumers call it
+// rather than re-implementing it, so "what the gate validated", "what got stored"
+// and "what got hashed" cannot drift apart:
+//
+//   - validateCoveredACs (this file) -- the §5.2 linkage gate, both the
+//     proposal's covered_acs and the requirement's AC set
+//   - ComputeCaseContentHash (hash.go) -- the canonical payload member
+//   - buildCaseVersion (application/graph.go) -- the propose write path
+//
+// A fourth caller, InsertCaseVersion in the PostgreSQL adapter, normalizes again
+// before encoding, so a version built outside the propose path still stores the
+// canonical form.
+//
+// Blanks are dropped here because canonicalization treats an empty element as
+// noise; a GATE that wants to reject blanks must check for them before calling
+// (validateCoveredACs does).
+//
+// The sort is plain lexicographic. All the hash needs is one deterministic
+// total order so that {AC-1, AC-2} and {AC-2, AC-1} produce identical bytes;
+// the numeric-suffix ordering the requirement context uses to *present* its AC
+// list (AC-2 before AC-10) is a display concern of that context and deliberately
+// not duplicated here.
+//
+// It replaces the v0.22 NormalizeIDSet, whose positive-decimal-ID rule has no
+// meaning for "AC-<n>" strings.
+func NormalizeACIDSet(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	normalized := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
 		}
 		if _, duplicate := seen[id]; duplicate {
 			continue
@@ -851,8 +827,8 @@ func NormalizeIDSet(ids []int64) ([]int64, error) {
 		seen[id] = struct{}{}
 		normalized = append(normalized, id)
 	}
-	sort.Slice(normalized, func(i, j int) bool { return normalized[i] < normalized[j] })
-	return normalized, nil
+	sort.Strings(normalized)
+	return normalized
 }
 
 func proposalField(kind string, index int) string {

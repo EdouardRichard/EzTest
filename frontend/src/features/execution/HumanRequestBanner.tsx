@@ -298,9 +298,8 @@ function LoginTakeoverBanner({
       <div data-testid="human-request-banner" className="space-y-2">
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone="warning">{HUMAN_REQUEST_KIND_LABEL[current.kind]}</Badge>
-          {current.payload.version_sut_id !== undefined &&
-          current.payload.version_sut_id !== null ? (
-            <span className="text-muted-foreground">系统 {current.payload.version_sut_id}</span>
+          {current.payload.sut_id !== undefined && current.payload.sut_id !== null ? (
+            <span className="text-muted-foreground">系统 {current.payload.sut_id}</span>
           ) : null}
           {current.payload.account_role !== undefined && current.payload.account_role !== "" ? (
             <span className="text-muted-foreground">账号角色 {current.payload.account_role}</span>

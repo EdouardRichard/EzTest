@@ -252,6 +252,12 @@ func newStageServiceEnv(t *testing.T, initial version.Stage) *stageServiceEnv {
 		Closer:      closer,
 		Handoff:     handoff,
 	})
+	// T9: the designing -> case_review edge now also consults the shared design
+	// review gate (nil fails closed). These legacy stage tests pin the count/
+	// coverage gates and the workflow edges, so inject a pass gate; the review
+	// predicate and its fail-closed/verdict contracts are pinned in
+	// stage_review_gate_test.go and designapp's review_gate_test.go.
+	svc.SetDesignReviewGate(&fakeStageReviewGate{})
 	return &stageServiceEnv{
 		svc: svc, repo: repo, jobs: jobs, audit: audit, publisher: publisher,
 		gates: gates, waves: waves, waveControl: waveControl, reports: reports,

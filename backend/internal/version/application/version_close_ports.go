@@ -6,17 +6,15 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// BlockingWorkItemCounts splits a version's blocking work items into the total
-// and the version.close tasks themselves. The version close service subtracts
-// the latter so the predicate never counts its own task as blocking work
-// (spec §7.3 check 2).
+// BlockingWorkItemCounts is the blocking-work projection of one version. GD-17
+// removed the version.close work type, so there is no self-task split: Total is
+// the raw count of open/claimed/running work items (spec §7.3 check 2).
 //
 // The reader counts statuses open/claimed/running. waiting_human is not
 // persisted on work items in P3; the state it represents is covered by the open
 // human_request and paused-wave checks (P3-D-25).
 type BlockingWorkItemCounts struct {
-	Total        int
-	VersionClose int
+	Total int
 }
 
 // VersionWorkItemReader is the agent task-board slice consumed by version close
@@ -76,12 +74,4 @@ type ReportStatusReader interface {
 // and the reconciler retries the projection.
 type VersionReportStaler interface {
 	MarkVersionReportStale(ctx context.Context, versionID int64, reason string) error
-}
-
-// VersionCloseTaskEnsurer ensures the steward version.close work item for the
-// current report revision and predicate fingerprint. It is idempotent: the
-// dedupe key is ver-close:{version_id}:{report_revision_id}:{fingerprint}, so a
-// changed predicate naturally produces a new item.
-type VersionCloseTaskEnsurer interface {
-	EnsureVersionClose(ctx context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error
 }

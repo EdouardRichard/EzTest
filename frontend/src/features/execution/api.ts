@@ -169,7 +169,7 @@ export async function listEvidence(
   const page = await apiGetPage<Evidence>(
     `${versionPath(versionId)}/evidence${query({
       case_run_id: options.caseRunId,
-      version_sut_id: options.versionSutId,
+      sut_id: options.sutId,
       kind: options.kind,
       before: options.before,
       limit: options.limit ?? 20,

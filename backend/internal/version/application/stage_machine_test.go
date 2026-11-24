@@ -207,6 +207,75 @@ func stringMetadata(t *testing.T, metadata map[string]any, key string) string {
 	return value
 }
 
+// TestStageMachinePersistsTransitionReason pins V-0020: the transition reason and
+// actor ride on the StageState handed to ApplyStage, so the repository persists
+// them as the durable stage_transition fact in the same transaction as the stage
+// row. The event payload alone is not durable under event retention.
+func TestStageMachinePersistsTransitionReason(t *testing.T) {
+	t.Run("hard gate carries reason and user actor", func(t *testing.T) {
+		env := newStageEnv(t, version.StageState{
+			Stage: version.StageRequirementReview, StageEnteredAt: testTime,
+		})
+		if _, err := env.machine.OnRequirementConfirmed(stageUserContext(42), 101, []int64{701}); err != nil {
+			t.Fatalf("OnRequirementConfirmed: %v", err)
+		}
+		if len(env.repo.applied) != 1 {
+			t.Fatalf("applied = %#v, want one transition", env.repo.applied)
+		}
+		applied := env.repo.applied[0]
+		if applied.Reason != "requirement_confirmed" {
+			t.Fatalf("applied reason = %q, want requirement_confirmed", applied.Reason)
+		}
+		if applied.Actor != "user" {
+			t.Fatalf("applied actor = %q, want user", applied.Actor)
+		}
+		if applied.Stage != version.StageDesigning {
+			t.Fatalf("applied stage = %q, want designing", applied.Stage)
+		}
+	})
+
+	t.Run("background callback is reported as system", func(t *testing.T) {
+		env := newStageEnv(t, version.StageState{
+			Stage: version.StageExecuting, StageEnteredAt: testTime,
+		})
+		if _, err := env.machine.OnWaveTerminal(requestContext(), 101); err != nil {
+			t.Fatalf("OnWaveTerminal: %v", err)
+		}
+		if len(env.repo.applied) != 1 {
+			t.Fatalf("applied = %#v, want one transition", env.repo.applied)
+		}
+		applied := env.repo.applied[0]
+		if applied.Reason != "wave_terminal" {
+			t.Fatalf("applied reason = %q, want wave_terminal", applied.Reason)
+		}
+		if applied.Actor != "system" {
+			t.Fatalf("applied actor = %q, want system", applied.Actor)
+		}
+	})
+
+	t.Run("suspend carries the suspension reason and blocker", func(t *testing.T) {
+		env := newStageEnv(t, version.StageState{
+			Stage: version.StageClarifying, StageEnteredAt: testTime,
+		})
+		if err := env.machine.Suspend(stageUserContext(42), 101, version.StageBlocked, "executor is offline"); err != nil {
+			t.Fatalf("Suspend: %v", err)
+		}
+		if len(env.repo.applied) != 1 {
+			t.Fatalf("applied = %#v, want one transition", env.repo.applied)
+		}
+		applied := env.repo.applied[0]
+		if applied.Reason != string(version.StageBlocked) {
+			t.Fatalf("applied reason = %q, want blocked", applied.Reason)
+		}
+		if applied.Blocker != "executor is offline" {
+			t.Fatalf("applied blocker = %q, want the suspension text", applied.Blocker)
+		}
+		if applied.Actor != "user" {
+			t.Fatalf("applied actor = %q, want user", applied.Actor)
+		}
+	})
+}
+
 // TestStageMachineTransitions covers the two hard gates, the rejection back
 // edges, illegal transitions and the stage-entry job dispatch.
 func TestStageMachineTransitions(t *testing.T) {

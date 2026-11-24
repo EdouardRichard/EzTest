@@ -48,7 +48,7 @@ export type IssueRetestStatus = "not_retested" | "retesting" | "passed" | "faile
 export type IssueRef = {
   kind: IssueRefKind
   ref_id: string
-  version_sut_id?: string | null
+  sut_id?: string | null
   role: string
 }
 
@@ -164,7 +164,7 @@ export type ReportRefKind =
   | "wave"
   | "case_run"
   | "issue"
-  | "version_sut"
+  | "sut"
 
 export type ReportRefView = {
   kind: ReportRefKind
@@ -237,8 +237,8 @@ export type IssueListOptions = {
   status?: IssueStatus
   category?: IssueCategory
   severity?: IssueSeverity
-  /** `version_sut_id` query parameter (decimal string). */
-  versionSutId?: string
+  /** `sut_id` query parameter (decimal string). */
+  sutId?: string
   before?: string
   limit?: number
 }
@@ -389,7 +389,7 @@ export const REPORT_REF_LABELS: Record<ReportRefKind, string> = {
   wave: "波次",
   case_run: "用例运行",
   issue: "问题",
-  version_sut: "SUT",
+  sut: "SUT",
 }
 
 export const REPORT_ARTIFACT_FORMAT_LABELS: Record<ReportArtifactFormat, string> = {

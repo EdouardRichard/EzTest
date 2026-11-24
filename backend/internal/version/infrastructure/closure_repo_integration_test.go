@@ -412,7 +412,7 @@ func TestClosureRepoCloseRecheckSeesConcurrentWorkItem(t *testing.T) {
 	<-locked
 	if _, err := fixture.pool.Exec(ctx, `
 		INSERT INTO work_item (id, version_id, team, type, status, priority, dedupe_key)
-		VALUES ($1, $2, 'steward', 'requirement.close', 'open', 0, 'race-open-work')
+		VALUES ($1, $2, 'design', 'design.gap', 'open', 0, 'race-open-work')
 	`, fixture.ids.Next(), fixture.versionID); err != nil {
 		t.Fatalf("insert work item: %v", err)
 	}

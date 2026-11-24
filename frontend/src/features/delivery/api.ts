@@ -66,7 +66,7 @@ export async function listIssues(
       status: options.status,
       category: options.category,
       severity: options.severity,
-      version_sut_id: options.versionSutId,
+      sut_id: options.sutId,
       before: options.before,
       limit: options.limit ?? 20,
     })}`,

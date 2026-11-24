@@ -1,15 +1,16 @@
 package versionapi
 
-// Task 29 (v0.22 C-1..C-4/API-16): the version binding read/update routes.
+// The version binding read/update routes (API-16).
 //
 //	GET /api/versions/{id}/binding
 //	PUT /api/versions/{id}/binding
 //
 // The handler only parses the path/body, validates decimal IDs and renders the
-// overview: resource ownership, environment/SUT derivation, repository
-// overrides, account threshold, scope_exclude persistence and the stage gate all
-// belong to *versionapp.Service (GetBinding/UpdateBinding). Route registration
-// and the OpenAPI schema are wired by the server task (Task 37).
+// overview: environment existence, the derived SUT catalog and code pool, the
+// account threshold and the stage gate all belong to *versionapp.Service
+// (GetBinding/UpdateBinding). v0.2.4-B removed the repository selection and the
+// scope_exclude document together with the version_sut chain, so the only
+// editable fields left are the bound environment and the version account subset.
 
 import (
 	"context"
@@ -20,7 +21,6 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
-	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // BindingService is the binding surface the handler needs.
@@ -44,13 +44,12 @@ func NewBindingHandler(svc BindingService) *BindingHandler {
 	return &BindingHandler{svc: svc}
 }
 
-// RegisterBindingRoutes mounts the binding read/update routes on mux for Task
-// 37. Both PUT and PATCH are mounted because the design spec names the write as
-// PATCH while the W0 task description names PUT; both share the same
-// partial-update semantics. A nil mux or authentication middleware is a wiring
-// bug (an authenticated route must never be silently unmounted), so the helper
-// panics; a nil handler keeps the route table of a deployment without the
-// binding context.
+// RegisterBindingRoutes mounts the binding read/update routes on mux. Both PUT
+// and PATCH are mounted because the design spec names the write as PATCH while
+// the original task description named PUT; both share the same partial-update
+// semantics. A nil mux or authentication middleware is a wiring bug (an
+// authenticated route must never be silently unmounted), so the helper panics; a
+// nil handler keeps the route table of a deployment without the binding context.
 func RegisterBindingRoutes(mux *http.ServeMux, auth func(http.Handler) http.Handler, h *BindingHandler) {
 	if mux == nil {
 		panic("versionapi: RegisterBindingRoutes requires a non-nil mux")
@@ -86,8 +85,8 @@ func (h *BindingHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 // Update PUT|PATCH /api/versions/{id}/binding. Every field is optional: an
-// omitted field is untouched, while an explicit empty repository/account list
-// clears the selection.
+// omitted field is untouched, while an explicit empty account list clears the
+// selection.
 func (h *BindingHandler) Update(w http.ResponseWriter, r *http.Request) {
 	actorID, ok := requireActor(w, r)
 	if !ok {
@@ -126,17 +125,13 @@ func bindingPathID(r *http.Request) (int64, error) {
 
 // ---------- request DTOs ----------
 
+// bindingUpdateRequest is the API-16 partial binding update. v0.2.4-B: the code
+// pool is derived from the bound environment (GD-03) and every approved asset of
+// its SUTs is in scope, so repository_ids and scope_exclude are no longer part
+// of the contract.
 type bindingUpdateRequest struct {
-	EnvironmentID *string                `json:"environment_id"`
-	RepositoryIDs *[]string              `json:"repository_ids"`
-	AccountIDs    *[]string              `json:"account_ids"`
-	ScopeExclude  *scopeExcludeInputJSON `json:"scope_exclude"`
-}
-
-type scopeExcludeInputJSON struct {
-	Pages     []string `json:"pages"`
-	APIs      []string `json:"apis"`
-	Databases []string `json:"databases"`
+	EnvironmentID *string   `json:"environment_id"`
+	AccountIDs    *[]string `json:"account_ids"`
 }
 
 func (r bindingUpdateRequest) patch() (versionapp.BindingPatch, error) {
@@ -151,35 +146,12 @@ func (r bindingUpdateRequest) patch() (versionapp.BindingPatch, error) {
 		}
 		patch.EnvironmentID = &environmentID
 	}
-	if r.RepositoryIDs != nil {
-		ids, err := parseDecimalIDList(*r.RepositoryIDs, "repository_ids")
-		if err != nil {
-			return versionapp.BindingPatch{}, err
-		}
-		patch.RepositoryIDs = &ids
-	}
 	if r.AccountIDs != nil {
 		ids, err := parseDecimalIDList(*r.AccountIDs, "account_ids")
 		if err != nil {
 			return versionapp.BindingPatch{}, err
 		}
 		patch.AccountIDs = &ids
-	}
-	if r.ScopeExclude != nil {
-		pages, err := parseDecimalIDList(r.ScopeExclude.Pages, "scope_exclude.pages")
-		if err != nil {
-			return versionapp.BindingPatch{}, err
-		}
-		apis, err := parseDecimalIDList(r.ScopeExclude.APIs, "scope_exclude.apis")
-		if err != nil {
-			return versionapp.BindingPatch{}, err
-		}
-		databases, err := parseDecimalIDList(r.ScopeExclude.Databases, "scope_exclude.databases")
-		if err != nil {
-			return versionapp.BindingPatch{}, err
-		}
-		scope := version.NewScopeExclude(pages, apis, databases)
-		patch.ScopeExclude = &scope
 	}
 	return patch, nil
 }
@@ -204,23 +176,17 @@ type bindingCountsDTO struct {
 	Databases bindingResourceCountsDTO `json:"databases"`
 }
 
+// bindingResourceCountsDTO is the approved/proposed projection of one asset kind
+// of the bound environment. Exclusions disappeared with the version_sut chain,
+// so approved is also the included count.
 type bindingResourceCountsDTO struct {
 	Approved int `json:"approved"`
 	Proposed int `json:"proposed"`
-	Excluded int `json:"excluded"`
-	Included int `json:"included"`
-}
-
-type bindingRepoRowDTO struct {
-	Repository codeRepositoryDTO `json:"repository"`
-	Role       string            `json:"role"`
-	Included   bool              `json:"included"`
-	Source     string            `json:"source"`
 }
 
 // bindingSnapshotDTO is the R-C4-1 snapshot projection. scope_version is the
 // deterministic reference of the current effective scope; frozen_wave_id stays
-// null in W0 because the frozen wave snapshot is execution-owned (R-C5/API-19,
+// null because the frozen wave snapshot is execution-owned (R-C5/API-19,
 // run_wave.scope_snapshot) and is not read by the version context.
 type bindingSnapshotDTO struct {
 	ScopeVersion string  `json:"scope_version"`
@@ -228,70 +194,43 @@ type bindingSnapshotDTO struct {
 }
 
 type bindingOverviewDTO struct {
-	VersionID          string              `json:"version_id"`
-	Stage              string              `json:"stage"`
-	Editable           bool                `json:"editable"`
-	SUT                sutDTO              `json:"sut"`
-	Environment        environmentDTO      `json:"environment"`
-	ScopeExclude       scopeExcludeDTO     `json:"scope_exclude"`
-	Counts             bindingCountsDTO    `json:"counts"`
-	Pages              []pageDTO           `json:"pages"`
-	APIs               []apiDTO            `json:"apis"`
-	Databases          []databaseDTO       `json:"databases"`
-	Accounts           []accountDTO        `json:"accounts"`
-	Repositories       []bindingRepoRowDTO `json:"repositories"`
-	CodeBaselineCommit *string             `json:"code_baseline_commit"`
-	Snapshot           bindingSnapshotDTO  `json:"snapshot"`
+	VersionID          string                 `json:"version_id"`
+	EnvironmentID      string                 `json:"environment_id"`
+	Stage              string                 `json:"stage"`
+	Editable           bool                   `json:"editable"`
+	Environment        environmentDTO         `json:"environment"`
+	Counts             bindingCountsDTO       `json:"counts"`
+	Pages              []pageDTO              `json:"pages"`
+	APIs               []apiDTO               `json:"apis"`
+	Databases          []databaseDTO          `json:"databases"`
+	Accounts           []accountDTO           `json:"accounts"`
+	Repositories       []bindingRepositoryDTO `json:"repositories"`
+	CodeBaselineCommit *string                `json:"code_baseline_commit"`
+	Snapshot           bindingSnapshotDTO     `json:"snapshot"`
 }
 
 func toBindingOverviewDTO(overview versionapp.BindingOverview) bindingOverviewDTO {
-	pages := make([]pageDTO, 0, len(overview.Pages))
-	for _, page := range overview.Pages {
-		pages = append(pages, toPageDTO(page))
-	}
-	apis := make([]apiDTO, 0, len(overview.APIs))
-	for _, api := range overview.APIs {
-		apis = append(apis, toAPIDTO(api))
-	}
-	databases := make([]databaseDTO, 0, len(overview.Databases))
-	for _, database := range overview.Databases {
-		databases = append(databases, toDatabaseDTO(database))
-	}
-	accounts := make([]accountDTO, 0, len(overview.Accounts))
-	for _, account := range overview.Accounts {
-		accounts = append(accounts, toAccountDTO(account))
-	}
-	repositories := make([]bindingRepoRowDTO, 0, len(overview.Repositories))
-	for _, repository := range overview.Repositories {
-		repositories = append(repositories, bindingRepoRowDTO{
-			Repository: toCodeRepositoryDTO(repository.Repository),
-			Role:       repository.Role,
-			Included:   repository.Included,
-			Source:     repository.Source,
-		})
-	}
 	var frozenWaveID *string
 	if overview.Snapshot.FrozenWaveID != nil {
 		formatted := strconv.FormatInt(*overview.Snapshot.FrozenWaveID, 10)
 		frozenWaveID = &formatted
 	}
 	return bindingOverviewDTO{
-		VersionID:    strconv.FormatInt(overview.VersionID, 10),
-		Stage:        string(overview.Stage),
-		Editable:     overview.Editable,
-		SUT:          toSUTDTO(overview.SUT),
-		Environment:  toEnvironmentDTO(overview.Environment),
-		ScopeExclude: toScopeExcludeDTO(overview.ScopeExclude),
+		VersionID:     strconv.FormatInt(overview.VersionID, 10),
+		EnvironmentID: strconv.FormatInt(overview.EnvironmentID, 10),
+		Stage:         string(overview.Stage),
+		Editable:      overview.Editable,
+		Environment:   toEnvironmentDTO(overview.Environment),
 		Counts: bindingCountsDTO{
 			Pages:     toBindingResourceCountsDTO(overview.Counts.Pages),
 			APIs:      toBindingResourceCountsDTO(overview.Counts.APIs),
 			Databases: toBindingResourceCountsDTO(overview.Counts.Databases),
 		},
-		Pages:              pages,
-		APIs:               apis,
-		Databases:          databases,
-		Accounts:           accounts,
-		Repositories:       repositories,
+		Pages:              toPageDTOs(overview.Pages),
+		APIs:               toAPIDTOs(overview.APIs),
+		Databases:          toDatabaseDTOs(overview.Databases),
+		Accounts:           toAccountDTOs(overview.Accounts),
+		Repositories:       toBindingRepositoryDTOs(overview.Repositories),
 		CodeBaselineCommit: formatOptionalString(overview.CodeBaselineCommit),
 		Snapshot: bindingSnapshotDTO{
 			ScopeVersion: overview.Snapshot.ScopeVersion,
@@ -304,7 +243,5 @@ func toBindingResourceCountsDTO(counts versionapp.BindingResourceCounts) binding
 	return bindingResourceCountsDTO{
 		Approved: counts.Approved,
 		Proposed: counts.Proposed,
-		Excluded: counts.Excluded,
-		Included: counts.Included,
 	}
 }

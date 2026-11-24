@@ -2,9 +2,11 @@ package designapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
@@ -36,7 +38,6 @@ type requirementGraphDTO struct {
 	Title                string             `json:"title"`
 	Status               string             `json:"status"`
 	DesignStatus         string             `json:"design_status"`
-	TargetVersionSUTIDs  []string           `json:"target_version_sut_ids"`
 	Scenarios            []scenarioGraphDTO `json:"scenarios"`
 }
 
@@ -45,30 +46,33 @@ type scenarioGraphDTO struct {
 	RequirementVersionID string        `json:"requirement_version_id"`
 	Name                 string        `json:"name"`
 	Description          string        `json:"description"`
-	VersionSUTIDs        []string      `json:"version_sut_ids"`
-	PageIDs              []string      `json:"page_ids"`
-	APIIDs               []string      `json:"api_ids"`
 	Sort                 int           `json:"sort"`
 	Cases                []caseCardDTO `json:"cases"`
 }
 
+// caseCardDTO is one case card of the graph. v0.2.4-B (§3.2/§5.2): the resource
+// id arrays are replaced by the natural-language contract -- sut_description and
+// the acceptance-criterion ids the case covers. Breaking REST change; the OpenAPI
+// document is rebuilt by T19/T20.
 type caseCardDTO struct {
-	CaseID              string   `json:"case_id"`
-	CurrentVersionID    string   `json:"current_version_id"`
-	Revision            int      `json:"revision"`
-	Title               string   `json:"title"`
-	Priority            string   `json:"priority"`
-	Status              string   `json:"status"`
-	DefaultVersionSUTID *string  `json:"default_version_sut_id"`
-	VersionSUTIDs       []string `json:"version_sut_ids"`
-	PageIDs             []string `json:"page_ids"`
-	APIIDs              []string `json:"api_ids"`
-	StepCount           int      `json:"step_count"`
-	AssertionCount      int      `json:"assertion_count"`
+	CaseID           string   `json:"case_id"`
+	CurrentVersionID string   `json:"current_version_id"`
+	Revision         int      `json:"revision"`
+	Title            string   `json:"title"`
+	Priority         string   `json:"priority"`
+	Status           string   `json:"status"`
+	SutDescription   string   `json:"sut_description"`
+	CoveredACs       []string `json:"covered_acs"`
+	StepCount        int      `json:"step_count"`
+	AssertionCount   int      `json:"assertion_count"`
 	// ExecutionVerdict is additive: the latest execution result of the case
 	// (passed/failed/blocked/inconclusive), inconclusive when never executed.
 	ExecutionVerdict string `json:"execution_verdict"`
-	CreatedAt        string `json:"created_at"`
+	// ReviewState is additive (T16, spec SC-E5): the judge review projection
+	// of the current case version (pending/pass/reworking/escalated_fail/
+	// judge_unavailable), empty when the judgment gate is unwired/unreadable.
+	ReviewState string `json:"review_state"`
+	CreatedAt   string `json:"created_at"`
 }
 
 func toGraphDTO(view designapp.GraphView) graphViewDTO {
@@ -93,7 +97,6 @@ func toGraphDTO(view designapp.GraphView) graphViewDTO {
 			Title:                requirement.Title,
 			Status:               requirement.Status,
 			DesignStatus:         requirement.DesignStatus,
-			TargetVersionSUTIDs:  formatIDs(requirement.TargetVersionSUTIDs),
 			Scenarios:            make([]scenarioGraphDTO, 0, len(requirement.Scenarios)),
 		}
 		for _, scenario := range requirement.Scenarios {
@@ -102,28 +105,24 @@ func toGraphDTO(view designapp.GraphView) graphViewDTO {
 				RequirementVersionID: platformid.Format(scenario.RequirementVersionID),
 				Name:                 scenario.Name,
 				Description:          scenario.Description,
-				VersionSUTIDs:        formatIDs(scenario.VersionSUTIDs),
-				PageIDs:              formatIDs(scenario.PageIDs),
-				APIIDs:               formatIDs(scenario.APIIDs),
 				Sort:                 scenario.SortOrder,
 				Cases:                make([]caseCardDTO, 0, len(scenario.Cases)),
 			}
 			for _, card := range scenario.Cases {
 				scenarioDTO.Cases = append(scenarioDTO.Cases, caseCardDTO{
-					CaseID:              platformid.Format(card.CaseID),
-					CurrentVersionID:    platformid.Format(card.CurrentVersionID),
-					Revision:            card.Revision,
-					Title:               card.Title,
-					Priority:            card.Priority,
-					Status:              card.Status,
-					DefaultVersionSUTID: formatOptionalID(card.DefaultVersionSUTID),
-					VersionSUTIDs:       formatIDs(card.VersionSUTIDs),
-					PageIDs:             formatIDs(card.PageIDs),
-					APIIDs:              formatIDs(card.APIIDs),
-					StepCount:           card.StepCount,
-					AssertionCount:      card.AssertionCount,
-					ExecutionVerdict:    card.ExecutionVerdict,
-					CreatedAt:           formatTime(card.CreatedAt),
+					CaseID:           platformid.Format(card.CaseID),
+					CurrentVersionID: platformid.Format(card.CurrentVersionID),
+					Revision:         card.Revision,
+					Title:            card.Title,
+					Priority:         card.Priority,
+					Status:           card.Status,
+					SutDescription:   card.SutDescription,
+					CoveredACs:       nonNilStrings(card.CoveredACs),
+					StepCount:        card.StepCount,
+					AssertionCount:   card.AssertionCount,
+					ExecutionVerdict: card.ExecutionVerdict,
+					ReviewState:      string(card.ReviewState),
+					CreatedAt:        formatTime(card.CreatedAt),
 				})
 			}
 			requirementDTO.Scenarios = append(requirementDTO.Scenarios, scenarioDTO)
@@ -184,6 +183,10 @@ type caseDetailDTO struct {
 	Versions             []caseVersionSummaryDTO `json:"versions"`
 	Selected             caseVersionDetailDTO    `json:"selected"`
 	Confirmable          bool                    `json:"confirmable"`
+	// ReviewState is additive (T16, spec SC-E5): the judge review projection
+	// of the CURRENT case version, independent of which historical revision
+	// Selected shows.
+	ReviewState string `json:"review_state"`
 }
 
 type caseVersionSummaryDTO struct {
@@ -196,45 +199,42 @@ type caseVersionSummaryDTO struct {
 }
 
 type caseVersionDetailDTO struct {
-	CaseVersionID       string             `json:"case_version_id"`
-	Revision            int                `json:"revision"`
-	Title               string             `json:"title"`
-	Description         string             `json:"description"`
-	Preconditions       string             `json:"preconditions"`
-	TestData            json.RawMessage    `json:"test_data"`
-	Priority            string             `json:"priority"`
-	DefaultVersionSUTID *string            `json:"default_version_sut_id"`
-	VersionSUTIDs       []string           `json:"version_sut_ids"`
-	PageIDs             []string           `json:"page_ids"`
-	APIIDs              []string           `json:"api_ids"`
-	Status              string             `json:"status"`
-	ContentHash         string             `json:"content_hash"`
-	CreatedAt           string             `json:"created_at"`
-	Steps               []caseStepDTO      `json:"steps"`
-	Assertions          []caseAssertionDTO `json:"assertions"`
-	Sources             []caseSourceDTO    `json:"sources"`
+	CaseVersionID  string             `json:"case_version_id"`
+	Revision       int                `json:"revision"`
+	Title          string             `json:"title"`
+	Description    string             `json:"description"`
+	SutDescription string             `json:"sut_description"`
+	Preconditions  string             `json:"preconditions"`
+	CoveredACs     []string           `json:"covered_acs"`
+	TestData       json.RawMessage    `json:"test_data"`
+	Priority       string             `json:"priority"`
+	Status         string             `json:"status"`
+	ContentHash    string             `json:"content_hash"`
+	CreatedAt      string             `json:"created_at"`
+	Steps          []caseStepDTO      `json:"steps"`
+	Assertions     []caseAssertionDTO `json:"assertions"`
+	Sources        []caseSourceDTO    `json:"sources"`
 }
 
 type caseStepDTO struct {
-	Seq                int             `json:"seq"`
-	Action             string          `json:"action"`
-	Expected           string          `json:"expected"`
-	TargetVersionSUTID *string         `json:"target_version_sut_id"`
-	TargetPageID       *string         `json:"target_page_id"`
-	TargetAPIID        *string         `json:"target_api_id"`
-	AccountRole        string          `json:"account_role"`
-	Data               json.RawMessage `json:"data"`
+	Seq               int             `json:"seq"`
+	Action            string          `json:"action"`
+	Expected          string          `json:"expected"`
+	TargetDescription string          `json:"target_description"`
+	AccountRole       string          `json:"account_role"`
+	Data              json.RawMessage `json:"data"`
 }
 
+// caseAssertionDTO. v0.2.4-B (§3.2, M-B4): target_version_sut_id/target_api_id
+// are gone and database_id is renamed sut_id -- a db assertion names the SUT it
+// reads. Omitted for every other kind.
 type caseAssertionDTO struct {
-	CaseAssertionID    string  `json:"case_assertion_id"`
-	StepSeq            int     `json:"step_seq"`
-	Kind               string  `json:"kind"`
-	Target             string  `json:"target"`
-	Expected           string  `json:"expected"`
-	TargetVersionSUTID *string `json:"target_version_sut_id"`
-	TargetAPIID        *string `json:"target_api_id"`
-	DatabaseID         *string `json:"database_id"`
+	CaseAssertionID string  `json:"case_assertion_id"`
+	StepSeq         int     `json:"step_seq"`
+	Kind            string  `json:"kind"`
+	Target          string  `json:"target"`
+	Expected        string  `json:"expected"`
+	SUTID           *string `json:"sut_id"`
 }
 
 type caseSourceDTO struct {
@@ -257,6 +257,7 @@ func toCaseDetailDTO(view designapp.CaseDetailView) caseDetailDTO {
 		Versions:             make([]caseVersionSummaryDTO, 0, len(view.Versions)),
 		Selected:             toCaseVersionDetailDTO(view.Selected),
 		Confirmable:          view.Confirmable,
+		ReviewState:          string(view.ReviewState),
 	}
 	for _, version := range view.Versions {
 		summary := caseVersionSummaryDTO{
@@ -274,23 +275,21 @@ func toCaseDetailDTO(view designapp.CaseDetailView) caseDetailDTO {
 
 func toCaseVersionDetailDTO(version designapp.CaseVersionDetailView) caseVersionDetailDTO {
 	dto := caseVersionDetailDTO{
-		CaseVersionID:       platformid.Format(version.CaseVersionID),
-		Revision:            version.Revision,
-		Title:               version.Title,
-		Description:         version.Description,
-		Preconditions:       version.Preconditions,
-		TestData:            version.TestData,
-		Priority:            version.Priority,
-		DefaultVersionSUTID: formatOptionalID(version.DefaultVersionSUTID),
-		VersionSUTIDs:       formatIDs(version.VersionSUTIDs),
-		PageIDs:             formatIDs(version.PageIDs),
-		APIIDs:              formatIDs(version.APIIDs),
-		Status:              version.Status,
-		ContentHash:         version.ContentHash,
-		CreatedAt:           formatTime(version.CreatedAt),
-		Steps:               make([]caseStepDTO, 0, len(version.Steps)),
-		Assertions:          make([]caseAssertionDTO, 0, len(version.Assertions)),
-		Sources:             make([]caseSourceDTO, 0, len(version.Sources)),
+		CaseVersionID:  platformid.Format(version.CaseVersionID),
+		Revision:       version.Revision,
+		Title:          version.Title,
+		Description:    version.Description,
+		SutDescription: version.SutDescription,
+		Preconditions:  version.Preconditions,
+		CoveredACs:     nonNilStrings(version.CoveredACs),
+		TestData:       version.TestData,
+		Priority:       version.Priority,
+		Status:         version.Status,
+		ContentHash:    version.ContentHash,
+		CreatedAt:      formatTime(version.CreatedAt),
+		Steps:          make([]caseStepDTO, 0, len(version.Steps)),
+		Assertions:     make([]caseAssertionDTO, 0, len(version.Assertions)),
+		Sources:        make([]caseSourceDTO, 0, len(version.Sources)),
 	}
 	if len(dto.TestData) == 0 {
 		dto.TestData = json.RawMessage(`{}`)
@@ -302,21 +301,17 @@ func toCaseVersionDetailDTO(version designapp.CaseVersionDetailView) caseVersion
 		}
 		dto.Steps = append(dto.Steps, caseStepDTO{
 			Seq: step.Seq, Action: step.Action, Expected: step.Expected,
-			TargetVersionSUTID: formatOptionalID(step.TargetVersionSUTID),
-			TargetPageID:       formatOptionalID(step.TargetPageID),
-			TargetAPIID:        formatOptionalID(step.TargetAPIID),
-			AccountRole:        step.AccountRole,
-			Data:               data,
+			TargetDescription: step.TargetDescription,
+			AccountRole:       step.AccountRole,
+			Data:              data,
 		})
 	}
 	for _, assertion := range version.Assertions {
 		dto.Assertions = append(dto.Assertions, caseAssertionDTO{
 			CaseAssertionID: platformid.Format(assertion.ID),
 			StepSeq:         assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
-			Expected:           assertion.Expected,
-			TargetVersionSUTID: formatOptionalID(assertion.TargetVersionSUTID),
-			TargetAPIID:        formatOptionalID(assertion.TargetAPIID),
-			DatabaseID:         formatOptionalID(assertion.DatabaseID),
+			Expected: assertion.Expected,
+			SUTID:    formatOptionalID(assertion.SUTID),
 		})
 	}
 	for _, source := range version.Sources {
@@ -404,6 +399,122 @@ func toCaseVersionRollbackDTO(view designapp.CaseVersionRollbackView) caseVersio
 	}
 }
 
+// ---------- judgment override + read report (T16) ----------
+
+type overrideJudgmentRequest struct {
+	Reason string `json:"reason"`
+}
+
+type judgmentOverrideDTO struct {
+	ID            string  `json:"id"`
+	CaseID        string  `json:"case_id"`
+	CaseVersionID string  `json:"case_version_id"`
+	ContentHash   string  `json:"content_hash"`
+	JudgmentID    *string `json:"judgment_id,omitempty"`
+	Condition     string  `json:"condition"`
+	ActorID       string  `json:"actor_id"`
+	Reason        string  `json:"reason"`
+	CreatedAt     string  `json:"created_at"`
+}
+
+func toJudgmentOverrideDTO(override design.Override) judgmentOverrideDTO {
+	return judgmentOverrideDTO{
+		ID:            platformid.Format(override.ID),
+		CaseID:        platformid.Format(override.CaseID),
+		CaseVersionID: platformid.Format(override.CaseVersionID),
+		ContentHash:   override.ContentHash,
+		JudgmentID:    formatOptionalID(override.JudgmentID),
+		Condition:     override.Condition,
+		ActorID:       platformid.Format(override.ActorID),
+		Reason:        override.Reason,
+		CreatedAt:     formatTime(override.CreatedAt),
+	}
+}
+
+type judgmentFindingDTO struct {
+	Dimension string `json:"dimension"`
+	Severity  string `json:"severity"`
+	Message   string `json:"message"`
+	CaseRef   string `json:"case_ref,omitempty"`
+}
+
+type judgmentDTO struct {
+	ID               string               `json:"id"`
+	CaseID           string               `json:"case_id"`
+	CaseVersionID    string               `json:"case_version_id"`
+	ContentHash      string               `json:"content_hash"`
+	Round            int                  `json:"round"`
+	Verdict          string               `json:"verdict"`
+	Findings         []judgmentFindingDTO `json:"findings"`
+	ACCoverageMatrix json.RawMessage      `json:"ac_coverage_matrix"`
+	CreatedAt        string               `json:"created_at"`
+}
+
+// toJudgmentDTO projects one judge fact onto the wire. The AC coverage matrix is
+// re-encoded from the stored JSON object; an encoding failure is surfaced as an
+// error rather than silently replaced by an empty object (constitution VII.6,
+// H-F10 T16). It is unreachable for a matrix decoded from JSONB — which is why
+// the failure must be loud if it ever happens, not invisible.
+func toJudgmentDTO(judgment design.Judgment) (judgmentDTO, error) {
+	findings := make([]judgmentFindingDTO, 0, len(judgment.Findings))
+	for _, finding := range judgment.Findings {
+		findings = append(findings, judgmentFindingDTO{
+			Dimension: finding.Dimension, Severity: finding.Severity,
+			Message: finding.Message, CaseRef: finding.CaseRef,
+		})
+	}
+	matrix := json.RawMessage(`{}`)
+	if len(judgment.ACCoverageMatrix) > 0 {
+		encoded, err := json.Marshal(judgment.ACCoverageMatrix)
+		if err != nil {
+			return judgmentDTO{}, fmt.Errorf("encode the AC coverage matrix of judgment %d: %w", judgment.ID, err)
+		}
+		matrix = encoded
+	}
+	return judgmentDTO{
+		ID:               platformid.Format(judgment.ID),
+		CaseID:           platformid.Format(judgment.CaseID),
+		CaseVersionID:    platformid.Format(judgment.CaseVersionID),
+		ContentHash:      judgment.ContentHash,
+		Round:            judgment.Round,
+		Verdict:          judgment.Verdict,
+		Findings:         findings,
+		ACCoverageMatrix: matrix,
+		CreatedAt:        formatTime(judgment.CreatedAt),
+	}, nil
+}
+
+type judgmentCaseDTO struct {
+	CaseID           string       `json:"case_id"`
+	CurrentVersionID string       `json:"current_version_id"`
+	ReviewState      string       `json:"review_state"`
+	Judgment         *judgmentDTO `json:"judgment"`
+}
+
+type judgmentReportDTO struct {
+	Cases []judgmentCaseDTO `json:"cases"`
+}
+
+func toJudgmentReportDTO(view designapp.JudgmentReportView) (judgmentReportDTO, error) {
+	dto := judgmentReportDTO{Cases: make([]judgmentCaseDTO, 0, len(view.Cases))}
+	for _, item := range view.Cases {
+		card := judgmentCaseDTO{
+			CaseID:           platformid.Format(item.CaseID),
+			CurrentVersionID: platformid.Format(item.CurrentVersionID),
+			ReviewState:      string(item.ReviewState),
+		}
+		if item.Judgment != nil {
+			judgment, err := toJudgmentDTO(*item.Judgment)
+			if err != nil {
+				return judgmentReportDTO{}, err
+			}
+			card.Judgment = &judgment
+		}
+		dto.Cases = append(dto.Cases, card)
+	}
+	return dto, nil
+}
+
 // ---------- exports ----------
 
 type createExportRequest struct {
@@ -454,6 +565,17 @@ func formatIDs(values []int64) []string {
 		ids = append(ids, platformid.Format(value))
 	}
 	return ids
+}
+
+// nonNilStrings keeps covered_acs a JSON array on every endpoint. The graph card
+// and the case detail project the same field, so without this one shared guard a
+// case with no covered ACs would serialize as [] on one endpoint and null on the
+// other -- and a frontend built against either reading would break on the other.
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func formatOptionalID(value *int64) *string {

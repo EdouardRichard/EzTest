@@ -68,7 +68,6 @@ export type HumanRequestKind =
   | "blocked_recovery"
   | "login_takeover"
   | "conflict"
-  | "other"
 
 /** v0.22 H1 human_request state machine (spec R-W2-1, DB-16). */
 export type HumanRequestStatus = "pending" | "answered" | "cancelled" | "expired"
@@ -82,12 +81,13 @@ export type EvidenceKind =
   | "db"
   | "download"
   | "text"
-  | "visual_actual"
-  | "visual_diff"
+  | "command"
+  | "file"
+  | "trace"
 
 export type StepResultStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "skipped"
 
-export type AssertionKind = "ui" | "api" | "db" | "text" | "visual"
+export type AssertionKind = "ui" | "api" | "db" | "text"
 
 export type AssertionVerdict = "passed" | "failed" | "inconclusive" | "skipped"
 
@@ -109,8 +109,8 @@ export type WaveCounts = {
   interrupted: number
   superseded: number
   evidence: number
-  /** Per-version-SUT projection keyed by decimal `version_sut_id`. */
-  by_version_sut?: Record<string, SutWaveCounts>
+  /** Per-SUT projection keyed by decimal `sut_id` (v0.2.4-B rekey). */
+  by_sut?: Record<string, SutWaveCounts>
 }
 
 /** The per-SUT counters the spec §5.6 example pins. */
@@ -122,7 +122,7 @@ export type SutWaveCounts = {
   inconclusive: number
 }
 
-/** Version-wide case-run projection (no `evidence`/`by_version_sut` keys). */
+/** Version-wide case-run projection (no `evidence`/`by_sut` keys). */
 export type CaseRunCounts = {
   total: number
   pending: number
@@ -139,10 +139,13 @@ export type CaseRunCounts = {
 
 /* --------------------------------- overview -------------------------------- */
 
+/**
+ * Single global concurrency projection (v0.2.4-F design P5):
+ * `execution.max_concurrent_case_runs`, 0 = unlimited. The retired
+ * global/per_sut/cross_system trio is gone from the wire.
+ */
 export type ExecutionQuotas = {
-  global: number
-  per_sut: number
-  cross_system: number
+  max_concurrent_case_runs: number
 }
 
 /** `executor` block of `GET /api/versions/{id}/execution/overview`. */
@@ -200,6 +203,18 @@ export type CaseRunUsage = {
   completion_tokens: number
 }
 
+/** Dispatch-time executor diagnostic persisted in `case_run.summary["dispatch"]` (X-01). */
+export type CaseRunDispatch = {
+  owner_executor_id: string
+  endpoint: string
+  executor_status: string
+  last_heartbeat: string | null
+  version: string
+  registry_hit: boolean
+  dispatch_at: string
+  attempt: number
+}
+
 /** `case_run.summary` fields the UI reads; unknown keys are ignored. */
 export type CaseRunSummary = {
   verdict_reason?: string
@@ -209,20 +224,20 @@ export type CaseRunSummary = {
   step_failed?: number
   evidence_count?: number
   human_request_id?: string | null
-  /** P5 visual counters (spec §7.3); `visual_skipped` stays compatible. */
-  visual_skipped?: number
-  visual_passed?: number
-  visual_failed?: number
-  visual_inconclusive?: number
   /**
    * QA Q2: a terminal run explains itself. `terminal_cause` names the concrete
    * stop (budget, agent stop, blocked, assertion failure, ...), `last_error`
    * carries the observable detail and `next_action` is the stable human next
-   * step. All three are absent on a clean verdict.
+   * step. All three are emitted as empty strings on a clean verdict (Go sends
+   * plain strings, never null/absent).
    */
   terminal_cause?: string
   last_error?: string
   next_action?: string
+  /** X-01: stable cause of a retryable run error (a retry reason, not a terminal class). */
+  retry_reason?: string
+  /** X-01: latest dispatch-time executor snapshot; null/absent when no dispatch recorded. */
+  dispatch?: CaseRunDispatch | null
   /** Observed agent-run usage; absent on rows settled before usage persisted. */
   usage?: CaseRunUsage | null
 }
@@ -241,7 +256,7 @@ export type CaseRun = {
   summary: CaseRunSummary
   started_at: string | null
   finished_at: string | null
-  version_sut_ids: string[]
+  sut_ids: string[]
   evidence_count: number
 }
 
@@ -254,7 +269,7 @@ export type StepObserved = {
 
 export type StepResult = {
   seq: number
-  target_version_sut_id: string | null
+  target_sut_id: string | null
   status: StepResultStatus
   observed: StepObserved
   error: string
@@ -270,14 +285,14 @@ export type AssertionResult = {
   expected: string
   actual: string
   reason: string
-  target_version_sut_id: string | null
+  target_sut_id: string | null
 }
 
 /** `EvidenceView` / the evidence summary embedded in `CaseRunDetail`. */
 export type Evidence = {
   id: string
   case_run_id: string
-  version_sut_id: string | null
+  sut_id: string | null
   step_seq?: number | null
   assertion_seq?: number | null
   kind: EvidenceKind
@@ -305,7 +320,7 @@ export type HumanRequestPayload = {
    */
   reason: string
   /** Nullable in the contract when the request is not tied to one SUT. */
-  version_sut_id?: string | null
+  sut_id?: string | null
   /** Login-takeover only fields (absent on v0.22 decision requests). */
   account_role?: string
   page_url?: string
@@ -359,7 +374,7 @@ export type Intent = {
   case_version_id: string
   case_id?: string | null
   case_title: string
-  version_sut_ids: string[]
+  sut_ids: string[]
   purpose: IntentPurpose
   status: IntentStatus
   attempt_no: number
@@ -394,7 +409,7 @@ export type CaseRunListOptions = WaveListOptions & {
 
 export type EvidenceListOptions = {
   caseRunId?: string
-  versionSutId?: string
+  sutId?: string
   kind?: EvidenceKind
   before?: string
   limit?: number

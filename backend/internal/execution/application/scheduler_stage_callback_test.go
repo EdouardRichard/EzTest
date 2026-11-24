@@ -146,9 +146,9 @@ func TestSchedulerNotifiesStageOnWaveTerminal(t *testing.T) {
 	run, _ := f.runs.Get(ctx, runs[0].ID)
 	run.Status = execution.CaseRunPassed
 	run.FailureClass = ""
-	if ok, err := f.runs.Update(ctx, run); err != nil || !ok {
-		t.Fatalf("finish run: %v %v", ok, err)
-	}
+	// Fixture seeding of a terminal state (V-0022: Update refuses terminal
+	// transitions).
+	f.runs.byID[run.ID] = run
 
 	notifier := &recordingWaveStageNotifier{}
 	f.scheduler.stageNotifier = notifier
@@ -195,9 +195,9 @@ func TestSchedulerWaveTerminalCallbackAdvancesStage(t *testing.T) {
 	run, _ := f.runs.Get(ctx, runs[0].ID)
 	run.Status = execution.CaseRunPassed
 	run.FailureClass = ""
-	if ok, err := f.runs.Update(ctx, run); err != nil || !ok {
-		t.Fatalf("finish run: %v %v", ok, err)
-	}
+	// Fixture seeding of a terminal state (V-0022: Update refuses terminal
+	// transitions).
+	f.runs.byID[run.ID] = run
 
 	repo := &stageServiceRepo{state: version.StageState{
 		VersionID:      100,
@@ -329,9 +329,9 @@ func TestSchedulerRetriesFailedWaveTerminalCallback(t *testing.T) {
 	run, _ := f.runs.Get(ctx, runs[0].ID)
 	run.Status = execution.CaseRunPassed
 	run.FailureClass = ""
-	if ok, err := f.runs.Update(ctx, run); err != nil || !ok {
-		t.Fatalf("finish run: %v %v", ok, err)
-	}
+	// Fixture seeding of a terminal state (V-0022: Update refuses terminal
+	// transitions).
+	f.runs.byID[run.ID] = run
 
 	notifier := &flakyWaveStageNotifier{failures: 1}
 	reconciler := &recordingStageReconciler{}

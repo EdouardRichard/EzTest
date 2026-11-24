@@ -38,7 +38,6 @@ type Service struct {
 	versionExists VersionExistsPort
 	design        DesignSnapshotPort
 	execution     ExecutionSnapshotPort
-	visual        VisualSnapshotPort
 	events        EventPublisher
 }
 
@@ -71,12 +70,10 @@ func (s *Service) WithSnapshotPorts(
 	execution ExecutionSnapshotPort,
 	version VersionSnapshotPort,
 	design DesignSnapshotPort,
-	visual VisualSnapshotPort,
 ) *Service {
 	s.execution = execution
 	s.version = version
 	s.design = design
-	s.visual = visual
 	return s
 }
 
@@ -104,7 +101,7 @@ func (s *Service) List(ctx context.Context, limit int) ([]EvalRun, error) {
 	return s.repo.List(ctx, normalizeLimit(limit))
 }
 
-// Record validates the sample, derives the 6+1 metrics and status on the
+// Record validates the sample, derives the six metrics and status on the
 // server, persists the run in one transaction and writes a best-effort audit
 // entry without corpus or sample content.
 func (s *Service) Record(ctx context.Context, actor platform.Actor, input RecordInput) (EvalRun, error) {
@@ -181,7 +178,7 @@ func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, ver
 	if s.repo == nil {
 		return EvalRun{}, platform.Unavailable("quality repository is not configured")
 	}
-	if s.execution == nil || s.version == nil || s.design == nil || s.visual == nil {
+	if s.execution == nil || s.version == nil || s.design == nil {
 		return EvalRun{}, platform.Unavailable("quality snapshot ports are not configured")
 	}
 	// Existence is checked before publishing eval.started or persisting the run:
@@ -208,10 +205,6 @@ func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, ver
 	if err != nil {
 		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot execution pass: %w", err))
 	}
-	visualPassed, visualFailed, err := s.visual.VisualClassification(ctx, &version)
-	if err != nil {
-		return EvalRun{}, s.snapshotFailure(ctx, runID, version, fmt.Errorf("snapshot visual classification: %w", err))
-	}
 
 	sample := quality.SnapshotSample{
 		ConfirmedRequirements: requirements,
@@ -219,8 +212,6 @@ func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, ver
 		ConfirmedCases:        confirmedCases,
 		ExecutionPassed:       executionPassed,
 		ExecutionFinished:     executionFinished,
-		VisualPassed:          visualPassed,
-		VisualEvaluated:       visualPassed + visualFailed,
 	}
 	if err := quality.ValidateSnapshot(sample); err != nil {
 		return EvalRun{}, s.snapshotFailure(ctx, runID, version, err)
@@ -235,8 +226,6 @@ func (s *Service) TriggerSnapshot(ctx context.Context, actor platform.Actor, ver
 		"confirmed_cases":        sample.ConfirmedCases,
 		"execution_passed":       sample.ExecutionPassed,
 		"execution_finished":     sample.ExecutionFinished,
-		"visual_passed":          sample.VisualPassed,
-		"visual_evaluated":       sample.VisualEvaluated,
 	}
 	run := EvalRun{
 		ID:            runID,

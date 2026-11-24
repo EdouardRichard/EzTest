@@ -25,10 +25,8 @@ import {
 import { stageLabel } from "./stage"
 import type {
   AccountResource,
-  BindingScopeExclude,
   Catalog,
   SutRepository,
-  SutResource,
   Version,
   VersionBindingOverview,
 } from "./types"
@@ -38,12 +36,10 @@ import {
   approvedPages,
   buildBindingUpdate,
   buildCreateVersionPayload,
-  emptyScopeExclude,
   findEnvironmentOption,
   resourceCounts,
   scopeDatabases,
   stepForBindingField,
-  toggleExclude,
   toggleSelection,
 } from "./wizard"
 
@@ -56,96 +52,69 @@ export type BindingWizardProps = {
 
 type Step = 1 | 2 | 3 | 4
 
-type ScopeOption = {
-  id: string
-  label: string
-  hint?: string
-}
-
 function stepTitle(step: Step): string {
   if (step === 1) return "版本信息"
   if (step === 2) return "代码仓与测试账号"
-  if (step === 3) return "范围与排除"
+  if (step === 3) return "范围预览"
   return "确认创建"
 }
 
-/** Baseline (approved) plus the live effective counts of one resource kind. */
-function scopeSummary(counts: {
-  approved: number
-  included: number
-  excluded: number
-  proposed: number
-}): string {
-  return `已确认 ${counts.approved} · 生效 ${counts.included} · 排除 ${counts.excluded} · 待确认 ${counts.proposed}`
+/** Baseline (approved) plus proposed counts of one resource kind. */
+function scopeSummary(counts: { approved: number; proposed: number }): string {
+  return `已确认 ${counts.approved} · 待确认 ${counts.proposed}`
 }
 
-type ScopeGroupProps = {
+type ScopeRowProps = {
   legend: string
-  options: ScopeOption[]
-  excluded: string[]
-  onToggle: (id: string) => void
+  rows: { id: string; label: string; hint?: string }[]
   emptyText: string
 }
 
-/** One include/exclude list; unchecked means "excluded from this version". */
-function ScopeGroup({ legend, options, excluded, onToggle, emptyText }: ScopeGroupProps) {
+/** One read-only resource list of the derived scope (v0.2.4-B: no exclusion). */
+function ScopeRows({ legend, rows, emptyText }: ScopeRowProps) {
   return (
     <fieldset className="rounded-lg border border-border bg-muted/30 p-3">
       <legend className="px-1 text-xs font-medium text-foreground">{legend}</legend>
-      {options.length === 0 ? (
+      {rows.length === 0 ? (
         <p className="text-[11px] text-muted-foreground">{emptyText}</p>
       ) : (
-        <div className="grid gap-1.5 sm:grid-cols-2">
-          {options.map((option) => {
-            const included = !excluded.includes(option.id)
-            return (
-              <label
-                key={option.id}
-                className="flex cursor-pointer items-start gap-2 text-xs text-foreground"
-              >
-                <input
-                  type="checkbox"
-                  className="mt-0.5 size-3.5 accent-primary"
-                  checked={included}
-                  onChange={() => onToggle(option.id)}
-                />
-                <span className="min-w-0">
-                  <span className="font-medium">{option.label}</span>
-                  {option.hint ? (
-                    <span className="ml-1 break-all text-[11px] text-muted-foreground">
-                      {option.hint}
-                    </span>
-                  ) : null}
-                </span>
-              </label>
-            )
-          })}
-        </div>
+        <ul className="grid gap-1.5 sm:grid-cols-2">
+          {rows.map((row) => (
+            <li key={row.id} className="flex items-start gap-2 text-xs text-foreground">
+              <span className="min-w-0">
+                <span className="font-medium">{row.label}</span>
+                {row.hint ? (
+                  <span className="ml-1 break-all text-[11px] text-muted-foreground">
+                    {row.hint}
+                  </span>
+                ) : null}
+              </span>
+            </li>
+          ))}
+        </ul>
       )}
     </fieldset>
   )
 }
 
-type VersionOnlyRepository = { id: string; name: string; branch: string }
-
 type RepositorySectionProps = {
   repositories: SutRepository[] | null
   loading: boolean
   error: unknown
-  selectedIds: string[] | null
-  versionOnlyRepositories: VersionOnlyRepository[]
-  onToggle: (repoId: string) => void
   onRetry: () => void
   onRefresh: () => void
 }
 
+/**
+ * Read-only preview of the environment code pool inherited across every SUT of
+ * the bound environment (v0.2.4-B: the code pool is derived from the environment;
+ * the version cannot override it). The actual pool is resolved server-side on the
+ * binding.
+ */
 function RepositorySection({
   repositories,
   loading,
   error,
-  selectedIds,
-  versionOnlyRepositories,
-  onToggle,
   onRetry,
   onRefresh,
 }: RepositorySectionProps) {
@@ -154,7 +123,7 @@ function RepositorySection({
       <legend className="px-1 text-xs font-medium text-foreground">代码仓</legend>
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <p className="text-[11px] text-muted-foreground">
-          默认继承 SUT 的代码仓；取消勾选只会为本版本排除，不会修改 SUT 关联。
+          代码仓由绑定环境的 SUT 继承（环境代码池），版本不可覆盖；此处仅为预览。
         </p>
         <Button variant="ghost" size="sm" onClick={onRefresh} disabled={loading}>
           <RefreshCw className="size-3.5" aria-hidden="true" />
@@ -171,7 +140,7 @@ function RepositorySection({
       {error ? (
         <Alert tone="warning" title="SUT 代码仓读取失败">
           <p>{error instanceof Error ? error.message : "代码仓暂不可用"}</p>
-          <p className="mt-1 text-[11px]">创建后会继续继承 SUT 的代码仓；接口恢复后可在此调整。</p>
+          <p className="mt-1 text-[11px]">创建后会继续继承 SUT 的代码仓；接口恢复后可在此预览。</p>
           <div className="mt-2">
             <Button variant="secondary" size="sm" onClick={onRetry}>
               重试
@@ -186,78 +155,22 @@ function RepositorySection({
 
       {repositories !== null && repositories.length > 0 ? (
         <ul className="space-y-1.5">
-          {repositories.map((row) => {
-            const included = selectedIds?.includes(row.repository.id) ?? false
-            return (
-              <li key={row.id}>
-                <label className="flex cursor-pointer items-start gap-2 text-xs text-foreground">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 size-3.5 accent-primary"
-                    checked={included}
-                    onChange={() => onToggle(row.repository.id)}
-                  />
-                  <span className="min-w-0">
-                    <span className="font-medium">{row.repository.name}</span>
-                    {row.repository.branch ? (
-                      <span className="ml-1 font-mono text-[11px] text-muted-foreground">
-                        {row.repository.branch}
-                      </span>
-                    ) : null}
-                    {row.role ? (
-                      <Badge tone="neutral" className="ml-1">
-                        {row.role}
-                      </Badge>
-                    ) : null}
-                    <Badge tone="neutral" className="ml-1">
-                      SUT 继承
-                    </Badge>
-                    {included ? null : (
-                      <Badge tone="warning" className="ml-1">
-                        已排除
-                      </Badge>
-                    )}
-                  </span>
-                </label>
-              </li>
-            )
-          })}
-        </ul>
-      ) : null}
-
-      {!error && !loading && versionOnlyRepositories.length > 0 ? (
-        <div className="mt-3 border-t border-border pt-2">
-          <p className="text-[11px] font-medium text-foreground">其他启用代码仓（仅本版本）</p>
-          <p className="mb-1.5 text-[11px] text-muted-foreground">
-            未关联到 SUT 的代码仓只会以「版本覆盖」加入本版本，不会影响 SUT 或后续版本。
-          </p>
-          <div className="grid gap-1.5 sm:grid-cols-2">
-            {versionOnlyRepositories.map((repository) => (
-              <label
-                key={repository.id}
-                className="flex cursor-pointer items-start gap-2 text-xs text-foreground"
-              >
-                <input
-                  type="checkbox"
-                  className="mt-0.5 size-3.5 accent-primary"
-                  checked={selectedIds?.includes(repository.id) ?? false}
-                  onChange={() => onToggle(repository.id)}
-                />
-                <span className="min-w-0">
-                  <span className="font-medium">{repository.name}</span>
-                  {repository.branch ? (
-                    <span className="ml-1 font-mono text-[11px] text-muted-foreground">
-                      {repository.branch}
-                    </span>
-                  ) : null}
-                  <Badge tone="info" className="ml-1">
-                    版本覆盖
-                  </Badge>
+          {repositories.map((row) => (
+            <li
+              key={row.id}
+              className="flex flex-wrap items-center gap-1.5 text-xs text-foreground"
+            >
+              <span className="font-medium">{row.repository.name}</span>
+              {row.repository.branch ? (
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {row.repository.branch}
                 </span>
-              </label>
-            ))}
-          </div>
-        </div>
+              ) : null}
+              {row.role ? <Badge tone="neutral">{row.role}</Badge> : null}
+              <Badge tone="neutral">SUT 继承</Badge>
+            </li>
+          ))}
+        </ul>
       ) : null}
     </fieldset>
   )
@@ -322,13 +235,14 @@ function ReviewRow({ label, children }: ReviewRowProps) {
 }
 
 /**
- * v0.22 environment-only create wizard (R-C3-1..R-C3-4/API-15/API-16).
+ * v0.2.4-B environment-only create wizard (API-15/API-16).
  *
- * Step 1 picks the version metadata and one environment; the SUT is derived.
- * Step 2 reviews SUT repositories and the global account threshold. Step 3
- * records `scope_exclude` for pages/APIs/databases (additive: resources are
- * never rewritten). Step 4 creates the version with the environment-only body
- * and then saves the binding through `PUT /api/versions/{id}/binding`.
+ * Step 1 picks the version metadata and one environment; the SUTs are derived.
+ * Step 2 previews the inherited code pool and selects the global account subset.
+ * Step 3 previews the derived scope (every approved asset of the environment's
+ * SUTs is in scope; there is no exclusion). Step 4 creates the version with the
+ * environment-only body and then saves the binding (account_ids) through
+ * `PUT /api/versions/{id}/binding`.
  */
 export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
@@ -346,11 +260,9 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
   const [repositories, setRepositories] = useState<SutRepository[] | null>(null)
   const [repositoryLoading, setRepositoryLoading] = useState(false)
   const [repositoryError, setRepositoryError] = useState<unknown>(null)
-  const [selectedRepositoryIds, setSelectedRepositoryIds] = useState<string[] | null>(null)
   const repositoryRequest = useRef(0)
 
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[] | null>(null)
-  const [scopeExclude, setScopeExclude] = useState<BindingScopeExclude>(emptyScopeExclude)
 
   const [submitting, setSubmitting] = useState(false)
   const [submitPhase, setSubmitPhase] = useState<"create" | "binding" | null>(null)
@@ -365,7 +277,10 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     setCatalogLoading(true)
     setCatalogError(null)
     try {
-      setCatalog(await getResourceCatalog())
+      const next = await getResourceCatalog()
+      setCatalog(next)
+      // Default to the whole global active account pool.
+      setSelectedAccountIds(activeAccounts(next.accounts).map((account) => account.id))
     } catch (error) {
       setCatalog(null)
       setCatalogError(error)
@@ -380,24 +295,31 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
 
   const environmentOption =
     catalog === null ? undefined : findEnvironmentOption(catalog, environmentId)
-  const derivedSut: SutResource | undefined = environmentOption?.sut
   const environment = environmentOption?.environment
-  const accounts = environment ? activeAccounts(environment) : []
-  const environmentAccountsAvailable = environment !== undefined
+  const accounts = catalog === null ? [] : activeAccounts(catalog.accounts)
 
-  const loadRepositories = useCallback(async (sutId: string) => {
+  // Preview the environment code pool across EVERY SUT (not just the first),
+  // deduplicated by repository id — same aggregation the scope counts use.
+  const loadRepositories = useCallback(async (sutIds: string[]) => {
     const requestId = ++repositoryRequest.current
     setRepositoryLoading(true)
     setRepositoryError(null)
     try {
-      const rows = await listSutRepositories(sutId)
+      const perSut = await Promise.all(sutIds.map((id) => listSutRepositories(id)))
       if (requestId !== repositoryRequest.current) return
+      const seen = new Set<string>()
+      const rows: SutRepository[] = []
+      for (const list of perSut) {
+        for (const row of list) {
+          if (seen.has(row.repository.id)) continue
+          seen.add(row.repository.id)
+          rows.push(row)
+        }
+      }
       setRepositories(rows)
-      setSelectedRepositoryIds(rows.filter((row) => row.enabled).map((row) => row.repository.id))
     } catch (error) {
       if (requestId !== repositoryRequest.current) return
       setRepositories(null)
-      setSelectedRepositoryIds(null)
       setRepositoryError(error)
     } finally {
       if (requestId === repositoryRequest.current) setRepositoryLoading(false)
@@ -409,28 +331,14 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
     setEnvironmentError("")
     setRepositoryError(null)
     setRepositories(null)
-    setSelectedRepositoryIds(null)
-    setScopeExclude(emptyScopeExclude())
 
     const option = catalog === null ? undefined : findEnvironmentOption(catalog, nextEnvironmentId)
-    if (option === undefined) {
-      setSelectedAccountIds(null)
-      return
-    }
-    setSelectedAccountIds(activeAccounts(option.environment).map((account) => account.id))
-    void loadRepositories(option.sut.id)
-  }
-
-  function toggleRepository(repositoryId: string): void {
-    setSelectedRepositoryIds((current) => toggleSelection(current ?? [], repositoryId))
+    if (option === undefined) return
+    void loadRepositories(option.environment.suts.map((sut) => sut.id))
   }
 
   function toggleAccount(accountId: string): void {
     setSelectedAccountIds((current) => toggleSelection(current ?? [], accountId))
-  }
-
-  function toggleScope(kind: keyof BindingScopeExclude, id: string): void {
-    setScopeExclude((current) => toggleExclude(current, kind, id))
   }
 
   function goTo(nextStep: Step): void {
@@ -498,14 +406,7 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
         setCreatedVersion(version)
       }
       setSubmitPhase("binding")
-      await updateVersionBinding(
-        version.id,
-        buildBindingUpdate({
-          includedRepositoryIds: selectedRepositoryIds,
-          accountIds: environmentAccountsAvailable ? selectedAccountIds : null,
-          scopeExclude,
-        }),
-      )
+      await updateVersionBinding(version.id, buildBindingUpdate({ accountIds: selectedAccountIds }))
       setSavedVersion(version)
       onCreated?.(version)
     } catch (error) {
@@ -552,9 +453,9 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
 
   const counts = environment
     ? {
-        pages: resourceCounts(environment.pages, scopeExclude.pages),
-        apis: resourceCounts(environment.apis, scopeExclude.apis),
-        databases: resourceCounts(scopeDatabases(environment), scopeExclude.databases),
+        pages: resourceCounts(environment.suts.flatMap((sut) => sut.pages)),
+        apis: resourceCounts(environment.suts.flatMap((sut) => sut.apis)),
+        databases: resourceCounts(scopeDatabases(environment)),
       }
     : null
   const pageCounts = counts?.pages
@@ -562,21 +463,21 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
   const databaseCounts = counts?.databases
   const proposedTotal = (pageCounts?.proposed ?? 0) + (apiCounts?.proposed ?? 0)
 
-  const scopePages: ScopeOption[] = environment
+  const scopePages = environment
     ? approvedPages(environment).map((page) => ({
         id: page.id,
         label: page.name,
         hint: page.route_template,
       }))
     : []
-  const scopeApis: ScopeOption[] = environment
+  const scopeApis = environment
     ? approvedAPIs(environment).map((api) => ({
         id: api.id,
         label: api.name,
         hint: `${api.method} ${api.path_template}`,
       }))
     : []
-  const scopeDatabaseOptions: ScopeOption[] = environment
+  const scopeDatabaseRows = environment
     ? scopeDatabases(environment).map((database) => ({
         id: database.id,
         label: database.name,
@@ -584,36 +485,10 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
       }))
     : []
 
-  const associatedRepositoryIds = new Set((repositories ?? []).map((row) => row.repository.id))
-  const versionOnlyRepositories = catalog.repositories
-    .filter((repository) => repository.status === "active")
-    .filter((repository) => !associatedRepositoryIds.has(repository.id))
-    .map((repository) => ({
-      id: repository.id,
-      name: repository.name,
-      branch: repository.branch,
-    }))
-
-  const selectedRepositoryRows =
-    selectedRepositoryIds === null
-      ? []
-      : selectedRepositoryIds.flatMap((id) => {
-          const inherited = repositories?.find((row) => row.repository.id === id)
-          if (inherited !== undefined) {
-            return [
-              {
-                label: `${inherited.repository.name}${
-                  inherited.role ? `（${inherited.role}）` : ""
-                }`,
-              },
-            ]
-          }
-          const repository = catalog.repositories.find((item) => item.id === id)
-          return repository === undefined ? [] : [{ label: `${repository.name}（版本覆盖）` }]
-        })
   const selectedAccounts = accounts.filter(
     (account) => selectedAccountIds?.includes(account.id) ?? false,
   )
+  const sutNames = environment ? environment.suts.map((sut) => sut.name).join("、") : ""
 
   const submitDetails = submitError === null ? null : bindingErrorDetails(submitError)
   const submitFieldStep =
@@ -678,32 +553,28 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
               onChange={(event) => selectEnvironment(event.target.value)}
             >
               <option value="">请选择环境（SUT 自动推导）</option>
-              {catalog.suts.flatMap((item) =>
-                item.environments.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {item.name} · {option.name}
-                    {option.is_default ? "（默认）" : ""}
-                  </option>
-                )),
-              )}
+              {catalog.environments.map((env) => (
+                <option key={env.id} value={env.id}>
+                  {env.name}
+                </option>
+              ))}
             </Select>
           </Field>
 
-          {catalog.suts.every((item) => item.environments.length === 0) ? (
+          {catalog.environments.length === 0 ? (
             <Alert tone="warning" title="暂无可选环境">
-              请先在资源页创建 SUT 与环境，再回来创建版本。
+              请先在资源页创建环境与 SUT，再回来创建版本。
             </Alert>
           ) : null}
 
           {environment === undefined ? (
             <Alert tone="info" title="选择环境后自动推导 SUT">
-              版本只会关联该环境所属的 SUT；页面/API/目标库默认全部绑定，无需手工勾选。
+              版本直接绑定该环境；环境内每个 SUT
+              的已确认页面/API/目标库默认全部在范围内，无需手工勾选。
             </Alert>
           ) : (
             <>
-              <p className="text-xs font-medium text-foreground">
-                SUT：{derivedSut?.name}（由环境推导）
-              </p>
+              <p className="text-xs font-medium text-foreground">SUT：{sutNames}（由环境推导）</p>
               {pageCounts !== undefined &&
               apiCounts !== undefined &&
               databaseCounts !== undefined ? (
@@ -729,14 +600,13 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
             repositories={repositories}
             loading={repositoryLoading}
             error={repositoryError}
-            selectedIds={selectedRepositoryIds}
-            versionOnlyRepositories={versionOnlyRepositories}
-            onToggle={toggleRepository}
             onRetry={() => {
-              if (derivedSut !== undefined) void loadRepositories(derivedSut.id)
+              if (environment !== undefined)
+                void loadRepositories(environment.suts.map((sut) => sut.id))
             }}
             onRefresh={() => {
-              if (derivedSut !== undefined) void loadRepositories(derivedSut.id)
+              if (environment !== undefined)
+                void loadRepositories(environment.suts.map((sut) => sut.id))
             }}
           />
           <AccountSection
@@ -749,39 +619,21 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
 
       {step === 3 ? (
         <div className="space-y-3">
-          <Alert tone="info" title="默认全部包含，只记录排除项">
-            取消勾选仅写入 scope_exclude，不会删除或改写环境资源目录；计数按「已确认基线 −
-            本版本排除」实时计算。执行中的 wave 使用已冻结快照，改动影响下一个 wave。
+          <Alert tone="info" title="范围由环境推导，默认全部包含">
+            环境内每个 SUT 的已确认页面/API 与启用目标库都在版本范围内；v0.2.4-B 不再有版本级排除。
+            执行中的 wave 使用已冻结快照，资源改动影响下一个 wave。
           </Alert>
-          <ScopeGroup
-            legend="页面"
-            options={scopePages}
-            excluded={scopeExclude.pages}
-            onToggle={(id) => toggleScope("pages", id)}
-            emptyText="该环境暂无已确认页面"
-          />
+          <ScopeRows legend="页面" rows={scopePages} emptyText="该环境暂无已确认页面" />
           {pageCounts !== undefined ? (
             <p className="-mt-2 text-[11px] text-muted-foreground">
               页面 {scopeSummary(pageCounts)}
             </p>
           ) : null}
-          <ScopeGroup
-            legend="API"
-            options={scopeApis}
-            excluded={scopeExclude.apis}
-            onToggle={(id) => toggleScope("apis", id)}
-            emptyText="该环境暂无已确认 API"
-          />
+          <ScopeRows legend="API" rows={scopeApis} emptyText="该环境暂无已确认 API" />
           {apiCounts !== undefined ? (
             <p className="-mt-2 text-[11px] text-muted-foreground">API {scopeSummary(apiCounts)}</p>
           ) : null}
-          <ScopeGroup
-            legend="目标库"
-            options={scopeDatabaseOptions}
-            excluded={scopeExclude.databases}
-            onToggle={(id) => toggleScope("databases", id)}
-            emptyText="该环境暂无目标数据库"
-          />
+          <ScopeRows legend="目标库" rows={scopeDatabaseRows} emptyText="该环境暂无目标数据库" />
           {databaseCounts !== undefined ? (
             <p className="-mt-2 text-[11px] text-muted-foreground">
               目标库 {scopeSummary(databaseCounts)}
@@ -798,14 +650,14 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
               <ReviewRow label="版本描述">{description.trim() || "未填写"}</ReviewRow>
               <ReviewRow label="版本目标">{goal.trim() || "未填写"}</ReviewRow>
               <ReviewRow label="SUT / 环境">
-                {derivedSut?.name} / {environment?.name}
+                {sutNames} / {environment?.name}
               </ReviewRow>
               <ReviewRow label="代码仓">
-                {selectedRepositoryIds === null
+                {repositories === null
                   ? "继承 SUT 的全部代码仓（代码仓接口未就绪，未覆盖）"
-                  : selectedRepositoryRows.length === 0
-                    ? "本版本不包含任何代码仓"
-                    : selectedRepositoryRows.map((row) => row.label).join("、")}
+                  : repositories.length === 0
+                    ? "该 SUT 未关联代码仓"
+                    : repositories.map((row) => row.repository.name).join("、")}
               </ReviewRow>
               <ReviewRow label="测试账号">
                 {selectedAccountIds === null
@@ -879,16 +731,11 @@ export function BindingWizard({ onCreated, onCancel }: BindingWizardProps) {
                     <ul className="space-y-0.5">
                       {refreshedBinding.repositories.map((row) => (
                         <li
-                          key={row.repository.id}
+                          key={`${row.repository.id}-${row.sut_id}`}
                           className="flex flex-wrap items-center gap-1 text-foreground"
                         >
                           <span>{row.repository.name}</span>
-                          <Badge tone={row.source === "override" ? "info" : "neutral"}>
-                            {row.source === "override" ? "版本覆盖" : "SUT 继承"}
-                          </Badge>
-                          <Badge tone={row.included ? "success" : "warning"}>
-                            {row.included ? "已包含" : "已排除"}
-                          </Badge>
+                          <Badge tone="neutral">SUT 继承</Badge>
                         </li>
                       ))}
                     </ul>

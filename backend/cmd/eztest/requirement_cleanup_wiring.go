@@ -26,7 +26,6 @@ import (
 func newRequirementService(
 	repo versiondomain.RequirementRepository,
 	versions versionapp.VersionReader,
-	resources versionapp.ResourceCatalog,
 	stale versionapp.CaseStaleHook,
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
@@ -36,5 +35,5 @@ func newRequirementService(
 	if versions == nil {
 		return nil, errors.New("requirement version reader is required")
 	}
-	return versionapp.NewRequirementService(repo, versions, resources, stale, audit, events, ids, clk), nil
+	return versionapp.NewRequirementService(repo, versions, stale, audit, events, ids, clk), nil
 }

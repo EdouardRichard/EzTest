@@ -23,6 +23,7 @@ vi.mock("@/lib/sse-client", () => ({
   connectSSE: sse.connectSSE,
 }))
 
+import { type ConversationStreamEntry, subscribeConversationStream } from "./useConversation"
 import { useVersionEvents } from "./useVersionEvents"
 
 function eventFrame(type: string, payload: Record<string, unknown>, scope = {}) {
@@ -231,6 +232,49 @@ describe("useVersionEvents", () => {
     expect(onDesignRoundChanged).toHaveBeenCalledTimes(2)
     expect(onDesignExportReady).toHaveBeenCalledTimes(1)
     expect(onDesignExportReady.mock.calls[0][0].type).toBe("design.export_ready")
+  })
+
+  it("routes the four v0.2.4-E judge events to the design case/graph refresh", () => {
+    // Whole-branch review Important #5: these four events matched no case and
+    // fell through the default branch (which only forwards requirement.* /
+    // team_room.*), so review_state never updated live and the judge-unavailable
+    // badge never appeared without a manual reload. Each one changes a case's
+    // review_state / round, so each must refresh the graph AND the case detail.
+    const onDesignCaseChanged = vi.fn()
+    const onDesignGraphChanged = vi.fn()
+    const onRequirementChanged = vi.fn()
+    const onTeamRoomChanged = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: {
+          onDesignCaseChanged,
+          onDesignGraphChanged,
+          onRequirementChanged,
+          onTeamRoomChanged,
+        },
+      }),
+    )
+
+    const judgeEvents = [
+      "design.judgment_submitted",
+      "design.judgment_overridden",
+      "design.rework_requested",
+      "design.judge_exhausted",
+    ]
+    for (const type of judgeEvents) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(type, { case_id: "7001", case_version_id: "8001" }),
+      })
+    }
+
+    expect(onDesignCaseChanged).toHaveBeenCalledTimes(judgeEvents.length)
+    expect(onDesignCaseChanged.mock.calls.map((call) => call[0].type)).toEqual(judgeEvents)
+    // The design page's onDesignCaseChanged already schedules the graph refresh;
+    // the router must not double-fire it for the same event.
+    expect(onDesignGraphChanged).not.toHaveBeenCalled()
+    expect(onRequirementChanged).not.toHaveBeenCalled()
+    expect(onTeamRoomChanged).not.toHaveBeenCalled()
   })
 
   it("routes P3 execution events to the execution handlers", () => {
@@ -509,5 +553,176 @@ describe("useVersionEvents", () => {
 
     unmount()
     expect(cleanupSpy).toHaveBeenCalledTimes(1)
+  })
+
+  describe("conversation.message.delta routing (T7, 039 constraint)", () => {
+    function deltaFrame(payload: Record<string, unknown>): string {
+      return eventFrame("conversation.message.delta", payload, { conversation_id: "4001" })
+    }
+
+    function streamHead(
+      messageId: string,
+      streamState: string,
+      parts: unknown[] = [],
+    ): Record<string, unknown> {
+      return {
+        id: messageId,
+        conversation_id: "4001",
+        role: "assistant",
+        parts,
+        refs: [],
+        created_at: "2026-11-17T10:00:00Z",
+        stream_state: streamState,
+      }
+    }
+
+    it("routes deltas into the workspace conversation stream projection on one connection", () => {
+      const seen: ConversationStreamEntry[] = []
+      const unsubscribe = subscribeConversationStream((versionId, entry) => {
+        if (versionId === "2001") seen.push(entry)
+      })
+      const onConversationMessage = vi.fn()
+      render(createElement(Harness, { handlers: { onConversationMessage } }))
+      expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame("conversation.message", streamHead("7001", "streaming")),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7001",
+          conversation_id: "4001",
+          seq: 1,
+          part_type: "text",
+          increment: "Hel",
+        }),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7001",
+          conversation_id: "4001",
+          seq: 1,
+          part_type: "text",
+          offset: 3,
+          increment: "lo",
+        }),
+      })
+
+      const last = seen[seen.length - 1]
+      expect(last.fullFrame).toBe(false)
+      expect(last.message.parts).toEqual([{ seq: 1, type: "text", text: "Hello" }])
+      expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+      unsubscribe()
+    })
+
+    it("ignores deltas on a subscription without a conversation handler (page-level, 039)", () => {
+      const seen: ConversationStreamEntry[] = []
+      const unsubscribe = subscribeConversationStream((versionId, entry) => {
+        if (versionId === "2001") seen.push(entry)
+      })
+      const onVersionChanged = vi.fn()
+      render(createElement(Harness, { handlers: { onVersionChanged } }))
+      expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7002",
+          conversation_id: "4001",
+          seq: 1,
+          part_type: "text",
+          increment: "Hel",
+        }),
+      })
+      // A full frame on the page-level subscription must not feed the projection either.
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame("conversation.message", streamHead("7002", "streaming")),
+      })
+
+      expect(seen).toHaveLength(0)
+      expect(onVersionChanged).not.toHaveBeenCalled()
+      expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+      unsubscribe()
+    })
+
+    it("publishes the terminal full frame to the projection for gap healing (same id as Begin)", () => {
+      const seen: ConversationStreamEntry[] = []
+      const unsubscribe = subscribeConversationStream((versionId, entry) => {
+        if (versionId === "2001") seen.push(entry)
+      })
+      const onConversationMessage = vi.fn()
+      render(createElement(Harness, { handlers: { onConversationMessage } }))
+
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame("conversation.message", streamHead("7003", "streaming")),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7003",
+          conversation_id: "4001",
+          seq: 1,
+          part_type: "text",
+          increment: "Hel",
+        }),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(
+          "conversation.message",
+          streamHead("7003", "complete", [{ seq: 1, type: "text", text: "Hello!" }]),
+        ),
+      })
+
+      // The handler receives both frames; the workspace may dedupe by id, but
+      // the projection must still carry the authoritative terminal snapshot.
+      expect(onConversationMessage).toHaveBeenCalledTimes(2)
+      const last = seen[seen.length - 1]
+      expect(last.fullFrame).toBe(true)
+      expect(last.message.stream_state).toBe("complete")
+      expect(last.message.parts).toEqual([{ seq: 1, type: "text", text: "Hello!" }])
+      unsubscribe()
+    })
+
+    it("ignores malformed delta payloads without notifying or reconnecting", () => {
+      const seen: ConversationStreamEntry[] = []
+      const unsubscribe = subscribeConversationStream((versionId, entry) => {
+        if (versionId === "2001") seen.push(entry)
+      })
+      render(createElement(Harness, { handlers: { onConversationMessage: vi.fn() } }))
+
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7004",
+          conversation_id: "4001",
+          seq: 0,
+          part_type: "text",
+          increment: "x",
+        }),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({
+          message_id: "7004",
+          conversation_id: "4001",
+          seq: 1,
+          part_type: "text",
+        }),
+      })
+      connectOptions.onEvent({
+        event: "message",
+        data: deltaFrame({ conversation_id: "4001", seq: 1, part_type: "text", increment: "x" }),
+      })
+
+      expect(seen).toHaveLength(0)
+      expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+      unsubscribe()
+    })
   })
 })

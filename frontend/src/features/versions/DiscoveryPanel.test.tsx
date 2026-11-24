@@ -38,7 +38,7 @@ function observation(overrides: Partial<DiscoveryObservation>): DiscoveryObserva
     decision: "proposed",
     wave_id: "9201",
     case_run_id: "9301",
-    version_sut_id: "5201",
+    sut_id: "5201",
     environment_id: "7201",
     resource_id: "11",
     fact_id: "6101",

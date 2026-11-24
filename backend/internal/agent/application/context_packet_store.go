@@ -25,6 +25,12 @@ type contextPacketMeta struct {
 	BriefingHash       string                     `json:"briefing_hash"`
 	InvalidationReason string                     `json:"invalidation_reason,omitempty"`
 	Segments           []contextPacketSegmentMeta `json:"segments"`
+	// Stage records the prefix's version stage (H-E3). Additive and omitempty: a
+	// row written before the field existed decodes with an empty stage, which the
+	// stage-boundary trigger reads as "no prior stage known" and never as a
+	// transition. No migration and no wire change: this section is internal
+	// packet storage, not the read API's projection.
+	Stage string `json:"stage,omitempty"`
 }
 
 // contextPacketSegmentMeta is the per-segment metadata that the plain sections
@@ -52,6 +58,7 @@ func EncodeContextPacket(runID, versionID int64, packet agentcontext.ContextPack
 		PrefixHash:         packet.PrefixHash,
 		BriefingHash:       packet.BriefingHash,
 		InvalidationReason: packet.InvalidationReason,
+		Stage:              packet.Stage,
 		Segments:           make([]contextPacketSegmentMeta, 0, len(packet.Segments)),
 	}
 	total := 0
@@ -127,6 +134,7 @@ func DecodeContextPacket(stored agent.ContextPacket) (agentcontext.ContextPacket
 		PrefixHash:         meta.PrefixHash,
 		BriefingHash:       meta.BriefingHash,
 		InvalidationReason: meta.InvalidationReason,
+		Stage:              meta.Stage,
 		CachedTokens:       stored.TokenCounts["cached_tokens"],
 		CacheHit:           stored.TokenCounts["cache_hit"] != 0,
 		Segments:           make([]agentcontext.Segment, 0, segmentCount),
@@ -184,4 +192,3 @@ func boolInt(value bool) int {
 	}
 	return 0
 }
-

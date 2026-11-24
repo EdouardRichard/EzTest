@@ -30,7 +30,7 @@ func TestTransportTimeoutNotExecutorLost(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	cause := executionError("executor_timeout", map[string]any{
-		"phase": "request", "method": "POST", "path": "/v1/contexts/ctx_1/actions",
+		"phase": "request", "method": "POST", "path": "/v1/sessions/sess_1/browser",
 	})
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: cause}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 3, 3); err != nil {
@@ -54,14 +54,14 @@ func TestTransportTimeoutNotExecutorLost(t *testing.T) {
 	}
 }
 
-// TestContextCreateTimeoutCause: a timeout on POST /v1/contexts gets the stable
+// TestContextCreateTimeoutCause: a timeout on POST /v1/sessions gets the stable
 // executor_context_create_failed cause (the browser context is lazily created,
 // so this is the pre-first-action failure the UAT hit).
 func TestContextCreateTimeoutCause(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	cause := executionError("executor_timeout", map[string]any{
-		"phase": "request", "method": "POST", "path": "/v1/contexts",
+		"phase": "request", "method": "POST", "path": "/v1/sessions",
 	})
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: cause}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 3, 3); err != nil {
@@ -83,7 +83,7 @@ func TestExecutorUnavailableWithoutDialIsEnvironment(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	cause := executionError("executor_unavailable", map[string]any{
-		"phase": "response", "method": "POST", "path": "/v1/contexts/ctx_1/actions", "status_code": 503,
+		"phase": "response", "method": "POST", "path": "/v1/sessions/sess_1/browser", "status_code": 503,
 	})
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: cause}
 	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, agentapp.RunResult{}, runErr, 3, 3); err != nil {
@@ -112,7 +112,7 @@ func TestFinalizeRetryReleasesLease(t *testing.T) {
 	prepareCaseRun(t, fixture)
 
 	cause := executionError("executor_unavailable", map[string]any{
-		"phase": "response", "method": "POST", "path": "/v1/contexts", "status_code": 503,
+		"phase": "response", "method": "POST", "path": "/v1/sessions", "status_code": 503,
 	})
 	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: cause}
 	before := fixture.caseRuns.get(t, 3001)
@@ -163,7 +163,7 @@ func TestFinalizeRetryReleasesLease(t *testing.T) {
 func TestStepRecordPersistsExecutorLimitation(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "failed",
 		Observed: "无法选择本地文件，上传动作未能发起",
 		Error:    "file_chooser_unavailable: the executor cannot drive the native file chooser",

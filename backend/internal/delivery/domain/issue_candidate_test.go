@@ -8,7 +8,7 @@ import (
 )
 
 func validCandidateInput() CandidateInput {
-	versionSUTID := int64(55)
+	sutID := int64(55)
 	waveID := int64(66)
 	return CandidateInput{
 		VersionID:                1,
@@ -27,13 +27,13 @@ func validCandidateInput() CandidateInput {
 		FailedExpected:           "HTTP 200",
 		FailedActual:             "HTTP 500",
 		FailedReason:             "status mismatch",
-		VersionSUTID:             &versionSUTID,
+		SUTID:                    &sutID,
 		WaveID:                   &waveID,
 		EvidenceIDs:              []int64{101, 102},
 	}
 }
 
-func TestDedupeKeyMatchesP3Algorithm(t *testing.T) {
+func TestDedupeKeyMatchesExecutionAlgorithm(t *testing.T) {
 	// Literal golden: sha256("11|22|3|4|application") hex-truncated to 32 chars
 	// (spec §5.1 P3 algorithm). Pinned so a payload or truncation change fails.
 	const want = "3fe9019f27a6380fa0b193b17845060c"
@@ -106,7 +106,7 @@ func TestCandidateInputValidation(t *testing.T) {
 		{"negative step seq", func(in *CandidateInput) { in.StepSeq = -1 }},
 		{"negative assertion seq", func(in *CandidateInput) { in.AssertionSeq = -2 }},
 		{"non positive wave", func(in *CandidateInput) { in.WaveID = int64Pointer(0) }},
-		{"non positive version SUT", func(in *CandidateInput) { in.VersionSUTID = int64Pointer(-55) }},
+		{"non positive SUT", func(in *CandidateInput) { in.SUTID = int64Pointer(-55) }},
 		{"negative requirement", func(in *CandidateInput) { in.RequirementID = -1 }},
 		{"negative failed step result", func(in *CandidateInput) { in.FailedStepResultID = -1 }},
 		{"non positive failed assertion", func(in *CandidateInput) { in.FailedAssertionResultIDs = []int64{301, 0} }},
@@ -390,8 +390,8 @@ func TestCandidateRefs(t *testing.T) {
 		if ref.Role != IssueRefRoleSource {
 			t.Fatalf("ref[%d] role = %q, want source", i, ref.Role)
 		}
-		if ref.VersionSUTID == nil || *ref.VersionSUTID != *in.VersionSUTID {
-			t.Fatalf("ref[%d] version_sut_id = %v, want %d", i, ref.VersionSUTID, *in.VersionSUTID)
+		if ref.SUTID == nil || *ref.SUTID != *in.SUTID {
+			t.Fatalf("ref[%d] sut_id = %v, want %d", i, ref.SUTID, *in.SUTID)
 		}
 	}
 

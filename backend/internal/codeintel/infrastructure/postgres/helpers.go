@@ -10,6 +10,7 @@ import (
 
 	codeintel "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // rowScanner is the shared pgx row/rows scan surface.
@@ -17,11 +18,17 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-// wrapDB maps pgx.ErrNoRows to the domain not-found sentinel and keeps other
+// wrapDB maps pgx.ErrNoRows to the domain not-found sentinel, unique violations
+// (SQLSTATE 23505, e.g. the partial unique active-index-run index) to the
+// domain conflict sentinel so racing callers answer 409, and keeps other
 // database failures opaque to callers (no SQL/DSN leakage upward).
 func wrapDB(action string, err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return codeintel.ErrNotFound
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return codeintel.ErrConflict
 	}
 	return fmt.Errorf("%s: %w", action, err)
 }

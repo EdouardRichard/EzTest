@@ -25,7 +25,7 @@ func NewExecutorAuthChecker(settings executionapp.SettingsReader) *ExecutorAuthC
 	return &ExecutorAuthCheckerAdapter{settings: settings}
 }
 
-// Check probes endpoint with GET /v1/contexts and the configured bearer token.
+// Check probes endpoint with GET /v1/sessions and the configured bearer token.
 // An empty endpoint is unreachable; an empty/unreadable token is
 // unauthenticated without issuing a request (an unauthenticated probe proves
 // nothing about the token).

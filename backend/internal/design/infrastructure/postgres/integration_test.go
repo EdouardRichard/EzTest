@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -33,89 +34,103 @@ func newRepo(t *testing.T) (*designpg.Repository, *pgxpool.Pool) {
 	return designpg.New(pool), pool
 }
 
+// seedVersion inserts one version row. v0.2.4-B: version.environment_id is NOT
+// NULL (version_0016) and version_sut is gone, so the fixture creates the
+// environment the version binds and points at it. The environment id is derived
+// from the version id so a test that seeds several versions does not collide.
 func seedVersion(t *testing.T, pool *pgxpool.Pool, versionID int64, autoDesign bool) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO version (id, title, status, auto_design_new_requirements, created_by)
-		VALUES ($1, 'P2 test version', 'initial', $2, 1)
-	`, versionID, autoDesign); err != nil {
+	ctx := context.Background()
+	environmentID := versionID*10 + 1
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO environment (id, name, status) VALUES ($1, $2, 'active')
+		ON CONFLICT (id) DO NOTHING
+	`, environmentID, fmt.Sprintf("design-env-%d", environmentID)); err != nil {
+		t.Fatalf("seed environment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO version (id, title, status, auto_design_new_requirements, created_by, environment_id)
+		VALUES ($1, 'P2 test version', 'initial', $2, 1, $3)
+	`, versionID, autoDesign, environmentID); err != nil {
 		t.Fatalf("seed version: %v", err)
 	}
 }
 
-func seedVersionSUT(t *testing.T, pool *pgxpool.Pool, versionID, versionSUTID int64, pages, apis []int64) {
+// seedApprovedPage creates one approved catalog page under the v0.2.4-B
+// hierarchy (environment -> sut -> sut_page, resource_0004). It replaces the
+// deleted seedVersionSUT: the discovery Critic ① still needs a real approved
+// sut_page row to find, but that row is CATALOG state, not version scope -- there
+// is no version_sut binding any more, and Critic ⑥ (target inside the version
+// scope) was deleted by Lead ruling 7.
+func seedApprovedPage(t *testing.T, pool *pgxpool.Pool, versionID, sutID, pageID int64) {
 	t.Helper()
 	ctx := context.Background()
-	// v0.22 derives the version range from the bound SUT environment's approved
-	// resources, so the fixture must create the owning SUT/environment and the
-	// approved page/API rows. The version_sut row itself no longer carries an
-	// inclusion list (scope_exclude is empty = whole environment).
+	environmentID := versionID*10 + 1
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut (id, name, created_by) VALUES ($1, $2, 1)
+		INSERT INTO sut (id, name, created_by, environment_id, base_url)
+		VALUES ($1, $2, 1, $3, $4)
 		ON CONFLICT (id) DO NOTHING
-	`, versionSUTID, fmt.Sprintf("design-sut-%d", versionSUTID)); err != nil {
-		t.Fatalf("seed version sut: %v", err)
+	`, sutID, fmt.Sprintf("design-sut-%d", sutID), environmentID,
+		fmt.Sprintf("https://sut-%d.example.test", sutID)); err != nil {
+		t.Fatalf("seed sut: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO sut_environment (id, sut_id, name, base_url)
-		VALUES ($1, $1, $2, $3)
-		ON CONFLICT (id) DO NOTHING
-	`, versionSUTID, fmt.Sprintf("env-%d", versionSUTID), fmt.Sprintf("https://env-%d.example.test", versionSUTID)); err != nil {
-		t.Fatalf("seed version environment: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO version_sut (id, version_id, sut_id, environment_id, status)
-		VALUES ($1, $2, $1, $1, 'active')
-	`, versionSUTID, versionID); err != nil {
-		t.Fatalf("seed version_sut: %v", err)
-	}
-	for _, pageID := range pages {
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template, status)
-			VALUES ($1, $2, $2, $3, $4, $5, 'approved')
-		`, pageID, versionSUTID, fmt.Sprintf("page-%d", pageID),
-			fmt.Sprintf("https://env.example.test/p%d", pageID), fmt.Sprintf("/p%d", pageID)); err != nil {
-			t.Fatalf("seed version page: %v", err)
-		}
-	}
-	for _, apiID := range apis {
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO sut_api (id, sut_id, environment_id, method, path_template, name, status)
-			VALUES ($1, $2, $2, 'GET', $3, $4, 'approved')
-		`, apiID, versionSUTID, fmt.Sprintf("/api/a%d", apiID), fmt.Sprintf("api-%d", apiID)); err != nil {
-			t.Fatalf("seed version api: %v", err)
-		}
+		INSERT INTO sut_page (id, sut_id, name, url, route_template, status)
+		VALUES ($1, $2, $3, $4, $5, 'approved')
+	`, pageID, sutID, fmt.Sprintf("page-%d", pageID),
+		fmt.Sprintf("https://sut-%d.example.test/p%d", sutID, pageID),
+		fmt.Sprintf("/p%d", pageID)); err != nil {
+		t.Fatalf("seed approved page: %v", err)
 	}
 }
 
-func seedVersionDatabase(t *testing.T, pool *pgxpool.Pool, versionSUTID, databaseID int64) {
-	t.Helper()
-	// v0.22 excludes databases through version_sut.scope_exclude; the version's
-	// databases are the bound environment's active target databases. A fixture
-	// row therefore lands in target_database, not in version_sut_resource.
-	if _, err := pool.Exec(context.Background(), `
-		INSERT INTO target_database (id, sut_id, environment_id, name, dsn, username)
-		VALUES ($1, $3, $3, $2, $4, 'reader')
-	`, databaseID, fmt.Sprintf("db-%d", databaseID), versionSUTID,
-		fmt.Sprintf("postgres://db-%d.example.test/test", databaseID)); err != nil {
-		t.Fatalf("seed version database: %v", err)
-	}
-}
-
+// seedRequirement inserts one requirement plus its current revision. The revision
+// carries the v0.2.4-B natural-language contract fields (version_0017): a
+// sut_description and a structured acceptance_criteria array, because
+// design.RequirementRef.ACIDs is what a proposal's covered_acs is validated
+// against. Two criteria with a two-digit id keep the numeric-suffix ordering
+// honest.
 func seedRequirement(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status, title string, revision int) {
+	t.Helper()
+	seedRequirementVersion(t, pool, versionID, requirementID, requirementVersionID, status, title, revision)
+}
+
+// defaultSeedCriteria is the AC document every seeded requirement revision gets
+// unless a test overrides it: two criteria, one with a two-digit id so the
+// numeric-suffix ordering stays honest.
+const defaultSeedCriteria = `[{"id":"AC-1","given":"已注册","when":"提交账号密码","then":"登录成功"},
+                              {"id":"AC-10","given":"连续失败","when":"再次提交","then":"账号锁定"}]`
+
+func seedRequirementVersion(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status, title string, revision int) {
+	t.Helper()
+	seedRequirementRevision(t, pool, versionID, requirementID, requirementVersionID, status, title, revision, defaultSeedCriteria)
+}
+
+// seedRequirementRevision writes ONE requirement revision and points
+// requirement.current_version_id at it. Calling it twice for the same requirement
+// with a different revision id and a different criteria document reproduces the
+// observable outcome of a requirement revision or a version-side Merge: the
+// current AC set changes, and ids that the previous revision minted are no longer
+// in it. That is the state the covered_acs linkage gate has to reject against, so
+// tests can seed a real renumber instead of hand-setting ProposalContext.
+func seedRequirementRevision(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID int64, status, title string, revision int, criteriaJSON string) {
 	t.Helper()
 	hash := strings.Repeat("a", 64)
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids)
-		VALUES ($1, $2, $3, $4, '[]'::jsonb)
+		INSERT INTO requirement (id, version_id, current_version_id, status)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (id) DO UPDATE SET current_version_id = EXCLUDED.current_version_id, status = EXCLUDED.status
 	`, requirementID, versionID, requirementVersionID, status); err != nil {
 		t.Fatalf("seed requirement: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement_version (id, requirement_id, revision, title, priority, content_hash)
-		VALUES ($1, $2, $3, $4, 'P2', $5)
-	`, requirementVersionID, requirementID, revision, title, hash); err != nil {
+		INSERT INTO requirement_version (
+			id, requirement_id, revision, title, priority, sut_description,
+			acceptance_criteria, content_hash
+		) VALUES ($1, $2, $3, $4, 'P2', $5, $6::jsonb, $7)
+	`, requirementVersionID, requirementID, revision, title,
+		seedSutDescription, criteriaJSON, hash); err != nil {
 		t.Fatalf("seed requirement_version: %v", err)
 	}
 }
@@ -124,21 +139,20 @@ func seedScenario(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, re
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO case_scenario (
-			id, version_id, requirement_id, requirement_version_id, name, description,
-			version_sut_ids, page_ids, api_ids, sort_order
-		) VALUES ($1, $2, $3, $4, $5, '', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, $6)
+			id, version_id, requirement_id, requirement_version_id, name, description, sort_order
+		) VALUES ($1, $2, $3, $4, $5, '', $6)
 	`, scenarioID, versionID, requirementID, requirementVersionID, name, sortOrder); err != nil {
 		t.Fatalf("seed case_scenario: %v", err)
 	}
 }
 
+// seedCase writes one logical case with a current version carrying the v0.2.4-B
+// contract columns (sut_description / covered_acs / required preconditions) and
+// one step. The stored content_hash is computed from the same shape the Go writer
+// would build, so a reader that decodes the row and re-hashes it agrees.
 func seedCase(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requirementVersionID, scenarioID, caseID, caseVersionID int64, revision int, status, title string) {
 	t.Helper()
-	hash, err := design.ComputeCaseContentHash(design.CaseVersion{
-		Title: title, Priority: "P2", Status: status,
-		VersionSUTIDs: []int64{9001}, DefaultVersionSUTID: int64Ptr(9001),
-		Steps: []design.CaseStep{{Seq: 1, Action: "step " + title, Data: json.RawMessage(`{}`)}},
-	})
+	hash, err := design.ComputeCaseContentHash(seededCaseVersion(caseVersionID, caseID, revision, status, title))
 	if err != nil {
 		t.Fatalf("hash case: %v", err)
 	}
@@ -151,48 +165,77 @@ func seedCase(t *testing.T, pool *pgxpool.Pool, versionID, requirementID, requir
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO case_version (
-			id, case_id, revision, title, description, preconditions, test_data, priority,
-			default_version_sut_id, version_sut_ids, page_ids, api_ids, status, content_hash
-		) VALUES ($1, $2, $3, $4, '', '', '{}'::jsonb, 'P2', 9001, '["9001"]'::jsonb,
-		          '[]'::jsonb, '[]'::jsonb, $5, $6)
-	`, caseVersionID, caseID, revision, title, status, hash); err != nil {
+			id, case_id, revision, title, description, sut_description, preconditions,
+			covered_acs, test_data, priority, status, content_hash
+		) VALUES ($1, $2, $3, $4, '', $5, $6, $7::jsonb, '{}'::jsonb, 'P2', $8, $9)
+	`, caseVersionID, caseID, revision, title,
+		seedSutDescription, seedPreconditions, `["AC-1"]`, status, hash); err != nil {
 		t.Fatalf("seed case_version: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO case_step (id, case_version_id, seq, action, data)
-		VALUES ($1, $2, 1, 'step', '{}'::jsonb)
-	`, caseVersionID+100000, caseVersionID); err != nil {
+		INSERT INTO case_step (id, case_version_id, seq, action, expected, target_description, data)
+		VALUES ($1, $2, 1, $3, $4, $5, '{}'::jsonb)
+	`, caseVersionID+100000, caseVersionID, "step "+title, "ok", seedTargetDescription); err != nil {
 		t.Fatalf("seed case_step: %v", err)
+	}
+}
+
+// The contract values every seeded case version shares. They are non-empty
+// because §5.2 requires them, and a fixture that stored blanks would not survive
+// the proposal gate it is meant to stand in for.
+const (
+	seedSutDescription    = "商城前台登录页与登录接口。"
+	seedPreconditions     = "已有可用账号"
+	seedTargetDescription = "登录页账号输入框"
+)
+
+// seededCaseVersion is the in-memory twin of the row seedCase writes, so the
+// stored content_hash and the value a reader recomputes are the same hash.
+func seededCaseVersion(caseVersionID, caseID int64, revision int, status, title string) design.CaseVersion {
+	return design.CaseVersion{
+		ID: caseVersionID, CaseID: caseID, Revision: revision, Status: status,
+		Title: title, Priority: "P2",
+		SutDescription: seedSutDescription,
+		Preconditions:  seedPreconditions,
+		CoveredACs:     []string{"AC-1"},
+		Steps: []design.CaseStep{{
+			Seq: 1, Action: "step " + title, Expected: "ok",
+			TargetDescription: seedTargetDescription, Data: json.RawMessage(`{}`),
+		}},
 	}
 }
 
 func int64Ptr(value int64) *int64 { return &value }
 
-func TestVersionContextTargetMaps(t *testing.T) {
+// TestVersionContextIsExistenceGate pins what survives of VersionContext after
+// v0.2.4-B (Lead ruling 9) and T27: the version id only. The four resource maps
+// were deleted with the proposal ownership group; T27 then removed the leftover
+// Status / AutoDesignNewRequirements fields because the only production caller
+// (GraphService.Propose) discards the value and uses the read purely as a
+// version-existence gate. The reflect checks below fail if any retired field is
+// re-added, so the dead projection cannot silently come back.
+func TestVersionContextIsExistenceGate(t *testing.T) {
 	repo, pool := newRepo(t)
 	seedVersion(t, pool, testVersionID, true)
-	seedVersionSUT(t, pool, testVersionID, 9001, []int64{6001}, []int64{4001})
-	seedVersionSUT(t, pool, testVersionID, 9002, []int64{6002}, []int64{4002})
-	seedVersionDatabase(t, pool, 9002, 8001)
 
 	ctxView, err := repo.VersionContext(context.Background(), testVersionID)
 	if err != nil {
 		t.Fatalf("VersionContext: %v", err)
 	}
-	if len(ctxView.AllowedVersionSUTs) != 2 {
-		t.Fatalf("allowed SUTs = %v", ctxView.AllowedVersionSUTs)
+	if ctxView.VersionID != testVersionID {
+		t.Fatalf("version id = %d, want %d", ctxView.VersionID, testVersionID)
 	}
-	if ctxView.PageToSUT[6001] != 9001 || ctxView.PageToSUT[6002] != 9002 {
-		t.Fatalf("page map = %v", ctxView.PageToSUT)
+	// Neither the retired resource maps nor the unconsumed state fields may come
+	// back: design has no resource scope to check a proposal against, and the
+	// existence gate reads no version state.
+	for _, gone := range []string{"PageToSUT", "AllowedVersionSUTs", "APIToSUT", "DBTOSUT", "Status", "AutoDesignNewRequirements"} {
+		if _, found := reflect.TypeOf(ctxView).FieldByName(gone); found {
+			t.Fatalf("VersionContext re-gained the retired field %q", gone)
+		}
 	}
-	if ctxView.APIToSUT[4002] != 9002 {
-		t.Fatalf("api map = %v", ctxView.APIToSUT)
-	}
-	if ctxView.DBTOSUT[8001] != 9002 {
-		t.Fatalf("database map = %v", ctxView.DBTOSUT)
-	}
-	if !ctxView.AutoDesignNewRequirements {
-		t.Fatal("auto design flag not projected")
+
+	if _, err := repo.VersionContext(context.Background(), testVersionID+99999); !errors.Is(err, design.ErrNotFound) {
+		t.Fatalf("missing version err = %v, want ErrNotFound", err)
 	}
 }
 
@@ -348,6 +391,107 @@ func TestConfirmAtomicAndIdempotent(t *testing.T) {
 	})
 	if !errors.Is(err, design.ErrStateConflict) {
 		t.Fatalf("repeat confirmation err = %v, want ErrStateConflict", err)
+	}
+}
+
+// seedExtraCaseVersion inserts one more case_version row of an existing case
+// (no steps/assertions needed for the supersede predicate, which reads status
+// only). The contract columns mirror seedCase so the row survives the design
+// CHECK constraints; the content hash is computed from the same in-memory twin.
+func seedExtraCaseVersion(t *testing.T, pool *pgxpool.Pool, caseID, caseVersionID int64, revision int, status, title string) {
+	t.Helper()
+	hash, err := design.ComputeCaseContentHash(seededCaseVersion(caseVersionID, caseID, revision, status, title))
+	if err != nil {
+		t.Fatalf("hash extra case version: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO case_version (
+			id, case_id, revision, title, description, sut_description, preconditions,
+			covered_acs, test_data, priority, status, content_hash
+		) VALUES ($1, $2, $3, $4, '', $5, $6, $7::jsonb, '{}'::jsonb, 'P2', $8, $9)
+	`, caseVersionID, caseID, revision, title,
+		seedSutDescription, seedPreconditions, `["AC-1"]`, status, hash); err != nil {
+		t.Fatalf("seed extra case_version: %v", err)
+	}
+}
+
+// TestSupersedeListMatchesSupersedeWrite pins the H-G4 T2① single-source fix:
+// SupersededVersionIDs (the preview) and SupersedeVersions (the write) must select
+// the SAME supersedable status set. The expected set is derived from the domain
+// constants (confirmed/stale), not hand-copied; a divergence between the two call
+// sites (one hand-mirrored set drifting) fails the list==write equality.
+func TestSupersedeListMatchesSupersedeWrite(t *testing.T) {
+	repo, pool := newRepo(t)
+	seedVersion(t, pool, testVersionID, false)
+	seedRequirement(t, pool, testVersionID, testReqID, testReqVersion, "clarified", "登录", 1)
+	seedScenario(t, pool, testVersionID, testReqID, testReqVersion, testScenarioID, "正常登录", 0)
+	// Current draft (the kept version) + one version per non-draft status.
+	seedCase(t, pool, testVersionID, testReqID, testReqVersion, testScenarioID, testCaseID, testCaseVersion, 1, design.CaseStatusDraft, "草稿")
+	seedExtraCaseVersion(t, pool, testCaseID, testCaseVersion+10, 2, design.CaseStatusConfirmed, "已确认")
+	seedExtraCaseVersion(t, pool, testCaseID, testCaseVersion+20, 3, design.CaseStatusStale, "已过期")
+	seedExtraCaseVersion(t, pool, testCaseID, testCaseVersion+30, 4, design.CaseStatusSuperseded, "已被替换")
+	ctx := context.Background()
+
+	// Expected supersedable set, derived from the domain authority: the versions
+	// whose status is confirmed or stale, excluding the kept current version.
+	supersedable := map[string]bool{design.CaseStatusConfirmed: true, design.CaseStatusStale: true}
+	wantIDs := make([]int64, 0)
+	rows, err := pool.Query(ctx, `SELECT id, status FROM case_version WHERE case_id = $1 AND id <> $2 ORDER BY id`, testCaseID, testCaseVersion)
+	if err != nil {
+		t.Fatalf("query case versions: %v", err)
+	}
+	for rows.Next() {
+		var vid int64
+		var status string
+		if err := rows.Scan(&vid, &status); err != nil {
+			rows.Close()
+			t.Fatalf("scan case version: %v", err)
+		}
+		if supersedable[status] {
+			wantIDs = append(wantIDs, vid)
+		}
+	}
+	rows.Close()
+	if len(wantIDs) != 2 {
+		t.Fatalf("fixture precondition: want 2 supersedable versions, got %d", len(wantIDs))
+	}
+
+	var listed []int64
+	err = repo.WithConfirmationLock(ctx, testVersionID, testReqID, func(ctx context.Context, tx design.ConfirmationTx) error {
+		var listErr error
+		listed, listErr = tx.SupersededVersionIDs(ctx, testCaseID, testCaseVersion)
+		if listErr != nil {
+			return listErr
+		}
+		return tx.SupersedeVersions(ctx, testCaseID, testCaseVersion, time.Now().UTC())
+	})
+	if err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	if !reflect.DeepEqual(listed, wantIDs) {
+		t.Fatalf("SupersededVersionIDs = %v, want the domain-derived supersedable set %v", listed, wantIDs)
+	}
+	// The write moved EXACTLY the listed versions to superseded; the kept draft
+	// and the already-superseded version are untouched.
+	for _, vid := range []int64{testCaseVersion, testCaseVersion + 10, testCaseVersion + 20, testCaseVersion + 30} {
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM case_version WHERE id = $1`, vid).Scan(&status); err != nil {
+			t.Fatalf("read version %d status: %v", vid, err)
+		}
+		switch vid {
+		case testCaseVersion:
+			if status != design.CaseStatusDraft {
+				t.Fatalf("kept version status = %q, want draft", status)
+			}
+		case testCaseVersion + 30:
+			if status != design.CaseStatusSuperseded {
+				t.Fatalf("already-superseded version status = %q, want superseded", status)
+			}
+		default:
+			if status != design.CaseStatusSuperseded {
+				t.Fatalf("supersedable version %d status = %q, want superseded (list and write diverged)", vid, status)
+			}
+		}
 	}
 }
 

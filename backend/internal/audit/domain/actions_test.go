@@ -39,7 +39,7 @@ func TestActionsCatalogIsUniqueAndWellFormed(t *testing.T) {
 	}
 	for _, prefix := range []string{
 		"auth.", "user.", "settings.", "llm.", "resource.", "version.", "agent.",
-		"agent_profile.", "quality.", "case.", "execution.", "visual.", "content.",
+		"agent_profile.", "quality.", "case.", "execution.", "content.",
 	} {
 		found := false
 		for name := range names {
@@ -66,7 +66,6 @@ var curatedEmitterActions = []struct {
 	{"quality.eval_recorded", "quality/application/service.go"},
 	{"case.updated", "design/application/data_plan.go"},
 	{"execution.credentials_read", "execution/application/credentials.go"},
-	{"visual.diff.create", "visual/application/diff_service.go"},
 	{"content.uploaded", "storage/application/service.go"},
 }
 

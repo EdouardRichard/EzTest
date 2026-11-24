@@ -20,30 +20,37 @@ func sampleRequirement(ids interface{ Next() int64 }, versionID int64) (version.
 	revisionID := ids.Next()
 	createdBy := int64(42)
 	requirement := version.Requirement{
-		ID:                  requirementID,
-		VersionID:           versionID,
-		CurrentVersionID:    &revisionID,
-		Status:              version.RequirementDraft,
-		TargetVersionSUTIDs: []string{"5001"},
-		CreatedBy:           &createdBy,
-		CreatedAt:           testTime,
-		UpdatedAt:           testTime,
+		ID:               requirementID,
+		VersionID:        versionID,
+		CurrentVersionID: &revisionID,
+		Status:           version.RequirementDraft,
+		CreatedBy:        &createdBy,
+		CreatedAt:        testTime,
+		UpdatedAt:        testTime,
 	}
 	revision := version.RequirementVersion{
-		ID:                 revisionID,
-		RequirementID:      requirementID,
-		Revision:           1,
-		Title:              "Checkout coupons",
-		Description:        "Users can apply coupons.",
-		AcceptanceCriteria: "A valid coupon reduces the total.",
-		Priority:           "P1",
-		Constraints:        json.RawMessage(`{"business_rules":["one coupon per order"]}`),
-		TargetVersionSUTs:  []string{"5001"},
-		TargetPages:        []string{"6001", "6002"},
-		TargetAPIs:         []string{"7001"},
-		ContentHash:        strings.Repeat("a", 64),
-		CreatedBy:          &createdBy,
-		CreatedAt:          testTime,
+		ID:            revisionID,
+		RequirementID: requirementID,
+		Revision:      1,
+		Title:         "Checkout coupons",
+		UserStory: version.UserStory{
+			AsA:    "a signed-in shopper",
+			IWant:  "to apply a coupon code at checkout",
+			SoThat: "I pay less for my order",
+		},
+		Rules: "One coupon per order.",
+		AcceptanceCriteria: []version.AcceptanceCriterion{
+			{ID: "AC-1", Given: "a valid coupon", When: "it is applied", Then: "the total drops"},
+			{ID: "AC-2", Given: "an expired coupon", When: "it is applied", Then: "it is rejected"},
+		},
+		Priority:         "P1",
+		Constraints:      json.RawMessage(`{"business_rules":["one coupon per order"]}`),
+		SutDescription:   "The web storefront checkout.",
+		ScopeOut:         "Gift cards.",
+		AccountRolesHint: []string{"shopper", "support"},
+		ContentHash:      strings.Repeat("a", 64),
+		CreatedBy:        &createdBy,
+		CreatedAt:        testTime,
 	}
 	return requirement, revision
 }
@@ -75,8 +82,25 @@ func TestRequirementRepositoryLifecycle(t *testing.T) {
 	if len(aggregate.Versions) != 1 || aggregate.Versions[0].Title != "Checkout coupons" {
 		t.Fatalf("versions = %#v", aggregate.Versions)
 	}
-	if got := aggregate.Versions[0].TargetPages; len(got) != 2 || got[0] != "6001" || got[1] != "6002" {
-		t.Fatalf("target pages = %#v", got)
+	// The two new JSONB documents and the new TEXT columns must round-trip
+	// exactly: this is the migration's read/write contract (version_0017).
+	stored := aggregate.Versions[0]
+	if stored.UserStory.AsA != "a signed-in shopper" || stored.UserStory.IWant != "to apply a coupon code at checkout" ||
+		stored.UserStory.SoThat != "I pay less for my order" {
+		t.Fatalf("user_story = %#v", stored.UserStory)
+	}
+	if len(stored.AcceptanceCriteria) != 2 ||
+		stored.AcceptanceCriteria[0].ID != "AC-1" || stored.AcceptanceCriteria[0].Given != "a valid coupon" ||
+		stored.AcceptanceCriteria[0].When != "it is applied" || stored.AcceptanceCriteria[0].Then != "the total drops" ||
+		stored.AcceptanceCriteria[1].ID != "AC-2" {
+		t.Fatalf("acceptance_criteria = %#v", stored.AcceptanceCriteria)
+	}
+	if stored.Rules != "One coupon per order." || stored.SutDescription != "The web storefront checkout." ||
+		stored.ScopeOut != "Gift cards." {
+		t.Fatalf("rules/sut_description/scope_out = %#v", stored)
+	}
+	if got := stored.AccountRolesHint; len(got) != 2 || got[0] != "shopper" || got[1] != "support" {
+		t.Fatalf("account_roles_hint = %#v", got)
 	}
 	if string(aggregate.Versions[0].Constraints) != `{"business_rules": ["one coupon per order"]}` {
 		t.Fatalf("constraints = %s", aggregate.Versions[0].Constraints)

@@ -74,8 +74,8 @@ func sampleCandidateView(repoID int64) codeintelapp.ImpactCandidateView {
 			Evidence: []byte(`[{"file":"src/a.ts"}]`), Selected: true,
 			CreatedAt: testTime, UpdatedAt: testTime,
 		},
-		RepoID:        repoID,
-		VersionSUTIDs: []int64{11},
+		RepoID: repoID,
+		SUTIDs: []int64{11},
 	}
 }
 
@@ -92,7 +92,7 @@ func TestImpactUnionRoute(t *testing.T) {
 	}
 	view := items[0].(map[string]any)
 	if view["id"] != "81" || view["subject_kind"] != "requirement" || view["repo_id"] != "10" ||
-		view["version_sut_id"] != "11" || view["selected"] != true {
+		view["sut_id"] != "11" || view["selected"] != true {
 		t.Fatalf("view = %+v", view)
 	}
 	if len(svc.unionCalls) != 1 || svc.unionCalls[0] != 1 {

@@ -20,7 +20,12 @@ func newConfirmFixture(t *testing.T) (*GraphService, *fakeRepo, *fakePublisher, 
 	}}
 	publisher := &fakePublisher{}
 	audit := &fakeAudit{}
-	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, publisher, &fakeTeamRoom{})
+	// The subject of this suite is the confirmation mechanics, not the judge
+	// review: the gate is satisfied by an always-pass stub so every original
+	// assertion keeps its meaning. The judgment routing itself is pinned by
+	// confirmation_judgment_test.go against the real judgment service.
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, publisher, &fakeTeamRoom{}).
+		SetJudgmentGate(alwaysPassJudgmentGate{})
 	return service, repo, publisher, audit
 }
 

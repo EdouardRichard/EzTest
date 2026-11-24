@@ -97,8 +97,7 @@ func (t *confirmationTx) Requirement(ctx context.Context) (design.RequirementRef
 func (t *confirmationTx) Scenario(ctx context.Context, scenarioID int64) (design.Scenario, error) {
 	row := t.tx.QueryRow(ctx, `
 		SELECT id, version_id, requirement_id, requirement_version_id, name, description,
-		       COALESCE(version_sut_ids, '[]'::jsonb), COALESCE(page_ids, '[]'::jsonb),
-		       COALESCE(api_ids, '[]'::jsonb), sort_order, created_at, updated_at
+		       sort_order, created_at, updated_at
 		FROM case_scenario
 		WHERE id = $1 AND version_id = $2 AND requirement_id = $3
 	`, scenarioID, t.versionID, t.requirementID)
@@ -161,14 +160,15 @@ func (t *confirmationTx) ConfirmCaseVersion(ctx context.Context, command design.
 	}
 	tag, err := t.tx.Exec(ctx, `
 		UPDATE case_version
-		SET status = 'confirmed',
+		SET status = $6,
 		    updated_at = $2,
 		    trigger = COALESCE(NULLIF($3, ''), trigger),
 		    source_observation_id = COALESCE($4, source_observation_id),
 		    auto_confirmed_by = COALESCE(NULLIF($5, ''), auto_confirmed_by)
-		WHERE id = $1 AND status = 'draft'
+		WHERE id = $1 AND status = $7
 	`, confirmation.CaseVersionID, at, confirmation.Trigger,
-		confirmation.SourceObservationID, confirmation.AutoConfirmedBy)
+		confirmation.SourceObservationID, confirmation.AutoConfirmedBy,
+		design.CaseStatusConfirmed, design.CaseStatusDraft)
 	if err != nil {
 		return fmt.Errorf("confirm case version: %w", err)
 	}
@@ -217,26 +217,34 @@ func insertConfirmation(ctx context.Context, tx pgx.Tx, confirmation design.Conf
 			auto_confirmed, auto_confirmed_by, trigger, source_observation_id,
 			created_at, updated_at
 		) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,
-		          $10, NULLIF($11, ''), COALESCE(NULLIF($12, ''), 'manual'), $13,
+		          $10, NULLIF($11, ''), COALESCE(NULLIF($12, ''), $14), $13,
 		          $9,$9)
 	`, confirmation.ID, confirmation.CaseVersionID, confirmation.Scope,
 		confirmation.TargetScopeID, confirmation.BatchID, string(affected),
 		string(snapshotJSON), confirmation.ConfirmedBy, confirmation.ConfirmedAt,
 		confirmation.AutoConfirmed, confirmation.AutoConfirmedBy, confirmation.Trigger,
-		confirmation.SourceObservationID); err != nil {
+		confirmation.SourceObservationID, string(design.CaseTriggerManual)); err != nil {
 		return fmt.Errorf("insert case confirmation: %w", err)
 	}
 	return nil
 }
+
+// supersedableCaseStatuses is the SINGLE supersedable status set shared by the
+// supersede write (SupersedeVersions) and its preview (SupersededVersionIDs):
+// confirming a new version supersedes the older confirmed/stale versions. Both
+// call sites bind this set as a query parameter, so the preview can never drift
+// from the write (H-G4 T2①, constitution 五.1; pinned by
+// TestSupersedeListMatchesSupersedeWrite).
+var supersedableCaseStatuses = []string{design.CaseStatusConfirmed, design.CaseStatusStale}
 
 // SupersedeVersions moves older confirmed/stale versions of one case to
 // superseded after a new version is confirmed (spec §4.1).
 func (t *confirmationTx) SupersedeVersions(ctx context.Context, caseID, keepVersionID int64, at time.Time) error {
 	_, err := t.tx.Exec(ctx, `
 		UPDATE case_version
-		SET status = 'superseded', updated_at = $3
-		WHERE case_id = $1 AND id <> $2 AND status IN ('confirmed', 'stale')
-	`, caseID, keepVersionID, at)
+		SET status = $4, updated_at = $3
+		WHERE case_id = $1 AND id <> $2 AND status = ANY($5)
+	`, caseID, keepVersionID, at, design.CaseStatusSuperseded, supersedableCaseStatuses)
 	if err != nil {
 		return fmt.Errorf("supersede older case versions: %w", err)
 	}
@@ -247,9 +255,9 @@ func (t *confirmationTx) SupersedeVersions(ctx context.Context, caseID, keepVers
 func (t *confirmationTx) SupersededVersionIDs(ctx context.Context, caseID, keepVersionID int64) ([]int64, error) {
 	rows, err := t.tx.Query(ctx, `
 		SELECT id FROM case_version
-		WHERE case_id = $1 AND id <> $2 AND status IN ('confirmed', 'stale')
+		WHERE case_id = $1 AND id <> $2 AND status = ANY($3)
 		ORDER BY id
-	`, caseID, keepVersionID)
+	`, caseID, keepVersionID, supersedableCaseStatuses)
 	if err != nil {
 		return nil, fmt.Errorf("list superseded case versions: %w", err)
 	}
@@ -330,9 +338,9 @@ func (t *staleTx) CasesByRequirement(ctx context.Context) ([]design.CaseWithCurr
 
 func (t *staleTx) MarkCaseVersionStale(ctx context.Context, caseVersionID int64, at time.Time) error {
 	if _, err := t.tx.Exec(ctx, `
-		UPDATE case_version SET status = 'stale', updated_at = $2
-		WHERE id = $1 AND status = 'confirmed'
-	`, caseVersionID, at); err != nil {
+		UPDATE case_version SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = $4
+	`, caseVersionID, at, design.CaseStatusStale, design.CaseStatusConfirmed); err != nil {
 		return fmt.Errorf("mark case version stale: %w", err)
 	}
 	return nil
@@ -340,9 +348,9 @@ func (t *staleTx) MarkCaseVersionStale(ctx context.Context, caseVersionID int64,
 
 func (t *staleTx) MarkCaseEntityStale(ctx context.Context, caseID int64, at time.Time) error {
 	if _, err := t.tx.Exec(ctx, `
-		UPDATE case_entity SET status = 'stale', updated_at = $2
-		WHERE id = $1 AND status = 'confirmed'
-	`, caseID, at); err != nil {
+		UPDATE case_entity SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = $4
+	`, caseID, at, design.CaseStatusStale, design.CaseStatusConfirmed); err != nil {
 		return fmt.Errorf("mark case entity stale: %w", err)
 	}
 	return nil
@@ -361,12 +369,12 @@ func (r *Repository) ListOutdatedConfirmedRequirements(ctx context.Context, limi
 		JOIN case_scenario s ON s.requirement_id = r.id AND s.version_id = r.version_id
 		JOIN case_entity ce ON ce.scenario_id = s.id
 		JOIN case_version cv ON cv.id = ce.current_version_id
-		WHERE cv.status = 'confirmed'
+		WHERE cv.status = $2
 		  AND r.current_version_id IS NOT NULL
 		  AND s.requirement_version_id <> r.current_version_id
 		ORDER BY r.id
 		LIMIT $1
-	`, limit)
+	`, limit, design.CaseStatusConfirmed)
 	if err != nil {
 		return nil, fmt.Errorf("list outdated confirmed requirements: %w", err)
 	}

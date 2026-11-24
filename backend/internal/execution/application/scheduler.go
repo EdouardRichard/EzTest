@@ -25,17 +25,39 @@ const (
 )
 
 // EventCaseRunBlocked is the 0.2.1 dispatch-health event (spec §5.6): a pending
-// case_run could not be dispatched because no healthy executor is available.
-// It is emitted once per (case_run, reason) until the run is dispatched, so
-// "no executor" never looks like a silent pending row.
+// case_run could not be dispatched. It is emitted once per (case_run, reason)
+// until the run is dispatched, so a pending row is never silent.
+//
+// v0.2.4-B fix round 2 (review C1): the reasons are no longer only executor
+// health. A quota or executor-capacity rejection carries the domain's own stable
+// reason string (execution.Reason*), because a dispatch refused by the capacity
+// gate has to be just as attributable as one refused for want of an executor.
 const EventCaseRunBlocked = "case_run.blocked"
 
-// Reasons carried by EventCaseRunBlocked.
+// Executor-health reasons carried by EventCaseRunBlocked. The quota reasons are
+// the execution domain's own constants (global_concurrency, executor_capacity).
 const (
 	BlockedReasonNoExecutor          = "no_executor"
 	BlockedReasonExecutorDegraded    = "executor_degraded"
 	BlockedReasonExecutorUnavailable = "executor_unavailable"
 )
+
+// blockedAction is the operator-facing "what happens next" of a blocked event.
+// The wording has to match the reason: telling an operator to wait for an
+// executor to recover when the real block is a concurrency quota sends them to
+// the wrong remedy.
+func blockedAction(reason string) string {
+	switch reason {
+	case BlockedReasonNoExecutor:
+		return "等待执行器注册后重试"
+	case execution.ReasonContextRequirementExceedsCapacity:
+		return "需要提高执行器容量（max_contexts）或减少用例的账号角色数后重新执行"
+	case execution.ReasonGlobalConcurrency, execution.ReasonExecutorCapacity:
+		return "等待并发配额或执行器容量释放后重试"
+	default:
+		return "等待执行器恢复后重试"
+	}
+}
 
 // DefaultDispatchLease is the dispatch-time case_run lease. It is deliberately
 // longer than DefaultCaseLease (the agent-side execution lease): the scheduler
@@ -46,8 +68,9 @@ const DefaultDispatchLease = 10 * time.Minute
 
 // Scheduler is the deterministic execution planner/reconciler (ARCH §7.1,
 // P3-D-15): it groups open intents into waves, dispatches pending case_runs
-// under the frozen quota, and finalizes waves into intent results plus the
-// failure/coverage analysis trigger. It is intentionally single-instance.
+// under the global concurrency quota, and finalizes waves into intent results
+// plus the failure/coverage analysis trigger. It is intentionally
+// single-instance.
 type Scheduler struct {
 	intents     IntentRepository
 	waves       WaveRepository
@@ -56,15 +79,20 @@ type Scheduler struct {
 	versions    VersionReader
 	executors   ExecutorRegistry
 	workQueue   WorkQueue
-	quota       execution.Quota
 	quotaReader QuotaReader
-	analyzer    WaveAnalyzer
-	replanner   SupersededIntentReplanner
-	ids         IDGenerator
-	clock       Clock
-	events      EventPublisher
-	instance    string
-	leaseTTL    time.Duration
+	// quotaResolver reads the concurrency settings with last-known-good
+	// retention (ruling P12) and composes the claim-headroom admission bound
+	// (ruling P13). settings nil is a degraded assembly (unbounded legacy
+	// behavior); production wires the settings service.
+	quotaResolver QuotaResolver
+	settings      SettingsReader
+	analyzer      WaveAnalyzer
+	replanner     SupersededIntentReplanner
+	ids           IDGenerator
+	clock         Clock
+	events        EventPublisher
+	instance      string
+	leaseTTL      time.Duration
 	// stageNotifier is the v0.22 production wave-terminal stage callback
 	// (R-B4-3). It is optional so the pre-v0.22 scheduler assemblies keep
 	// working: nil means "do not drive the stage machine from execution".
@@ -79,6 +107,7 @@ type Scheduler struct {
 	// retestNotifier is the v0.22 W2-5 retest writeback callback. nil keeps the
 	// pre-v0.22 behavior; the composition root binds the delivery adapter.
 	retestNotifier WaveTerminalRetestNotifier
+	teamRoom       TeamRoom
 	// delta is the optional v0.22 version-context discovery-delta trigger
 	// (W1-14A): the scheduler calls it once when a wave becomes terminal
 	// (done or failed); PauseService does the same for a cancelled wave.
@@ -131,14 +160,21 @@ type SchedulerDeps struct {
 	Versions    VersionReader
 	Executors   ExecutorRegistry
 	WorkQueue   WorkQueue
-	Quota       execution.Quota
 	QuotaReader QuotaReader
-	Analyzer    WaveAnalyzer
-	IDs         IDGenerator
-	Clock       Clock
-	Events      EventPublisher
-	Instance    string
-	LeaseTTL    time.Duration
+	// Settings supplies the live concurrency settings on every dispatch pass
+	// (hot-reloadable): execution.max_concurrent_case_runs (0 = unlimited, the
+	// catalog default) and the worker claim headroom agent.max_concurrent_runs.
+	// Reads go through QuotaResolver: a failed read logs a WARN and retains the
+	// last-known-good value -- there is deliberately NO construction-time quota
+	// port that could silently fail open (ruling P12). nil is a degraded
+	// assembly without resource governance (tests / half-wired processes).
+	Settings SettingsReader
+	Analyzer WaveAnalyzer
+	IDs      IDGenerator
+	Clock    Clock
+	Events   EventPublisher
+	Instance string
+	LeaseTTL time.Duration
 	// Replanner is the Task 106 stale-intent re-plan (implemented by
 	// *IntentService). nil keeps the P3-only retire behavior.
 	Replanner SupersededIntentReplanner
@@ -155,14 +191,14 @@ type SchedulerDeps struct {
 	// RetestNotifier is the v0.22 W2-5 a wave-terminal retest writeback callback
 	// implemented by the delivery issue service adapter. nil disables it.
 	RetestNotifier WaveTerminalRetestNotifier
+	// TeamRoom receives the human handoff post of a run the scheduler itself
+	// terminates (v0.2.4-B review round 4, Important 2). nil disables the post;
+	// the run is still terminally blocked and its events are still published.
+	TeamRoom TeamRoom
 }
 
 // NewScheduler builds the scheduler.
 func NewScheduler(deps SchedulerDeps) *Scheduler {
-	quota := deps.Quota
-	if quota.Global <= 0 && quota.PerSUT <= 0 && quota.CrossSystem <= 0 {
-		quota = execution.QuotaFromSettings(0, 0, 0)
-	}
 	lease := deps.LeaseTTL
 	if lease < DefaultDispatchLease {
 		// The dispatch lease must cover the queue wait, not the agent lease: a
@@ -180,8 +216,8 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		versions:        deps.Versions,
 		executors:       deps.Executors,
 		workQueue:       deps.WorkQueue,
-		quota:           quota,
 		quotaReader:     deps.QuotaReader,
+		settings:        deps.Settings,
 		analyzer:        deps.Analyzer,
 		replanner:       deps.Replanner,
 		ids:             deps.IDs,
@@ -193,6 +229,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		stageReconciler: deps.StageReconciler,
 		delta:           deps.Delta,
 		retestNotifier:  deps.RetestNotifier,
+		teamRoom:        deps.TeamRoom,
 		pendingStage:    map[int64]stageRetryState{},
 		blocked:         map[int64]string{},
 	}
@@ -300,9 +337,13 @@ func (s *Scheduler) failEmptyWave(ctx context.Context, wave execution.RunWave) e
 	return nil
 }
 
-// dispatchPending attempts to start every pending case_run of a wave. Quota is
-// reserved in one shot per candidate: a cross-system run either gets all of its
-// version_sut slots or is skipped without blocking later runs (§5.3).
+// dispatchPending attempts to start every pending case_run of a wave.
+// Admission follows the effective global bound (admin limit AND provable
+// claim headroom, see QuotaResolver.DispatchLimit / ruling P13): one slot per
+// dispatched run, so a refused candidate is skipped without blocking later
+// runs (§5.3, design P5). Runs beyond the bound stay PENDING -- no lease, no
+// attempts -- so Recovery can never false-recover a queued run as
+// dispatch_timeout.
 func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave, runs []execution.CaseRun) error {
 	pending := make([]execution.CaseRun, 0)
 	for _, run := range runs {
@@ -310,6 +351,9 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 			pending = append(pending, run)
 		}
 	}
+	// runs is the wave's full list, so this also reclaims the dedup entries of
+	// runs a pause/cancel/interrupt moved out of pending (review M-new-2).
+	s.pruneBlocked(runs)
 	if len(pending) == 0 {
 		return nil
 	}
@@ -317,6 +361,12 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 	if err != nil {
 		return err
 	}
+	quota := execution.Quota{Global: s.quotaResolver.DispatchLimit(ctx, s.settings)}
+	// executor.ActiveContexts is only refreshed by the executor health poll
+	// (Registry), never by dispatch itself. Reserve the contexts admitted in
+	// THIS pass per executor so a lagging ActiveContexts cannot let one tick
+	// over-admit past an executor's whole capacity (ruling P13).
+	reservedContexts := map[int64]int{}
 	for index := range pending {
 		run := pending[index]
 		// P7 multi-endpoint selection: re-select the best executor for every
@@ -356,22 +406,92 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 				result.ReplacementCaseVersionID, result.Replanned); err != nil {
 				return err
 			}
+			// The run left pending without being dispatched, so its blocked-dedup
+			// entry would otherwise leak for the life of the process (review
+			// M-new-2: clearBlocked used to have exactly one caller, the
+			// successful-dispatch path below).
+			s.clearBlocked(run.ID)
 			continue
 		}
-		sutIDs := intent.VersionSUTIDs
+		sutIDs := intent.SUTIDs
 		if len(sutIDs) == 0 {
-			sutIDs = caseIntentVersionSUTIDs(snapshot)
+			// v0.2.4-B: the case snapshot no longer carries a SUT set (design
+			// went natural-language), so the only remaining source for a legacy
+			// intent row with no sut_ids is the version binding itself.
+			if binding, bindingErr := s.versions.Get(ctx, wave.VersionID); bindingErr == nil {
+				sutIDs = SUTIDs(binding)
+			}
 		}
-		candidate := execution.RunningCase{
-			CaseRunID:     run.ID,
-			VersionSUTIDs: sutIDs,
-			CrossSystem:   len(sutIDs) > 1,
-		}
-		ok, _ := execution.CanDispatch(s.quota, usage, candidate,
-			executor.Capacity, executor.ActiveContexts, requiredContextCount(snapshot))
+		// The bound SUT set above is a recorded fact (resolution/fingerprint/
+		// knowledge and the case_run.started event payload), NOT a quota input:
+		// design P5 removed the per-SUT and cross-system dimensions, so a
+		// running run consumes exactly one global slot regardless of its SUTs.
+		candidate := execution.RunningCase{CaseRunID: run.ID}
+		contexts := requiredContextCount(snapshot)
+		ok, reason := execution.CanDispatch(quota, usage,
+			executor.Capacity, executor.ActiveContexts+reservedContexts[executor.ID], contexts)
 		if !ok {
+			if reason == execution.ReasonContextRequirementExceedsCapacity {
+				// Review I-new-1: this rejection can never be cleared by waiting,
+				// so skipping the run leaves it pending forever. Nothing else
+				// rescues it -- run.Attempts is incremented below, after this
+				// gate, so a never-dispatched run stays at Attempts 0 and the
+				// DefaultMaxDispatchAttempts budget never applies; LeaseUntil is
+				// likewise set after the gate, so recovery has no expired lease
+				// to reclaim; there is no pending-age watchdog; and completeWave
+				// needs every run finished, so the wave wedges with it.
+				// Terminate the run instead, loudly and attributably.
+				//
+				// Review round 4, Important 1: only after proving it is impossible
+				// for the WHOLE fleet, not just for the executor Select happened to
+				// return -- see fleetCapacityCeiling.
+				//
+				// Review round 7: the probe stays INSIDE this reason check, so it
+				// short-circuits. Round 5's TOCTOU fix had hoisted it above the
+				// `reason ==` test, which ran an executorConfig (three settings
+				// reads) plus a full repo.List of the executor table on EVERY
+				// rejection -- global_concurrency and plain executor_capacity
+				// (plus the per-SUT/cross-system reasons retired by design P5),
+				// i.e. the common case in any busy wave under a finite limit --
+				// turning roughly zero extra queries per tick into one per
+				// pending run per tick. Worse for
+				// observability: fleetCapacityCeiling logs slog.Warn on error, so
+				// during a registry outage every rejected run logged a warning
+				// every tick blaming "an oversized context requirement" for runs
+				// that have none -- noise aimed at whoever is reading logs during
+				// the incident. Nesting restores the short-circuit and keeps the
+				// TOCTOU fix: fleetMax is still the value just proven, passed
+				// through to the message rather than re-read.
+				if fleetMax, impossible := s.fleetCapacityCeiling(ctx, contexts); impossible {
+					if err := s.terminateUnsatisfiableRun(ctx, wave, run, contexts, fleetMax); err != nil {
+						return err
+					}
+					continue
+				}
+				// CanDispatch judged the SELECTED executor, but the fleet ceiling
+				// is at least contexts, so some active executor Select did not
+				// return could serve this run. It was passed over only for a
+				// transient reason -- it is momentarily full, or carries the
+				// degraded health label, both of which MaxDispatchableCapacity
+				// deliberately counts (review round 5, Important A: degraded is set
+				// by one failed probe and cleared by the next poll a second later,
+				// and the executor keeps its capacity throughout). So this is a
+				// wait, and the operator must be told to wait rather than to raise
+				// capacity -- reporting the structural reason here would
+				// mis-attribute a transient condition as a permanent one.
+				reason = execution.ReasonExecutorCapacity
+			}
+			// 七.6/七.7: a quota or capacity block must be attributable, never an
+			// infinite silent skip. The reason used to be discarded here, so a
+			// run that could not satisfy the gate stayed pending with nothing in
+			// the event stream explaining why -- which is exactly how the C1
+			// livelock stayed invisible. publishBlockedPending dedupes by
+			// (case_run, reason), so a run waiting on the same slot publishes
+			// once, and clearBlocked on dispatch resets it.
+			s.publishBlockedPending(ctx, wave, []execution.CaseRun{run}, reason)
 			continue
 		}
+
 		now := s.now()
 		run.Attempts++
 		run.DispatchEpoch++
@@ -396,6 +516,13 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		// Reserve the slots in the local usage snapshot so the next candidate
 		// of this tick sees the one-shot reservation.
 		usage = append(usage, candidate)
+		reserved := contexts
+		if reserved < 1 {
+			// CanDispatch floors an unknown requirement to one context; the
+			// in-tick reservation must count the same floor.
+			reserved = 1
+		}
+		reservedContexts[executor.ID] += reserved
 		workItem := WorkItemInput{
 			VersionID: wave.VersionID,
 			Type:      WorkTypeExecuteCase,
@@ -450,7 +577,7 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 				"wave_id":         platformid.Format(wave.ID),
 				"case_run_id":     platformid.Format(run.ID),
 				"case_version_id": platformid.Format(run.CaseVersionID),
-				"version_sut_ids": idsToStrings(sutIDs),
+				"sut_ids":         idsToStrings(sutIDs),
 			}, nil)
 	}
 	return nil
@@ -597,7 +724,7 @@ func (s *Scheduler) runningUsage(ctx context.Context) ([]execution.RunningCase, 
 	}
 	usage := make([]execution.RunningCase, 0, len(running))
 	for _, run := range running {
-		usage = append(usage, execution.RunningCase{CaseRunID: run.ID, CrossSystem: false})
+		usage = append(usage, execution.RunningCase{CaseRunID: run.ID})
 	}
 	return usage, nil
 }
@@ -605,6 +732,10 @@ func (s *Scheduler) runningUsage(ctx context.Context) ([]execution.RunningCase, 
 // completeWave finalizes a wave whose case_runs all reached a finished state
 // (§5.2 step 3): counts, intents, wave.finished and the analysis trigger.
 func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, runs []execution.CaseRun) error {
+	// Every run of a completing wave is terminal, so none of them can ever be
+	// blocked-and-pending again: drop their dedup entries here rather than
+	// leaking one per run for the life of the process (review M-new-2).
+	s.pruneBlocked(runs)
 	now := s.now()
 	counts, err := s.waves.Counts(ctx, wave.ID)
 	if err != nil {
@@ -641,8 +772,16 @@ func (s *Scheduler) completeWave(ctx context.Context, wave execution.RunWave, ru
 	if s.analyzer != nil {
 		// Analysis failure never blocks the wave terminal state: the
 		// deterministic fallback runs inside AnalyzeWave and the agent tasks are
-		// deduplicated by the work queue.
-		_ = s.analyzer.AnalyzeWave(ctx, wave.ID)
+		// deduplicated by the work queue. The error is never silently dropped
+		// (V-0022, constitution art.7.6/7.7): an incomplete classification/
+		// coverage pass is logged with the wave/version attribution and cause.
+		if err := s.analyzer.AnalyzeWave(ctx, wave.ID); err != nil {
+			slog.Default().WarnContext(ctx,
+				"execution: wave analysis failed; classification/coverage may be incomplete until the analyst tasks run",
+				"wave_id", platformid.Format(wave.ID),
+				"version_id", platformid.Format(wave.VersionID),
+				"error", err)
+		}
 	}
 	// The wave row is terminal now, so the version stage machine may advance
 	// executing -> reporting (R-B4-3). The callback runs after analysis so the
@@ -948,10 +1087,7 @@ func blockedReason(executor *execution.ExecutorInstance) string {
 // publishBlockedPending publishes one deduplicated blocked event per pending
 // case_run of the wave.
 func (s *Scheduler) publishBlockedPending(ctx context.Context, wave execution.RunWave, runs []execution.CaseRun, reason string) {
-	action := "等待执行器恢复后重试"
-	if reason == BlockedReasonNoExecutor {
-		action = "等待执行器注册后重试"
-	}
+	action := blockedAction(reason)
 	for _, run := range runs {
 		if !s.markBlocked(run.ID, reason) {
 			continue
@@ -972,6 +1108,147 @@ func (s *Scheduler) publishBlockedPending(ctx context.Context, wave execution.Ru
 	}
 }
 
+// fleetCapacityCeiling returns the largest context requirement the fleet could
+// serve, and whether this run's requirement is impossible for it.
+//
+// Review round 4, Important 1: the escalation this guards is a PERMANENT verdict,
+// so it must not be inferred from the one executor Select happened to return.
+// Registry.Select drops full and degraded rows before sorting the survivors by
+// capacity DESC, and in endpoint-less single mode it sorts by ID ascending and
+// ignores capacity entirely -- so with two configured endpoints, a large executor
+// that is momentarily full or merely degraded is skipped in favour of a small idle
+// one. Escalating on that row terminally blocked the run, recorded a settled wrong
+// verdict, told the operator to raise a capacity that was already high enough, and
+// let the wave complete and the stage machine advance, while the larger executor
+// would have served the run seconds later. That is worse in kind than the silent
+// pending row the escalation was added to fix.
+//
+// So impossibility is proven against the fleet ceiling instead, which
+// Registry.MaxDispatchableCapacity computes over exactly the rows Select may reach
+// (see its doc for which filters are dropped and which are kept, and why).
+//
+// Failing closed: a probe error or a zero ceiling means "cannot prove
+// impossibility", so the caller falls back to the transient blocked path. A run
+// that waits is recoverable; a run that is wrongly terminally blocked is not.
+//
+// The ceiling is returned alongside the verdict so the caller can quote the very
+// number it proved against, instead of re-reading it and risking a TOCTOU race
+// (review round 5).
+func (s *Scheduler) fleetCapacityCeiling(ctx context.Context, contexts int) (int, bool) {
+	maxCapacity, err := s.executors.MaxDispatchableCapacity(ctx)
+	if err != nil {
+		slog.Warn("execution: cannot read the fleet capacity ceiling, treating an oversized context requirement as transient",
+			"required_contexts", contexts, "error", err)
+		return 0, false
+	}
+	if maxCapacity <= 0 {
+		return 0, false
+	}
+	return maxCapacity, contexts > maxCapacity
+}
+
+// terminateUnsatisfiableRun ends a pending run whose context requirement exceeds
+// the WHOLE FLEET's ceiling (review I-new-1, narrowed by review round 4 Important 1
+// and round 5 Importants A/B). Callers must have proven impossibility through
+// fleetCapacityCeiling first and pass the proven fleetMax back in, so the message
+// quotes the number the verdict actually rests on.
+//
+// Why terminal rather than another skip: the gate is execActive + contexts >
+// execCapacity, so once contexts alone exceeds every reachable executor's capacity
+// it fails for every possible execActive including a completely idle fleet, and no
+// future tick changes either number. Waiting is not a strategy here -- it is a
+// permanent, silent wedge, because the run also never accrues an attempt (Attempts
+// is incremented only after the gate) and never gets a lease to expire. The only
+// remedies are operator-side: raise the executors' capacity/max_contexts, or reduce
+// the number of distinct account roles in the case. Both need a human, so the run
+// is handed to one.
+//
+// The run is blocked, not failed: nothing about the product under test was
+// exercised or found wanting, so FailureClassBlocked plus a distinct TerminalCause
+// is the honest record, and blocked is terminal so the wave can complete instead of
+// hanging on a run that will never start.
+//
+// Review round 4, Important 2: the run must actually REACH a human, not merely be
+// labelled as needing one. execution.TerminalCauseNeedsHuman has exactly one
+// production consumer, CaseRunner.postTerminalHandoff, reached from the executor
+// finalize path -- and a run the scheduler terminated was never dispatched, so it
+// never enters CaseRunner and no handoff was ever posted. Nor is there a retest
+// entry point: FailureClass.IsIssueCandidate() is FailureClassApplication only, so
+// a blocked run emits no issue candidate, and StartRetest requires an issueID. So
+// this posts the same team-room handoff postTerminalHandoff would, and the recovery
+// path is the manual one -- raise capacity or cut roles, create an issue for the
+// case_run, then retest -- never an automatic retest.
+func (s *Scheduler) terminateUnsatisfiableRun(ctx context.Context, wave execution.RunWave, run execution.CaseRun, contexts, fleetMax int) error {
+	reason := execution.ReasonContextRequirementExceedsCapacity
+	detail := fmt.Sprintf(
+		"the case needs %d executor browser context(s) (one per distinct account role) but no dispatchable executor the scheduler can reach has that much capacity (fleet maximum %d); "+
+			"waiting cannot help -- raise the executor capacity/max_contexts or reduce the case's account roles, then re-run",
+		contexts, fleetMax)
+	if _, err := s.caseRuns.UpdateCAS(ctx, run.ID, 0, "", func(current *execution.CaseRun) error {
+		current.FailureClass = execution.FailureClassBlocked
+		current.Summary.TerminalCause = reason
+		current.Summary.NextAction = execution.NextActionResolveBlocker
+		if current.Summary.LastError == "" {
+			current.Summary.LastError = detail
+		}
+		return nil
+	}); err != nil {
+		return mapExecutionError(err, "case run")
+	}
+	changed, err := s.caseRuns.Transition(ctx, run.ID,
+		[]execution.CaseRunStatus{execution.CaseRunPending},
+		execution.CaseRunBlocked, 0, "")
+	if err != nil {
+		return mapExecutionError(err, "case run")
+	}
+	// The run has left pending for good, so its dedup entry must not leak.
+	s.clearBlocked(run.ID)
+	if !changed {
+		// Someone else already moved the run; do not double-publish.
+		return nil
+	}
+	slog.Warn("execution: case_run blocked, its context requirement exceeds every reachable executor's capacity",
+		"version_id", wave.VersionID, "wave_id", wave.ID, "case_run_id", run.ID,
+		"required_contexts", contexts, "fleet_max_capacity", fleetMax, "reason", reason)
+	scope := map[string]any{
+		"wave_id":     platformid.Format(wave.ID),
+		"case_run_id": platformid.Format(run.ID),
+		"intent_id":   platformid.Format(run.IntentID),
+	}
+	publishEvent(ctx, s.events, EventCaseRunBlocked, wave.VersionID, scope, map[string]any{
+		"wave_id":           platformid.Format(wave.ID),
+		"case_run_id":       platformid.Format(run.ID),
+		"intent_id":         platformid.Format(run.IntentID),
+		"reason":            reason,
+		"action":            blockedAction(reason),
+		"required_contexts": platformid.Format(int64(contexts)),
+		"executor_capacity": platformid.Format(int64(fleetMax)),
+		"terminal":          true,
+	}, nil)
+	publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID, scope, map[string]any{
+		"case_run_id":   platformid.Format(run.ID),
+		"wave_id":       platformid.Format(wave.ID),
+		"status":        string(execution.CaseRunBlocked),
+		"failure_class": string(execution.FailureClassBlocked),
+		"reason":        reason,
+		"next_action":   execution.NextActionResolveBlocker,
+	}, nil)
+	// The durable human handoff, mirroring CaseRunner.postTerminalHandoff. Best
+	// effort: the terminal verdict and its summary never depend on it.
+	if s.teamRoom != nil {
+		content := fmt.Sprintf("case run %s needs a human (%s); %s; next action: %s",
+			platformid.Format(run.ID), reason, detail, execution.NextActionResolveBlocker)
+		_ = s.teamRoom.Post(ctx, TeamPost{
+			VersionID: wave.VersionID,
+			Team:      TeamExecution,
+			Kind:      "handoff",
+			Content:   truncateRunes(content, 2000),
+			Refs:      []TeamPostRef{{Kind: "case_run", ID: platformid.Format(run.ID)}},
+		})
+	}
+	return nil
+}
+
 // markBlocked reports whether this (case_run, reason) pair must be published.
 func (s *Scheduler) markBlocked(caseRunID int64, reason string) bool {
 	s.blockedMu.Lock()
@@ -983,6 +1260,22 @@ func (s *Scheduler) markBlocked(caseRunID int64, reason string) bool {
 	return true
 }
 
+// pruneBlocked forgets the blocked-dedup state of every run in the list that is
+// no longer pending (review M-new-2). clearBlocked alone only covered the
+// successful-dispatch path, so a run that left pending any other way -- superseded,
+// paused, cancelled, interrupted, or terminally blocked -- kept its map entry for
+// the life of the process. The scheduler owns this map and PauseService.CancelWave
+// does not reach it, so the entries are reclaimed here, on the next reconcile of
+// the wave that still lists those runs, and again in completeWave.
+func (s *Scheduler) pruneBlocked(runs []execution.CaseRun) {
+	for i := range runs {
+		if runs[i].Status == execution.CaseRunPending {
+			continue
+		}
+		s.clearBlocked(runs[i].ID)
+	}
+}
+
 // clearBlocked forgets the blocked state once the run is dispatched.
 func (s *Scheduler) clearBlocked(caseRunID int64) {
 	s.blockedMu.Lock()
@@ -990,25 +1283,40 @@ func (s *Scheduler) clearBlocked(caseRunID int64) {
 	delete(s.blocked, caseRunID)
 }
 
-// requiredContextCount is the number of executor contexts a case needs: one per
-// distinct (version_sut, account_role) pair (§5.3).
+// requiredContextCount is the number of executor browser contexts this dispatch
+// commits to creating: one per distinct account_role in the case (§5.3).
+//
+// v0.2.4-B fix round 2 (review C1): this must agree with what
+// ensureSUTContexts actually creates, and it must never over-reserve. A step no
+// longer names its SUT, so the tempting bound is distinct roles x the intent's
+// whole bound SUT set. That is wrong twice over:
+//
+//   - ensureSUTContexts pre-warms one context per distinct role for the
+//     single-bound-SUT case and pre-warms NOTHING for a multi-SUT run (its
+//     DefaultSUTID is 0), creating each context lazily in ensureBrowserContext
+//     once the model picks a SUT. So the cross product is contexts the run
+//     never asks for at dispatch time.
+//   - executor.ActiveContexts, the other input to the capacity gate, already
+//     counts the contexts that lazily get created. Reserving the cross product
+//     on top of that double-counts them.
+//
+// The two together were a livelock, not a throughput loss: with the default
+// executor capacity of 8, a version binding 3 SUTs whose case has 3 distinct
+// roles reserved 9 > 8, so CanDispatch returned false on every tick forever,
+// the run never left pending and the wave never completed. Any roles x boundSUTs
+// product over the capacity deadlocked the same way. The reservation is now the
+// role count, which is exactly what the single-SUT path creates, is a floor (so
+// it cannot deadlock) for the lazy multi-SUT path, and is identical to the
+// pre-v0.2.4 value whenever the case used one SUT.
 func requiredContextCount(snapshot execution.CaseSnapshot) int {
-	type contextKey struct {
-		sutID int64
-		role  string
-	}
-	seen := map[contextKey]struct{}{}
+	roles := map[string]struct{}{}
 	for _, step := range snapshot.Steps {
-		sutID := step.TargetVersionSUTID
-		if sutID <= 0 {
-			sutID = snapshot.DefaultVersionSUTID
-		}
-		seen[contextKey{sutID: sutID, role: step.AccountRole}] = struct{}{}
+		roles[step.AccountRole] = struct{}{}
 	}
-	if len(seen) == 0 {
+	if len(roles) == 0 {
 		return 1
 	}
-	return len(seen)
+	return len(roles)
 }
 
 func newDispatchToken() string {

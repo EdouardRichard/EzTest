@@ -25,11 +25,11 @@ func serve(mux *http.ServeMux, method, path string) int {
 	return recorder.Code
 }
 
-func TestP4WiringNilHandlersDoNotPanic(t *testing.T) {
+func TestDeliveryWiringNilHandlersDoNotPanic(t *testing.T) {
 	mux := http.NewServeMux()
 	registerDeliveryRoutes(mux, denyAuth, nil)
 	registerChainRoutes(mux, denyAuth, nil)
-	registerVersionP4Routes(mux, denyAuth, nil, nil)
+	registerVersionReopenRoutes(mux, denyAuth, nil, nil)
 
 	if status := serve(mux, http.MethodGet, "/api/versions/1/issues"); status != http.StatusNotFound {
 		t.Fatalf("nil delivery handler status = %d, want 404", status)
@@ -39,7 +39,7 @@ func TestP4WiringNilHandlersDoNotPanic(t *testing.T) {
 	}
 }
 
-func TestP4WiringRoutesAreBehindAuthentication(t *testing.T) {
+func TestDeliveryWiringRoutesAreBehindAuthentication(t *testing.T) {
 	mux := http.NewServeMux()
 	// Handler construction is nil-safe; the auth middleware rejects before the
 	// service is touched.
@@ -48,7 +48,7 @@ func TestP4WiringRoutesAreBehindAuthentication(t *testing.T) {
 		versionapi.WithRequirementReopener(nil),
 		versionapi.WithRequirementClosures(nil),
 	)
-	registerVersionP4Routes(mux, denyAuth, versionHandler, requirementHandler)
+	registerVersionReopenRoutes(mux, denyAuth, versionHandler, requirementHandler)
 
 	cases := []struct {
 		method string
@@ -67,7 +67,7 @@ func TestP4WiringRoutesAreBehindAuthentication(t *testing.T) {
 	}
 }
 
-func TestP4WiringDeliveryAndChainRoutesRegistered(t *testing.T) {
+func TestDeliveryWiringRoutesRegistered(t *testing.T) {
 	mux := http.NewServeMux()
 	registerDeliveryRoutes(mux, denyAuth, deliveryapi.New(nil))
 	registerChainRoutes(mux, denyAuth, chainapi.New(nil))

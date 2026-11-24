@@ -372,9 +372,9 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
     () =>
       version === null
         ? []
-        : version.bindings.map((binding) => ({
-            value: binding.id,
-            label: `${binding.sut.name}（SUT ${binding.id}）`,
+        : version.binding.environment.suts.map((sut) => ({
+            value: sut.id,
+            label: `${sut.name}（SUT ${sut.id}）`,
           })),
     [version],
   )
@@ -383,9 +383,7 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
     () =>
       version === null
         ? []
-        : version.bindings.flatMap((binding) =>
-            binding.pages.map((page) => ({ value: page.id, label: page.name })),
-          ),
+        : version.binding.pages.map((page) => ({ value: page.id, label: page.name })),
     [version],
   )
 

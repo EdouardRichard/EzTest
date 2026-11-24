@@ -28,6 +28,28 @@ const (
 	maxClaimLimit     = 500
 )
 
+// workItemLeasedStatuses is the set of work-item statuses that hold an active
+// lease (claimed or running), bound as a query parameter -- never SQL-inline
+// literals (V-0017/H-B2 single source: a domain rename or a new leased status
+// cannot leave the SQL silently diverging).
+var workItemLeasedStatuses = []string{string(agent.WorkItemClaimed), string(agent.WorkItemRunning)}
+
+// attemptOpenStatuses is the set of attempt-log statuses still open (claimed or
+// running), bound as a query parameter. It mirrors workItemLeasedStatuses today
+// but is a separate vocabulary (work_item_attempt.status), so it derives from
+// the AttemptStatus constants independently.
+var attemptOpenStatuses = []string{string(agent.AttemptClaimed), string(agent.AttemptRunning)}
+
+// finishableWorkItemStatuses is the set Finish accepts when closing a parked
+// item without a failure. "pending" is a legacy pre-0.2.1 value with no
+// WorkItemStatus constant (the frozen work_item CHECK forbids it on new rows);
+// it is retained only to tolerate historical rows and is the one value here
+// that cannot derive from a domain constant.
+var finishableWorkItemStatuses = []string{
+	string(agent.WorkItemWaitingHuman), "pending", string(agent.WorkItemOpen),
+	string(agent.WorkItemClaimed), string(agent.WorkItemRunning),
+}
+
 // WorkItemRepository stores work_item and work_item_attempt rows.
 type WorkItemRepository struct {
 	pool *pgxpool.Pool
@@ -60,11 +82,11 @@ func (r *WorkItemRepository) Ensure(ctx context.Context, in agent.NewWorkItem) (
 	item, err := scanWorkItem(r.pool.QueryRow(ctx, `
 		INSERT INTO work_item (id, version_id, team, type, status, priority, dedupe_key,
 			payload, max_attempts, available_at, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'open', $5, $6, $7::jsonb, $8, now(), now(), now())
+		VALUES ($1, $2, $3, $4, $9, $5, $6, $7::jsonb, $8, now(), now(), now())
 		ON CONFLICT (version_id, type, dedupe_key) DO NOTHING
 		RETURNING `+workItemColumns,
 		r.ids.Next(), in.VersionID, string(team), workType, in.Priority, dedupeKey,
-		string(payload), maxAttempts))
+		string(payload), maxAttempts, string(agent.WorkItemOpen)))
 	if err == nil {
 		return item, true, nil
 	}
@@ -108,7 +130,7 @@ func (r *WorkItemRepository) ClaimForTeams(ctx context.Context, claimant string,
 	names := make([]string, 0, len(teams))
 	for _, team := range teams {
 		if !team.Valid() {
-			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, code, ops")
 		}
 		names = append(names, string(team))
 	}
@@ -159,13 +181,13 @@ func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string,
 		SELECT id FROM work_item
 		WHERE kind = ''
 		  AND type = ANY($1::text[])
-		  AND ((status = 'open' AND available_at <= now())
-		       OR (status IN ('claimed', 'running')
+		  AND ((status = $2 AND available_at <= now())
+		       OR (status = ANY($3::text[])
 		           AND lease_until IS NOT NULL AND lease_until < now()))
 		ORDER BY priority DESC, id ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`, names).Scan(&id)
+	`, names, string(agent.WorkItemOpen), workItemLeasedStatuses).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return agent.WorkItem{}, false, fmt.Errorf("claim work item by type: commit empty: %w", err)
@@ -178,7 +200,7 @@ func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string,
 
 	item, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = 'claimed',
+		SET status = $4,
 		    lease_epoch = lease_epoch + 1,
 		    attempts = attempts + 1,
 		    claimed_by = $2,
@@ -186,7 +208,7 @@ func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string,
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING `+workItemColumns,
-		id, claimant, lease.Seconds()))
+		id, claimant, lease.Seconds(), string(agent.WorkItemClaimed)))
 	if err != nil {
 		return agent.WorkItem{}, false, wrapDB("claim work item by type", err)
 	}
@@ -194,15 +216,15 @@ func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string,
 	// before appending this claim's attempt.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'recovered', error = COALESCE(error, 'lease expired'), finished_at = now()
-		WHERE work_item_id = $1 AND attempt < $2 AND status IN ('claimed', 'running')
-	`, item.ID, item.Attempts); err != nil {
+		SET status = $3, error = COALESCE(error, 'lease expired'), finished_at = now()
+		WHERE work_item_id = $1 AND attempt < $2 AND status = ANY($4::text[])
+	`, item.ID, item.Attempts, string(agent.AttemptRecovered), attemptOpenStatuses); err != nil {
 		return agent.WorkItem{}, false, wrapDB("recover abandoned work item attempts", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
-		VALUES ($1, $2, $3, 'claimed', now())
-	`, r.ids.Next(), item.ID, item.Attempts); err != nil {
+		VALUES ($1, $2, $3, $4, now())
+	`, r.ids.Next(), item.ID, item.Attempts, string(agent.AttemptClaimed)); err != nil {
 		return agent.WorkItem{}, false, wrapDB("insert work item attempt", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -224,20 +246,20 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 	if len(teams) == 0 {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM work_item
-			WHERE kind = '' AND status = 'open' AND available_at <= now()
+			WHERE kind = '' AND status = $1 AND available_at <= now()
 			ORDER BY priority DESC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
-		`).Scan(&id)
+		`, string(agent.WorkItemOpen)).Scan(&id)
 	} else {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM work_item
-			WHERE kind = '' AND status = 'open' AND available_at <= now()
+			WHERE kind = '' AND status = $2 AND available_at <= now()
 			  AND team = ANY($1::text[])
 			ORDER BY priority DESC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
-		`, teams).Scan(&id)
+		`, teams, string(agent.WorkItemOpen)).Scan(&id)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -251,7 +273,7 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 
 	item, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = 'claimed',
+		SET status = $4,
 		    lease_epoch = lease_epoch + 1,
 		    attempts = attempts + 1,
 		    claimed_by = $2,
@@ -259,14 +281,14 @@ func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams [
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING `+workItemColumns,
-		id, claimant, lease.Seconds()))
+		id, claimant, lease.Seconds(), string(agent.WorkItemClaimed)))
 	if err != nil {
 		return agent.WorkItem{}, false, wrapDB("claim work item", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
-		VALUES ($1, $2, $3, 'claimed', now())
-	`, r.ids.Next(), item.ID, item.Attempts); err != nil {
+		VALUES ($1, $2, $3, $4, now())
+	`, r.ids.Next(), item.ID, item.Attempts, string(agent.AttemptClaimed)); err != nil {
 		return agent.WorkItem{}, false, wrapDB("insert work item attempt", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -304,14 +326,14 @@ func (r *WorkItemRepository) CreateWorkItem(ctx context.Context, in agent.Create
 			expected, budget, status, priority, dedupe_key, depends_on, payload,
 			created_by, idempotency_key, result, max_attempts, available_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb,
-			'open', $11, $12, $13::bigint[], $14::jsonb, $15, $16, '{}'::jsonb, $17,
+			$18, $11, $12, $13::bigint[], $14::jsonb, $15, $16, '{}'::jsonb, $17,
 			now(), now(), now())
 		ON CONFLICT DO NOTHING
 		RETURNING `+workItemColumns,
 		id, in.VersionID, string(in.Team), in.Type, in.Kind, in.Goal,
 		string(target), string(inputs), string(expected), string(budget),
 		in.Priority, dedupeKey, in.DependsOn, string(payload), in.CreatedBy,
-		idempotencyKey, in.MaxAttempts))
+		idempotencyKey, in.MaxAttempts, string(agent.WorkItemOpen)))
 	if err == nil {
 		return item, nil
 	}
@@ -396,41 +418,41 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 	// required for the 0.2.1 queue.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'failed',
+		SET status = $2,
 		    error = COALESCE(error, 'lease expired: attempts exhausted'),
 		    finished_at = $1
 		WHERE work_item_id IN (
 		        SELECT id FROM work_item
 		        WHERE kind <> ''
-		          AND status IN ('claimed', 'running')
+		          AND status = ANY($3::text[])
 		          AND lease_until IS NOT NULL
 		          AND lease_until < $1
 		          AND attempts >= max_attempts
 		        FOR UPDATE SKIP LOCKED)
-		  AND status IN ('claimed', 'running')
-	`, now); err != nil {
+		  AND status = ANY($4::text[])
+	`, now, string(agent.AttemptFailed), workItemLeasedStatuses, attemptOpenStatuses); err != nil {
 		return nil, wrapDB("settle expired 0.2.1 work item attempts", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'failed',
+		SET status = $2,
 		    last_error = COALESCE(last_error, 'lease expired: attempts exhausted'),
 		    claimed_by = NULL,
 		    lease_until = NULL,
 		    updated_at = $1
 		WHERE kind <> ''
-		  AND status IN ('claimed', 'running')
+		  AND status = ANY($3::text[])
 		  AND lease_until IS NOT NULL
 		  AND lease_until < $1
 		  AND attempts >= max_attempts
-	`, now); err != nil {
+	`, now, string(agent.WorkItemFailed), workItemLeasedStatuses); err != nil {
 		return nil, wrapDB("settle expired 0.2.1 work items", err)
 	}
 
 	teamFilter := ""
-	args := []any{now}
+	args := []any{now, string(agent.WorkItemOpen), string(agent.WorkItemFailed), workItemLeasedStatuses, string(agent.WorkItemDone)}
 	if len(teams) > 0 {
-		teamFilter = " AND w.team = ANY($2::text[])"
+		teamFilter = " AND w.team = ANY($6::text[])"
 		args = append(args, teams)
 	}
 
@@ -439,9 +461,9 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 		SELECT w.id FROM work_item w
 		WHERE w.kind <> ''
 		  AND w.available_at <= $1
-		  AND (w.status = 'open'
-		       OR (w.status = 'failed' AND w.attempts < w.max_attempts)
-		       OR (w.status IN ('claimed', 'running')
+		  AND (w.status = $2
+		       OR (w.status = $3 AND w.attempts < w.max_attempts)
+		       OR (w.status = ANY($4::text[])
 		           AND w.lease_until IS NOT NULL AND w.lease_until < $1
 		           AND w.attempts < w.max_attempts))
 		  AND (w.depends_on IS NULL
@@ -450,7 +472,7 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 		           SELECT 1 FROM unnest(w.depends_on) AS dependency(id)
 		           WHERE NOT EXISTS (
 		               SELECT 1 FROM work_item done
-		               WHERE done.id = dependency.id AND done.status = 'done')))`+
+		               WHERE done.id = dependency.id AND done.status = $5)))`+
 		teamFilter+`
 		ORDER BY w.priority DESC, w.id ASC
 		FOR UPDATE SKIP LOCKED
@@ -468,7 +490,7 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 
 	item, err := scanWorkItem(tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = 'claimed',
+		SET status = $5,
 		    lease_epoch = lease_epoch + 1,
 		    attempts = attempts + 1,
 		    claimed_by = $2,
@@ -476,7 +498,7 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 		    updated_at = $3
 		WHERE id = $1
 		RETURNING `+workItemColumns,
-		id, owner, now, agent.DefaultWorkItemLease.Seconds()))
+		id, owner, now, agent.DefaultWorkItemLease.Seconds(), string(agent.WorkItemClaimed)))
 	if err != nil {
 		return nil, wrapDB("claim 0.2.1 work item", err)
 	}
@@ -498,15 +520,15 @@ func (r *WorkItemRepository) claimWorkItem(ctx context.Context, owner string, te
 	// failed item leave the already-closed attempt untouched.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'recovered', error = COALESCE(error, 'lease expired'), finished_at = $3
-		WHERE work_item_id = $1 AND attempt < $2 AND status IN ('claimed', 'running')
-	`, item.ID, attemptNumber, now); err != nil {
+		SET status = $4, error = COALESCE(error, 'lease expired'), finished_at = $3
+		WHERE work_item_id = $1 AND attempt < $2 AND status = ANY($5::text[])
+	`, item.ID, attemptNumber, now, string(agent.AttemptRecovered), attemptOpenStatuses); err != nil {
 		return nil, wrapDB("recover abandoned 0.2.1 work item attempts", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
-		VALUES ($1, $2, $3, 'claimed', $4)
-	`, r.ids.Next(), item.ID, attemptNumber, now); err != nil {
+		VALUES ($1, $2, $3, $5, $4)
+	`, r.ids.Next(), item.ID, attemptNumber, now, string(agent.AttemptClaimed)); err != nil {
 		return nil, wrapDB("insert 0.2.1 work item attempt", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -527,8 +549,8 @@ func (r *WorkItemRepository) RenewLease(ctx context.Context, id, epoch int64, un
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE work_item
 		SET lease_until = $3, updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
-	`, id, epoch, until)
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status = ANY($4::text[])
+	`, id, epoch, until, workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("renew 0.2.1 work item lease", err)
 	}
@@ -557,13 +579,13 @@ func (r *WorkItemRepository) CompleteWorkItem(ctx context.Context, id, epoch int
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'done',
+		SET status = $4,
 		    result = $3::jsonb,
 		    claimed_by = NULL,
 		    lease_until = NULL,
 		    updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
-	`, id, epoch, string(encoded))
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status = ANY($5::text[])
+	`, id, epoch, string(encoded), string(agent.WorkItemDone), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("complete 0.2.1 work item", err)
 	}
@@ -576,10 +598,10 @@ func (r *WorkItemRepository) CompleteWorkItem(ctx context.Context, id, epoch int
 	// most one open attempt row, so the status identifies it.
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'done', finished_at = now()
+		SET status = $2, finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id); err != nil {
+		  AND status = ANY($3::text[])
+	`, id, string(agent.AttemptDone), attemptOpenStatuses); err != nil {
 		return wrapDB("complete 0.2.1 work item attempt", err)
 	}
 	return tx.Commit(ctx)
@@ -600,14 +622,14 @@ func (r *WorkItemRepository) FailWorkItem(ctx context.Context, id, epoch int64, 
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'failed',
+		SET status = $4,
 		    last_error = $3,
 		    claimed_by = NULL,
 		    lease_until = NULL,
 		    available_at = now(),
 		    updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
-	`, id, epoch, reason)
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status = ANY($5::text[])
+	`, id, epoch, reason, string(agent.WorkItemFailed), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("fail 0.2.1 work item", err)
 	}
@@ -616,10 +638,10 @@ func (r *WorkItemRepository) FailWorkItem(ctx context.Context, id, epoch int64, 
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'failed', error = COALESCE(NULLIF($2, ''), error), finished_at = now()
+		SET status = $3, error = COALESCE(NULLIF($2, ''), error), finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id, reason); err != nil {
+		  AND status = ANY($4::text[])
+	`, id, reason, string(agent.AttemptFailed), attemptOpenStatuses); err != nil {
 		return wrapDB("fail 0.2.1 work item attempt", err)
 	}
 	return tx.Commit(ctx)
@@ -642,15 +664,15 @@ func (r *WorkItemRepository) FailWorkItemTerminal(ctx context.Context, id, epoch
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'failed',
+		SET status = $4,
 		    attempts = max_attempts,
 		    last_error = $3,
 		    claimed_by = NULL,
 		    lease_until = NULL,
 		    available_at = now(),
 		    updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status IN ('claimed', 'running')
-	`, id, epoch, reason)
+		WHERE id = $1 AND lease_epoch = $2 AND kind <> '' AND status = ANY($5::text[])
+	`, id, epoch, reason, string(agent.WorkItemFailed), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("fail 0.2.1 work item terminally", err)
 	}
@@ -659,10 +681,10 @@ func (r *WorkItemRepository) FailWorkItemTerminal(ctx context.Context, id, epoch
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'failed', error = COALESCE(NULLIF($2, ''), error), finished_at = now()
+		SET status = $3, error = COALESCE(NULLIF($2, ''), error), finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id, reason); err != nil {
+		  AND status = ANY($4::text[])
+	`, id, reason, string(agent.AttemptFailed), attemptOpenStatuses); err != nil {
 		return wrapDB("fail 0.2.1 work item attempt terminally", err)
 	}
 	return tx.Commit(ctx)
@@ -699,9 +721,9 @@ func (r *WorkItemRepository) MarkRunning(ctx context.Context, id, epoch int64) e
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx, `
-		UPDATE work_item SET status = 'running', updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND status = 'claimed'
-	`, id, epoch)
+		UPDATE work_item SET status = $3, updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND status = $4
+	`, id, epoch, string(agent.WorkItemRunning), string(agent.WorkItemClaimed))
 	if err != nil {
 		return wrapDB("mark work item running", err)
 	}
@@ -709,10 +731,10 @@ func (r *WorkItemRepository) MarkRunning(ctx context.Context, id, epoch int64) e
 		return agent.ErrLeaseLost
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE work_item_attempt SET status = 'running'
+		UPDATE work_item_attempt SET status = $2
 		WHERE work_item_id = $1
-		  AND status = 'claimed'
-	`, id); err != nil {
+		  AND status = $3
+	`, id, string(agent.AttemptRunning), string(agent.AttemptClaimed)); err != nil {
 		return wrapDB("mark work item attempt running", err)
 	}
 	return tx.Commit(ctx)
@@ -726,8 +748,8 @@ func (r *WorkItemRepository) Renew(ctx context.Context, id, epoch int64, lease t
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE work_item
 		SET lease_until = now() + make_interval(secs => $3), updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND status IN ('claimed', 'running')
-	`, id, epoch, lease.Seconds())
+		WHERE id = $1 AND lease_epoch = $2 AND status = ANY($4::text[])
+	`, id, epoch, lease.Seconds(), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("renew work item lease", err)
 	}
@@ -747,9 +769,9 @@ func (r *WorkItemRepository) Complete(ctx context.Context, id, epoch int64) erro
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'done', claimed_by = NULL, lease_until = NULL, updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND status IN ('claimed', 'running')
-	`, id, epoch)
+		SET status = $3, claimed_by = NULL, lease_until = NULL, updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND status = ANY($4::text[])
+	`, id, epoch, string(agent.WorkItemDone), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("complete work item", err)
 	}
@@ -758,10 +780,10 @@ func (r *WorkItemRepository) Complete(ctx context.Context, id, epoch int64) erro
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'done', finished_at = now()
+		SET status = $2, finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id); err != nil {
+		  AND status = ANY($3::text[])
+	`, id, string(agent.AttemptDone), attemptOpenStatuses); err != nil {
 		return wrapDB("complete work item attempt", err)
 	}
 	return tx.Commit(ctx)
@@ -778,10 +800,10 @@ func (r *WorkItemRepository) MarkWaitingHuman(ctx context.Context, id, epoch int
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'waiting_human', claimed_by = NULL, lease_until = NULL,
-		    last_error = 'waiting_human', updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND status IN ('claimed', 'running')
-	`, id, epoch)
+		SET status = $3, claimed_by = NULL, lease_until = NULL,
+		    last_error = $3, updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND status = ANY($4::text[])
+	`, id, epoch, string(agent.WorkItemWaitingHuman), workItemLeasedStatuses)
 	if err != nil {
 		return wrapDB("mark work item waiting_human", err)
 	}
@@ -790,10 +812,10 @@ func (r *WorkItemRepository) MarkWaitingHuman(ctx context.Context, id, epoch int
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'done', finished_at = now()
+		SET status = $2, finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id); err != nil {
+		  AND status = ANY($3::text[])
+	`, id, string(agent.AttemptDone), attemptOpenStatuses); err != nil {
 		return wrapDB("mark work item attempt waiting_human", err)
 	}
 	return tx.Commit(ctx)
@@ -810,10 +832,10 @@ func (r *WorkItemRepository) Finish(ctx context.Context, id int64, reason string
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE work_item
-		SET status = 'done', claimed_by = NULL, lease_until = NULL,
+		SET status = $3, claimed_by = NULL, lease_until = NULL,
 		    last_error = $2, updated_at = now()
-		WHERE id = $1 AND status IN ('waiting_human', 'pending', 'open', 'claimed', 'running')
-	`, id, reason)
+		WHERE id = $1 AND status = ANY($4::text[])
+	`, id, reason, string(agent.WorkItemDone), finishableWorkItemStatuses)
 	if err != nil {
 		return wrapDB("finish work item", err)
 	}
@@ -822,10 +844,10 @@ func (r *WorkItemRepository) Finish(ctx context.Context, id int64, reason string
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
-		SET status = 'done', finished_at = now()
+		SET status = $2, finished_at = now()
 		WHERE work_item_id = $1
-		  AND status IN ('claimed', 'running')
-	`, id); err != nil {
+		  AND status = ANY($3::text[])
+	`, id, string(agent.AttemptDone), attemptOpenStatuses); err != nil {
 		return wrapDB("finish work item attempt", err)
 	}
 	return tx.Commit(ctx)
@@ -847,7 +869,7 @@ func (r *WorkItemRepository) Fail(ctx context.Context, id, epoch int64, message 
 	var attempts int
 	err = tx.QueryRow(ctx, `
 		UPDATE work_item
-		SET status = CASE WHEN $3 AND attempts < max_attempts THEN 'open' ELSE 'dead' END,
+		SET status = CASE WHEN $3 AND attempts < max_attempts THEN $6 ELSE $7 END,
 		    last_error = $4,
 		    claimed_by = NULL,
 		    lease_until = NULL,
@@ -855,9 +877,9 @@ func (r *WorkItemRepository) Fail(ctx context.Context, id, epoch int64, message 
 		                        THEN now() + make_interval(secs => $5)
 		                        ELSE now() END,
 		    updated_at = now()
-		WHERE id = $1 AND lease_epoch = $2 AND status IN ('claimed', 'running')
+		WHERE id = $1 AND lease_epoch = $2 AND status = ANY($8::text[])
 		RETURNING status, attempts
-	`, id, epoch, retryable, message, backoff.Seconds()).Scan(&status, &attempts)
+	`, id, epoch, retryable, message, backoff.Seconds(), string(agent.WorkItemOpen), string(agent.WorkItemDead), workItemLeasedStatuses).Scan(&status, &attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return agent.ErrLeaseLost
 	}
@@ -865,15 +887,15 @@ func (r *WorkItemRepository) Fail(ctx context.Context, id, epoch int64, message 
 		return wrapDB("fail work item", err)
 	}
 
-	attemptStatus := "failed"
+	attemptStatus := string(agent.AttemptFailed)
 	if status == string(agent.WorkItemDead) {
 		attemptStatus = string(agent.AttemptDead)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE work_item_attempt
 		SET status = $3, error = COALESCE(NULLIF($4, ''), error), finished_at = now()
-		WHERE work_item_id = $1 AND attempt = $2 AND status IN ('claimed', 'running')
-	`, id, attempts, attemptStatus, message); err != nil {
+		WHERE work_item_id = $1 AND attempt = $2 AND status = ANY($5::text[])
+	`, id, attempts, attemptStatus, message, attemptOpenStatuses); err != nil {
 		return wrapDB("fail work item attempt", err)
 	}
 	return tx.Commit(ctx)
@@ -896,12 +918,12 @@ func (r *WorkItemRepository) RecoverExpired(ctx context.Context) (int64, error) 
 	rows, err := tx.Query(ctx, `
 		SELECT id, attempts, max_attempts FROM work_item
 		WHERE kind = ''
-		  AND status IN ('claimed', 'running')
+		  AND status = ANY($1::text[])
 		  AND lease_until IS NOT NULL
 		  AND lease_until < now()
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
-	`)
+	`, workItemLeasedStatuses)
 	if err != nil {
 		return 0, wrapDB("select expired work items", err)
 	}
@@ -927,28 +949,28 @@ func (r *WorkItemRepository) RecoverExpired(ctx context.Context) (int64, error) 
 	}
 
 	for _, item := range expired {
-		status := "open"
-		attemptStatus := "recovered"
+		status := string(agent.WorkItemOpen)
+		attemptStatus := string(agent.AttemptRecovered)
 		if item.attempts >= item.maxAttempts {
-			status = "dead"
-			attemptStatus = "dead"
+			status = string(agent.WorkItemDead)
+			attemptStatus = string(agent.AttemptDead)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE work_item
 			SET status = $2,
-			    last_error = CASE WHEN $2 = 'dead' AND last_error IS NULL THEN 'lease expired' ELSE last_error END,
+			    last_error = CASE WHEN $2 = $3 AND last_error IS NULL THEN 'lease expired' ELSE last_error END,
 			    claimed_by = NULL,
 			    lease_until = NULL,
 			    updated_at = now()
 			WHERE id = $1
-		`, item.id, status); err != nil {
+		`, item.id, status, string(agent.WorkItemDead)); err != nil {
 			return 0, wrapDB("recover work item", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE work_item_attempt
 			SET status = $3, error = COALESCE(error, 'lease expired'), finished_at = now()
-			WHERE work_item_id = $1 AND attempt = $2 AND status IN ('claimed', 'running')
-		`, item.id, item.attempts, attemptStatus); err != nil {
+			WHERE work_item_id = $1 AND attempt = $2 AND status = ANY($4::text[])
+		`, item.id, item.attempts, attemptStatus, attemptOpenStatuses); err != nil {
 			return 0, wrapDB("recover work item attempt", err)
 		}
 	}

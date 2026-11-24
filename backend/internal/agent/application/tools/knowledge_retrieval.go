@@ -173,14 +173,14 @@ type knowledgeSearchPayload struct {
 }
 
 func (t *knowledgeSearch) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
-	if t.deps.P7.Retrieval == nil {
+	if t.deps.Knowledge.Retrieval == nil {
 		return nil, missingDep("knowledge retrieval service")
 	}
 	filters, toolErr := buildKnowledgeSearchFilters(scope, raw)
 	if toolErr != nil {
 		return nil, toolErr
 	}
-	result, err := t.deps.P7.Retrieval.SearchKnowledge(ctx, filters)
+	result, err := t.deps.Knowledge.Retrieval.SearchKnowledge(ctx, filters)
 	if err != nil {
 		return nil, mapPortError(err)
 	}
@@ -306,7 +306,7 @@ type knowledgeReadPayload struct {
 }
 
 func (t *knowledgeRead) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
-	if t.deps.P7.Retrieval == nil {
+	if t.deps.Knowledge.Retrieval == nil {
 		return nil, missingDep("knowledge retrieval service")
 	}
 	var params knowledgeReadPayload
@@ -320,7 +320,7 @@ func (t *knowledgeRead) Execute(ctx context.Context, scope Scope, raw json.RawMe
 	if toolErr != nil {
 		return nil, toolErr
 	}
-	detail, err := t.deps.P7.Retrieval.ReadKnowledge(ctx, scope, id)
+	detail, err := t.deps.Knowledge.Retrieval.ReadKnowledge(ctx, scope, id)
 	if err != nil {
 		return nil, mapPortError(err)
 	}

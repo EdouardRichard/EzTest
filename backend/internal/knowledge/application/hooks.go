@@ -102,8 +102,9 @@ func (s *Service) OnAPIAuthSuccess(ctx context.Context, fact SuccessFact) (knowl
 }
 
 // AutoApprove promotes one stored draft to approved when (and only when) its
-// kind is one of the three low-risk kinds and the item carries no credential or
-// secret field. The caller-supplied item is treated as a handle: the stored row
+// kind is one of the three low-risk kinds, the item carries no credential or
+// secret field, and knowledge.review_required is false (the human-judgment
+// gate). The caller-supplied item is treated as a handle: the stored row
 // is re-read by ID and scanned, so a draft edited after the caller read it
 // cannot be approved on stale content. A successful promotion writes the
 // knowledge.auto_approved audit entry and publishes the same system event; both
@@ -133,6 +134,14 @@ func (s *Service) autoApprove(ctx context.Context, item knowledge.Item) (knowled
 		return knowledge.Item{}, false
 	}
 	if stored.Status != knowledge.StatusDraft || itemHasSecrets(stored) {
+		return knowledge.Item{}, false
+	}
+	// knowledge.review_required is the human-judgment gate (constitution 一.3):
+	// when review is required, execution-sedimented knowledge stays a draft for
+	// an admin to review, even for a low-risk kind. reviewRequired fails closed
+	// (a nil/unreadable setting keeps review required), so an unset toggle never
+	// silently auto-approves.
+	if s.reviewRequired(ctx) {
 		return knowledge.Item{}, false
 	}
 	approved, err := s.UpdateStatus(ctx, stored.ID, knowledge.StatusApproved, "")
@@ -222,10 +231,10 @@ func (s *Service) createSuccessDraft(ctx context.Context, kind Kind, fact Succes
 	if err != nil {
 		return knowledge.Item{}, err
 	}
-	// The success pipeline continues past the draft: low-risk kinds are
-	// auto-approved by default (the settings toggle is a later task). This is
-	// best effort — a failed promotion leaves the draft for review and never
-	// fails the hook caller (spec §10.1).
+	// The success pipeline continues past the draft: a low-risk kind is
+	// auto-approved only when knowledge.review_required is false (the human
+	// judgment gate). This is best effort — a gated or failed promotion leaves
+	// the draft for review and never fails the hook caller (spec §10.1).
 	if approved, ok := s.autoApprove(ctx, item); ok {
 		return approved, nil
 	}

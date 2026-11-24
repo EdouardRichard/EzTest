@@ -344,29 +344,19 @@ describe("code-intel api", () => {
     expect(readBody(fetchMock.mock.calls[0][1])).toEqual({ selected: true })
   })
 
-  it("loads the merged impact view with and without a repo filter", async () => {
-    const impact = {
-      version_id: "2001",
-      analyses: [
-        {
-          repo_id: "1201",
-          analysis_id: "7001",
-          base_commit_sha: BASE_COMMIT,
-          head_commit_sha: HEAD_COMMIT,
-          status: "done",
-          degraded: false,
-          candidates_count: 2,
-        },
-      ],
-      candidates: candidatesFixture,
-    }
-    fetchMock.mockResolvedValueOnce(jsonResponse({ data: impact }))
-
-    await expect(getCodeImpact("2001")).resolves.toEqual(impact)
+  it("loads the merged impact candidate list with and without a repo filter", async () => {
+    // Contract (api.yaml CodeImpactListEnvelope): the union endpoint is a list envelope,
+    // so `data` is the candidate array; the base client unwraps `data`.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ data: candidatesFixture, next_cursor: "", has_more: false }),
+    )
+    await expect(getCodeImpact("2001")).resolves.toEqual(candidatesFixture)
     expect(fetchMock.mock.calls[0][0]).toBe("http://localhost:13333/api/versions/2001/code/impact")
 
-    fetchMock.mockResolvedValueOnce(jsonResponse({ data: impact }))
-    await getCodeImpact("2001", "1201")
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ data: candidatesFixture, next_cursor: "", has_more: false }),
+    )
+    await expect(getCodeImpact("2001", "1201")).resolves.toEqual(candidatesFixture)
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://localhost:13333/api/versions/2001/code/impact?repoId=1201",
     )

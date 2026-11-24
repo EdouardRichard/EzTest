@@ -116,7 +116,7 @@ describe("CodeRepoPanel", () => {
       "href",
       "/versions/2001?tab=overview",
     )
-    expect(screen.getByText(/请先在版本绑定中移除该代码仓关联/)).toBeVisible()
+    expect(screen.getByText(/请先解除引用版本所属环境 SUT 的代码仓关联/)).toBeVisible()
     expect(screen.queryByText(/repository is referenced by a version binding/)).toBeNull()
     expect(screen.queryByText(/名称\/键重复/)).toBeNull()
     expect(api.deleteRepository).toHaveBeenCalledWith("1201")

@@ -23,6 +23,7 @@ type Recovery struct {
 	intents     IntentRepository
 	waves       WaveRepository
 	caseRuns    CaseRunRepository
+	evidence    EvidenceRepository
 	humans      humanExpirer
 	executors   ExecutorRepository
 	contexts    SUTContextRepository
@@ -36,6 +37,9 @@ type Recovery struct {
 	audit       AuditRecorder
 	maxAttempts int
 	contextTTL  time.Duration
+	// offlineWindowFn reports the executor offline window. nil falls back to
+	// execution.DefaultExecutorOfflineSeconds.
+	offlineWindowFn func(context.Context) time.Duration
 }
 
 // RecoveryDeps wires the recovery sweep. humans/executor/canceller may be nil.
@@ -43,6 +47,7 @@ type RecoveryDeps struct {
 	Intents     IntentRepository
 	Waves       WaveRepository
 	CaseRuns    CaseRunRepository
+	Evidence    EvidenceRepository
 	Humans      humanExpirer
 	Executors   ExecutorRepository
 	Contexts    SUTContextRepository
@@ -55,6 +60,9 @@ type RecoveryDeps struct {
 	Audit       AuditRecorder
 	MaxAttempts int
 	ContextTTL  time.Duration
+	// OfflineWindow reports the executor offline window from the same
+	// settings source as the registry. nil falls back to the default.
+	OfflineWindow func(context.Context) time.Duration
 	// Replanner is the Task 106 stale-intent re-plan (implemented by
 	// *IntentService). nil keeps the P3-only retire behavior.
 	Replanner SupersededIntentReplanner
@@ -71,22 +79,24 @@ func NewRecovery(deps RecoveryDeps) *Recovery {
 		ttl = 300 * time.Second
 	}
 	return &Recovery{
-		intents:     deps.Intents,
-		waves:       deps.Waves,
-		caseRuns:    deps.CaseRuns,
-		humans:      deps.Humans,
-		executors:   deps.Executors,
-		contexts:    deps.Contexts,
-		cases:       deps.Cases,
-		workQueue:   deps.WorkQueue,
-		canceller:   deps.Canceller,
-		executor:    deps.Executor,
-		replanner:   deps.Replanner,
-		clock:       deps.Clock,
-		events:      deps.Events,
-		audit:       deps.Audit,
-		maxAttempts: maxAttempts,
-		contextTTL:  ttl,
+		intents:         deps.Intents,
+		waves:           deps.Waves,
+		caseRuns:        deps.CaseRuns,
+		evidence:        deps.Evidence,
+		humans:          deps.Humans,
+		executors:       deps.Executors,
+		contexts:        deps.Contexts,
+		cases:           deps.Cases,
+		workQueue:       deps.WorkQueue,
+		canceller:       deps.Canceller,
+		executor:        deps.Executor,
+		replanner:       deps.Replanner,
+		clock:           deps.Clock,
+		events:          deps.Events,
+		audit:           deps.Audit,
+		maxAttempts:     maxAttempts,
+		contextTTL:      ttl,
+		offlineWindowFn: deps.OfflineWindow,
 	}
 }
 
@@ -231,32 +241,48 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 		s.record(ctx, "execution.case_run_redispatched", run, oldEpoch, map[string]any{"reason": cause, "failure_class": string(class)})
 		return nil
 	}
+	// The dispatch budget is exhausted: settle the run through the single
+	// terminal entry (V-0022). The verdict comes from the single domain
+	// authority execution.Aggregate (agent-level settlement with the classified
+	// failure cause), so the evidence gate applies: a zero-evidence failed
+	// degrades inconclusive while the terminal cause stays visible for triage.
 	lastError := strings.TrimSpace(run.Summary.LastError)
 	if lastError == "" {
 		lastError = cause
 	}
-	run.Status = execution.CaseRunFailed
-	run.FailureClass = class
-	run.Summary.VerdictReason = execution.VerdictReasonAgentFailure
-	run.Summary.TerminalCause = cause
-	run.Summary.LastError = lastError
-	run.FinishedAt = &now
-	run.LeaseUntil = nil
-	run.UpdatedAt = now
-	run.Summary.TerminalCause, run.Summary.NextAction = execution.TerminalExplanation(run.Status, run.FailureClass, run.Summary)
-	if _, err := s.caseRuns.Update(ctx, run); err != nil {
+	status, failureClass, summary, err := aggregateWithEvidenceFacts(ctx, s.evidence, run, execution.VerdictInput{
+		AgentSettlement: &execution.AgentSettlement{
+			Class:   class,
+			Reason:  execution.VerdictReasonAgentFailure,
+			Summary: run.Summary,
+		},
+	})
+	if err != nil {
 		return mapExecutionError(err, "case run")
 	}
+	summary.LastError = lastError
+	summary.TerminalCause = cause
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, failureClass, summary)
+	finished, wrote, err := settleTerminalVerdict(ctx, s.caseRuns, now, run, status, failureClass, summary)
+	if err != nil {
+		return err
+	}
+	if !wrote {
+		// A new dispatch took over (fence lost) or another owner settled the
+		// run first; the stored truth stands and that owner publishes the
+		// finished event.
+		return nil
+	}
 	publishEvent(ctx, s.events, EventCaseRunFinished, intent.VersionID,
-		map[string]any{"wave_id": platformid.Format(run.WaveID), "case_run_id": platformid.Format(run.ID)},
+		map[string]any{"wave_id": platformid.Format(finished.WaveID), "case_run_id": platformid.Format(finished.ID)},
 		map[string]any{
-			"wave_id":        platformid.Format(run.WaveID),
-			"case_run_id":    platformid.Format(run.ID),
-			"status":         string(execution.CaseRunFailed),
-			"failure_class":  string(class),
-			"terminal_cause": cause,
+			"wave_id":        platformid.Format(finished.WaveID),
+			"case_run_id":    platformid.Format(finished.ID),
+			"status":         string(finished.Status),
+			"failure_class":  string(finished.FailureClass),
+			"terminal_cause": finished.Summary.TerminalCause,
 		}, nil)
-	s.record(ctx, "execution.case_run_failed", run, oldEpoch, map[string]any{"reason": cause, "failure_class": string(class), "attempts": run.Attempts})
+	s.record(ctx, "execution.case_run_failed", finished, oldEpoch, map[string]any{"reason": cause, "failure_class": string(finished.FailureClass), "attempts": finished.Attempts})
 	return nil
 }
 
@@ -358,8 +384,19 @@ func (s *Recovery) executorUnreachable(ctx context.Context, run execution.CaseRu
 	if instance.LastHeartbeat == nil {
 		return true
 	}
-	window := time.Duration(execution.DefaultExecutorOfflineSeconds) * time.Second
+	window := s.offlineWindow(ctx)
 	return s.now().Sub(*instance.LastHeartbeat) > window
+}
+
+// offlineWindow reports the executor offline window from the same settings
+// source as the registry, falling back to the default when unwired.
+func (s *Recovery) offlineWindow(ctx context.Context) time.Duration {
+	if s.offlineWindowFn != nil {
+		if window := s.offlineWindowFn(ctx); window > 0 {
+			return window
+		}
+	}
+	return time.Duration(execution.DefaultExecutorOfflineSeconds) * time.Second
 }
 
 // recoverStale supersedes active intents whose case version left the
@@ -434,8 +471,8 @@ func (s *Recovery) cleanupContexts(ctx context.Context) error {
 		if item.ExecutorID != nil {
 			executorID = *item.ExecutorID
 		}
-		if item.BrowserContextID != "" {
-			_ = s.executor.DeleteContext(ctx, executorID, item.BrowserContextID)
+		if item.SessionID != "" {
+			_ = s.executor.DeleteSession(ctx, executorID, item.SessionID)
 		}
 		closedAt := s.now()
 		_, _ = s.contexts.UpdateCAS(ctx, item.ID, func(current *execution.CaseRunSUTContext) error {
@@ -454,7 +491,7 @@ func (s *Recovery) reconcileOrphans(ctx context.Context) error {
 	if s.executor == nil || s.contexts == nil {
 		return nil
 	}
-	live, err := s.executor.ListContexts(ctx)
+	live, err := s.executor.ListSessions(ctx)
 	if err != nil {
 		return nil // executor unavailable: retry next tick
 	}
@@ -464,8 +501,8 @@ func (s *Recovery) reconcileOrphans(ctx context.Context) error {
 		return mapExecutionError(err, "sut context")
 	}
 	for _, item := range items {
-		if item.BrowserContextID != "" {
-			known[item.BrowserContextID] = struct{}{}
+		if item.SessionID != "" {
+			known[item.SessionID] = struct{}{}
 		}
 	}
 	for _, ref := range live {
@@ -475,7 +512,7 @@ func (s *Recovery) reconcileOrphans(ctx context.Context) error {
 		if _, ok := known[ref.ID]; ok {
 			continue
 		}
-		_ = s.executor.DeleteContext(ctx, ref.ExecutorID, ref.ID)
+		_ = s.executor.DeleteSession(ctx, ref.ExecutorID, ref.ID)
 	}
 	return nil
 }
@@ -494,8 +531,8 @@ func (s *Recovery) closeRunContexts(ctx context.Context, caseRunID int64) {
 		if item.ExecutorID != nil {
 			executorID = *item.ExecutorID
 		}
-		if item.BrowserContextID != "" && s.executor != nil {
-			_ = s.executor.DeleteContext(ctx, executorID, item.BrowserContextID)
+		if item.SessionID != "" && s.executor != nil {
+			_ = s.executor.DeleteSession(ctx, executorID, item.SessionID)
 		}
 		if item.Status == execution.SUTContextClosed {
 			continue

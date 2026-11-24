@@ -7,6 +7,7 @@ import (
 	"time"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -62,16 +63,25 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 	}
 
 	requirementIndex := map[int64]int{}
+	// The requirement ref carries the SAME contract columns RequirementContext
+	// reads (repo.go): priority, sut_description and the acceptance_criteria id
+	// set. ACIDs is load-bearing for the judge scheduler's coverage precheck
+	// (ensureJudgeTasks -> NeedsACRepair) and the shared review gate
+	// (ReviewGateService -> MissingACs): an empty set here made CoverageComplete
+	// trivially true, silently disabling the SC-E2 coverage gate and the SC-E4
+	// AC-gap repair (T19 closed-loop integration caught it; the application unit
+	// tests hand-populated ACIDs on their fakes and never exercised this reader).
 	requirementRows, err := q.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       COALESCE(rv.target_version_suts, '[]'::jsonb)
+		       COALESCE(rv.priority, $3), COALESCE(rv.sut_description, ''),
+		       COALESCE(rv.acceptance_criteria, '[]'::jsonb)
 		FROM requirement r
 		LEFT JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1
-		  AND (r.status = 'clarified'
+		  AND (r.status = $2
 		       OR EXISTS (SELECT 1 FROM case_scenario s WHERE s.version_id = $1 AND s.requirement_id = r.id))
 		ORDER BY r.id
-	`, versionID)
+	`, versionID, string(version.RequirementClarified), version.DefaultPriority)
 	if err != nil {
 		return design.GraphData{}, fmt.Errorf("read design graph requirements: %w", err)
 	}
@@ -80,9 +90,10 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 		var currentVersionID *int64
 		var revision *int
 		var title *string
-		var targetSUTs []byte
+		var criteria []byte
 		if err := requirementRows.Scan(
-			&ref.ID, &ref.VersionID, &currentVersionID, &revision, &title, &ref.Status, &targetSUTs,
+			&ref.ID, &ref.VersionID, &currentVersionID, &revision, &title, &ref.Status,
+			&ref.Priority, &ref.SutDescription, &criteria,
 		); err != nil {
 			requirementRows.Close()
 			return design.GraphData{}, fmt.Errorf("scan design graph requirement: %w", err)
@@ -96,7 +107,7 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 		if title != nil {
 			ref.Title = *title
 		}
-		if ref.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
+		if ref.ACIDs, err = decodeACIDs(criteria); err != nil {
 			requirementRows.Close()
 			return design.GraphData{}, err
 		}
@@ -118,8 +129,7 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 	scenarioIndex := map[int64]scenarioLocation{}
 	scenarioRows, err := q.Query(ctx, `
 		SELECT id, version_id, requirement_id, requirement_version_id, name, description,
-		       COALESCE(version_sut_ids, '[]'::jsonb), COALESCE(page_ids, '[]'::jsonb),
-		       COALESCE(api_ids, '[]'::jsonb), sort_order, created_at, updated_at
+		       sort_order, created_at, updated_at
 		FROM case_scenario
 		WHERE version_id = $1
 		ORDER BY requirement_id, sort_order, id
@@ -155,8 +165,7 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 		SELECT ce.id, ce.scenario_id, ce.current_version_id, ce.status,
 		       ce.created_by, ce.created_by_run_id, ce.created_at, ce.updated_at,
 		       cv.id, cv.revision, cv.title, COALESCE(cv.description, ''), cv.priority,
-		       cv.default_version_sut_id, COALESCE(cv.version_sut_ids, '[]'::jsonb),
-		       COALESCE(cv.page_ids, '[]'::jsonb), COALESCE(cv.api_ids, '[]'::jsonb),
+		       cv.sut_description, COALESCE(cv.covered_acs, '[]'::jsonb),
 		       cv.status, cv.content_hash, cv.created_at,
 		       (SELECT count(*) FROM case_step st WHERE st.case_version_id = cv.id),
 		       (SELECT count(*) FROM case_assertion a WHERE a.case_version_id = cv.id)
@@ -172,28 +181,18 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 	for caseRows.Next() {
 		var item design.CaseGraph
 		var current design.CaseVersion
-		var defaultSUT *int64
-		var suts, pages, apis []byte
+		var coveredACs []byte
 		if err := caseRows.Scan(
 			&item.Case.ID, &item.Case.ScenarioID, &item.Case.CurrentVersionID, &item.Case.Status,
 			&item.Case.CreatedBy, &item.Case.CreatedByRunID, &item.Case.CreatedAt, &item.Case.UpdatedAt,
 			&current.ID, &current.Revision, &current.Title, &current.Description, &current.Priority,
-			&defaultSUT, &suts, &pages, &apis, &current.Status, &current.ContentHash, &current.CreatedAt,
-			&item.StepCount, &item.AssertionCount,
+			&current.SutDescription, &coveredACs, &current.Status, &current.ContentHash,
+			&current.CreatedAt, &item.StepCount, &item.AssertionCount,
 		); err != nil {
 			caseRows.Close()
 			return design.GraphData{}, fmt.Errorf("scan design graph case: %w", err)
 		}
-		current.DefaultVersionSUTID = defaultSUT
-		if current.VersionSUTIDs, err = decodeIDArray(suts); err != nil {
-			caseRows.Close()
-			return design.GraphData{}, err
-		}
-		if current.PageIDs, err = decodeIDArray(pages); err != nil {
-			caseRows.Close()
-			return design.GraphData{}, err
-		}
-		if current.APIIDs, err = decodeIDArray(apis); err != nil {
+		if current.CoveredACs, err = decodeStringArray(coveredACs); err != nil {
 			caseRows.Close()
 			return design.GraphData{}, err
 		}
@@ -233,8 +232,8 @@ func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.Graph
 func activeRequirementIDs(ctx context.Context, q pgxQuerier, versionID int64) (map[int64]struct{}, error) {
 	rows, err := q.Query(ctx, `
 		SELECT requirement_id FROM design_scope
-		WHERE version_id = $1 AND status = 'active'
-	`, versionID)
+		WHERE version_id = $1 AND status = $2
+	`, versionID, design.ScopeStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("read active design scopes: %w", err)
 	}
@@ -280,34 +279,31 @@ func designStatus(requirement design.RequirementGraph, activeScopes map[int64]st
 		}
 	}
 	if hasDraft {
-		return "draft"
+		return design.CaseStatusDraft
 	}
 	if hasConfirmed && allConfirmed {
-		return "confirmed"
+		return design.CaseStatusConfirmed
 	}
 	if total == 0 {
-		if requirement.Requirement.Status == "clarified" {
+		if requirement.Requirement.Status == string(version.RequirementClarified) {
 			if _, activated := activeScopes[requirement.Requirement.ID]; !activated {
-				return "pending"
+				return design.DesignStatusPending
 			}
 		}
 	}
-	return "in_design"
+	return design.DesignStatusInDesign
 }
 
 // ReadCase returns the case detail with its version history and one selected
 // version (the requested one or the current version).
 func (r *Repository) ReadCase(ctx context.Context, versionID, caseID int64, caseVersionID *int64) (design.CaseData, error) {
 	var data design.CaseData
-	var targetSUTs, sceneSUTs, scenePages, sceneAPIs []byte
 	err := r.pool.QueryRow(ctx, `
 		SELECT ce.id, ce.scenario_id, ce.current_version_id, ce.status,
 		       ce.created_by, ce.created_by_run_id, ce.created_at, ce.updated_at,
 		       s.id, s.version_id, s.requirement_id, s.requirement_version_id, s.name, s.description,
-		       COALESCE(s.version_sut_ids, '[]'::jsonb), COALESCE(s.page_ids, '[]'::jsonb),
-		       COALESCE(s.api_ids, '[]'::jsonb), s.sort_order, s.created_at, s.updated_at,
-		       r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       COALESCE(rv.target_version_suts, '[]'::jsonb)
+		       s.sort_order, s.created_at, s.updated_at,
+		       r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status
 		FROM case_entity ce
 		JOIN case_scenario s ON s.id = ce.scenario_id
 		JOIN requirement r ON r.id = s.requirement_id
@@ -318,29 +314,15 @@ func (r *Repository) ReadCase(ctx context.Context, versionID, caseID int64, case
 		&data.Case.CreatedBy, &data.Case.CreatedByRunID, &data.Case.CreatedAt, &data.Case.UpdatedAt,
 		&data.Scenario.ID, &data.Scenario.VersionID, &data.Scenario.RequirementID,
 		&data.Scenario.RequirementVersionID, &data.Scenario.Name, &data.Scenario.Description,
-		&sceneSUTs, &scenePages, &sceneAPIs,
 		&data.Scenario.SortOrder, &data.Scenario.CreatedAt, &data.Scenario.UpdatedAt,
 		&data.Requirement.ID, &data.Requirement.VersionID, &data.Requirement.CurrentVersionID,
 		&data.Requirement.Revision, &data.Requirement.Title, &data.Requirement.Status,
-		&targetSUTs,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return design.CaseData{}, design.ErrNotFound
 	}
 	if err != nil {
 		return design.CaseData{}, fmt.Errorf("read case detail: %w", err)
-	}
-	if data.Requirement.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
-		return design.CaseData{}, err
-	}
-	if data.Scenario.VersionSUTIDs, err = decodeIDArray(sceneSUTs); err != nil {
-		return design.CaseData{}, err
-	}
-	if data.Scenario.PageIDs, err = decodeIDArray(scenePages); err != nil {
-		return design.CaseData{}, err
-	}
-	if data.Scenario.APIIDs, err = decodeIDArray(sceneAPIs); err != nil {
-		return design.CaseData{}, err
 	}
 
 	versionRows, err := r.pool.Query(ctx, `
@@ -431,13 +413,11 @@ func (r *Repository) Overview(ctx context.Context, versionID int64) (design.Over
 // loadCaseVersion loads one immutable version with its steps/assertions/sources.
 func loadCaseVersion(ctx context.Context, q querier, caseVersionID int64) (design.CaseVersion, error) {
 	var version design.CaseVersion
-	var defaultSUT *int64
-	var testData, suts, pages, apis []byte
+	var testData, coveredACs []byte
 	var createdAt time.Time
 	err := q.QueryRow(ctx, `
-		SELECT id, case_id, revision, title, description, preconditions, test_data, priority,
-		       default_version_sut_id, COALESCE(version_sut_ids, '[]'::jsonb),
-		       COALESCE(page_ids, '[]'::jsonb), COALESCE(api_ids, '[]'::jsonb),
+		SELECT id, case_id, revision, title, description, sut_description, preconditions,
+		       COALESCE(covered_acs, '[]'::jsonb), test_data, priority,
 		       status, content_hash, trigger, source_observation_id,
 		       COALESCE(auto_confirmed_by, ''), rollback_of,
 		       created_by, created_by_run_id, created_at, updated_at
@@ -445,7 +425,7 @@ func loadCaseVersion(ctx context.Context, q querier, caseVersionID int64) (desig
 		WHERE id = $1
 	`, caseVersionID).Scan(
 		&version.ID, &version.CaseID, &version.Revision, &version.Title, &version.Description,
-		&version.Preconditions, &testData, &version.Priority, &defaultSUT, &suts, &pages, &apis,
+		&version.SutDescription, &version.Preconditions, &coveredACs, &testData, &version.Priority,
 		&version.Status, &version.ContentHash, &version.Trigger, &version.SourceObservationID,
 		&version.AutoConfirmedBy, &version.RollbackOf,
 		&version.CreatedBy, &version.CreatedByRunID, &createdAt, &version.UpdatedAt,
@@ -457,15 +437,8 @@ func loadCaseVersion(ctx context.Context, q querier, caseVersionID int64) (desig
 		return design.CaseVersion{}, fmt.Errorf("read case version: %w", err)
 	}
 	version.CreatedAt = createdAt
-	version.DefaultVersionSUTID = defaultSUT
 	version.TestData = testData
-	if version.VersionSUTIDs, err = decodeIDArray(suts); err != nil {
-		return design.CaseVersion{}, err
-	}
-	if version.PageIDs, err = decodeIDArray(pages); err != nil {
-		return design.CaseVersion{}, err
-	}
-	if version.APIIDs, err = decodeIDArray(apis); err != nil {
+	if version.CoveredACs, err = decodeStringArray(coveredACs); err != nil {
 		return design.CaseVersion{}, err
 	}
 	if version.Steps, err = loadSteps(ctx, q, caseVersionID); err != nil {
@@ -482,31 +455,20 @@ func loadCaseVersion(ctx context.Context, q querier, caseVersionID int64) (desig
 
 func scanScenario(row pgx.Row) (design.Scenario, error) {
 	var scenario design.Scenario
-	var suts, pages, apis []byte
 	if err := row.Scan(
 		&scenario.ID, &scenario.VersionID, &scenario.RequirementID, &scenario.RequirementVersionID,
-		&scenario.Name, &scenario.Description, &suts, &pages, &apis, &scenario.SortOrder,
+		&scenario.Name, &scenario.Description, &scenario.SortOrder,
 		&scenario.CreatedAt, &scenario.UpdatedAt,
 	); err != nil {
 		return design.Scenario{}, fmt.Errorf("scan scenario: %w", err)
-	}
-	var err error
-	if scenario.VersionSUTIDs, err = decodeIDArray(suts); err != nil {
-		return design.Scenario{}, err
-	}
-	if scenario.PageIDs, err = decodeIDArray(pages); err != nil {
-		return design.Scenario{}, err
-	}
-	if scenario.APIIDs, err = decodeIDArray(apis); err != nil {
-		return design.Scenario{}, err
 	}
 	return scenario, nil
 }
 
 func loadSteps(ctx context.Context, q querier, caseVersionID int64) ([]design.CaseStep, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, case_version_id, seq, action, expected, target_version_sut_id,
-		       target_page_id, target_api_id, account_role, COALESCE(data, '{}'::jsonb), created_at
+		SELECT id, case_version_id, seq, action, expected, target_description,
+		       account_role, COALESCE(data, '{}'::jsonb), created_at
 		FROM case_step
 		WHERE case_version_id = $1
 		ORDER BY seq
@@ -520,8 +482,7 @@ func loadSteps(ctx context.Context, q querier, caseVersionID int64) ([]design.Ca
 		var step design.CaseStep
 		if err := rows.Scan(
 			&step.ID, &step.CaseVersionID, &step.Seq, &step.Action, &step.Expected,
-			&step.TargetVersionSUTID, &step.TargetPageID, &step.TargetAPIID, &step.AccountRole,
-			&step.Data, &step.CreatedAt,
+			&step.TargetDescription, &step.AccountRole, &step.Data, &step.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan case step: %w", err)
 		}
@@ -535,8 +496,7 @@ func loadSteps(ctx context.Context, q querier, caseVersionID int64) ([]design.Ca
 
 func loadAssertions(ctx context.Context, q querier, caseVersionID int64) ([]design.CaseAssertion, error) {
 	rows, err := q.Query(ctx, `
-		SELECT id, case_version_id, step_seq, kind, target, expected,
-		       target_version_sut_id, target_api_id, database_id, created_at
+		SELECT id, case_version_id, step_seq, kind, target, expected, sut_id, created_at
 		FROM case_assertion
 		WHERE case_version_id = $1
 		ORDER BY step_seq, id
@@ -550,8 +510,7 @@ func loadAssertions(ctx context.Context, q querier, caseVersionID int64) ([]desi
 		var assertion design.CaseAssertion
 		if err := rows.Scan(
 			&assertion.ID, &assertion.CaseVersionID, &assertion.StepSeq, &assertion.Kind,
-			&assertion.Target, &assertion.Expected, &assertion.TargetVersionSUTID,
-			&assertion.TargetAPIID, &assertion.DatabaseID, &assertion.CreatedAt,
+			&assertion.Target, &assertion.Expected, &assertion.SUTID, &assertion.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan case assertion: %w", err)
 		}

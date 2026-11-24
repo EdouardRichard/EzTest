@@ -154,41 +154,54 @@ func errorBody(t *testing.T, recorder *httptest.ResponseRecorder) map[string]any
 func actor() *platform.Actor { return &platform.Actor{ID: 42, Role: "user"} }
 
 func sampleView() versionapp.VersionView {
+	pages := []resourceapp.PageView{
+		{ID: "1301", SUTID: "1001", Name: "Order list", URL: "https://orders.example.test/orders", RouteTemplate: "/orders", PageType: "page", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime},
+	}
+	apis := []resourceapp.APIView{
+		{ID: "1401", SUTID: "1001", Method: "GET", PathTemplate: "/api/orders", Name: "List orders", Status: "approved", Source: "manual", CreatedAt: testTime, UpdatedAt: testTime},
+	}
+	databases := []resourceapp.DatabaseView{
+		{ID: "1501", SUTID: "1001", Name: "orders-db", DSN: "postgres://orders", Username: "orders", PasswordSet: true, ReadOnly: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime},
+	}
+	accounts := []resourceapp.AccountView{
+		{ID: "1601", SUTID: "1001", Username: "order-admin", Roles: []string{"admin"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime},
+	}
 	return versionapp.VersionView{
 		ID:                        101,
 		Title:                     "Orders Q4",
 		Status:                    "initial",
 		AutoDesignNewRequirements: true,
-		Bindings: []versionapp.BindingView{
-			{
-				ID:                 201,
-				CodeBaselineCommit: sampleCodeBaselineCommit,
-				SUT: resourceapp.SUTView{
-					ID: "1001", Name: "Orders", Intro: "order center",
-					CreatedAt: testTime, UpdatedAt: testTime,
-				},
-				Environment: resourceapp.EnvironmentView{
-					ID: "1101", SUTID: "1001", Name: "prod", BaseURL: "https://orders.example.test",
-					IsDefault: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime,
-				},
-				Repository: &resourceapp.CodeRepositoryView{
-					ID: "1201", Name: "orders-repo", Path: "C:/repos/orders", Branch: "main",
-					Include: []string{"src"}, Exclude: []string{"node_modules"}, CreatedBy: 42,
-					Status: "active", CreatedAt: testTime, UpdatedAt: testTime,
-				},
-				Pages: []resourceapp.PageView{
-					{ID: "1301", SUTID: "1001", EnvironmentID: "1101", Name: "Order list", URL: "https://orders.example.test/orders", RouteTemplate: "/orders", PageType: "page", Status: "approved", Source: "admin", CreatedAt: testTime, UpdatedAt: testTime},
-				},
-				APIs: []resourceapp.APIView{
-					{ID: "1401", SUTID: "1001", EnvironmentID: "1101", Method: "GET", PathTemplate: "/api/orders", Name: "List orders", Status: "approved", Source: "manual", CreatedAt: testTime, UpdatedAt: testTime},
-				},
-				Databases: []resourceapp.DatabaseView{
-					{ID: "1501", SUTID: "1001", EnvironmentID: "1101", Name: "orders-db", DSN: "postgres://orders", Username: "orders", PasswordSet: true, ReadOnly: true, Status: "active", CreatedAt: testTime, UpdatedAt: testTime},
-				},
-				Accounts: []resourceapp.AccountView{
-					{ID: "1601", SUTID: "1001", EnvironmentID: "1101", Username: "order-admin", Roles: []string{"admin"}, Status: "active", PasswordSet: true, CreatedAt: testTime, UpdatedAt: testTime},
+		EnvironmentID:             1101,
+		Binding: versionapp.EnvironmentSUTCatalog{
+			VersionID:     101,
+			EnvironmentID: 1101,
+			Environment: resourceapp.EnvironmentView{
+				ID: "1101", Name: "prod", Description: "production", Status: "active",
+				CreatedAt: testTime, UpdatedAt: testTime,
+				SUTs: []resourceapp.SUTView{
+					{
+						ID: "1001", EnvironmentID: "1101", Name: "Orders", Intro: "order center",
+						BaseURL: "https://orders.example.test",
+						Pages:   pages, APIs: apis, Databases: databases,
+						CreatedAt: testTime, UpdatedAt: testTime,
+					},
 				},
 			},
+			Pages:     pages,
+			APIs:      apis,
+			Databases: databases,
+			Accounts:  accounts,
+			Repositories: []versionapp.BindingRepository{
+				{
+					Repository: resourceapp.CodeRepositoryView{
+						ID: "1201", Name: "orders-repo", Path: "C:/repos/orders", Branch: "main",
+						Include: []string{"src"}, Exclude: []string{"node_modules"}, CreatedBy: 42,
+						Status: "active", CreatedAt: testTime, UpdatedAt: testTime,
+					},
+					SUTID: 1001, Role: "backend", CodeBaselineCommit: sampleCodeBaselineCommit,
+				},
+			},
+			CodeBaselineCommit: sampleCodeBaselineCommit,
 		},
 		CreatedBy: 42,
 		CreatedAt: testTime,
@@ -229,35 +242,38 @@ func TestCreateVersionParsesPayloadAndReturnsNestedView(t *testing.T) {
 	if data["created_at"] != "2026-10-31T12:00:00Z" {
 		t.Fatalf("created_at = %#v", data["created_at"])
 	}
-	bindings := data["bindings"].([]any)
-	if len(bindings) != 1 {
-		t.Fatalf("bindings = %#v", bindings)
+	if data["environment_id"] != "1101" {
+		t.Fatalf("environment_id = %#v", data["environment_id"])
 	}
-	binding := bindings[0].(map[string]any)
-	if binding["id"] != "201" {
-		t.Fatalf("binding id = %#v", binding["id"])
+	binding := data["binding"].(map[string]any)
+	// The derived bindings array and its scope_exclude document are gone.
+	if _, present := data["bindings"]; present {
+		t.Fatalf("bindings must no longer be part of the contract: %#v", data)
 	}
-	if binding["sut"].(map[string]any)["name"] != "Orders" {
-		t.Fatalf("sut = %#v", binding["sut"])
+	if _, present := binding["scope_exclude"]; present {
+		t.Fatalf("scope_exclude must no longer be part of the contract: %#v", binding)
 	}
-	if binding["environment"].(map[string]any)["name"] != "prod" {
-		t.Fatalf("environment = %#v", binding["environment"])
+	environment := binding["environment"].(map[string]any)
+	if environment["name"] != "prod" {
+		t.Fatalf("environment = %#v", environment)
 	}
-	if binding["repository"].(map[string]any)["name"] != "orders-repo" {
-		t.Fatalf("repository = %#v", binding["repository"])
+	suts := environment["suts"].([]any)
+	if len(suts) != 1 || suts[0].(map[string]any)["name"] != "Orders" {
+		t.Fatalf("suts = %#v", suts)
 	}
-	if binding["codeBaselineCommit"] != sampleCodeBaselineCommit {
-		t.Fatalf("codeBaselineCommit = %#v, want %q", binding["codeBaselineCommit"], sampleCodeBaselineCommit)
+	repositories := binding["repositories"].([]any)
+	if len(repositories) != 1 ||
+		repositories[0].(map[string]any)["repository"].(map[string]any)["name"] != "orders-repo" {
+		t.Fatalf("repositories = %#v", repositories)
+	}
+	if binding["code_baseline_commit"] != sampleCodeBaselineCommit {
+		t.Fatalf("code_baseline_commit = %#v, want %q", binding["code_baseline_commit"], sampleCodeBaselineCommit)
 	}
 	if len(binding["pages"].([]any)) != 1 || len(binding["apis"].([]any)) != 1 {
 		t.Fatalf("pages/apis = %#v", binding)
 	}
 	if len(binding["databases"].([]any)) != 1 || len(binding["accounts"].([]any)) != 1 {
 		t.Fatalf("databases/accounts = %#v", binding)
-	}
-	if scopes, ok := binding["scope_exclude"].(map[string]any); !ok ||
-		len(scopes["pages"].([]any)) != 0 || len(scopes["apis"].([]any)) != 0 || len(scopes["databases"].([]any)) != 0 {
-		t.Fatalf("scope_exclude = %#v", binding["scope_exclude"])
 	}
 	if strings.Contains(recorder.Body.String(), `"password"`) {
 		t.Fatalf("response exposes a password field: %s", recorder.Body.String())
@@ -280,17 +296,16 @@ func TestCreateVersionRequiresEnvironment(t *testing.T) {
 func TestGetVersionOmitsUnresolvedCodeBaseline(t *testing.T) {
 	handler, stub := newTestServer(t)
 	view := sampleView()
-	view.Bindings[0].CodeBaselineCommit = ""
+	view.Binding.CodeBaselineCommit = ""
 	stub.view = view
 
 	recorder := call(t, handler, http.MethodGet, "/api/versions/101", "", actor())
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	bindings := dataBody(t, recorder)["bindings"].([]any)
-	binding := bindings[0].(map[string]any)
-	if value, ok := binding["codeBaselineCommit"]; ok {
-		t.Fatalf("unresolved codeBaselineCommit must be omitted, got %#v", value)
+	binding := dataBody(t, recorder)["binding"].(map[string]any)
+	if value, ok := binding["code_baseline_commit"]; ok {
+		t.Fatalf("an unresolved code_baseline_commit must be omitted, got %#v", value)
 	}
 }
 
@@ -386,7 +401,7 @@ func TestCreateVersionSurfacesServiceValidationDetails(t *testing.T) {
 	}
 }
 
-func TestGetVersionValidatesPathAndNestsBindings(t *testing.T) {
+func TestGetVersionValidatesPathAndNestsTheEnvironmentBinding(t *testing.T) {
 	handler, stub := newTestServer(t)
 	stub.view = sampleView()
 
@@ -401,10 +416,10 @@ func TestGetVersionValidatesPathAndNestsBindings(t *testing.T) {
 	if data["id"] != "101" || data["title"] != "Orders Q4" {
 		t.Fatalf("data = %#v", data)
 	}
-	bindings := data["bindings"].([]any)
-	binding := bindings[0].(map[string]any)
-	if binding["sut"].(map[string]any)["id"] != "1001" {
-		t.Fatalf("sut = %#v", binding["sut"])
+	binding := data["binding"].(map[string]any)
+	suts := binding["environment"].(map[string]any)["suts"].([]any)
+	if len(suts) != 1 || suts[0].(map[string]any)["id"] != "1001" {
+		t.Fatalf("suts = %#v", suts)
 	}
 	if binding["pages"].([]any)[0].(map[string]any)["route_template"] != "/orders" {
 		t.Fatalf("page = %#v", binding["pages"])

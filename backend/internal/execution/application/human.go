@@ -22,6 +22,7 @@ import (
 type HumanService struct {
 	humans    HumanRequestRepository
 	caseRuns  CaseRunRepository
+	evidence  EvidenceRepository
 	waves     WaveRepository
 	canceller RunCanceller
 	workQueue WorkQueue
@@ -46,6 +47,7 @@ type StageUnblocker interface {
 type HumanServiceDeps struct {
 	Humans    HumanRequestRepository
 	CaseRuns  CaseRunRepository
+	Evidence  EvidenceRepository
 	Waves     WaveRepository
 	Canceller RunCanceller
 	WorkQueue WorkQueue
@@ -63,6 +65,7 @@ func NewHumanService(deps HumanServiceDeps) *HumanService {
 	return &HumanService{
 		humans:    deps.Humans,
 		caseRuns:  deps.CaseRuns,
+		evidence:  deps.Evidence,
 		waves:     deps.Waves,
 		canceller: deps.Canceller,
 		workQueue: deps.WorkQueue,
@@ -97,7 +100,7 @@ type HumanCreateInput struct {
 	MessageID      int64
 	Kind           string
 	Reason         string
-	VersionSUTID   *int64
+	SUTID          *int64
 	AccountRole    string
 	ChallengeKind  string
 	ActorID        int64
@@ -180,7 +183,11 @@ func (s *HumanService) CreateFromTool(ctx context.Context, scope tools.Scope, in
 		DispatchToken: scope.DispatchToken,
 		Kind:          in.Kind,
 		Reason:        in.Reason,
-		VersionSUTID:  in.VersionSUTID,
+		// in.VersionSUTID is the agent-owned tool DTO field
+		// (tools.HumanRequestInput); its value is a SUT id. C renamed the wire
+		// key to sut_id (T14, R-C1); this internal Go field name is not a wire
+		// surface and stays as-is.
+		SUTID:         in.VersionSUTID,
 		AccountRole:   in.AccountRole,
 		ChallengeKind: in.ChallengeKind,
 	})
@@ -244,8 +251,8 @@ func (s *HumanService) Create(ctx context.Context, in HumanCreateInput) (executi
 		execution.HumanPayloadAccountRole:   strings.TrimSpace(in.AccountRole),
 		execution.HumanPayloadChallengeKind: strings.TrimSpace(in.ChallengeKind),
 	}
-	if in.VersionSUTID != nil && *in.VersionSUTID > 0 {
-		payload[execution.HumanPayloadVersionSUTID] = platformid.Format(*in.VersionSUTID)
+	if in.SUTID != nil && *in.SUTID > 0 {
+		payload[execution.HumanPayloadSUTID] = platformid.Format(*in.SUTID)
 	}
 	request := execution.HumanRequest{
 		ID:        s.ids.Next(),
@@ -572,7 +579,13 @@ func (s *HumanService) resumeWaveAfterHuman(ctx context.Context, caseRunID, acto
 	return nil
 }
 
-// failCaseRun writes the human-timeout/cancel failure of a paused case_run.
+// failCaseRun settles the human-timeout/cancel failure of a paused case_run
+// through the single terminal entry (V-0022). The verdict comes from the single
+// domain authority execution.Aggregate (agent-level settlement: failed(session)
+// with the stable human reason code), so the evidence gate applies: a paused
+// run with zero persisted evidence degrades inconclusive instead of settling as
+// a trustworthy failure. A run that is no longer paused belongs to its new
+// owner (resumed/redispatched or already settled) and is left untouched.
 func (s *HumanService) failCaseRun(ctx context.Context, caseRunID int64, reason string) error {
 	run, err := s.caseRuns.Get(ctx, caseRunID)
 	if err != nil {
@@ -581,33 +594,41 @@ func (s *HumanService) failCaseRun(ctx context.Context, caseRunID int64, reason 
 		}
 		return mapExecutionError(err, "case run")
 	}
-	if run.Status.Terminal() {
+	if run.Status != execution.CaseRunPaused {
 		return nil
 	}
-	now := s.now()
-	run.Status = execution.CaseRunFailed
-	run.FailureClass = execution.FailureClassSession
-	run.Summary.VerdictReason = reason
-	run.Summary.LastError = reason
-	run.FinishedAt = &now
-	run.PausedAt = nil
-	run.PausedBy = nil
-	run.PauseReason = ""
-	run.UpdatedAt = now
-	if _, err := s.caseRuns.Update(ctx, run); err != nil {
+	status, class, summary, err := aggregateWithEvidenceFacts(ctx, s.evidence, run, execution.VerdictInput{
+		AgentSettlement: &execution.AgentSettlement{
+			Class:   execution.FailureClassSession,
+			Reason:  reason,
+			Summary: run.Summary,
+		},
+	})
+	if err != nil {
 		return mapExecutionError(err, "case run")
 	}
-	versionID, err := s.caseRunVersionID(ctx, run)
+	summary.LastError = reason
+	summary.TerminalCause, summary.NextAction = execution.TerminalExplanation(status, class, summary)
+	finished, wrote, err := settleTerminalVerdict(ctx, s.caseRuns, s.now(), run, status, class, summary)
+	if err != nil {
+		return err
+	}
+	if !wrote {
+		// Another owner settled the run first; the stored truth stands and the
+		// finished event was already published by that owner.
+		return nil
+	}
+	versionID, err := s.caseRunVersionID(ctx, finished)
 	if err != nil {
 		return err
 	}
 	publishEvent(ctx, s.events, EventCaseRunFinished, versionID,
-		map[string]any{"case_run_id": platformid.Format(run.ID)},
+		map[string]any{"case_run_id": platformid.Format(finished.ID)},
 		map[string]any{
-			"case_run_id":   platformid.Format(run.ID),
-			"wave_id":       platformid.Format(run.WaveID),
-			"status":        string(execution.CaseRunFailed),
-			"failure_class": string(execution.FailureClassSession),
+			"case_run_id":   platformid.Format(finished.ID),
+			"wave_id":       platformid.Format(finished.WaveID),
+			"status":        string(finished.Status),
+			"failure_class": string(finished.FailureClass),
 			"reason":        reason,
 		}, nil)
 	return nil

@@ -18,6 +18,62 @@ import (
 // (SHA-256, pinned by the DB CHECK in version_0007_stage_plan_fact.sql).
 const FactHashLength = 64
 
+// FactKindStageTransition is the version_fact kind that persists one stage
+// transition's reason as a durable fact (V-0020). Unlike the version.stage_changed
+// event, a fact is never removed by event retention, so the R49 stage-entry-job
+// repair can still read the reason after retention.event_days deletes the event.
+// The key is the visit's stage_entered_at (RFC3339, UTC); the payload is
+// {from,to,reason,actor}. version_fact.kind is a free-text CHECK (non-empty), so
+// this kind needs no migration.
+const FactKindStageTransition = "stage_transition"
+
+// Fact kinds the clarification handoff projects into its decisions/open blocks
+// (design v0.2.4-B §8.1). version_fact.kind is a free-text CHECK (non-empty), so
+// these need no migration. This is the VERSION domain's fact vocabulary,
+// deliberately separate from the clarification.search tool's Host-facing
+// result-kind contract (agenttools.ClarificationSearchKind*): the handoff blocks
+// and every version_fact.kind filter source from here, so retuning the tool's
+// result contract cannot silently draw a different row set of the same table.
+const (
+	FactKindDecision   = "decision"
+	FactKindConstraint = "constraint"
+	FactKindGap        = "gap"
+	FactKindAssumption = "assumption"
+	FactKindRisk       = "risk"
+)
+
+// FactKindProgress is the version_fact kind of an agent run's own completion /
+// settlement narrative (task.complete writes it; payload.summary IS the agent's
+// conclusion). It belongs to the VERSION domain's fact vocabulary so the
+// producer (agent completion service) and every consumer that must exclude agent
+// narrative — notably the independent design judge's briefing (I-B4) — read the
+// same single authority instead of repeating the literal.
+const FactKindProgress = "progress"
+
+// FactKindWaiver is the version_fact kind of an admin waiver (v0.2.4-G SC-G11,
+// GD-06/P23). It is the durable, append-only record of WHY a version or
+// requirement was waived and WHO waived it — independent of the event ledger
+// (constitution 五.7), so the report read model can project the waiver reason
+// and operator even after event retention. version_fact.kind is a free-text
+// CHECK (non-empty), so this kind needs no migration.
+//
+// Key convention: "version" for a version-level waive_close; "requirement:<id>"
+// for a requirement-level waiver. Payload carries {scope, version_id, reason,
+// actor_id, ...} with decimal-string IDs (D29). The CURRENT waiver state is the
+// version.closure_kind/unverified and requirement.waived columns (cleared on
+// reopen); waiver facts are append-only history and are never deleted — a
+// reopened version's report gates on the columns, not on the presence of a fact.
+const FactKindWaiver = "waiver"
+
+// RequirementFactKeyPrefix is the version_fact key prefix of a requirement-scoped
+// fact: the full key is the prefix plus the requirement id in decimal. The waiver
+// producer (version/application waiver_service) and the delivery report read model
+// (which projects the latest waiver fact per requirement) must agree on this pure
+// vocabulary prefix, so the single source lives here (R-H9; registered in
+// docs/design/architecture-constraints.md §5.1). It carries no entity state — it
+// is a wire-key prefix, not a domain behaviour.
+const RequirementFactKeyPrefix = "requirement:"
+
 // Fact persistence errors. They are intentionally separate from ErrNotFound so
 // an application error can name the right resource.
 var (

@@ -55,6 +55,6 @@ describe("AppShell", () => {
     expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument()
     expect(screen.getByTestId("topbar-title")).toHaveTextContent("问题")
     expect(screen.getByRole("main")).toHaveTextContent("placeholder content")
-    expect(screen.getByText(/开发测试环境 · 受控网络/)).toBeInTheDocument()
+    expect(screen.getByText(/自托管测试环境/)).toBeInTheDocument()
   })
 })

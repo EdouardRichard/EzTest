@@ -23,7 +23,9 @@ import * as api from "./api"
 import { PageAPIPanel, type PageAPIPanelProps } from "./PageAPIPanel"
 import {
   apiFixture,
+  environmentFixture,
   pageFixture,
+  secondEnvironmentFixture,
   secondSutFixture,
   sutFixture,
   sutListItemFixture,
@@ -32,6 +34,7 @@ import type { ResourceScope } from "./types"
 
 const baseScope: ResourceScope = {
   suts: [sutListItemFixture, secondSutFixture],
+  environments: [environmentFixture, secondEnvironmentFixture],
   sutId: "1001",
   environmentId: "1101",
   detail: sutFixture,
@@ -109,7 +112,7 @@ describe("PageAPIPanel", () => {
       <PageAPIPanel
         scope={{
           ...baseScope,
-          detail: { ...sutFixture, environments: [] },
+          detail: { ...sutFixture },
           environmentId: "",
         }}
         onSelectSut={vi.fn()}
@@ -140,7 +143,7 @@ describe("PageAPIPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建页面" }))
 
     await waitFor(() =>
-      expect(api.createPage).toHaveBeenCalledWith("1101", {
+      expect(api.createPage).toHaveBeenCalledWith("1001", {
         name: "订单详情",
         url: "https://order.test/orders/{id}",
         routeTemplate: "/orders/{id}",
@@ -180,7 +183,7 @@ describe("PageAPIPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "导入" }))
 
     await waitFor(() =>
-      expect(api.importPages).toHaveBeenCalledWith("1101", [
+      expect(api.importPages).toHaveBeenCalledWith("1001", [
         {
           name: "订单详情",
           url: "https://order.test/orders/{id}",
@@ -208,7 +211,7 @@ describe("PageAPIPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "创建 API" }))
 
     await waitFor(() =>
-      expect(api.createApi).toHaveBeenCalledWith("1101", {
+      expect(api.createApi).toHaveBeenCalledWith("1001", {
         name: "查询订单",
         method: "GET",
         pathTemplate: "/api/orders",
@@ -287,7 +290,7 @@ describe("PageAPIPanel", () => {
       "href",
       "/versions/2001?tab=overview",
     )
-    expect(within(editableGroup).getByText(/请先在引用版本的页面范围中排除该页面/)).toBeVisible()
+    expect(within(editableGroup).getByText(/请先调整引用版本的环境绑定/)).toBeVisible()
 
     const terminalGroup = screen.getByTestId("resource-terminal-versions")
     expect(within(terminalGroup).getByRole("link", { name: "已完成版本" })).toHaveAttribute(
@@ -319,7 +322,7 @@ describe("PageAPIPanel", () => {
 
     expect(await screen.findByText("该页面已被版本绑定引用，无法删除")).toBeVisible()
     expect(
-      screen.getByText(/请先在引用版本的页面范围中排除该页面，或调整版本的环境绑定。/),
+      screen.getByText(/请先调整引用版本的环境绑定（改用不含该 SUT 的环境），或删除这些版本。/),
     ).toBeVisible()
     expect(screen.queryByTestId("resource-editable-versions")).toBeNull()
     expect(screen.queryByTestId("resource-terminal-versions")).toBeNull()

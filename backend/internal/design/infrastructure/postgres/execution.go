@@ -9,17 +9,21 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// executableCaseSelect is the current+confirmed guard of P3 §3.4 invariant 1:
-// the case version is the case entity's current version and confirmed, the
+// executableCaseSelect renders the current+confirmed guard of P3 §3.4 invariant
+// 1: the case version is the case entity's current version and confirmed, the
 // scenario belongs to the requested version and still targets the current
-// requirement revision.
-const executableCaseSelect = `
-	WHERE cv.status = 'confirmed'
-	  AND entity.status = 'confirmed'
+// requirement revision. cvStatusParam and entityStatusParam are the query
+// placeholder indices ($n) the caller binds to design.CaseStatusConfirmed, so the
+// status is a query parameter rather than an SQL-inline literal (V-0030 / H-A9).
+func executableCaseSelect(cvStatusParam, entityStatusParam string) string {
+	return `
+	WHERE cv.status = ` + cvStatusParam + `
+	  AND entity.status = ` + entityStatusParam + `
 	  AND entity.current_version_id = cv.id
 	  AND entity.scenario_id = scenario.id
 	  AND scenario.requirement_version_id = requirement.current_version_id
 `
+}
 
 // ReadExecutableCase loads one current+confirmed case version for execution.
 func (r *Repository) ReadExecutableCase(ctx context.Context, versionID, caseVersionID int64) (design.ExecutableCase, error) {
@@ -31,9 +35,9 @@ func (r *Repository) ReadExecutableCase(ctx context.Context, versionID, caseVers
 		JOIN case_scenario scenario ON scenario.id = entity.scenario_id AND scenario.version_id = $1
 		JOIN requirement requirement ON requirement.id = scenario.requirement_id
 			AND requirement.version_id = scenario.version_id
-		`+executableCaseSelect+`
+		`+executableCaseSelect("$3", "$4")+`
 		  AND cv.id = $2
-	`, versionID, caseVersionID).Scan(&caseID, &requirementID, &requirementVersionID)
+	`, versionID, caseVersionID, design.CaseStatusConfirmed, design.CaseStatusConfirmed).Scan(&caseID, &requirementID, &requirementVersionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return design.ExecutableCase{}, design.ErrNotFound
 	}
@@ -62,9 +66,9 @@ func (r *Repository) ListExecutableCases(ctx context.Context, versionID int64) (
 		JOIN case_scenario scenario ON scenario.id = entity.scenario_id AND scenario.version_id = $1
 		JOIN requirement requirement ON requirement.id = scenario.requirement_id
 			AND requirement.version_id = scenario.version_id
-		`+executableCaseSelect+`
+		`+executableCaseSelect("$2", "$3")+`
 		ORDER BY cv.id
-	`, versionID)
+	`, versionID, design.CaseStatusConfirmed, design.CaseStatusConfirmed)
 	if err != nil {
 		return nil, fmt.Errorf("list executable case versions: %w", err)
 	}

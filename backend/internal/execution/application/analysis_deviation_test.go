@@ -70,6 +70,9 @@ func TestRealRequirementDeviationIsApplication(t *testing.T) {
 	f.addCase(fixture.CaseRun.CaseVersionID, 375970593205391360, 375970593205391361, "P0")
 	f.addRun(fixture.CaseRun.ID, 1, fixture.CaseRun.CaseVersionID,
 		execution.CaseRunStatus(fixture.CaseRun.Status), execution.FailureClass(fixture.CaseRun.FailureClass))
+	// The QA evidence run stored evidence_count rows; seed them so the evidence
+	// gate sees the persisted count (it reads the repository, not the projection).
+	f.addEvidenceRows(fixture.CaseRun.ID, fixture.CaseRun.EvidenceCount)
 	for _, step := range fixture.Steps {
 		f.results.steps[fixture.CaseRun.ID] = append(f.results.steps[fixture.CaseRun.ID], execution.StepResult{
 			CaseRunID: fixture.CaseRun.ID, Seq: step.Seq,
@@ -121,6 +124,7 @@ func TestAutomationFailureStaysAutomation(t *testing.T) {
 	ctx := context.Background()
 	f.addCase(301, 902, 903, "P2")
 	f.addRun(501, 2, 301, execution.CaseRunFailed, execution.FailureClassAutomation)
+	f.addEvidenceRows(501, 1)
 	f.results.steps[501] = append(f.results.steps[501], execution.StepResult{
 		CaseRunID: 501, Seq: 1, Status: execution.StepFailed,
 		Error: "target_not_found: selector #login-submit",
@@ -129,6 +133,7 @@ func TestAutomationFailureStaysAutomation(t *testing.T) {
 	// evidence either: it must stay automation, never become application.
 	f.addCase(303, 906, 907, "P2")
 	f.addRun(503, 4, 303, execution.CaseRunFailed, "")
+	f.addEvidenceRows(503, 1)
 	f.results.steps[503] = append(f.results.steps[503], execution.StepResult{
 		CaseRunID: 503, Seq: 1, Status: execution.StepFailed,
 	})

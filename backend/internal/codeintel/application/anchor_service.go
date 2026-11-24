@@ -115,7 +115,7 @@ func (s *AnchorService) Create(ctx context.Context, in CreateAnchorInput) (codei
 	if in.VersionID <= 0 {
 		return codeintel.Anchor{}, platform.NotFound("version")
 	}
-	bindings, err := s.versions.VersionSUTBindings(ctx, in.VersionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, in.VersionID)
 	if err != nil {
 		return codeintel.Anchor{}, err
 	}
@@ -333,9 +333,9 @@ func (s *AnchorService) checkSubject(ctx context.Context, versionID int64, kind 
 }
 
 // targetCommit resolves the create-time commit: explicit 40-hex, then this
-// version's latest done index commit, then the version baseline only when it
-// resolves in this repository, then the branch head.
-func (s *AnchorService) targetCommit(ctx context.Context, versionID int64, binding VersionSUTBinding, repository RepoRef, explicit string) (string, error) {
+// version's latest done index commit, then the pinned (SUT, repository) baseline
+// only when it resolves in this repository, then the branch head.
+func (s *AnchorService) targetCommit(ctx context.Context, versionID int64, binding SUTRepoBinding, repository RepoRef, explicit string) (string, error) {
 	if value := strings.TrimSpace(explicit); value != "" {
 		if !ValidCommitSHA(value) {
 			return "", unprocessable("invalid_commit", "commit must be a 40-character lowercase hex commit SHA")
@@ -345,10 +345,9 @@ func (s *AnchorService) targetCommit(ctx context.Context, versionID int64, bindi
 		}
 		return value, nil
 	}
-	// The version_sut baseline is shared by every repository of a multi-repo
-	// binding, so the repository's own latest done index commit wins. The
-	// shared baseline remains the fallback only when it resolves in this
-	// repository; otherwise it belongs to another repository.
+	// The repository's own latest done index commit wins over the pinned
+	// (SUT, repository) baseline. The baseline remains the fallback and is only
+	// used when it resolves in this repository's local clone.
 	if commit, ok := s.latestDoneCommit(ctx, versionID, repository.ID); ok {
 		return commit, nil
 	}

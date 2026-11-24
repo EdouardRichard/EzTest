@@ -61,10 +61,14 @@ type TopKRetriever interface {
 	SearchTopK(ctx context.Context, query knowledge.InjectionQuery) ([]knowledge.Item, error)
 }
 
-// UsageRepository appends knowledge_usage rows. Insert must be best-effort
-// from the caller's point of view; the caller ignores the returned error.
+// UsageRepository appends knowledge_usage rows and reads their per-item
+// aggregates. Insert must be best-effort from the caller's point of view; the
+// caller ignores the returned error. StatsByItem is the detail read surface:
+// COUNT of usage rows and MAX(created_at) for one item; an item without rows
+// reads as {0, nil}.
 type UsageRepository interface {
 	Insert(ctx context.Context, usages []knowledge.Usage) error
+	StatsByItem(ctx context.Context, itemID int64) (UsageStats, error)
 }
 
 // SettingsReader is the knowledge view of the settings centre.

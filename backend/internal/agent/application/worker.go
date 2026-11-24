@@ -35,7 +35,6 @@ var agentProductTeams = []agent.Team{
 	agent.TeamDesign,
 	agent.TeamExecution,
 	agent.TeamDelivery,
-	agent.TeamSteward,
 }
 
 // WorkerOption customizes worker timings (used by tests and future tuning).
@@ -112,6 +111,19 @@ func WithWorkerRunSink(sink RunSink) WorkerOption {
 	return func(w *Worker) { w.runSink = sink }
 }
 
+// CrashSweeper recovers the runs a dead attempt left behind (H-E2). The worker
+// runs it right after every lease-recovery pass, because that pass is what turns
+// a crashed attempt's work item into a settled/reopened row — the fact the sweep
+// selects on. A nil sweeper leaves the runs unrecovered (pre-T12 behaviour).
+type CrashSweeper interface {
+	Sweep(ctx context.Context) (CrashSweepReport, error)
+}
+
+// WithWorkerCrashSweeper registers the run-level crash sweep.
+func WithWorkerCrashSweeper(sweeper CrashSweeper) WorkerOption {
+	return func(w *Worker) { w.crashSweeper = sweeper }
+}
+
 // Worker claims work items, runs them with bounded concurrency and heartbeats
 // their leases. It is started by cmd/eztest and stopped by cancelling its
 // context; the P1 deployment assumes a single instance.
@@ -124,6 +136,8 @@ type Worker struct {
 	events     eventingapp.Publisher
 	runSink    RunSink
 	drainGate  func() bool
+	// crashSweeper recovers runs whose attempt died (H-E2). Nil disables it.
+	crashSweeper CrashSweeper
 	// jobEvents coalesces the 0.2.1 job.progress/finished stream for every run
 	// this worker owns. It is nil when no publisher is wired.
 	jobEvents *JobProgressEmitter
@@ -183,6 +197,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	} else if recovered > 0 {
 		w.logger.Info("agent worker: recovered expired leases", "count", recovered)
 	}
+	w.sweepCrashedRuns(ctx)
 
 	limit := w.concurrency()
 	w.logger.Info("agent worker started", "instance_id", w.instanceID, "concurrency", limit)
@@ -216,7 +231,30 @@ func (w *Worker) Run(ctx context.Context) error {
 			} else if recovered > 0 {
 				w.logger.Info("agent worker: recovered expired leases", "count", recovered)
 			}
+			w.sweepCrashedRuns(ctx)
 		}
+	}
+}
+
+// sweepCrashedRuns runs the run-level crash sweep after a lease-recovery pass
+// (H-E2). RecoverExpired settles the WORK ITEM; this settles the RUN and seals its
+// transcript/Host heads, which no work-item recovery ever touched. It is best
+// effort — a sweep failure must never stop the worker — but never silent: the
+// report's failure counters and the error are both logged.
+func (w *Worker) sweepCrashedRuns(ctx context.Context) {
+	if w.crashSweeper == nil || ctx.Err() != nil {
+		return
+	}
+	report, err := w.crashSweeper.Sweep(ctx)
+	if err != nil {
+		w.logger.Warn("agent worker: run crash sweep failed", "error", err)
+		return
+	}
+	if report.Runs > 0 || report.Failed > 0 || report.SealFailures > 0 {
+		w.logger.Info("agent worker: run crash sweep finished",
+			"runs", report.Runs, "transcript_heads", report.TranscriptHeads,
+			"conversation_heads", report.ConversationHeads,
+			"seal_failures", report.SealFailures, "failed", report.Failed)
 	}
 }
 

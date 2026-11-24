@@ -127,6 +127,15 @@ type ContextPacket struct {
 	CacheHit           bool
 	InvalidationReason string
 	BriefingHash       string
+	// Stage is the version stage this packet's stable prefix was rendered with
+	// (v0.2.4-H T12, H-E3). It is recorded so the NEXT assembly of the version's
+	// prompt chain can tell a stage transition from an unchanged stage without
+	// re-parsing the prefix text: stage is a prefix input, so a change is a
+	// declared stage_boundary. Empty means the packet predates this field (or the
+	// stage was unknown), which is "no prior stage known" — never a transition.
+	// It is bookkeeping only: it is not part of the rendered prompt and not part
+	// of the admin read API's wire projection.
+	Stage string
 }
 
 // Assembly is one fully rendered prompt: the ordered messages plus the packet
@@ -296,6 +305,7 @@ func (a *Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembl
 		CacheHit:           cacheHit,
 		InvalidationReason: string(request.Invalidation),
 		BriefingHash:       digestText(renderBriefing(request.Briefing)),
+		Stage:              strings.TrimSpace(request.Stage),
 	}
 	if cacheHit {
 		packet.CachedTokens = cachedPrefixTokens(segments)

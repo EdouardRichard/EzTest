@@ -113,7 +113,7 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 		return chain.ChainView{}, err
 	}
 	f = f.Normalize()
-	if err := validateP6Filter(f); err != nil {
+	if err := validateChainFilter(f); err != nil {
 		return chain.ChainView{}, err
 	}
 	eventLower, eventUpper, err := s.eventTimeBounds(ctx, versionID, f)
@@ -142,12 +142,12 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 	if err != nil {
 		requirements = nil
 	}
-	versionSUTs, err := s.version.VersionSUTs(ctx, versionID)
+	suts, err := s.version.SUTs(ctx, versionID)
 	if fatal := tracker.handle(chain.LayerRequirement, err); fatal != nil {
 		return chain.ChainView{}, fatal
 	}
 	if err != nil {
-		versionSUTs = nil
+		suts = nil
 	}
 
 	var scenarios, cases []chain.Node
@@ -302,7 +302,7 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 		Issues:       issues,
 		Reports:      reports,
 		Closures:     closures,
-		SUTs:         mergeSUTNames(versionSUTs, sutNames),
+		SUTs:         mergeSUTNames(suts, sutNames),
 		Pages:        nonNilNames(pageNames),
 	}
 	view := chain.BuildChain(filterSourceGraphByEventRange(source, eventLower, eventUpper), f, budget, cursor, s.clock.Now())
@@ -313,7 +313,7 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 	return view, nil
 }
 
-func validateP6Filter(f chain.ChainFilter) error {
+func validateChainFilter(f chain.ChainFilter) error {
 	if utf8.RuneCountInString(f.Q) > 100 {
 		return platform.Invalid("q", "must be at most 100 characters")
 	}
@@ -503,11 +503,11 @@ func missingCaseVersionIDs(cases, caseRuns []chain.Node) []int64 {
 	return ids
 }
 
-// mergeSUTNames builds the version-SUT-ID label map. VersionSUT nodes provide
-// the binding labels, resource SUT names refine them (they win on conflict).
-func mergeSUTNames(versionSUTs []chain.Node, names map[int64]string) map[int64]string {
-	out := make(map[int64]string, len(versionSUTs)+len(names))
-	for _, node := range versionSUTs {
+// mergeSUTNames builds the SUT-ID label map. SUT nodes provide the binding
+// labels, resource SUT names refine them (they win on conflict).
+func mergeSUTNames(suts []chain.Node, names map[int64]string) map[int64]string {
+	out := make(map[int64]string, len(suts)+len(names))
+	for _, node := range suts {
 		id, ok := nodeRefID(node)
 		if !ok || node.Label == "" {
 			continue

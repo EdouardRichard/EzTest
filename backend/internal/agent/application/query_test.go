@@ -12,11 +12,11 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-func agentP6Int64Ptr(value int64) *int64 { return &value }
+func agentInt64Ptr(value int64) *int64 { return &value }
 
-// fakeP6RetryReader is the agent-context P6 retry read source used by the query
+// fakeRetryReader is the agent-context P6 retry read source used by the query
 // port tests.
-type fakeP6RetryReader struct {
+type fakeRetryReader struct {
 	num   int
 	denom int
 	err   error
@@ -41,33 +41,33 @@ type fakeP6RetryReader struct {
 	getWorkItemID int64
 }
 
-func (f *fakeP6RetryReader) CountTaskRetries(_ context.Context, versionID *int64) (int, int, error) {
+func (f *fakeRetryReader) CountTaskRetries(_ context.Context, versionID *int64) (int, int, error) {
 	f.calls++
 	f.scope = versionID
 	return f.num, f.denom, f.err
 }
 
-func (f *fakeP6RetryReader) ListDeadWorkItems(_ context.Context, limit int) ([]agentapp.DeadWorkItemRow, error) {
+func (f *fakeRetryReader) ListDeadWorkItems(_ context.Context, limit int) ([]agentapp.DeadWorkItemRow, error) {
 	f.deadCalls++
 	f.deadLimit = limit
 	return f.deadRows, f.deadErr
 }
 
-func (f *fakeP6RetryReader) ListWorkItems(_ context.Context, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool, error) {
+func (f *fakeRetryReader) ListWorkItems(_ context.Context, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool, error) {
 	f.workItemCalls++
 	f.workItemQuery = query
 	return f.workItemRows, f.workItemsMore, f.workItemsErr
 }
 
-func (f *fakeP6RetryReader) GetWorkItem(_ context.Context, versionID, id int64) (agent.WorkItem, error) {
+func (f *fakeRetryReader) GetWorkItem(_ context.Context, versionID, id int64) (agent.WorkItem, error) {
 	f.getCalls++
 	f.getVersionID, f.getWorkItemID = versionID, id
 	return f.getItem, f.getErr
 }
 
-func TestP6ListDeadWorkItems(t *testing.T) {
+func TestListDeadWorkItems(t *testing.T) {
 	created := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
-	reader := &fakeP6RetryReader{deadRows: []agentapp.DeadWorkItemRow{
+	reader := &fakeRetryReader{deadRows: []agentapp.DeadWorkItemRow{
 		{ID: 11, VersionID: 7, Title: "execute.case 重试耗尽", CreatedAt: created},
 	}}
 	service := agentapp.NewQueryService(reader)
@@ -94,15 +94,15 @@ func TestP6ListDeadWorkItems(t *testing.T) {
 	}
 
 	want := errors.New("boom")
-	failing := agentapp.NewQueryService(&fakeP6RetryReader{deadErr: want})
+	failing := agentapp.NewQueryService(&fakeRetryReader{deadErr: want})
 	if _, err := failing.ListDeadWorkItems(context.Background(), 10); !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
 	}
 }
 
-func TestP6CountTaskRetries(t *testing.T) {
+func TestCountTaskRetries(t *testing.T) {
 	t.Run("empty store returns zero counts", func(t *testing.T) {
-		reader := &fakeP6RetryReader{}
+		reader := &fakeRetryReader{}
 		service := agentapp.NewQueryService(reader)
 
 		num, denom, err := service.CountTaskRetries(context.Background(), nil)
@@ -118,10 +118,10 @@ func TestP6CountTaskRetries(t *testing.T) {
 	})
 
 	t.Run("version filter is forwarded", func(t *testing.T) {
-		reader := &fakeP6RetryReader{num: 2, denom: 9}
+		reader := &fakeRetryReader{num: 2, denom: 9}
 		service := agentapp.NewQueryService(reader)
 
-		num, denom, err := service.CountTaskRetries(context.Background(), agentP6Int64Ptr(7))
+		num, denom, err := service.CountTaskRetries(context.Background(), agentInt64Ptr(7))
 		if err != nil {
 			t.Fatalf("CountTaskRetries: %v", err)
 		}
@@ -134,7 +134,7 @@ func TestP6CountTaskRetries(t *testing.T) {
 	})
 
 	t.Run("zero denominator is reported without error", func(t *testing.T) {
-		service := agentapp.NewQueryService(&fakeP6RetryReader{})
+		service := agentapp.NewQueryService(&fakeRetryReader{})
 
 		num, denom, err := service.CountTaskRetries(context.Background(), nil)
 		if err != nil {
@@ -146,10 +146,10 @@ func TestP6CountTaskRetries(t *testing.T) {
 	})
 
 	t.Run("non-positive version is rejected", func(t *testing.T) {
-		reader := &fakeP6RetryReader{}
+		reader := &fakeRetryReader{}
 		service := agentapp.NewQueryService(reader)
 
-		if _, _, err := service.CountTaskRetries(context.Background(), agentP6Int64Ptr(0)); err == nil {
+		if _, _, err := service.CountTaskRetries(context.Background(), agentInt64Ptr(0)); err == nil {
 			t.Fatal("expected invalid_argument for version_id=0")
 		}
 		if reader.calls != 0 {
@@ -159,7 +159,7 @@ func TestP6CountTaskRetries(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := agentapp.NewQueryService(&fakeP6RetryReader{err: want})
+		service := agentapp.NewQueryService(&fakeRetryReader{err: want})
 
 		if _, _, err := service.CountTaskRetries(context.Background(), nil); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)
@@ -217,7 +217,7 @@ func sampleWorkItems() []agent.WorkItem {
 
 func TestVersionWorkItemsRead(t *testing.T) {
 	t.Run("filters are normalized and views projected", func(t *testing.T) {
-		reader := &fakeP6RetryReader{workItemRows: sampleWorkItems(), workItemsMore: true}
+		reader := &fakeRetryReader{workItemRows: sampleWorkItems(), workItemsMore: true}
 		service := agentapp.NewQueryService(reader)
 		before := int64(900)
 
@@ -282,7 +282,7 @@ func TestVersionWorkItemsRead(t *testing.T) {
 	})
 
 	t.Run("default limit is 20", func(t *testing.T) {
-		reader := &fakeP6RetryReader{}
+		reader := &fakeRetryReader{}
 		service := agentapp.NewQueryService(reader)
 
 		if _, _, err := service.WorkItems(context.Background(), agentapp.WorkItemFilter{VersionID: 7}); err != nil {
@@ -294,7 +294,7 @@ func TestVersionWorkItemsRead(t *testing.T) {
 	})
 
 	t.Run("empty store returns an empty list", func(t *testing.T) {
-		service := agentapp.NewQueryService(&fakeP6RetryReader{})
+		service := agentapp.NewQueryService(&fakeRetryReader{})
 		views, hasMore, err := service.WorkItems(context.Background(), agentapp.WorkItemFilter{VersionID: 7})
 		if err != nil {
 			t.Fatalf("WorkItems: %v", err)
@@ -314,11 +314,11 @@ func TestVersionWorkItemsRead(t *testing.T) {
 			{"state dead", agentapp.WorkItemFilter{VersionID: 7, State: "dead"}},
 			{"state unknown", agentapp.WorkItemFilter{VersionID: 7, State: "bogus"}},
 			{"created_by", agentapp.WorkItemFilter{VersionID: 7, CreatedBy: "robot"}},
-			{"before", agentapp.WorkItemFilter{VersionID: 7, BeforeID: agentP6Int64Ptr(0)}},
+			{"before", agentapp.WorkItemFilter{VersionID: 7, BeforeID: agentInt64Ptr(0)}},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				reader := &fakeP6RetryReader{}
+				reader := &fakeRetryReader{}
 				service := agentapp.NewQueryService(reader)
 				if _, _, err := service.WorkItems(context.Background(), tc.filter); err == nil {
 					t.Fatal("expected invalid_argument")
@@ -334,14 +334,14 @@ func TestVersionWorkItemsRead(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := agentapp.NewQueryService(&fakeP6RetryReader{workItemsErr: want})
+		service := agentapp.NewQueryService(&fakeRetryReader{workItemsErr: want})
 		if _, _, err := service.WorkItems(context.Background(), agentapp.WorkItemFilter{VersionID: 7}); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)
 		}
 	})
 
 	t.Run("single work item is version scoped", func(t *testing.T) {
-		reader := &fakeP6RetryReader{getItem: sampleWorkItems()[0]}
+		reader := &fakeRetryReader{getItem: sampleWorkItems()[0]}
 		service := agentapp.NewQueryService(reader)
 
 		view, err := service.WorkItem(context.Background(), 7, 401)
@@ -357,7 +357,7 @@ func TestVersionWorkItemsRead(t *testing.T) {
 	})
 
 	t.Run("foreign or missing work item is not found", func(t *testing.T) {
-		reader := &fakeP6RetryReader{getErr: agent.ErrNotFound}
+		reader := &fakeRetryReader{getErr: agent.ErrNotFound}
 		service := agentapp.NewQueryService(reader)
 
 		_, err := service.WorkItem(context.Background(), 7, 999)
@@ -373,7 +373,7 @@ func TestVersionWorkItemsRead(t *testing.T) {
 	})
 
 	t.Run("non-positive ids are rejected before the read", func(t *testing.T) {
-		reader := &fakeP6RetryReader{}
+		reader := &fakeRetryReader{}
 		service := agentapp.NewQueryService(reader)
 		for _, ids := range [][2]int64{{0, 401}, {7, 0}, {-1, 401}} {
 			if _, err := service.WorkItem(context.Background(), ids[0], ids[1]); err == nil {
@@ -411,7 +411,7 @@ func TestVersionWorkItemsDeadProjection(t *testing.T) {
 		{ID: 453, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemFailed, LastError: &cancelledReason},
 		{ID: 454, VersionID: 7, Kind: agent.WorkItemKindExecuteBatch, Status: agent.WorkItemDead, LastError: &cancelledReason},
 	}
-	service := agentapp.NewQueryService(&fakeP6RetryReader{workItemRows: rows})
+	service := agentapp.NewQueryService(&fakeRetryReader{workItemRows: rows})
 
 	views, _, err := service.WorkItems(context.Background(), agentapp.WorkItemFilter{VersionID: 7})
 	if err != nil {

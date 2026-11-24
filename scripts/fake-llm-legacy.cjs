@@ -5,9 +5,17 @@
 //
 // The 0.2.1 P0 rewrite replaced scripts/fake-llm.cjs with the P0/P1/P2
 // deterministic upstream and dropped these scenario dispatchers, so the legacy
-// suites went red. This module ports them back verbatim (deterministic plans
-// computed from the request and the repo fixtures) and is called by
-// fake-llm.cjs before its current profile dispatcher.
+// suites went red. This module ports them back (deterministic plans computed
+// from the request and the repo fixtures) and is called by fake-llm.cjs before
+// its current profile dispatcher.
+//
+// EXCEPTION (v0.2.4-C T13): the P6 execution scenario is NOT the legacy 0.2.0
+// contract any more — it answers the current seeded "[profile:case_executor]"
+// marker with the capability-domain tool surface (context.task_pack / exec.run /
+// http.request / execution.* / human.request, dotted names). The retired
+// browser.* actions, execution_case_context and execution.db_assert are gone;
+// scripts/fake-llm.p6.test.cjs and the P6 sections of .p7.test.cjs were
+// rewritten from that contract in the same change.
 //
 // It also maps the P5 mindmap role markers to their current equivalents in
 // backend/internal/agent/application/profiles.go and roles.go: the removed
@@ -837,19 +845,28 @@ async function handleP4Scenario(messages, res, stream) {
 
 // --- P5 deterministic mindmap scenarios (design spec §10.6) ----------------
 //
-// P5 requests are identified by the stable Chinese role markers of the four
-// mindmap profiles (`backend/internal/mindmap/domain/prompts.go`, spec §8.1).
-// Each run is scripted from the number of assistant tool turns already present
-// after the run instruction (same counting trick as P3):
+// P5 requests are identified either by the original Chinese mindmap role markers
+// (below) or — for the live design scenarios — by the current seeded profile
+// prompts in backend/internal/agent/application/profiles.go, gated on the P5 run
+// instruction so the current P1/P2 dispatcher is never stolen. Each run is
+// scripted from the number of assistant tool turns already present after the run
+// instruction (same counting trick as P3):
 //
-//   design    case_graph_read -> case_graph_propose -> final text
-//   review    case_graph_read -> case_review_submit -> final text
-//   data_plan case_graph_read -> case_data_plan_submit -> final text
+//   design    design_graph_read -> case_graph_propose -> final text
+//   review    design_graph_read -> design_review_submit -> final text
+//   data_plan design_graph_read -> design_data_plan_submit -> final text
 //   explore   explore_http x2 -> app_model_propose -> final text
 //
-// Tool function names use the P1 gateway's dot->underscore wire form
-// (`internal/agent/infrastructure/llm/gateway.go`), so the backend registers
-// `case.graph_propose` but the model must answer `case_graph_propose`.
+// explore.* was removed from the product (roles.go), and the data planner
+// profile was retired; their P5 handlers stay only as inert legacy shapes and
+// are no longer exercised by scripts/fake-llm.p5.test.cjs.
+//
+// Tool function names use the current Go registry names, sanitized to the wire
+// form exactly as backend/internal/llm/infrastructure/openai_chat.go does
+// (every rune outside [A-Za-z0-9_-] -> '_'): design.graph_read -> design_graph_read,
+// case.graph_propose -> case_graph_propose, design.review_submit ->
+// design_review_submit. scripts/generate-fake-llm-p5-mirror.cjs derives these
+// from the Go tool registry so the mirror cannot drift again (H-D14).
 //
 // Modes (§10.6): normal (default) | invalid (structurally invalid proposal, so
 // a design run must fail with zero materialization) | degraded (text only, no
@@ -925,7 +942,21 @@ function detectP5Scenario(systemText, userText) {
   if (systemText.includes(P5_REVIEW_MARKER)) return "review";
   if (P5_DATA_PLAN_MARKERS.some((marker) => systemText.includes(marker))) return "data_plan";
   if (systemText.includes(P5_EXPLORE_MARKER)) return "explore";
+  // The live seeded profile prompts (profiles.go) are matched only when the user
+  // text carries a camelCase `versionId=` run-instruction line. That is the only
+  // stable discriminator available now that this detector must be driven by the
+  // CURRENT prompts: the original P5 product markers above are gone, and the p5
+  // scenario instructions do not share any single P5-specific footer (some
+  // intentionally omit the "必须调用 …" line to exercise table parsing), so a
+  // fragment gate would either break those cases or just re-encode test wording.
+  //
+  // PRECONDITION (do not silently violate): the production agent task packs use
+  // snake_case `version_id=`. handleLegacyScenario runs BEFORE the current profile
+  // dispatcher (fake-llm.cjs handleChatCompletions), so if a current task ever
+  // starts emitting camelCase `versionId=`, this fallback would misfire and steal
+  // that run — re-tighten the gate to a P5-specific marker at that point.
   if (/\bversionId\s*=/.test(String(userText || ""))) {
+    if (systemText.includes("[profile:design_author]")) return "design";
     if (systemText.includes("[profile:case_author]")) return "design";
     if (systemText.includes("[profile:design_critic]")) return "review";
     if (systemText.includes("[profile:data_planner]")) return "data_plan";
@@ -1381,7 +1412,7 @@ function planP5Turn(kind, run, userText, mode) {
   if (kind === "design") {
     if (run.step === 0) {
       if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
-      return p5Tool("case_graph_read", { versionId }, "P5 设计：读取现有脑图摘要");
+      return p5Tool("design_graph_read", { versionId }, "P5 设计：读取现有脑图摘要");
     }
     if (run.step === 1) {
       if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
@@ -1397,12 +1428,12 @@ function planP5Turn(kind, run, userText, mode) {
   if (kind === "review") {
     if (run.step === 0) {
       if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
-      return p5Tool("case_graph_read", { versionId }, "P5 评审：读取现有脑图摘要");
+      return p5Tool("design_graph_read", { versionId }, "P5 评审：读取现有脑图摘要");
     }
     if (run.step === 1) {
       if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
       return p5Tool(
-        "case_review_submit",
+        "design_review_submit",
         p5ReviewProposal(versionId, run.toolResults),
         "P5 评审：提交覆盖/重复/代码未覆盖 findings",
       );
@@ -1412,12 +1443,12 @@ function planP5Turn(kind, run, userText, mode) {
 
   if (run.step === 0) {
     if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
-    return p5Tool("case_graph_read", { versionId }, "P5 数据规划：读取现有脑图摘要");
+    return p5Tool("design_graph_read", { versionId }, "P5 数据规划：读取现有脑图摘要");
   }
   if (run.step === 1) {
     if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
     return p5Tool(
-      "case_data_plan_submit",
+      "design_data_plan_submit",
       p5DataPlanProposal(versionId, run.toolResults),
       "P5 数据规划：提交前置条件与测试数据",
     );
@@ -1459,36 +1490,49 @@ async function handleP5Scenario(messages, res, stream) {
   return true;
 }
 
-// --- P6 deterministic execution scenarios (design spec §10.2) --------------
+// --- P6 deterministic execution scenarios (v0.2.4-C T13 contract) ----------
 //
-// P6 requests are identified by the stable Chinese system-prompt marker of the
-// execution-agent profile (`backend/internal/execution/domain/profile.go`,
-// spec §7.2). Every run is scripted from the number of assistant tool turns
-// already present after the run instruction (same counting trick as P3/P5):
+// P6 requests are identified by the seeded case_executor prompt marker
+// "[profile:case_executor]" (backend/internal/agent/application/execution_profiles.go).
+// Every run is scripted from the number of assistant tool turns already present
+// after the run instruction (same counting trick as P3/P5/P7).
 //
-//   normal   case_context -> goto (/p6/orders/new) -> snapshot -> fill -> click
-//            -> screenshot -> step_record xN -> assertion_record xM -> case_finish(passed)
-//            (P7: a kind=db assertion uses execution_db_assert instead of
-//            assertion_record; the server reads SQL/expected/target and records
-//            the db_result evidence, spec §9.5)
-//   fail     case_context -> goto (/p6/assert-fail) -> snapshot -> screenshot
-//            -> step_record xN -> assertion_record xM(failed) -> case_finish(failed, application)
-//   blocked  case_context -> goto (/p6/requires-auth) -> snapshot -> screenshot
-//            -> records -> case_finish(blocked, environment)
-//   takeover case_context -> goto (/p6/login?mfa=1) -> snapshot -> screenshot
-//            -> records -> case_finish(blocked, session, reason=mfa_required)
-//   budget   case_context -> two slow goto turns (pause window) -> snapshots forever
+// The tool surface is the CURRENT capability-domain registry (dotted names):
+// the 13 browser.* atomic actions are retired (T13); browser operation returns
+// as browser.cli over the general-execution domain in T15. The case snapshot
+// comes from context.task_pack -> result.execution (steps[].seq /
+// assertions[].step_seq+assertion_seq); evidence is settled automatically by
+// the execution tools, so recording arguments carry no evidence_ids.
 //
-// The recorder validates step/assertion completeness and evidence, so the
-// blocked takeover scenarios also record every step/assertion before finishing.
-// The browser screenshot tool is the evidence source: its `evidence_id` is
-// reused in the step/assertion/finish submissions.
+// v0.2.4-F T15 (SC-F11, new contract): the execution snapshot is natural language
+// (execution.sut_description / covered_acs / environment_id; suts[].intro /
+// environment_id; steps[].target_description — the design-target SUT/page/API id
+// columns are gone). The scenario resolves the SUT through sut.read (the new
+// detail reader) using the catalog sut_id, then carries that sut_id as FACTUAL
+// attribution on http.request / step_record / assertion_record (the wire key the
+// whole execution tool surface uses). The "fixture" mode exercises the P18
+// cross-case login-state chain: fixture.download (not_found on a first run) ->
+// login -> browser.cli state-save -> fixture.upload.
 //
-// Modes: normal (default) | fail | blocked | takeover | budget.
+//   normal   task_pack -> sut.read -> exec.run -> http.request -> step_record xN
+//            -> assertion_record xM -> case_finish(passed)
+//   fail     task_pack -> sut.read -> exec.run -> http.request -> step_record xN
+//            -> assertion_record xM(failed) -> case_finish(failed, application)
+//   blocked  task_pack -> sut.read -> exec.run -> http.request -> step_record(blocked)
+//            -> case_finish(blocked, environment)
+//   takeover task_pack -> sut.read -> exec.run -> http.request -> human.request(login_takeover)
+//            -> records -> case_finish(passed)
+//   fixture  task_pack -> sut.read -> fixture.download(not_found) -> exec.run(login)
+//            -> browser.cli(state-save) -> fixture.upload -> http.request
+//            -> records -> case_finish(passed)
+//   budget   task_pack -> two slow exec.run turns (pause window)
+//            -> exec.run probes forever (never finishes)
+//
+// Modes: normal (default) | fail | blocked | takeover | fixture | budget.
 // `POST /__p6-mode` switches the mode at runtime; every mode answers through
 // the same system prompt so the E2E can switch without restarting the fake.
-const P6_EXECUTION_MARKER = "EzTest 的执行 Agent";
-const P6_MODES = new Set(["normal", "fail", "blocked", "takeover", "budget"]);
+const P6_EXECUTION_MARKER = "[profile:case_executor]";
+const P6_MODES = new Set(["normal", "fail", "blocked", "takeover", "fixture", "budget"]);
 const P6_TOOL_USAGE = makeUsage(960, 220, 96);
 const P6_TEXT_USAGE = makeUsage(220, 24, 0);
 const P6_FINAL_TEXT = "P6 执行结束：已提交用例的步骤、断言与最终结果。";
@@ -1516,7 +1560,7 @@ async function handleP6ModeControl(req, res) {
     .trim()
     .toLowerCase();
   if (!P6_MODES.has(mode)) {
-    sendError(res, 400, "mode must be one of normal, fail, blocked, takeover, budget");
+    sendError(res, 400, "mode must be one of normal, fail, blocked, takeover, fixture, budget");
     return;
   }
   process.env.EZTEST_FAKE_LLM_P6_MODE = mode;
@@ -1530,7 +1574,7 @@ function p6Mode() {
   return P6_MODES.has(value) ? value : "normal";
 }
 
-/** Matches the execution-agent system prompt; null for P1-P5. */
+/** Matches the case_executor system prompt marker; null for other profiles. */
 function detectP6Scenario(systemText) {
   return systemText.includes(P6_EXECUTION_MARKER) ? "execution" : null;
 }
@@ -1555,26 +1599,20 @@ function p6ParseObject(text) {
   }
 }
 
-/** Returns the latest parsed execution.case_context result, or null. */
-function p6CaseContext(toolResults) {
+/**
+ * Returns the execution snapshot of the latest context.task_pack result
+ * (result.execution), or null when the run has not read a usable task pack.
+ */
+function p6ExecutionContext(toolResults) {
   for (let index = toolResults.length - 1; index >= 0; index -= 1) {
-    if (toolResults[index].name !== "execution_case_context") continue;
+    if (toolResults[index].name !== "context.task_pack") continue;
     const parsed = p6ParseObject(toolResults[index].text);
-    if (parsed !== null) return parsed;
+    if (parsed !== null && parsed.execution && typeof parsed.execution === "object") {
+      return parsed.execution;
+    }
+    return null;
   }
   return null;
-}
-
-/** Returns the latest screenshot evidence id, or "". */
-function p6EvidenceId(toolResults) {
-  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
-    if (toolResults[index].name !== "browser_screenshot") continue;
-    const parsed = p6ParseObject(toolResults[index].text);
-    if (parsed !== null && typeof parsed.evidence_id === "string" && /^\d+$/.test(parsed.evidence_id)) {
-      return parsed.evidence_id;
-    }
-  }
-  return "";
 }
 
 function p6Tool(name, args, reasoning) {
@@ -1585,144 +1623,178 @@ function p6Text(text) {
   return { kind: "text", text };
 }
 
-function p6JoinUrl(base, pathValue) {
-  return String(base || "").replace(/\/+$/, "") + pathValue;
-}
-
-/** Builds one browser.goto plan for the fixture page of the mode. */
-function p6GotoPlan(mode, baseUrl) {
-  const pathValue =
-    mode === "fail"
-      ? P6_FAIL_PATH
-      : mode === "blocked"
-        ? P6_REQUIRES_AUTH_PATH
-        : mode === "takeover"
-          ? P6_MFA_PATH
-          : P6_ORDER_FORM_PATH;
-  return p6Tool(
-    "browser_goto",
-    { url: p6JoinUrl(baseUrl, pathValue) },
-    "P6 执行：打开 " + pathValue,
-  );
-}
-
 /**
- * Maps the latest execution.visual_assert tool result of the trailing run onto
- * the finish decision the visual-assertion prompt rule prescribes. It returns
- * null when the run has not called the visual tool yet, so every existing P6
- * scenario keeps its mode-driven finish unchanged.
+ * The resolved SUT id for the run (factual attribution). The task pack SUT
+ * catalog carries sut_id (the single value source); the scenario confirms the
+ * match through sut.read and then attributes every recording to this SUT.
+ * Returns "" when the catalog is empty (no SUT to resolve).
  */
-function p6VisualFinish(toolResults) {
-  let text = "";
-  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
-    if (toolResults[index].name !== "execution_visual_assert") continue;
-    text = toolResults[index].text;
-    break;
-  }
-  if (text === "") return null;
-  if (text.includes("missing_visual_baseline")) {
-    return { verdict: "inconclusive", failure_class: "case", reason: "missing_visual_baseline" };
-  }
-  if (text.includes("visual_environment_mismatch")) {
-    return {
-      verdict: "inconclusive",
-      failure_class: "environment",
-      reason: "visual_environment_mismatch",
-    };
-  }
-  const parsed = p6ParseObject(text);
-  if (parsed !== null && parsed.classification === "failed") {
-    return {
-      verdict: "failed",
-      failure_class: "application",
-      reason: typeof parsed.reason === "string" ? parsed.reason : "visual_mismatch",
-    };
-  }
-  if (parsed !== null && parsed.classification === "passed") {
-    return { verdict: "passed", reason: "视觉断言通过" };
-  }
-  return {
-    verdict: "inconclusive",
-    failure_class: "case",
-    reason: (parsed !== null && typeof parsed.reason === "string" && parsed.reason) ||
-      "visual_assertion_inconclusive",
-  };
+function p6ResolvedSUTID(execution) {
+  const suts = Array.isArray(execution.suts) ? execution.suts : [];
+  const first = suts.find((sut) => sut && sut.sut_id);
+  return first ? String(first.sut_id) : "";
+}
+
+/** Adds the factual sut_id attribution to a recording/http argument object. */
+function p6WithSUT(args, sutID) {
+  return sutID === "" ? args : { ...args, sut_id: sutID };
+}
+
+/** The fixture page each mode operates on (relative SUT path for http.request). */
+function p6ModePath(mode) {
+  return mode === "fail"
+    ? P6_FAIL_PATH
+    : mode === "blocked"
+      ? P6_REQUIRES_AUTH_PATH
+      : mode === "takeover"
+        ? P6_MFA_PATH
+        : P6_ORDER_FORM_PATH;
 }
 
 /** Plans exactly one P6 turn from the mode and the already executed turns. */
 function planP6Turn(mode, run) {
   if (run.step === 0) {
-    return p6Tool("execution_case_context", {}, "P6 执行：读取用例快照与恢复检查点");
+    return p6Tool("context.task_pack", {}, "P6 执行：读取用例任务包");
   }
 
-  const context = p6CaseContext(run.toolResults);
-  if (context === null) return p6Text(P6_EMPTY_CONTEXT_TEXT);
+  const execution = p6ExecutionContext(run.toolResults);
+  if (execution === null) return p6Text(P6_EMPTY_CONTEXT_TEXT);
 
-  const finished = run.toolResults.some((result) => result.name === "execution_case_finish");
+  const finished = run.toolResults.some((result) => result.name === "execution.case_finish");
   if (finished) return p6Text(P6_FINAL_TEXT);
 
-  const baseUrl = typeof context.base_url === "string" ? context.base_url : "";
   if (mode === "budget") {
-    // Two slow navigations create a deterministic in-flight window for the
-    // immediate-pause E2E, then rapid snapshots exhaust the tool-call budget.
+    // Two slow commands create a deterministic in-flight window for the
+    // immediate-pause E2E, then rapid probes exhaust the tool-call budget.
     if (run.step === 1 || run.step === 2) {
       return p6Tool(
-        "browser_goto",
-        { url: p6JoinUrl(baseUrl, "/p6/slow?ms=8000") },
-        "P6 预算场景：慢响应以验证暂停",
+        "exec.run",
+        { argv: ["node", "-e", "setTimeout(()=>{},8000)"], timeout_ms: 20000 },
+        "P6 预算场景：慢命令以验证暂停",
       );
     }
-    return p6Tool("browser_snapshot", {}, "P6 预算场景：继续调用工具");
+    return p6Tool(
+      "exec.run",
+      { argv: ["node", "-e", "console.log('p6-budget-probe')"] },
+      "P6 预算场景：继续调用工具",
+    );
   }
 
-  const evidenceId = p6EvidenceId(run.toolResults);
-  const steps = (Array.isArray(context.remaining_steps) ? context.remaining_steps : []).filter(
+  const sutID = p6ResolvedSUTID(execution);
+
+  // Resolution (v0.2.4-F): confirm the catalog SUT through the new detail
+  // reader before operating. The catalog carries sut_id; sut.read returns the
+  // base_url/source/status + effective asset summary the executor matches against
+  // the case sut_description. Skipped only when the catalog has no SUT.
+  if (run.step === 1 && sutID !== "") {
+    return p6Tool("sut.read", { sut_id: sutID }, "P6 执行：读取 SUT 详情确认解析 " + sutID);
+  }
+
+  const steps = (Array.isArray(execution.steps) ? execution.steps : []).filter(
     (step) => step && Number.isInteger(step.seq) && step.seq > 0,
   );
-  const assertions = (Array.isArray(context.assertions) ? context.assertions : []).filter(
-    (assertion) => assertion && typeof assertion.assertion_id === "string",
+  const assertions = (Array.isArray(execution.assertions) ? execution.assertions : []).filter(
+    (assertion) =>
+      assertion && Number.isInteger(assertion.step_seq) && Number.isInteger(assertion.assertion_seq),
   );
 
-  // The normal scenario exercises the fixture's create-order form; the other
-  // modes only need a page whose content supports the intended verdict.
-  const prepared =
-    mode === "normal"
-      ? [
-          p6GotoPlan(mode, baseUrl),
-          p6Tool("browser_snapshot", {}, "P6 执行：读取订单表单的 ARIA 快照"),
-          p6Tool(
-            "browser_fill",
-            { target: { selector: "#order-number" }, value: "P6-E2E-ORDER" },
-            "P6 执行：填写订单号",
-          ),
-          p6Tool(
-            "browser_click",
-            { target: { role: "button", name: "Create order" } },
-            "P6 执行：提交新建订单",
-          ),
-          p6Tool("browser_screenshot", {}, "P6 执行：截图作为断言证据"),
-        ]
-      : [
-          p6GotoPlan(mode, baseUrl),
-          p6Tool("browser_snapshot", {}, "P6 执行：读取页面 ARIA 快照"),
-          p6Tool("browser_screenshot", {}, "P6 执行：截图作为断言证据"),
-        ];
+  // Preparation: one general-execution probe plus one SUT HTTP fetch. Both
+  // tools settle their evidence automatically (command / http kind), so the
+  // recording calls below carry no evidence_ids. The http fetch carries the
+  // resolved sut_id (relative path convenience-prepends that SUT's base URL).
+  const prepared = [
+    p6Tool(
+      "exec.run",
+      { argv: ["node", "-e", "console.log('p6-step-prep')"] },
+      "P6 执行：通用执行通道探针",
+    ),
+    p6Tool(
+      "http.request",
+      p6WithSUT({ path: p6ModePath(mode), method: "GET" }, sutID),
+      "P6 执行：读取 fixture 页面 " + p6ModePath(mode),
+    ),
+  ];
+  if (mode === "takeover") {
+    prepared.push(
+      p6Tool(
+        "human.request",
+        { kind: "login_takeover", reason: "mfa_required：登录需要人工接管", account_role: "admin" },
+        "P6 执行：请求人工接管登录",
+      ),
+    );
+  }
+  if (mode === "fixture") {
+    // P18 cross-case login-state chain (first run saves a fixture): try to reuse
+    // an existing fixture (not_found on a first run) -> login -> CLI state-save ->
+    // upload to the server fixture library. A later run reuses via download.
+    prepared.unshift(
+      p6Tool(
+        "fixture.download",
+        p6WithSUT({ account_role: "admin" }, sutID),
+        "P6 执行：尝试复用会话夹具（首次运行无夹具）",
+      ),
+    );
+    prepared.push(
+      p6Tool(
+        "browser.cli",
+        p6WithSUT({ subcommand: "state-save", args: ["state.json"], account_role: "admin" }, sutID),
+        "P6 执行：保存登录态为工作区文件",
+      ),
+      p6Tool(
+        "fixture.upload",
+        p6WithSUT({ account_role: "admin", path: "state.json" }, sutID),
+        "P6 执行：上传登录态到服务端夹具库",
+      ),
+    );
+  }
 
-  const phase = run.step - 1;
+  // step 0 = task_pack, step 1 = sut.read (when a SUT exists); preparation starts
+  // at step 2 (or step 1 when the catalog is empty and resolution was skipped).
+  const prepStart = sutID !== "" ? 2 : 1;
+  const phase = run.step - prepStart;
   if (phase < prepared.length) return prepared[phase];
   let index = phase - prepared.length;
 
+  if (mode === "blocked") {
+    // An environment-blocked run records the first step as blocked and never
+    // fabricates assertions for steps it could not execute.
+    if (index === 0) {
+      const first = steps[0] || { seq: 1 };
+      return p6Tool(
+        "execution.step_record",
+        p6WithSUT(
+          {
+            seq: first.seq,
+            status: "blocked",
+            observed: "环境不可达：fixture 目标请求失败",
+            error: "environment_unreachable",
+          },
+          sutID,
+        ),
+        "P6 执行：记录受阻步骤 " + first.seq,
+      );
+    }
+    index -= 1;
+    if (index === 0) {
+      return p6Tool(
+        "execution.case_finish",
+        { verdict: "blocked", failure_class: "environment", summary: "环境不可达：fixture 目标请求失败" },
+        "P6 执行：用例判定为阻塞（环境）",
+      );
+    }
+    return p6Text(P6_FINAL_TEXT);
+  }
+
   if (index < steps.length) {
     const step = steps[index];
-    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
+    // Consume the natural-language design target (the design no longer supplies
+    // target SUT/page/API ids); the observed text reflects the prose target.
+    const target = typeof step.target_description === "string" && step.target_description !== ""
+      ? step.target_description
+      : step.action;
     return p6Tool(
-      "execution_step_record",
-      {
-        seq: step.seq,
-        status: "passed",
-        actual: "步骤执行成功",
-        evidence_ids: [evidenceId],
-      },
+      "execution.step_record",
+      p6WithSUT({ seq: step.seq, status: "passed", observed: "步骤执行成功：" + target }, sutID),
       "P6 执行：记录步骤 " + step.seq,
     );
   }
@@ -1730,110 +1802,33 @@ function planP6Turn(mode, run) {
 
   if (index < assertions.length) {
     const assertion = assertions[index];
-    // P7 addition (spec §9.5): a kind=db snapshot assertion is executed by the
-    // server-side execution.db_assert tool, not by execution.assertion_record.
-    // The agent sends only the assertion id; SQL, expected value and the target
-    // stay on the server. The tool itself records the db_result evidence.
-    if (assertion.kind === "db") {
-      return p6Tool(
-        "execution_db_assert",
-        { assertionId: assertion.assertion_id },
-        "P7 执行：执行服务器端 db 断言 " + assertion.assertion_id,
-      );
-    }
-    // P8 visual assertions (design spec §9.3) are executed by the server-owned
-    // execution.visual_assert tool: the agent sends only the assertion id and
-    // the recorded result/evidence drives the final case verdict below.
-    if (assertion.kind === "visual") {
-      return p6Tool(
-        "execution_visual_assert",
-        { assertionId: assertion.assertion_id },
-        "P8 执行：执行视觉断言 " + assertion.assertion_id,
-      );
-    }
-    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
     const failed = mode === "fail";
+    const args = {
+      step_seq: assertion.step_seq,
+      assertion_seq: assertion.assertion_seq,
+      verdict: failed ? "failed" : "passed",
+      actual: failed ? "页面实际文案与用例期望不一致" : "断言通过：页面文案与期望一致",
+    };
+    if (failed) args.reason = "assertion_mismatch";
     return p6Tool(
-      "execution_assertion_record",
-      {
-        assertion_id: assertion.assertion_id,
-        verdict: failed ? "failed" : "passed",
-        actual: failed ? "页面实际文案与用例期望不一致" : "断言通过：页面文案与期望一致",
-        evidence_ids: [evidenceId],
-      },
-      "P6 执行：记录断言 " + assertion.assertion_id,
+      "execution.assertion_record",
+      p6WithSUT(args, sutID),
+      "P6 执行：记录断言 " + assertion.step_seq + "/" + assertion.assertion_seq,
     );
   }
   index -= assertions.length;
 
   if (index === 0) {
-    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
-    // A visual assertion owns the verdict: a missing baseline is
-    // inconclusive(case), an environment mismatch inconclusive(environment), a
-    // pixel diff over the threshold failed(application), otherwise passed.
-    const visualFinish = p6VisualFinish(run.toolResults);
-    if (visualFinish !== null) {
-      if (visualFinish.verdict === "passed") {
-        return p6Tool(
-          "execution_case_finish",
-          {
-            verdict: "passed",
-            reason: visualFinish.reason,
-            evidence_ids: [evidenceId],
-          },
-          "P8 执行：视觉断言通过",
-        );
-      }
-      if (visualFinish.verdict === "failed") {
-        return p6Tool(
-          "execution_case_finish",
-          {
-            verdict: "failed",
-            failure_class: "application",
-            reason: visualFinish.reason,
-            evidence_ids: [evidenceId],
-          },
-          "P8 执行：视觉断言不一致",
-        );
-      }
-      return p6Tool(
-        "execution_case_finish",
-        {
-          verdict: "inconclusive",
-          failure_class: visualFinish.failure_class,
-          reason: visualFinish.reason,
-        },
-        "P8 执行：视觉断言按分类结束",
-      );
-    }
     if (mode === "fail") {
       return p6Tool(
-        "execution_case_finish",
-        { verdict: "failed", failure_class: "application", reason: "断言失败：页面文案与期望不一致" },
+        "execution.case_finish",
+        { verdict: "failed", failure_class: "application", summary: "断言失败：页面文案与期望不一致" },
         "P6 执行：用例判定为失败（应用缺陷）",
       );
     }
-    if (mode === "blocked") {
-      return p6Tool(
-        "execution_case_finish",
-        { verdict: "blocked", failure_class: "environment", reason: "环境不可达：fixture 目标请求失败" },
-        "P6 执行：用例判定为阻塞（环境）",
-      );
-    }
-    if (mode === "takeover") {
-      return p6Tool(
-        "execution_case_finish",
-        { verdict: "blocked", failure_class: "session", reason: "mfa_required：会话需要人工接管" },
-        "P6 执行：用例判定为阻塞（会话）",
-      );
-    }
     return p6Tool(
-      "execution_case_finish",
-      {
-        verdict: "passed",
-        reason: "全部步骤与断言通过",
-        evidence_ids: [evidenceId],
-      },
+      "execution.case_finish",
+      { verdict: "passed", summary: "全部步骤与断言通过" },
       "P6 执行：用例判定为通过",
     );
   }
@@ -1843,7 +1838,7 @@ function planP6Turn(mode, run) {
 
 /**
  * Handles one P6 execution request. Returns true when the system prompt carried
- * the execution-agent marker, false so P1-P5 stay untouched.
+ * the case_executor marker, false so other profiles stay untouched.
  */
 async function handleP6Scenario(messages, res, stream) {
   const kind = detectP6Scenario(systemPromptText(messages));
@@ -1876,7 +1871,6 @@ async function handleP6Scenario(messages, res, stream) {
   sendJson(res, 200, completionBody({ content: plan.text }, "stop", P6_TEXT_USAGE));
   return true;
 }
-
 // --- P7 autonomous-loop scenarios (design spec §9.1-§9.5, §12.5) -----------
 //
 // P7 requests are identified by the stable Chinese system-prompt markers of the
@@ -2431,7 +2425,7 @@ function diagnosticMessage() {
   return {
     content: null,
     reasoning_content: REASONING_TEXT,
-    tool_calls: toolCallPayload("file_read", README_ARGUMENTS),
+    tool_calls: toolCallPayload("file.read", README_ARGUMENTS),
   };
 }
 

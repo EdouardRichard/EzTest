@@ -1,10 +1,25 @@
 // Package resourceapi exposes the resource-catalog HTTP API.
+//
+// v0.2.4-B inverted the hierarchy, so the route tree follows
+// environment -> SUT -> assets:
+//
+//	GET|POST        /api/resources/environments
+//	GET|PATCH|DEL   /api/resources/environments/{id}
+//	GET|POST        /api/resources/environments/{id}/suts
+//	GET|POST        /api/resources/suts
+//	GET|PATCH|DEL   /api/resources/suts/{id}
+//	GET             /api/resources/suts/{id}/registrations  (R-B4 append-only facts)
+//	GET|POST        /api/resources/suts/{id}/pages        (+ /import)
+//	GET|POST        /api/resources/suts/{id}/apis         (+ /import)
+//	GET|POST        /api/resources/suts/{id}/databases
+//	GET|POST        /api/resources/accounts               (global pool)
 package resourceapi
 
 import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
@@ -16,44 +31,56 @@ import (
 const (
 	bodyLimit       = int64(1 << 20)
 	importBodyLimit = int64(4 << 20)
+
+	// catalogRepositoryLimit bounds the code-repository registry embedded in the
+	// GET /api/resources/catalog response.
+	catalogRepositoryLimit = 1000
 )
 
 // Service is the application surface the resource handlers need.
 type Service interface {
-	Catalog(ctx context.Context) ([]resourceapp.SUTView, error)
+	Catalog(ctx context.Context) ([]resourceapp.EnvironmentView, error)
 
-	CreateSUT(ctx context.Context, input resourceapp.SUTInput, actorID int64) (resourceapp.SUTView, error)
+	CreateEnvironment(ctx context.Context, input resourceapp.EnvironmentInput, actorID int64) (resourceapp.EnvironmentView, error)
+	UpdateEnvironment(ctx context.Context, id int64, patch resourceapp.EnvironmentPatch, actorID int64) (resourceapp.EnvironmentView, error)
+	DeleteEnvironment(ctx context.Context, id int64, actorID int64) error
+	ListEnvironments(ctx context.Context, limit int, beforeID *int64) ([]resourceapp.EnvironmentView, bool, error)
+	GetEnvironment(ctx context.Context, id int64) (resourceapp.EnvironmentView, error)
+	ListSUTsByEnvironment(ctx context.Context, environmentID int64) ([]resourceapp.SUTView, error)
+
+	CreateSUT(ctx context.Context, environmentID int64, input resourceapp.SUTInput, actorID int64) (resourceapp.SUTView, error)
 	UpdateSUT(ctx context.Context, id int64, patch resourceapp.SUTPatch, actorID int64) (resourceapp.SUTView, error)
+	// RejectSUT is the admin post-hoc audit/reject entry (v0.2.4-F R-B4/R-F1, SC-F4):
+	// a proposed or auto-approved SUT → rejected.
+	RejectSUT(ctx context.Context, id int64, actorID int64) (resourceapp.SUTView, error)
 	DeleteSUT(ctx context.Context, id int64, actorID int64) error
 	ListSUTs(ctx context.Context, limit int, beforeID *int64) ([]resourceapp.SUTView, bool, error)
 	GetSUT(ctx context.Context, id int64) (resourceapp.SUTView, error)
+	// ListSUTRegistrations returns one SUT's append-only registration facts
+	// (v0.2.4-B R-B4), the production read path for sut_registration.
+	ListSUTRegistrations(ctx context.Context, sutID int64) ([]resourceapp.SUTRegistrationView, error)
 
-	CreateEnvironment(ctx context.Context, sutID int64, input resourceapp.EnvironmentInput, actorID int64) (resourceapp.EnvironmentView, error)
-	UpdateEnvironment(ctx context.Context, id int64, patch resourceapp.EnvironmentPatch, actorID int64) (resourceapp.EnvironmentView, error)
-	DeleteEnvironment(ctx context.Context, id int64, actorID int64) error
-	ListEnvironments(ctx context.Context, sutID int64) ([]resourceapp.EnvironmentView, error)
-
-	CreatePage(ctx context.Context, environmentID int64, input resourceapp.PageInput, actorID int64) (resourceapp.PageView, error)
+	CreatePage(ctx context.Context, sutID int64, input resourceapp.PageInput, actorID int64) (resourceapp.PageView, error)
 	UpdatePage(ctx context.Context, id int64, patch resourceapp.PagePatch, actorID int64) (resourceapp.PageView, error)
 	DeletePage(ctx context.Context, id int64, actorID int64) error
-	ListPages(ctx context.Context, environmentID int64) ([]resourceapp.PageView, error)
-	ImportPages(ctx context.Context, environmentID int64, items []resourceapp.PageInput, actorID int64) (resourceapp.ImportPagesResult, error)
+	ListPages(ctx context.Context, sutID int64) ([]resourceapp.PageView, error)
+	ImportPages(ctx context.Context, sutID int64, items []resourceapp.PageInput, actorID int64) (resourceapp.ImportPagesResult, error)
 
-	CreateAPI(ctx context.Context, environmentID int64, input resourceapp.APIInput, actorID int64) (resourceapp.APIView, error)
+	CreateAPI(ctx context.Context, sutID int64, input resourceapp.APIInput, actorID int64) (resourceapp.APIView, error)
 	UpdateAPI(ctx context.Context, id int64, patch resourceapp.APIPatch, actorID int64) (resourceapp.APIView, error)
 	DeleteAPI(ctx context.Context, id int64, actorID int64) error
-	ListAPIs(ctx context.Context, environmentID int64) ([]resourceapp.APIView, error)
-	ImportAPIs(ctx context.Context, environmentID int64, items []resourceapp.APIInput, actorID int64) (resourceapp.ImportAPIsResult, error)
+	ListAPIs(ctx context.Context, sutID int64) ([]resourceapp.APIView, error)
+	ImportAPIs(ctx context.Context, sutID int64, items []resourceapp.APIInput, actorID int64) (resourceapp.ImportAPIsResult, error)
 
 	CreateDatabase(ctx context.Context, sutID int64, input resourceapp.DatabaseInput, actorID int64) (resourceapp.DatabaseView, error)
 	UpdateDatabase(ctx context.Context, id int64, patch resourceapp.DatabasePatch, actorID int64) (resourceapp.DatabaseView, error)
 	DeleteDatabase(ctx context.Context, id int64, actorID int64) error
 	ListDatabases(ctx context.Context, sutID int64) ([]resourceapp.DatabaseView, error)
 
-	CreateAccount(ctx context.Context, sutID int64, input resourceapp.AccountInput, actorID int64) (resourceapp.AccountView, error)
+	CreateAccount(ctx context.Context, input resourceapp.AccountInput, actorID int64) (resourceapp.AccountView, error)
 	UpdateAccount(ctx context.Context, id int64, patch resourceapp.AccountPatch, actorID int64) (resourceapp.AccountView, error)
 	DeleteAccount(ctx context.Context, id int64, actorID int64) error
-	ListAccounts(ctx context.Context, sutID int64) ([]resourceapp.AccountView, error)
+	ListAccounts(ctx context.Context) ([]resourceapp.AccountView, error)
 
 	CreateRepository(ctx context.Context, input resourceapp.RepositoryInput, actorID int64) (resourceapp.CodeRepositoryView, error)
 	UpdateRepository(ctx context.Context, id int64, patch resourceapp.RepositoryPatch, actorID int64) (resourceapp.CodeRepositoryView, error)
@@ -99,6 +126,19 @@ func bodyID(field, raw string) (int64, error) {
 	return validation.NonEmptyID(field, raw)
 }
 
+// optionalBodyID parses an optional decimal ID: a blank value is nil, a
+// malformed one is a field-level 400.
+func optionalBodyID(field, raw string) (*int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	id, err := validation.NonEmptyID(field, raw)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
+}
+
 func actorID(r *http.Request) (int64, error) {
 	actor, ok := platform.ActorFrom(r.Context())
 	if !ok || actor.ID <= 0 {
@@ -117,36 +157,185 @@ func writeList[T any](w http.ResponseWriter, items []T, hasMore bool, lastID fun
 
 // ---------- catalog ----------
 
-// Catalog GET /api/resources/catalog.
+// Catalog GET /api/resources/catalog: the whole inverted tree (environments
+// with their SUTs and assets), the global code-repository registry and the
+// global test-account pool.
 func (h *Handler) Catalog(w http.ResponseWriter, r *http.Request) {
 	views, err := h.svc.Catalog(r.Context())
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	repositories, _, err := h.svc.ListRepositories(r.Context(), 1000, nil)
+	// The catalog is the whole-registry read the resource UI boots from, so it
+	// fetches beyond the paginated list cap (the previous behaviour); the
+	// per-page /api/resources/code-repos route keeps the capped cursor.
+	repositories, _, err := h.svc.ListRepositories(r.Context(), catalogRepositoryLimit, nil)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	suts := make([]sutDTO, 0, len(views))
+	accounts, err := h.svc.ListAccounts(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	environments := make([]environmentDTO, 0, len(views))
 	for _, view := range views {
-		suts = append(suts, toSUTDTO(view))
+		environments = append(environments, toEnvironmentDTO(view))
 	}
 	repos := make([]codeRepositoryDTO, 0, len(repositories))
 	for _, view := range repositories {
 		repos = append(repos, toCodeRepositoryDTO(view))
 	}
+	accountDTOs := make([]accountDTO, 0, len(accounts))
+	for _, view := range accounts {
+		accountDTOs = append(accountDTOs, toAccountDTO(view))
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
-		"suts":         suts,
+		"environments": environments,
 		"repositories": repos,
+		"accounts":     accountDTOs,
 	})
 }
 
-// ---------- SUT ----------
+// ---------- environments ----------
 
-// CreateSUT POST /api/resources/suts.
+// CreateEnvironment POST /api/resources/environments.
+func (h *Handler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
+	actor, err := actorID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var body environmentCreateRequest
+	if err := decodeJSON(w, r, &body, bodyLimit); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.CreateEnvironment(r.Context(), resourceapp.EnvironmentInput{
+		Name: body.Name, Description: body.Description, Status: body.Status,
+	}, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, toEnvironmentDTO(view))
+}
+
+// ListEnvironments GET /api/resources/environments.
+func (h *Handler) ListEnvironments(w http.ResponseWriter, r *http.Request) {
+	limit := pagination.Limit(r.URL.Query().Get("limit"), pagination.DefaultLimit, pagination.MaxLimit)
+	cursor, err := pagination.Cursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		httpx.Error(w, r, platform.Invalid("cursor", "cursor must be a decimal ID"))
+		return
+	}
+	var beforeID *int64
+	if cursor > 0 {
+		beforeID = &cursor
+	}
+	views, hasMore, err := h.svc.ListEnvironments(r.Context(), limit, beforeID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]environmentDTO, 0, len(views))
+	for _, view := range views {
+		items = append(items, toEnvironmentDTO(view))
+	}
+	writeList(w, items, hasMore, func(item environmentDTO) string { return item.ID })
+}
+
+// GetEnvironment GET /api/resources/environments/{id}: the environment with its
+// whole SUT catalog nested.
+func (h *Handler) GetEnvironment(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.GetEnvironment(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toEnvironmentDTO(view))
+}
+
+// UpdateEnvironment PATCH /api/resources/environments/{id}.
+func (h *Handler) UpdateEnvironment(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	actor, err := actorID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var body environmentPatchRequest
+	if err := decodeJSON(w, r, &body, bodyLimit); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.UpdateEnvironment(r.Context(), id, resourceapp.EnvironmentPatch{
+		Name: body.Name, Description: body.Description, Status: body.Status,
+	}, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toEnvironmentDTO(view))
+}
+
+// DeleteEnvironment DELETE /api/resources/environments/{id}.
+func (h *Handler) DeleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	actor, err := actorID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if err := h.svc.DeleteEnvironment(r.Context(), id, actor); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListEnvironmentSUTs GET /api/resources/environments/{id}/suts.
+func (h *Handler) ListEnvironmentSUTs(w http.ResponseWriter, r *http.Request) {
+	environmentID, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	views, err := h.svc.ListSUTsByEnvironment(r.Context(), environmentID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]sutDTO, 0, len(views))
+	for _, view := range views {
+		items = append(items, toSUTDTO(view))
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
+// ---------- SUTs ----------
+
+// CreateSUT POST /api/resources/environments/{id}/suts.
 func (h *Handler) CreateSUT(w http.ResponseWriter, r *http.Request) {
+	environmentID, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
 	actor, err := actorID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -157,8 +346,8 @@ func (h *Handler) CreateSUT(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.CreateSUT(r.Context(), resourceapp.SUTInput{
-		Name: body.Name, Intro: body.Intro, Family: body.Family,
+	view, err := h.svc.CreateSUT(r.Context(), environmentID, resourceapp.SUTInput{
+		Name: body.Name, Intro: body.Intro, BaseURL: body.BaseURL, Family: body.Family,
 	}, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -206,6 +395,28 @@ func (h *Handler) GetSUT(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toSUTDTO(view))
 }
 
+// ListSUTRegistrations GET /api/resources/suts/{id}/registrations: the SUT's
+// append-only registration facts in time order (v0.2.4-B R-B4). This is the
+// production read path for sut_registration — the admin audit trail of how the
+// SUT was registered.
+func (h *Handler) ListSUTRegistrations(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	views, err := h.svc.ListSUTRegistrations(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	items := make([]sutRegistrationDTO, 0, len(views))
+	for _, view := range views {
+		items = append(items, toSUTRegistrationDTO(view))
+	}
+	httpx.JSON(w, http.StatusOK, items)
+}
+
 // UpdateSUT PATCH /api/resources/suts/{id}.
 func (h *Handler) UpdateSUT(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
@@ -224,7 +435,7 @@ func (h *Handler) UpdateSUT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view, err := h.svc.UpdateSUT(r.Context(), id, resourceapp.SUTPatch{
-		Name: body.Name, Intro: body.Intro, Family: body.Family,
+		Name: body.Name, Intro: body.Intro, BaseURL: body.BaseURL, Family: body.Family,
 	}, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -252,105 +463,33 @@ func (h *Handler) DeleteSUT(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---------- environments ----------
-
-// CreateEnvironment POST /api/resources/suts/{id}/environments.
-func (h *Handler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
-	sutID, err := pathID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
+// RejectSUT POST /api/resources/suts/{id}/reject: the admin post-hoc audit/reject
+// entry (v0.2.4-F R-B4/R-F1, SC-F4). The Agent auto-approves a new SUT on evidence;
+// an admin can reject it afterwards, or reject a proposed SUT the gate did not
+// approve. proposed/approved → rejected; a rejected SUT is terminal (409).
+func (h *Handler) RejectSUT(w http.ResponseWriter, r *http.Request) {
+	actor, ok := requireAdmin(w, r)
+	if !ok {
 		return
 	}
-	actor, err := actorID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	var body environmentCreateRequest
-	if err := decodeJSON(w, r, &body, bodyLimit); err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	view, err := h.svc.CreateEnvironment(r.Context(), sutID, resourceapp.EnvironmentInput{
-		Name: body.Name, BaseURL: body.BaseURL, IsDefault: body.IsDefault, Status: body.Status,
-	}, actor)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	httpx.JSON(w, http.StatusCreated, toEnvironmentDTO(view))
-}
-
-// ListEnvironments GET /api/resources/suts/{id}/environments.
-func (h *Handler) ListEnvironments(w http.ResponseWriter, r *http.Request) {
-	sutID, err := pathID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	views, err := h.svc.ListEnvironments(r.Context(), sutID)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	items := make([]environmentDTO, 0, len(views))
-	for _, view := range views {
-		items = append(items, toEnvironmentDTO(view))
-	}
-	httpx.JSON(w, http.StatusOK, items)
-}
-
-// UpdateEnvironment PATCH /api/resources/environments/{id}.
-func (h *Handler) UpdateEnvironment(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	actor, err := actorID(r)
+	view, err := h.svc.RejectSUT(r.Context(), id, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	var body environmentPatchRequest
-	if err := decodeJSON(w, r, &body, bodyLimit); err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	view, err := h.svc.UpdateEnvironment(r.Context(), id, resourceapp.EnvironmentPatch{
-		Name: body.Name, BaseURL: body.BaseURL, IsDefault: body.IsDefault, Status: body.Status,
-	}, actor)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, toEnvironmentDTO(view))
-}
-
-// DeleteEnvironment DELETE /api/resources/environments/{id}.
-func (h *Handler) DeleteEnvironment(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	actor, err := actorID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	if err := h.svc.DeleteEnvironment(r.Context(), id, actor); err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	httpx.JSON(w, http.StatusOK, toSUTDTO(view))
 }
 
 // ---------- pages ----------
 
-// CreatePage POST /api/resources/environments/{id}/pages.
+// CreatePage POST /api/resources/suts/{id}/pages.
 func (h *Handler) CreatePage(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -365,7 +504,7 @@ func (h *Handler) CreatePage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.CreatePage(r.Context(), environmentID, toPageInput(body), actor)
+	view, err := h.svc.CreatePage(r.Context(), sutID, toPageInput(body), actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -373,14 +512,14 @@ func (h *Handler) CreatePage(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, toPageDTO(view))
 }
 
-// ListPages GET /api/resources/environments/{id}/pages.
+// ListPages GET /api/resources/suts/{id}/pages.
 func (h *Handler) ListPages(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	views, err := h.svc.ListPages(r.Context(), environmentID)
+	views, err := h.svc.ListPages(r.Context(), sutID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -392,9 +531,9 @@ func (h *Handler) ListPages(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, items)
 }
 
-// ImportPages POST /api/resources/environments/{id}/pages/import.
+// ImportPages POST /api/resources/suts/{id}/pages/import.
 func (h *Handler) ImportPages(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -413,7 +552,7 @@ func (h *Handler) ImportPages(w http.ResponseWriter, r *http.Request) {
 	for _, item := range body.Items {
 		items = append(items, toPageInput(item))
 	}
-	result, err := h.svc.ImportPages(r.Context(), environmentID, items, actor)
+	result, err := h.svc.ImportPages(r.Context(), sutID, items, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -481,9 +620,9 @@ func toPageInput(body pageCreateRequest) resourceapp.PageInput {
 
 // ---------- APIs ----------
 
-// CreateAPI POST /api/resources/environments/{id}/apis.
+// CreateAPI POST /api/resources/suts/{id}/apis.
 func (h *Handler) CreateAPI(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -498,7 +637,7 @@ func (h *Handler) CreateAPI(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.CreateAPI(r.Context(), environmentID, toAPIInput(body), actor)
+	view, err := h.svc.CreateAPI(r.Context(), sutID, toAPIInput(body), actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -506,14 +645,14 @@ func (h *Handler) CreateAPI(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, toAPIDTO(view))
 }
 
-// ListAPIs GET /api/resources/environments/{id}/apis.
+// ListAPIs GET /api/resources/suts/{id}/apis.
 func (h *Handler) ListAPIs(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	views, err := h.svc.ListAPIs(r.Context(), environmentID)
+	views, err := h.svc.ListAPIs(r.Context(), sutID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -525,9 +664,9 @@ func (h *Handler) ListAPIs(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, items)
 }
 
-// ImportAPIs POST /api/resources/environments/{id}/apis/import.
+// ImportAPIs POST /api/resources/suts/{id}/apis/import.
 func (h *Handler) ImportAPIs(w http.ResponseWriter, r *http.Request) {
-	environmentID, err := pathID(r)
+	sutID, err := pathID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -546,7 +685,7 @@ func (h *Handler) ImportAPIs(w http.ResponseWriter, r *http.Request) {
 	for _, item := range body.Items {
 		items = append(items, toAPIInput(item))
 	}
-	result, err := h.svc.ImportAPIs(r.Context(), environmentID, items, actor)
+	result, err := h.svc.ImportAPIs(r.Context(), sutID, items, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -735,13 +874,8 @@ func (h *Handler) CreateDatabase(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	environmentID, err := bodyID("environment_id", body.EnvironmentID)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
 	view, err := h.svc.CreateDatabase(r.Context(), sutID, resourceapp.DatabaseInput{
-		EnvironmentID: environmentID, Name: body.Name, DSN: body.DSN,
+		Name: body.Name, DSN: body.DSN,
 		Username: body.Username, Password: body.Password,
 		ReadOnly: body.ReadOnly, Status: body.Status,
 	}, actor)
@@ -789,8 +923,8 @@ func (h *Handler) UpdateDatabase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view, err := h.svc.UpdateDatabase(r.Context(), id, resourceapp.DatabasePatch{
-		Name: body.Name, DSN: body.DSN, Username: body.Username, Password: body.Password,
-		ReadOnly: body.ReadOnly, Status: body.Status,
+		Name: body.Name, DSN: body.DSN, Username: body.Username,
+		Password: body.Password, ReadOnly: body.ReadOnly, Status: body.Status,
 	}, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -818,15 +952,11 @@ func (h *Handler) DeleteDatabase(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---------- test accounts ----------
+// ---------- test accounts (global pool) ----------
 
-// CreateAccount POST /api/resources/suts/{id}/accounts.
+// CreateAccount POST /api/resources/accounts. sut_id is the optional affinity
+// hint of the global pool (v0.2.4-B); it is never required.
 func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
-	sutID, err := pathID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
 	actor, err := actorID(r)
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -837,13 +967,13 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	environmentID, err := bodyID("environment_id", body.EnvironmentID)
+	sutID, err := optionalBodyID("sut_id", body.SUTID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.CreateAccount(r.Context(), sutID, resourceapp.AccountInput{
-		EnvironmentID: environmentID, Username: body.Username, Password: body.Password,
+	view, err := h.svc.CreateAccount(r.Context(), resourceapp.AccountInput{
+		SUTID: sutID, Username: body.Username, Password: body.Password,
 		Roles: body.Roles, Notes: body.Notes, Status: body.Status,
 	}, actor)
 	if err != nil {
@@ -853,14 +983,9 @@ func (h *Handler) CreateAccount(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusCreated, toAccountDTO(view))
 }
 
-// ListAccounts GET /api/resources/suts/{id}/accounts.
+// ListAccounts GET /api/resources/accounts: the whole global pool.
 func (h *Handler) ListAccounts(w http.ResponseWriter, r *http.Request) {
-	sutID, err := pathID(r)
-	if err != nil {
-		httpx.Error(w, r, err)
-		return
-	}
-	views, err := h.svc.ListAccounts(r.Context(), sutID)
+	views, err := h.svc.ListAccounts(r.Context())
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -889,10 +1014,19 @@ func (h *Handler) UpdateAccount(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.UpdateAccount(r.Context(), id, resourceapp.AccountPatch{
-		Username: body.Username, Password: body.Password, Roles: body.Roles,
-		Notes: body.Notes, Status: body.Status,
-	}, actor)
+	patch := resourceapp.AccountPatch{
+		Username: body.Username, Password: body.Password,
+		Roles: body.Roles, Notes: body.Notes, Status: body.Status,
+	}
+	if body.SUTID != nil {
+		sutID, err := optionalBodyID("sut_id", *body.SUTID)
+		if err != nil {
+			httpx.Error(w, r, err)
+			return
+		}
+		patch.SUTID = sutID
+	}
+	view, err := h.svc.UpdateAccount(r.Context(), id, patch, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

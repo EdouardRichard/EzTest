@@ -103,7 +103,7 @@ export function VersionsPage() {
           </p>
           <h1 className="mt-1 text-xl font-semibold text-foreground">版本</h1>
           <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-            以版本为单位组织单个 SUT 环境的测试范围；每个版本绑定一个环境（SUT
+            以版本为单位组织测试范围；每个版本绑定一个环境（环境内的 SUT
             由环境推导），创建后进入版本工作区。
           </p>
         </div>

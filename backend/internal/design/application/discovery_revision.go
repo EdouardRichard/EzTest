@@ -10,27 +10,44 @@ package designapp
 //
 //	observation -> case_run -> case_version -> case_source(requirement)
 //
-// The deterministic Critic is the six-predicate subset of R-EX-6:
+// The deterministic Critic is the predicate subset of R-EX-6 that survives the
+// v0.2.4-B natural-language case contract:
 //  1. the discovered page/API is approved;
 //  2. the requirement is current + clarified;
 //  3. at least one supporting observation/evidence row exists;
-//  4. no confirmed case of the requirement already has the same target and
-//     content hash;
-//  5. the draft has at least one step and one assertion;
-//  6. the target page/API is inside the version scope.
+//  4. no confirmed case of the requirement already has the same content hash
+//     and the same sut_description/target_description;
+//  5. the draft has at least one step and one assertion.
 //
-// Only when every predicate passes is the draft auto-confirmed; a low-confidence
-// result (fewer than two evidence rows or no requirement link) stays a human
-// draft. The current wave is never mutated: a discovery revision only becomes
-// executable in the next wave, which reads current+confirmed cases.
+// The sixth predicate -- "the target page/API is inside the version scope" -- is
+// DELETED (Lead ruling 7). A version binds an environment and a case describes
+// its target in prose, so there is no resource scope left for a discovered id to
+// be inside or outside of. What replaces it as the gate on "may this become a
+// case at all" is the §5.2 contract itself: the draft must be able to state a
+// sut_description and name at least one acceptance criterion it covers, and both
+// are inherited from traceable sources (the requirement, and the case version
+// whose execution produced the observation). When either is missing the pass
+// fails CLOSED to a low-confidence draft rather than fabricating coverage.
 //
-// Rollback keeps the original revision as history (`superseded`) and inserts a
-// replacement revision with `trigger='rollback'` and `rollback_of=<original>`;
-// no case_revision table is introduced (spec DB-28). The replacement is copied
-// from the previous confirmed revision of the same case; when the additive case
-// has no earlier confirmed revision (it is a brand-new case), the replacement
-// re-freezes the same content so the rollback still yields one confirmed
-// revision and the original remains auditable history.
+// R-E2r (owner 2026-11-18) ABOLISHED discovery auto-confirm: when every predicate
+// passes the result is a DRAFT (low_confidence_reason=judgment_pending), never a
+// confirmation. The draft enters the normal judge scheduling and a human confirms
+// it after review; Confirm is the only terminal entry. A low-confidence result
+// (fewer than two evidence rows, no requirement link, or a missing contract
+// element) stays a draft with its own reason. The current wave is never mutated:
+// a discovery revision only becomes executable in a later wave after a human
+// confirms it (waves read current+confirmed cases).
+//
+// Rollback is legacy-only after the abolition: it keeps the original
+// system-auto-confirmed revision as history (`superseded`) and inserts a DRAFT
+// replacement with `trigger='rollback'` and `rollback_of=<original>`; no
+// case_revision table is introduced (spec DB-28). The replacement is copied from
+// the previous confirmed revision of the same case (or the original itself when
+// the additive case was brand-new) and awaits judge review + human confirm — it
+// is never written confirmed, never carries a system auto-confirm actor and never
+// bypasses Confirm. rollbackableCaseVersion still requires the ORIGINAL to be a
+// pre-E system-auto-confirmed discovery_delta revision; no new such revisions are
+// produced, so Rollback only ever serves historical data (retirement planned 0.3).
 
 import (
 	"context"
@@ -47,6 +64,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // DiscoveryProvenance is the design context's read projection of the execution
@@ -61,13 +79,26 @@ type DiscoveryProvenance struct {
 	CaseVersionID        int64
 	RequirementID        int64
 	RequirementVersionID int64
-	VersionSUTID         int64
+	// SUTID is the SUT the observation was made against. It was named
+	// VersionSUTID while the column held a version_sut binding-row id; T11
+	// renamed execution_discovery_observation.version_sut_id to sut_id, and the
+	// value has been a SUT id since W2, so the field follows (same rename T6+T7
+	// applied to versionapp.DiscoveryObservation).
+	SUTID int64
 	// FactID is the version_fact recorded by the discovery delta for the new
 	// resource; the additive draft keeps it as a knowledge source.
 	FactID int64
 	// EvidenceRows counts the evidence rows recorded for the observation's
 	// case_run. R-EX-6 low confidence is evidence < 2.
 	EvidenceRows int
+	// CoveredACs is the covered_acs of the case version whose execution produced
+	// the observation. v0.2.4-B (§5.2) requires every case to name the
+	// acceptance criteria it covers, and an additive discovery draft cannot
+	// invent that: it inherits the set of the case it extends, which is exactly
+	// the traceable answer ("this new target was found while covering these
+	// criteria"). Empty means the executed revision predates the contract or was
+	// written outside the proposal gate, and the pass then fails closed.
+	CoveredACs []string
 }
 
 // DiscoveryApprovedResource is the catalog projection the Critic checks first.
@@ -89,14 +120,23 @@ type DiscoveryRevisionStore interface {
 	ReadProvenanceByObservation(ctx context.Context, versionID, observationID int64) (DiscoveryProvenance, error)
 	ApprovedResource(ctx context.Context, resourceID int64, kind string) (DiscoveryApprovedResource, bool, error)
 	// FindConfirmedCaseByContent is Critic predicate ④: no already-confirmed
-	// case of the requirement has the same target and content hash.
-	FindConfirmedCaseByContent(ctx context.Context, versionID, requirementID int64, contentHash string, pageID, apiID int64) (int64, bool, error)
+	// case of the requirement has the same content.
+	//
+	// v0.2.4-B (Lead ruling 7): the duplicate test is a CONTENT key, not a
+	// resource key. It used to match cv.page_ids/api_ids @> the discovered id;
+	// those columns are gone, so it now matches content_hash plus the two
+	// natural-language fields that identify what the case tests --
+	// sut_description and the first step's target_description. Two drafts about
+	// the same target in the same system hash the same and are duplicates; the
+	// same content aimed at a different described system is not.
+	FindConfirmedCaseByContent(ctx context.Context, versionID, requirementID int64, contentHash, sutDescription, targetDescription string) (int64, bool, error)
 }
 
 // DiscoveryRevisionView is the service result of one resource-confirmed pass or
-// one rollback. Status is the resulting case version status (confirmed or
-// draft); zero IDs mean no draft could be attached (no requirement link / the
-// target is out of the version scope).
+// one rollback. After R-E2r both paths produce a draft (Status=draft); a
+// confirmed Status only appears when an idempotent replay returns a pre-E legacy
+// revision. Zero IDs mean no draft could be attached (no requirement link / a
+// missing contract element).
 type DiscoveryRevisionView struct {
 	CaseID              int64
 	CaseVersionID       int64
@@ -106,16 +146,24 @@ type DiscoveryRevisionView struct {
 	SourceObservationID int64
 	RollbackOf          int64
 	Revision            int
-	// LowConfidenceReason names the predicate that kept the revision as a
-	// draft (or prevented creating one): missing_requirement,
-	// resource_not_approved, requirement_not_current, target_out_of_scope,
-	// requirement_not_clarified, insufficient_evidence, duplicate_target,
-	// incomplete_content.
+	// LowConfidenceReason names why the revision is a draft: judgment_pending
+	// (every predicate passed — the draft awaits the independent judge then a
+	// human, R-E2r), or a predicate that kept it low-confidence / prevented
+	// creating one: missing_requirement, resource_not_approved,
+	// requirement_not_current, target_out_of_scope (a non page/api observation
+	// kind), requirement_not_clarified, insufficient_evidence, duplicate_target,
+	// incomplete_content, missing_sut_description, missing_covered_acs.
+	//
+	// The last two are v0.2.4-B additions: the §5.2 case contract requires a
+	// sut_description and at least one covered AC, and when the requirement or
+	// the executed case version cannot supply one the pass refuses to invent
+	// it. They replace the deleted "target inside the version scope" predicate
+	// as the fail-closed gate on turning an approval into a case.
 	LowConfidenceReason string
 }
 
-// CaseVersionRollbackView is the rollback API result: the replacement revision
-// and the auto-confirmed revision it replaces.
+// CaseVersionRollbackView is the rollback API result: the draft replacement
+// revision and the legacy auto-confirmed revision it replaces (R-E2r).
 type CaseVersionRollbackView struct {
 	CaseID         int64
 	CaseVersionID  int64
@@ -126,7 +174,9 @@ type CaseVersionRollbackView struct {
 }
 
 // discoveryRevisionEvidenceThreshold is R-EX-6's low-confidence evidence floor:
-// an auto-confirmation needs at least two evidence rows.
+// a discovery draft needs at least two evidence rows to reach judgment_pending;
+// fewer stays insufficient_evidence. R-E2r abolished the auto-confirm this floor
+// used to gate, but the evidence predicate itself is retained.
 const discoveryRevisionEvidenceThreshold = 2
 
 // discoveryRevisionTimeout bounds the detached observer work so a stalled
@@ -200,7 +250,7 @@ func (s *GraphService) OnResourceConfirmed(ctx context.Context, versionID, resou
 		}
 		return DiscoveryRevisionView{}, mapDesignError(err, "requirement")
 	}
-	if requirement.Status != "clarified" {
+	if requirement.Status != string(version.RequirementClarified) {
 		return lowConfidenceDraft(resourceID, observationID, "requirement_not_clarified"), nil
 	}
 	if requirement.CurrentVersionID <= 0 {
@@ -210,23 +260,24 @@ func (s *GraphService) OnResourceConfirmed(ctx context.Context, versionID, resou
 		return lowConfidenceDraft(resourceID, observationID, "requirement_not_current"), nil
 	}
 
-	// Critic ⑥: the target must be inside the current version scope. The map is
-	// exactly the approved-and-not-excluded resource set of the version.
-	versionContext, err := s.repo.VersionContext(ctx, versionID)
-	if err != nil {
-		return DiscoveryRevisionView{}, mapDesignError(err, "version")
+	// Critic ⑥ ("the target is inside the version scope") is DELETED here
+	// (Lead ruling 7): a version binds an environment and a case describes its
+	// target in prose, so there is no resource scope for a discovered id to be
+	// checked against. VersionContext is no longer read on this path at all.
+	//
+	// What replaces it is the §5.2 contract synthesis below, which fails closed:
+	// the draft must be able to state the system under test and name at least one
+	// acceptance criterion it covers, both inherited from traceable sources.
+	sutDescription := strings.TrimSpace(requirement.SutDescription)
+	if sutDescription == "" {
+		return lowConfidenceDraft(resourceID, observationID, "missing_sut_description"), nil
 	}
-	versionSUTID := int64(0)
-	if kind == "page" {
-		versionSUTID = versionContext.PageToSUT[resourceID]
-	} else {
-		versionSUTID = versionContext.APIToSUT[resourceID]
-	}
-	if versionSUTID <= 0 {
-		return lowConfidenceDraft(resourceID, observationID, "target_out_of_scope"), nil
+	coveredACs := design.NormalizeACIDSet(provenance.CoveredACs)
+	if len(coveredACs) == 0 {
+		return lowConfidenceDraft(resourceID, observationID, "missing_covered_acs"), nil
 	}
 
-	draft := discoveryAugmentedDraft(provenance, resourceID, approved, requirement, versionSUTID, observationID)
+	draft := discoveryAugmentedDraft(provenance, resourceID, approved, requirement, sutDescription, coveredACs, observationID)
 	created, err := s.CreateAugmentedDraftCase(ctx, versionID, draft)
 	if err != nil {
 		// A confirmed same-title case (the Task 106 freeze) is a duplicate
@@ -247,15 +298,10 @@ func (s *GraphService) OnResourceConfirmed(ctx context.Context, versionID, resou
 	}
 
 	// Critic ④: no confirmed case of the requirement already covers the same
-	// target with the same content.
-	pageID, apiID := int64(0), int64(0)
-	if kind == "page" {
-		pageID = resourceID
-	} else {
-		apiID = resourceID
-	}
+	// content. The key is the content identity (ruling 7), not a resource id.
 	duplicate, found, err := s.revisionStore.FindConfirmedCaseByContent(
-		ctx, versionID, requirementID, data.Selected.ContentHash, pageID, apiID)
+		ctx, versionID, requirementID, data.Selected.ContentHash,
+		data.Selected.SutDescription, firstStepTargetDescription(data.Selected))
 	if err != nil {
 		return DiscoveryRevisionView{}, err
 	}
@@ -269,38 +315,21 @@ func (s *GraphService) OnResourceConfirmed(ctx context.Context, versionID, resou
 		return discoveryDraftView(data.Selected, "insufficient_evidence"), nil
 	}
 
-	observationRef := observationID
-	confirmResult, err := s.Confirm(ctx, versionID, ConfirmInput{
-		Scope:               design.ConfirmScopeCase,
-		TargetID:            created.CaseID,
-		AutoConfirmed:       true,
-		AutoConfirmedBy:     design.AutoConfirmationActor,
-		Trigger:             design.CaseTriggerDiscoveryDelta,
-		SourceObservationID: &observationRef,
-	}, 0)
-	if err != nil {
-		return DiscoveryRevisionView{}, err
-	}
-	if len(confirmResult.Confirmed) == 0 {
-		return DiscoveryRevisionView{}, platform.NewError(http.StatusConflict, "case_not_confirmed",
-			"the additive discovery case could not be confirmed")
-	}
-	view := DiscoveryRevisionView{
-		CaseID:              created.CaseID,
-		CaseVersionID:       created.CaseVersionID,
-		Status:              design.CaseStatusConfirmed,
-		Trigger:             design.CaseTriggerDiscoveryDelta,
-		ResourceID:          resourceID,
-		SourceObservationID: observationID,
-		Revision:            data.Selected.Revision,
-	}
-	s.publishDiscoveryRevisionEvent(ctx, versionID, requirementID, view, "high", design.AutoConfirmationActor, 0)
-	return view, nil
+	// R-E2r (owner 2026-11-18): discovery auto-confirm is formally abolished.
+	// Every predicate passing now yields a DRAFT, never a confirmation: the
+	// draft enters the normal judge scheduling (ensureJudgeTasks covers any
+	// current draft, discovery or author) and a human confirms it after review.
+	// Confirm stays the only terminal entry — this path writes no confirmation
+	// row, records no system actor and emits no auto-confirm event. The draft is
+	// already persisted by CreateAugmentedDraftCase above; judgment_pending names
+	// the next step (independent judge, then human), not a predicate failure.
+	return discoveryDraftView(data.Selected, "judgment_pending"), nil
 }
 
-// Rollback supersedes one auto-confirmed discovery revision and creates a
-// replacement revision. It is idempotent: repeating the rollback returns the
-// existing replacement.
+// Rollback supersedes one legacy system-auto-confirmed discovery revision and
+// creates a DRAFT replacement (trigger=rollback) that awaits judge review + human
+// confirm (R-E2r). It is idempotent: repeating the rollback returns the existing
+// replacement. It never writes a confirmation row and never bypasses Confirm.
 func (s *GraphService) Rollback(ctx context.Context, versionID, caseVersionID int64, reason string, actorID int64) (DiscoveryRevisionView, error) {
 	if err := requirePositiveID("version_id", versionID); err != nil {
 		return DiscoveryRevisionView{}, err
@@ -376,37 +405,12 @@ func (s *GraphService) Rollback(ctx context.Context, versionID, caseVersionID in
 		if err := tx.SupersedeCaseVersion(ctx, locked.ID, now); err != nil {
 			return err
 		}
-		if err := tx.SetCurrentVersion(ctx, caseID, stored.ID, design.CaseStatusConfirmed, now); err != nil {
-			return err
-		}
-		batchID, err := design.NewBatchID()
-		if err != nil {
-			return err
-		}
-		observation := locked.SourceObservationID
-		if err := tx.InsertConfirmation(ctx, design.Confirmation{
-			ID:                     s.ids.Next(),
-			CaseVersionID:          stored.ID,
-			Scope:                  design.ConfirmScopeCase,
-			TargetScopeID:          caseID,
-			BatchID:                batchID,
-			// The confirmation freezes the replacement, exactly like the normal
-			// Confirm path lists the versions it confirms. The rolled-back
-			// original is recorded in the snapshot (rollback_of) and was already
-			// superseded, not confirmed by this batch.
-			AffectedCaseVersionIDs: []string{platformid.Format(stored.ID)},
-			Snapshot: map[string]any{
-				"trigger":     design.CaseTriggerRollback,
-				"rollback_of": platformid.Format(locked.ID),
-				"reason":      strings.TrimSpace(reason),
-			},
-			ConfirmedBy:         0,
-			ConfirmedAt:         now,
-			AutoConfirmed:       true,
-			AutoConfirmedBy:     design.AutoConfirmationActor,
-			Trigger:             design.CaseTriggerRollback,
-			SourceObservationID: observation,
-		}); err != nil {
+		// R-E2r: the replacement is a DRAFT (trigger=rollback) awaiting judge
+		// review + human confirm. The case entity projects that draft; Confirm
+		// remains the only terminal entry, so the rollback writes no confirmation
+		// row and never freezes the replacement itself. The legacy original was
+		// superseded above (rollback intent = undo the old auto-confirm).
+		if err := tx.SetCurrentVersion(ctx, caseID, stored.ID, design.CaseStatusDraft, now); err != nil {
 			return err
 		}
 		replacement = stored
@@ -534,7 +538,7 @@ func (s *GraphService) ResourceConfirmedObserver(logger *slog.Logger) eventingap
 			seenVersions[provenance.VersionID] = true
 			if _, err := s.OnResourceConfirmed(writeCtx, provenance.VersionID, resourceID,
 				provenance.ObservationID, provenance.RequirementID); err != nil {
-				logger.WarnContext(writeCtx, "design discovery revision: auto-confirm failed",
+				logger.WarnContext(writeCtx, "design discovery revision: draft creation failed",
 					slog.String("type", event.Type),
 					slog.Int64("resource_id", resourceID),
 					slog.Int64("version_id", provenance.VersionID),
@@ -585,9 +589,15 @@ func lowConfidenceDraft(resourceID, observationID int64, reason string) Discover
 
 // discoveryAugmentedDraft builds the additive draft content for the approved
 // target. The title/steps are deterministic so a replay produces the same
-// natural key, and the target page/API is bound on the scenario, the case and
-// the step.
-func discoveryAugmentedDraft(provenance DiscoveryProvenance, resourceID int64, approved DiscoveryApprovedResource, requirement design.RequirementRef, versionSUTID, observationID int64) AugmentedCaseDraft {
+// natural key, and the discovered resource is bound as the step's
+// target_description plus a page/api provenance source.
+//
+// v0.2.4-B: sutDescription and coveredACs are supplied by the caller, which has
+// already failed closed when neither could be derived (see OnResourceConfirmed).
+// preconditions is the explicit "无" the §5.2 contract allows: a discovery smoke
+// case ("open the new page" / "call the new API") has no setup of its own to
+// declare, and saying so is information where a blank says nothing.
+func discoveryAugmentedDraft(provenance DiscoveryProvenance, resourceID int64, approved DiscoveryApprovedResource, requirement design.RequirementRef, sutDescription string, coveredACs []string, observationID int64) AugmentedCaseDraft {
 	label := strings.TrimSpace(approved.Label)
 	if label == "" {
 		label = strings.TrimSpace(approved.Template)
@@ -600,69 +610,89 @@ func discoveryAugmentedDraft(provenance DiscoveryProvenance, resourceID int64, a
 		action, expected, assertionKind, assertionExpected = "请求 "+label, "接口可调用", design.AssertionAPI, "响应成功"
 	}
 	title := truncateRunes("探索补用例："+label, design.CaseTitleMax)
-	step := AugmentedCaseDraftStep{
-		Seq: 1, Action: action, Expected: expected,
-		TargetVersionSUTID: &versionSUTID,
-	}
-	assertion := AugmentedCaseDraftAssertion{
-		StepSeq: 1, Kind: assertionKind, Target: label, Expected: assertionExpected,
-		TargetVersionSUTID: &versionSUTID,
-	}
-	draft := AugmentedCaseDraft{
+	return AugmentedCaseDraft{
 		RequirementID:        requirement.ID,
 		RequirementVersionID: requirement.CurrentVersionID,
-		VersionSUTID:         versionSUTID,
 		Title:                title,
 		Description:          "探索发现的新" + discoveryKindLabel(provenance.Kind) + "，自动生成的追加用例草案，等待确认",
+		SutDescription:       sutDescription,
+		Preconditions:        discoveryDraftNoPreconditions,
+		CoveredACs:           coveredACs,
 		Priority:             design.PriorityP2,
-		Steps:                []AugmentedCaseDraftStep{step},
-		Assertions:           []AugmentedCaseDraftAssertion{assertion},
-		SourceObservationID:  &observationID,
+		DiscoveryKind:        provenance.Kind,
+		DiscoveryID:          resourceID,
+		Steps: []AugmentedCaseDraftStep{{
+			Seq: 1, Action: action, Expected: expected, TargetDescription: label,
+		}},
+		Assertions: []AugmentedCaseDraftAssertion{{
+			StepSeq: 1, Kind: assertionKind, Target: label, Expected: assertionExpected,
+		}},
+		SourceObservationID: &observationID,
+		SourceFactIDs:       discoveryFactIDs(provenance.FactID),
 	}
-	if provenance.Kind == "page" {
-		draft.PageIDs = []int64{resourceID}
-		step.TargetPageID = &resourceID
-	} else {
-		draft.APIIDs = []int64{resourceID}
-		step.TargetAPIID = &resourceID
-		assertion.TargetAPIID = &resourceID
+}
+
+// discoveryDraftNoPreconditions is the explicit "no setup" value §5.2 allows for
+// the required preconditions element.
+const discoveryDraftNoPreconditions = "无"
+
+func discoveryFactIDs(factID int64) []int64 {
+	if factID <= 0 {
+		return nil
 	}
-	draft.Steps = []AugmentedCaseDraftStep{step}
-	draft.Assertions = []AugmentedCaseDraftAssertion{assertion}
-	if provenance.FactID > 0 {
-		draft.SourceFactIDs = []int64{provenance.FactID}
+	return []int64{factID}
+}
+
+// firstStepTargetDescription is the target_description half of the Critic ④
+// content key: the first step's, in seq order. A discovery draft always has
+// exactly one step, so this is stable for the duplicate test; a hand-written
+// case contributes its opening step, which is what distinguishes two cases about
+// the same system.
+func firstStepTargetDescription(version design.CaseVersion) string {
+	for _, step := range version.Steps {
+		if strings.TrimSpace(step.TargetDescription) != "" {
+			return step.TargetDescription
+		}
 	}
-	return draft
+	return ""
 }
 
 // caseVersionResourceID returns the discovered page/API id a case version is
-// bound to. Additive discovery revisions carry it on the version (and, since a
-// step may target the resource directly, defensively on the first step).
+// bound to.
+//
+// v0.2.4-B: case_version.page_ids/api_ids and case_step.target_page_id/
+// target_api_id are gone, so the id is recovered from the page/api provenance
+// source the additive draft always records (case_draft.go writes one with
+// path='discovery_delta'). That keeps DiscoveryRevisionView.ResourceID and the
+// EV-12 `resource_id` payload carrying the REAL catalog id rather than a
+// surrogate, which is what a rollback audit line needs. A version with no such
+// source reports 0 -- it was not produced by discovery.
+//
+// NOTE FOR THE LEAD: ruling 7 asked for this to become "a content identity based
+// on sut_description/target_description". It was implemented as source-based id
+// recovery instead, because the provenance source survives the contract change
+// and yields the actual id; a hash of prose would be uninterpretable to every
+// consumer of resource_id. The content-identity ruling IS applied where dedup
+// semantics depend on it (FindConfirmedCaseByContent). See task-9-report.md.
 func caseVersionResourceID(version design.CaseVersion) int64 {
-	for _, pageID := range version.PageIDs {
-		if pageID > 0 {
-			return pageID
+	for _, source := range version.Sources {
+		if source.Path != "discovery_delta" {
+			continue
 		}
-	}
-	for _, apiID := range version.APIIDs {
-		if apiID > 0 {
-			return apiID
-		}
-	}
-	for _, step := range version.Steps {
-		if step.TargetPageID != nil && *step.TargetPageID > 0 {
-			return *step.TargetPageID
-		}
-		if step.TargetAPIID != nil && *step.TargetAPIID > 0 {
-			return *step.TargetAPIID
+		switch source.Kind {
+		case design.SourcePage, design.SourceAPI:
+			if id, err := platformid.Parse(strings.TrimSpace(source.RefID)); err == nil && id > 0 {
+				return id
+			}
 		}
 	}
 	return 0
 }
 
-// buildRollbackReplacement copies base into a new confirmed revision of the
-// rolled-back case. The original stays in history as superseded; the
-// replacement carries the rollback provenance (trigger/rollback_of).
+// buildRollbackReplacement copies base into a new DRAFT revision of the
+// rolled-back case (R-E2r). The original stays in history as superseded; the
+// replacement carries the rollback provenance (trigger/rollback_of) and no system
+// auto-confirm actor — it awaits judge review + human confirm.
 func buildRollbackReplacement(ids platformid.Generator, base, original design.CaseVersion, now time.Time) design.CaseVersion {
 	replacement := design.CaseVersion{
 		ID:                  ids.Next(),
@@ -670,18 +700,15 @@ func buildRollbackReplacement(ids platformid.Generator, base, original design.Ca
 		Revision:            original.Revision + 1,
 		Title:               base.Title,
 		Description:         base.Description,
+		SutDescription:      base.SutDescription,
 		Preconditions:       base.Preconditions,
+		CoveredACs:          append([]string(nil), base.CoveredACs...),
 		TestData:            base.TestData,
 		Priority:            base.Priority,
-		DefaultVersionSUTID: base.DefaultVersionSUTID,
-		VersionSUTIDs:       append([]int64(nil), base.VersionSUTIDs...),
-		PageIDs:             append([]int64(nil), base.PageIDs...),
-		APIIDs:              append([]int64(nil), base.APIIDs...),
-		Status:              design.CaseStatusConfirmed,
+		Status:              design.CaseStatusDraft,
 		ContentHash:         base.ContentHash,
 		Trigger:             design.CaseTriggerRollback,
 		SourceObservationID: original.SourceObservationID,
-		AutoConfirmedBy:     design.AutoConfirmationActor,
 		RollbackOf:          &original.ID,
 		CreatedAt:           now,
 		UpdatedAt:           now,
@@ -713,9 +740,11 @@ func buildRollbackReplacement(ids platformid.Generator, base, original design.Ca
 	return replacement
 }
 
-// rollbackableCaseVersion enforces that only a current confirmed
-// discovery_delta revision can be rolled back (a manual or already-rolled-back
-// revision is a typed 409).
+// rollbackableCaseVersion enforces that only a current confirmed, system
+// auto-confirmed discovery_delta revision can be rolled back (a manual,
+// human-confirmed, post-abolition draft or already-rolled-back revision is a
+// typed 409). After R-E2r no new system auto-confirms are produced, so this
+// predicate makes Rollback legacy-only.
 func rollbackableCaseVersion(version design.CaseVersion) error {
 	switch {
 	case version.Status != design.CaseStatusConfirmed:
@@ -734,16 +763,25 @@ func rollbackableCaseVersion(version design.CaseVersion) error {
 }
 
 // publishDiscoveryRevisionEvent emits EV-12 `case.revision.auto_confirmed` on
-// the version channel. Both the discovery auto-confirmation and the rollback
-// replacement use the same event; rollback_of distinguishes them.
+// the version channel. After R-E2r abolished discovery auto-confirm only the
+// rollback replacement still uses it (rollback_of distinguishes it); the
+// discovery draft path emits no auto-confirm event. The event name/confidence are
+// a legacy published contract retained pending the T17 event-contract update.
 func (s *GraphService) publishDiscoveryRevisionEvent(ctx context.Context, versionID, requirementID int64, view DiscoveryRevisionView, confidence, actor string, actorID int64) {
 	if s == nil || s.events == nil {
 		return
 	}
 	payload := map[string]any{
-		"version_id":            platformid.Format(versionID),
-		"case_id":               platformid.Format(view.CaseID),
-		"case_version_id":       platformid.Format(view.CaseVersionID),
+		"version_id":      platformid.Format(versionID),
+		"case_id":         platformid.Format(view.CaseID),
+		"case_version_id": platformid.Format(view.CaseVersionID),
+		// status is additive hardening: the legacy event NAME claims an auto
+		// confirmation while the replacement is a DRAFT awaiting the judge and a
+		// human. Carrying the authoritative lifecycle status lets a payload-only
+		// consumer render it correctly instead of trusting the name. It is always
+		// draft today: both idempotent replay paths return the stored replacement
+		// WITHOUT publishing (see the pre-check and the `replayed` early return).
+		"status":                view.Status,
 		"trigger":               view.Trigger,
 		"source_observation_id": platformid.Format(view.SourceObservationID),
 		"resource_id":           platformid.Format(view.ResourceID),

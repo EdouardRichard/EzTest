@@ -463,7 +463,7 @@ func TestCreateRequestValidatesDecisionPayloads(t *testing.T) {
 		"empty kind":       {VersionID: 7, Kind: "  ", Reason: "x"},
 		"login takeover":   {VersionID: 7, Kind: "login_takeover", Reason: "x"},
 		"clarification":    {VersionID: 7, Kind: "clarification_question", Reason: "x"},
-		"other kind":       {VersionID: 7, Kind: "other", Reason: "x"},
+		"unknown kind":     {VersionID: 7, Kind: "other", Reason: "x"},
 		"missing version":  {VersionID: 0, Kind: "approval", Reason: "x"},
 		"empty reason":     {VersionID: 7, Kind: "approval", Reason: "   "},
 		"oversized reason": {VersionID: 7, Kind: "conflict", Reason: strings.Repeat("x", 2001)},

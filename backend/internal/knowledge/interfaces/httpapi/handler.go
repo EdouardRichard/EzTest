@@ -42,6 +42,7 @@ type Service interface {
 	Reject(ctx context.Context, actor platform.Actor, id int64, reason string) (knowledge.Item, error)
 	Revoke(ctx context.Context, actor platform.Actor, id int64, reason string) (knowledge.Item, error)
 	Revisions(ctx context.Context, id int64) ([]knowledge.Revision, error)
+	ItemUsage(ctx context.Context, id int64) (knowledgeapp.UsageStats, error)
 }
 
 // Handler serves the P7 knowledge endpoints.
@@ -178,7 +179,14 @@ func (h *Handler) GetItem(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusOK, toItemDetailView(item, visibleKnowledgeRevisions(revisions)))
+	// The usage aggregates are read behind the same R91 secret gate: a hidden
+	// item must not leak its injection history either.
+	usage, err := h.service.ItemUsage(r.Context(), id)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toItemDetailView(item, visibleKnowledgeRevisions(revisions), usage))
 }
 
 // UpdateItem PATCH /api/knowledge/items/{knowledgeId} (author or admin). The

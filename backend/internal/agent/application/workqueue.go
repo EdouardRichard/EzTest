@@ -117,7 +117,7 @@ func (q *WorkQueue) ClaimForTeams(ctx context.Context, claimant string, teams []
 	}
 	for _, team := range teams {
 		if !team.Valid() {
-			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, code, ops")
 		}
 	}
 	return q.repo.ClaimForTeams(ctx, claimant, teams, q.lease)
@@ -155,7 +155,7 @@ func (q *WorkQueue) ClaimForTypes(ctx context.Context, claimant string, types []
 }
 
 // ClaimContract leases the next runnable 0.2.1 contract item (kind != "") whose
-// team is in teams. Legacy 0.2.0 rows (kind='') are never selected here; they
+// team is in teams. Legacy 0.2.0 rows (kind is empty) are never selected here; they
 // keep their frozen Claim/ClaimForTeams/ClaimForTypes paths. An empty team set
 // claims nothing, and an unknown team is a client error.
 func (q *WorkQueue) ClaimContract(ctx context.Context, claimant string, teams []agent.Team) (*agent.WorkItem, bool, error) {
@@ -168,7 +168,7 @@ func (q *WorkQueue) ClaimContract(ctx context.Context, claimant string, teams []
 	}
 	for _, team := range teams {
 		if !team.Valid() {
-			return nil, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
+			return nil, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, code, ops")
 		}
 	}
 	if q.contract == nil {

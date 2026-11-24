@@ -98,7 +98,6 @@ var _ designadapter.GraphGateway = (*fakeGraphGateway)(nil)
 var _ tools.DesignPort = (*designadapter.Adapter)(nil)
 
 func sampleGraphView() designapp.GraphView {
-	defaultSUT := int64(9001)
 	return designapp.GraphView{
 		VersionID:                 1001,
 		GeneratedAt:               adapterTime,
@@ -116,32 +115,26 @@ func sampleGraphView() designapp.GraphView {
 				Title:                "登录",
 				Status:               "clarified",
 				DesignStatus:         "draft",
-				TargetVersionSUTIDs:  []int64{9001},
 				Scenarios: []designapp.ScenarioGraphView{
 					{
 						ID:                   5001,
 						RequirementVersionID: 3002,
 						Name:                 "正常登录",
 						Description:          "手机号密码登录",
-						VersionSUTIDs:        []int64{9001},
-						PageIDs:              []int64{9101},
-						APIIDs:               []int64{9201},
 						SortOrder:            0,
 						Cases: []designapp.CaseCardView{
 							{
-								CaseID:              7001,
-								CurrentVersionID:    7002,
-								Revision:            2,
-								Title:               "账号密码登录成功",
-								Priority:            "P1",
-								Status:              "draft",
-								DefaultVersionSUTID: &defaultSUT,
-								VersionSUTIDs:       []int64{9001},
-								PageIDs:             []int64{9101},
-								APIIDs:              []int64{9201},
-								StepCount:           3,
-								AssertionCount:      2,
-								CreatedAt:           adapterTime,
+								CaseID:           7001,
+								CurrentVersionID: 7002,
+								Revision:         2,
+								Title:            "账号密码登录成功",
+								Priority:         "P1",
+								Status:           "draft",
+								SutDescription:   "商城前台登录页与登录接口。",
+								CoveredACs:       []string{"AC-1", "AC-2"},
+								StepCount:        3,
+								AssertionCount:   2,
+								CreatedAt:        adapterTime,
 							},
 						},
 					},
@@ -153,7 +146,6 @@ func sampleGraphView() designapp.GraphView {
 				Revision:             1,
 				Title:                "退款",
 				Status:               "clarified",
-				TargetVersionSUTIDs:  []int64{9001},
 			},
 		},
 	}
@@ -161,7 +153,6 @@ func sampleGraphView() designapp.GraphView {
 
 func sampleCaseDetail() designapp.CaseDetailView {
 	defaultSUT := int64(9001)
-	pageID := int64(9101)
 	line := 12
 	return designapp.CaseDetailView{
 		CaseID:               7001,
@@ -176,25 +167,24 @@ func sampleCaseDetail() designapp.CaseDetailView {
 			{CaseVersionID: 7000, Revision: 1, Status: "confirmed", Title: "账号密码登录成功", CreatedAt: adapterTime, ConfirmedAt: &adapterTime},
 		},
 		Selected: designapp.CaseVersionDetailView{
-			CaseVersionID:       7002,
-			Revision:            2,
-			Title:               "账号密码登录成功",
-			Description:         "使用有效账号登录",
-			Preconditions:       "已注册账号",
-			TestData:            json.RawMessage(`{"phone":"13800000000"}`),
-			Priority:            "P1",
-			DefaultVersionSUTID: &defaultSUT,
-			VersionSUTIDs:       []int64{9001},
-			PageIDs:             []int64{9101},
-			APIIDs:              []int64{9201},
-			Status:              "draft",
-			ContentHash:         strings.Repeat("b", 64),
-			CreatedAt:           adapterTime,
+			CaseVersionID:  7002,
+			Revision:       2,
+			Title:          "账号密码登录成功",
+			Description:    "使用有效账号登录",
+			SutDescription: "商城前台登录页与登录接口。",
+			Preconditions:  "已注册账号",
+			CoveredACs:     []string{"AC-1", "AC-2"},
+			TestData:       json.RawMessage(`{"phone":"13800000000"}`),
+			Priority:       "P1",
+			Status:         "draft",
+			ContentHash:    strings.Repeat("b", 64),
+			CreatedAt:      adapterTime,
 			Steps: []designapp.CaseStepView{
-				{Seq: 1, Action: "打开登录页", Expected: "显示表单", TargetVersionSUTID: &defaultSUT, TargetPageID: &pageID, AccountRole: "admin", Data: json.RawMessage(`{}`)},
+				{Seq: 1, Action: "打开登录页", Expected: "显示表单", TargetDescription: "登录页的手机号输入框", AccountRole: "admin", Data: json.RawMessage(`{}`)},
 			},
 			Assertions: []designapp.CaseAssertionView{
 				{StepSeq: 1, Kind: "ui", Target: "表单", Expected: "可见"},
+				{StepSeq: 1, Kind: "db", Target: "登录审计行数", Expected: "1", SUTID: &defaultSUT},
 			},
 			Sources: []designapp.CaseSourceView{
 				{Kind: "requirement", RefID: "3002", Line: &line},
@@ -254,16 +244,30 @@ func TestReadGraphRendersSnakeCaseAndFiltersRequirement(t *testing.T) {
 	if scenario["id"] != "5001" || scenario["name"] != "正常登录" || scenario["sort"] != 0 {
 		t.Fatalf("scenario = %#v", scenario)
 	}
-	if suts, _ := scenario["version_sut_ids"].([]string); len(suts) != 1 || suts[0] != "9001" {
-		t.Fatalf("scenario suts = %#v", scenario["version_sut_ids"])
+	// v0.2.4-B: a scenario is a pure grouping node; the resource arrays are gone.
+	for _, gone := range []string{"version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := scenario[gone]; ok {
+			t.Fatalf("scenario payload still carries the retired key %q: %#v", gone, scenario)
+		}
 	}
 	cases := scenario["cases"].([]any)
 	card := cases[0].(map[string]any)
 	if card["case_id"] != "7001" || card["current_version_id"] != "7002" || card["status"] != "draft" {
 		t.Fatalf("case card = %#v", card)
 	}
-	if card["default_version_sut_id"] != "9001" || card["step_count"] != 3 || card["assertion_count"] != 2 {
+	if card["step_count"] != 3 || card["assertion_count"] != 2 {
 		t.Fatalf("case card = %#v", card)
+	}
+	if card["sut_description"] != "商城前台登录页与登录接口。" {
+		t.Fatalf("case card sut_description = %#v", card["sut_description"])
+	}
+	if acs, _ := card["covered_acs"].([]string); len(acs) != 2 || acs[0] != "AC-1" || acs[1] != "AC-2" {
+		t.Fatalf("case card covered_acs = %#v", card["covered_acs"])
+	}
+	for _, gone := range []string{"default_version_sut_id", "version_sut_ids", "page_ids", "api_ids"} {
+		if _, ok := card[gone]; ok {
+			t.Fatalf("case card payload still carries the retired key %q: %#v", gone, card)
+		}
 	}
 	if gateway.factsVersionID != 1001 {
 		t.Fatalf("case-author facts version = %d", gateway.factsVersionID)
@@ -303,8 +307,16 @@ func TestReadGraphWithCaseIDReturnsCaseDetail(t *testing.T) {
 	}
 	steps := selected["steps"].([]any)
 	step := steps[0].(map[string]any)
-	if step["seq"] != 1 || step["action"] != "打开登录页" || step["target_page_id"] != "9101" || step["account_role"] != "admin" {
+	if step["seq"] != 1 || step["action"] != "打开登录页" || step["account_role"] != "admin" {
 		t.Fatalf("step = %#v", step)
+	}
+	if step["target_description"] != "登录页的手机号输入框" {
+		t.Fatalf("step target_description = %#v", step["target_description"])
+	}
+	for _, gone := range []string{"target_version_sut_id", "target_page_id", "target_api_id"} {
+		if _, ok := step[gone]; ok {
+			t.Fatalf("step payload still carries the retired key %q: %#v", gone, step)
+		}
 	}
 	assertions := selected["assertions"].([]any)
 	if assertions[0].(map[string]any)["kind"] != "ui" {
@@ -327,20 +339,23 @@ func TestProposeMapsToolsProposalToDesignInput(t *testing.T) {
 		RequirementVersionID: 3002,
 		BaseGraphHash:        strings.Repeat("a", 64),
 		Scenarios: []tools.ScenarioProposal{
-			{Ref: "s1", ID: 5001, Name: "正常登录", Description: "d", VersionSUTIDs: []int64{9001}, PageIDs: []int64{9101}, APIIDs: []int64{9201}, SortOrder: 2},
-			{Ref: "s2", Name: "异常登录", VersionSUTIDs: []int64{9001}},
+			{Ref: "s1", ID: 5001, Name: "正常登录", Description: "d", SortOrder: 2},
+			{Ref: "s2", Name: "异常登录"},
 		},
 		Cases: []tools.CaseProposal{
 			{
 				Ref: "c1", ID: updateCaseID, ScenarioRef: "s1", Title: "账号密码登录成功",
-				Description: "d", Preconditions: "p", TestData: json.RawMessage(`{"a":1}`), Priority: "P1",
-				DefaultVersionSUTID: 9001, VersionSUTIDs: []int64{9001}, PageIDs: []int64{9101}, APIIDs: []int64{9201},
+				Description:    "d",
+				SutDescription: "商城前台登录页与登录接口。",
+				Preconditions:  "p",
+				CoveredACs:     []string{"AC-1", "AC-2"},
+				TestData:       json.RawMessage(`{"a":1}`), Priority: "P1",
 				Steps: []tools.StepProposal{
-					{Seq: 1, Action: "打开", Expected: "显示", TargetVersionSUTID: 9001, TargetPageID: 9101, AccountRole: "admin", Data: json.RawMessage(`{}`)},
+					{Seq: 1, Action: "打开", Expected: "显示", TargetDescription: "登录页的手机号输入框", AccountRole: "admin", Data: json.RawMessage(`{}`)},
 					{Seq: 2, Action: "提交"},
 				},
 				Assertions: []tools.AssertionProposal{
-					{StepSeq: 1, Kind: "ui", Target: "表单", Expected: "可见", TargetVersionSUTID: 9001, DatabaseID: 9301},
+					{StepSeq: 1, Kind: "db", Target: "登录审计行数", Expected: "1", SUTID: 9301},
 				},
 				Sources: []tools.SourceProposal{
 					{Kind: "requirement", RefID: "3002", Path: "p", Line: intPtr(3), SHA: "s"},
@@ -363,25 +378,31 @@ func TestProposeMapsToolsProposalToDesignInput(t *testing.T) {
 	if len(input.Scenarios) != 2 || input.Scenarios[0].ID == nil || *input.Scenarios[0].ID != 5001 || input.Scenarios[1].ID != nil {
 		t.Fatalf("scenarios = %#v", input.Scenarios)
 	}
-	if input.Scenarios[0].SortOrder != 2 || len(input.Scenarios[0].PageIDs) != 1 {
+	if input.Scenarios[0].SortOrder != 2 || input.Scenarios[0].Name != "正常登录" {
 		t.Fatalf("scenario = %#v", input.Scenarios[0])
 	}
 	if len(input.Cases) != 1 {
 		t.Fatalf("cases = %#v", input.Cases)
 	}
 	item := input.Cases[0]
-	if item.ID == nil || *item.ID != 7001 || item.DefaultVersionSUTID == nil || *item.DefaultVersionSUTID != 9001 {
+	if item.ID == nil || *item.ID != 7001 {
 		t.Fatalf("case = %#v", item)
 	}
-	if item.Steps[0].TargetVersionSUTID == nil || *item.Steps[0].TargetVersionSUTID != 9001 ||
-		item.Steps[0].TargetPageID == nil || *item.Steps[0].TargetPageID != 9101 {
+	// The v0.2.4-B contract elements must cross the adapter verbatim.
+	if item.SutDescription != "商城前台登录页与登录接口。" || item.Preconditions != "p" {
+		t.Fatalf("case contract = %#v", item)
+	}
+	if len(item.CoveredACs) != 2 || item.CoveredACs[0] != "AC-1" || item.CoveredACs[1] != "AC-2" {
+		t.Fatalf("covered_acs = %#v", item.CoveredACs)
+	}
+	if item.Steps[0].TargetDescription != "登录页的手机号输入框" {
 		t.Fatalf("step = %#v", item.Steps[0])
 	}
-	if item.Steps[1].TargetVersionSUTID != nil || item.Steps[1].TargetPageID != nil {
-		t.Fatalf("nullable step targets = %#v", item.Steps[1])
+	if item.Steps[1].TargetDescription != "" {
+		t.Fatalf("unset target_description = %#v", item.Steps[1])
 	}
-	if item.Assertions[0].DatabaseID == nil || *item.Assertions[0].DatabaseID != 9301 {
-		t.Fatalf("assertion = %#v", item.Assertions[0])
+	if item.Assertions[0].SUTID == nil || *item.Assertions[0].SUTID != 9301 {
+		t.Fatalf("db assertion sut_id = %#v", item.Assertions[0])
 	}
 	if item.Sources[0].Line == nil || *item.Sources[0].Line != 3 {
 		t.Fatalf("source = %#v", item.Sources[0])

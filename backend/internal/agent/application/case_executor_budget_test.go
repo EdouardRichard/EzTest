@@ -92,7 +92,7 @@ func TestCaseExecutorBudgetAllowsExecution(t *testing.T) {
 		Key:     ProfileKeyDesignHost,
 		Budgets: agent.ProfileBudgets{MaxTurns: 16, SoftSeconds: 600, HardSeconds: 900},
 	}
-	if budget := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: WorkTypeDesignRound}, designHost); !budget.UnlimitedTokens || budget.MaxTokens != 0 {
+	if budget := runner.resourceBudget(agent.WorkItem{VersionID: 1, Type: WorkTypeDesignRequirement}, designHost); !budget.UnlimitedTokens || budget.MaxTokens != 0 {
 		t.Fatalf("design token budget = {max=%d unlimited=%v}, want unlimited",
 			budget.MaxTokens, budget.UnlimitedTokens)
 	}

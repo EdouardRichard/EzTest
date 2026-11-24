@@ -261,7 +261,7 @@ func (r *fakeReportRepo) CreateRevision(_ context.Context, revision delivery.Rep
 	return revision, nil
 }
 
-func (r *fakeReportRepo) FinalizePublished(_ context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string) error {
+func (r *fakeReportRepo) FinalizePublished(_ context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string, displayFingerprint ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	report, ok := r.reports[reportID]
@@ -283,6 +283,9 @@ func (r *fakeReportRepo) FinalizePublished(_ context.Context, reportID int64, re
 	report.CurrentRevisionID = &row.ID
 	report.Status = delivery.ReportStatusPublished
 	report.InputFingerprint = fingerprint
+	if len(displayFingerprint) > 0 {
+		report.DisplayFingerprint = displayFingerprint[0]
+	}
 	r.reports[reportID] = report
 	r.record("repo.finalize")
 	return nil
@@ -785,7 +788,7 @@ func reportTestWaveSnapshot(versionID, waveID int64) delivery.ReportSnapshot {
 			ID: 5001, VersionID: versionID, Title: "问题", Status: delivery.IssueStatusOpen,
 			Category: "api", Severity: "major",
 		}},
-		VersionSUTs: []delivery.VersionSUTSnapshot{{ID: 6001, SUTID: 7001, SUTName: "API"}},
+		SUTs: []delivery.SUTSnapshot{{ID: 6001, SUTID: 7001, SUTName: "API"}},
 	}
 }
 
@@ -1542,6 +1545,10 @@ func TestReportServiceEnsureReports(t *testing.T) {
 		fixture.data.version[versionID] = reportTestVersionSnapshot(versionID)
 		fixture.data.wave[reportDataWaveKey(versionID, 12)] = reportTestWaveSnapshot(versionID, 12)
 
+		// Stale detection is the causal watcher/sweep's job (T11); simulate it.
+		if _, err := fixture.svc.MarkStaleIfChanged(context.Background(), versionID); err != nil {
+			t.Fatalf("MarkStaleIfChanged: %v", err)
+		}
 		if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
 			t.Fatalf("EnsureReports: %v", err)
 		}

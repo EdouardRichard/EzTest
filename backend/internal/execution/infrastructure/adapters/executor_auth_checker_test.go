@@ -36,7 +36,7 @@ func (authCheckerSettings) Bool(context.Context, string) (bool, error) { return 
 // TestExecutorAuthCheckerMapsProbeOutcomes is the D8 contract: the admin action
 // must distinguish a valid bearer token (ok) from a rejected/missing token
 // (unauthenticated) and from an executor that cannot be reached at all
-// (unreachable). The probe reuses the token-bearing GET /v1/contexts self-check;
+// (unreachable). The probe reuses the token-bearing GET /v1/sessions self-check;
 // /healthz is unauthenticated and cannot prove the token works.
 func TestExecutorAuthCheckerMapsProbeOutcomes(t *testing.T) {
 	const token = "super-secret-executor-token"
@@ -44,8 +44,8 @@ func TestExecutorAuthCheckerMapsProbeOutcomes(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		var authorization string
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodGet || r.URL.Path != "/v1/contexts" {
-				t.Errorf("request = %s %s, want GET /v1/contexts", r.Method, r.URL.Path)
+			if r.Method != http.MethodGet || r.URL.Path != "/v1/sessions" {
+				t.Errorf("request = %s %s, want GET /v1/sessions", r.Method, r.URL.Path)
 			}
 			authorization = r.Header.Get("Authorization")
 			w.WriteHeader(http.StatusOK)

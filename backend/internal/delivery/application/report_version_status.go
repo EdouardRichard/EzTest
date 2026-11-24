@@ -61,7 +61,7 @@ func (s *ReportService) VersionReportStatus(ctx context.Context, versionID int64
 		status.RevisionID = current.ID
 		status.Fingerprint = current.InputFingerprint
 		revisionReady := current.Status == delivery.ReportStatusPublished &&
-			current.RenderStatus == reportRenderDone && current.HTMLRef != nil
+			current.RenderStatus == ReportRenderDone && current.HTMLRef != nil
 		if report.Status == delivery.ReportStatusPublished && !revisionReady {
 			// A published header without a published/rendered current revision
 			// is not a usable report: never expose it as published.

@@ -11,6 +11,8 @@ import type {
   ExportFormat,
   ExportRequest,
   ExportView,
+  JudgmentOverrideView,
+  JudgmentReportView,
   StageView,
 } from "./types"
 
@@ -90,6 +92,39 @@ export function confirmStageCases(versionId: string, caseIds: string[]): Promise
   })
 }
 
+/* ----------------------------- judgment (T16) ------------------------------- */
+
+/**
+ * Read-only judgment report (spec SC-E5): one entry per current case with its
+ * review_state and latest current-version judge fact. Visible to admin and user
+ * (the case_review report is user-facing); the server enforces visibility.
+ */
+export function listJudgments(
+  versionId: string,
+  requirementId?: string,
+): Promise<JudgmentReportView> {
+  return apiGet<JudgmentReportView>(
+    `${versionPath(versionId)}/design/judgments${query({ requirement_id: requirementId })}`,
+  )
+}
+
+/**
+ * ADMIN-only human override of an escalated judge verdict (spec SC-E5). The
+ * server re-checks the admin role AND the overridable precondition; the client
+ * only offers the action for escalated_fail/judge_unavailable. `reason` is
+ * mandatory audit metadata.
+ */
+export function overrideJudgment(
+  versionId: string,
+  caseId: string,
+  reason: string,
+): Promise<JudgmentOverrideView> {
+  return apiPost<JudgmentOverrideView>(
+    `${versionPath(versionId)}/design/judgments/${encodeURIComponent(caseId)}/override`,
+    { reason },
+  )
+}
+
 /* --------------------------- discovery revisions ---------------------------- */
 
 /**
@@ -149,9 +184,13 @@ export type HandoffRequirement = {
   current_version_id: string
   revision: number
   title: string
-  description: string
-  acceptance_criteria: string
+  user_story: { as_a: string; i_want: string; so_that: string }
+  rules: string
+  acceptance_criteria: Array<{ id: string; given: string; when: string; then: string }>
   priority: string
+  sut_description: string
+  scope_out: string
+  account_roles_hint: string[]
   status: string
   source_quote: string
   confidence?: number | null
@@ -213,12 +252,18 @@ export type HandoffPlan = {
 }
 
 export type HandoffResources = {
-  suts: Array<Record<string, unknown>>
-  pages: Array<Record<string, unknown>>
-  apis: Array<Record<string, unknown>>
+  environment: { id: string; name: string; status: string }
+  suts: Array<{
+    sut_id: string
+    name: string
+    base_url: string
+    pages: Array<Record<string, unknown>>
+    apis: Array<Record<string, unknown>>
+    databases: Array<Record<string, unknown>>
+  }>
   accounts: Array<Record<string, unknown>>
-  databases: Array<Record<string, unknown>>
   repositories: Array<Record<string, unknown>>
+  truncated: boolean
 }
 
 /** `HandoffView`: the six-block clarification → design handoff document. */

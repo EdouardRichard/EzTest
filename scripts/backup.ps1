@@ -648,7 +648,7 @@ try {
     Write-Note "files       $totalFileCount file(s) across $(@($directories | Where-Object { $_.status -eq 'archived' }).Count) archived director(ies)"
     Write-Note "repository  $branch @ $($manifest.repository.commitShort) ($version)"
     Write-Note "duration    $($manifest.durationSeconds)s"
-    Write-Note "secrets     not included; supply EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE separately on restore"
+    Write-Note "secrets     .env / .secrets not archived (supply .env separately on restore); LLM/resource credentials are plaintext in the database dump by design (GD-01/Q05=B), no keyring"
     exit 0
 } catch {
     Write-Host ""

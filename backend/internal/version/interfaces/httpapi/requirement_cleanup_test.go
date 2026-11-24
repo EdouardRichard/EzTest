@@ -297,7 +297,6 @@ func newCleanupRoutes(t *testing.T) *cleanupRoutes {
 		repo,
 		cleanupVersionReader{id: cleanupVersionID},
 		nil,
-		nil,
 		audit,
 		events,
 		&cleanupIDs{next: 1000},
@@ -312,20 +311,27 @@ func newCleanupRoutes(t *testing.T) *cleanupRoutes {
 }
 
 // seed inserts one requirement with a current revision and distinct revision ID.
-func (f *cleanupRoutes) seed(id int64, status version.RequirementStatus, title, description, acceptance string) version.Requirement {
-	return f.seedInVersion(cleanupVersionID, id, status, title, description, acceptance)
+func (f *cleanupRoutes) seed(id int64, status version.RequirementStatus, title, rules, acceptance string) version.Requirement {
+	return f.seedInVersion(cleanupVersionID, id, status, title, rules, acceptance)
 }
 
 // seedInVersion inserts a requirement belonging to another version, so
 // cross-version (foreign) access can be asserted through the real handlers.
-func (f *cleanupRoutes) seedInVersion(versionID, id int64, status version.RequirementStatus, title, description, acceptance string) version.Requirement {
+// rules carries the free text and acceptance becomes the single criterion's
+// then, which is what the old flat description/acceptance pair maps onto under
+// the §5.1 contract.
+func (f *cleanupRoutes) seedInVersion(versionID, id int64, status version.RequirementStatus, title, rules, acceptance string) version.Requirement {
 	revisionID := id + 100
 	revision := version.RequirementVersion{
 		ID: revisionID, RequirementID: id, Revision: 1,
-		Title: title, Description: description, AcceptanceCriteria: acceptance,
+		Title: title, Rules: rules,
+		UserStory: version.UserStory{AsA: "a shopper", IWant: "the behaviour", SoThat: "it is testable"},
+		AcceptanceCriteria: []version.AcceptanceCriterion{
+			{ID: "AC-1", Given: "the system runs", When: "it is exercised", Then: acceptance},
+		},
 		Priority: "P1", Constraints: json.RawMessage(`{}`),
-		TargetVersionSUTs: []string{}, TargetPages: []string{}, TargetAPIs: []string{},
-		ContentHash: strings.Repeat("a", 64), CreatedAt: testTime,
+		SutDescription: "The system under test.",
+		ContentHash:    strings.Repeat("a", 64), CreatedAt: testTime,
 	}
 	requirement := version.Requirement{
 		ID: id, VersionID: versionID, CurrentVersionID: &revisionID, Status: status,
@@ -611,9 +617,19 @@ func TestRequirementCleanupRoutes(t *testing.T) {
 			t.Fatalf("merged requirement = %#v", data["requirement"])
 		}
 		current := requirement["current_version"].(map[string]any)
-		acceptance, _ := current["acceptance_criteria"].(string)
-		if !strings.Contains(acceptance, "publicly visible") || !strings.Contains(acceptance, "public list shows it") {
-			t.Fatalf("merged acceptance = %q", acceptance)
+		// The merge folds the source's criterion into the target's set rather
+		// than concatenating acceptance text.
+		criteria, _ := current["acceptance_criteria"].([]any)
+		if len(criteria) != 2 {
+			t.Fatalf("merged acceptance_criteria = %#v, want the target's plus the source's", criteria)
+		}
+		thens := make([]string, 0, len(criteria))
+		for _, item := range criteria {
+			criterion := item.(map[string]any)
+			thens = append(thens, criterion["then"].(string))
+		}
+		if thens[0] != "The article is publicly visible." || thens[1] != "The public list shows it." {
+			t.Fatalf("merged acceptance_criteria then = %v", thens)
 		}
 		if stored := statusOf(t, routes.repo, 9202); stored != version.RequirementObsolete {
 			t.Fatalf("merge source status = %q, want obsolete", stored)

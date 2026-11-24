@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { InlineError } from "@/components/ui/ErrorState"
 
+import { CASE_VERSION_STATUS_LABEL } from "./nodeActions"
 import type { CaseRevisionRollbackView, CaseVersionStatus, DiscoveryRevisionData } from "./types"
 
 export type DiscoveryRevisionNoticeProps = {
@@ -22,6 +23,7 @@ export type DiscoveryRevisionNoticeProps = {
 }
 
 const LOW_CONFIDENCE_LABEL: Record<string, string> = {
+  judgment_pending: "等待裁判审查，需人工确认",
   insufficient_evidence: "支撑证据少于 2 条",
   missing_requirement: "缺少需求关联",
   requirement_not_current: "需求已不是当前版本",
@@ -50,9 +52,31 @@ function decimalID(value: unknown): string | null {
 }
 
 /**
+ * Reads the authoritative lifecycle status out of an event payload. The value
+ * set is DERIVED from CASE_VERSION_STATUS_LABEL (an exhaustive
+ * Record<CaseVersionStatus, string>), so no second hand-written status list is
+ * introduced here. A missing or unknown value falls back to `draft` — the only
+ * status the rollback producer publishes today.
+ */
+function caseVersionStatusFromPayload(value: unknown): CaseVersionStatus {
+  if (typeof value === "string" && value in CASE_VERSION_STATUS_LABEL) {
+    return value as CaseVersionStatus
+  }
+  return "draft"
+}
+
+/**
  * Maps the EV-12 `case.revision.auto_confirmed` payload to the notice model.
- * Both the discovery auto-confirmation and the rollback replacement travel on
- * this event; `trigger`/`rollback_of` distinguish them (spec R-EX-6/EV-12).
+ *
+ * R-E2r (v0.2.4-E, release notes E §3): discovery auto-confirm is abolished, so
+ * the event's ONLY producer is the Rollback path, and it announces a DRAFT
+ * replacement (trigger=rollback, rollback_of nonzero) — not an auto-confirm.
+ * The payload now carries the authoritative `status` (additive hardening, final
+ * review fix wave); it is always `draft` today because both idempotent-replay
+ * paths return the stored replacement without publishing. We READ it rather
+ * than hard-coding draft, so a payload-only consumer never infers lifecycle
+ * from the misleading event name. A missing/unknown status falls back to draft.
+ * The legacy event name is retained pending its 0.3 retirement.
  */
 export function discoveryRevisionFromEventPayload(payload: unknown): DiscoveryRevisionData | null {
   if (!isRecord(payload)) return null
@@ -61,7 +85,7 @@ export function discoveryRevisionFromEventPayload(payload: unknown): DiscoveryRe
   return {
     caseId: decimalID(payload.case_id) ?? undefined,
     caseVersionId,
-    status: "confirmed",
+    status: caseVersionStatusFromPayload(payload.status),
     trigger: typeof payload.trigger === "string" ? payload.trigger : undefined,
     autoConfirmedBy:
       typeof payload.auto_confirmed_by === "string"
@@ -98,7 +122,11 @@ export function discoveryRevisionFromCaseVersion(version: {
     revision: version.revision,
     status: version.status,
     inferred: true,
-    lowConfidenceReason: version.status === "draft" ? "low_confidence" : null,
+    // R-E2r: a discovery draft now awaits judge review (judgment_pending), never
+    // an auto-confirm. The case-detail GET does not expose low_confidence_reason,
+    // so the inferred notice uses the post-E normal; `inferred` suppresses any
+    // auto-confirm claim regardless.
+    lowConfidenceReason: version.status === "draft" ? "judgment_pending" : null,
   }
 }
 
@@ -131,7 +159,13 @@ export function DiscoveryRevisionNotice({
     revision.trigger === "discovery_delta" ||
     revision.inferred === true ||
     (revision.lowConfidenceReason !== null && revision.lowConfidenceReason !== undefined)
-  const isLowConfidence = !isRollback && revision.status === "draft" && isDiscovery
+  const isJudgmentPending =
+    !isRollback &&
+    revision.status === "draft" &&
+    isDiscovery &&
+    revision.lowConfidenceReason === "judgment_pending"
+  const isLowConfidence =
+    !isRollback && revision.status === "draft" && isDiscovery && !isJudgmentPending
   const confirmedBySystem =
     revision.autoConfirmedBy === undefined ||
     revision.autoConfirmedBy === null ||
@@ -189,8 +223,9 @@ export function DiscoveryRevisionNotice({
         <h3 className="text-xs font-semibold text-foreground">探索修订</h3>
         {isRollback ? <Badge tone="info">已回滚</Badge> : null}
         {isAutoConfirmed ? <Badge tone="success">自动确认</Badge> : null}
+        {isJudgmentPending ? <Badge tone="info">待裁判审查</Badge> : null}
         {isLowConfidence ? <Badge tone="warning">低置信草案</Badge> : null}
-        {!isRollback && !isAutoConfirmed && !isLowConfidence ? (
+        {!isRollback && !isAutoConfirmed && !isJudgmentPending && !isLowConfidence ? (
           <Badge tone="neutral">探索修订</Badge>
         ) : null}
         <span className="ml-auto text-[10px] text-muted-foreground">
@@ -211,6 +246,12 @@ export function DiscoveryRevisionNotice({
         </p>
       ) : null}
 
+      {isJudgmentPending ? (
+        <p className="text-[11px] text-foreground">
+          探索草案已创建，等待裁判审查后由人工确认（不会自动确认）。
+        </p>
+      ) : null}
+
       {isLowConfidence ? (
         <p className="text-[11px] text-foreground">
           草案需人工确认后才能进入执行。
@@ -218,7 +259,7 @@ export function DiscoveryRevisionNotice({
         </p>
       ) : null}
 
-      {!isRollback && !isAutoConfirmed && !isLowConfidence ? (
+      {!isRollback && !isAutoConfirmed && !isJudgmentPending && !isLowConfidence ? (
         <p className="text-[11px] text-foreground">
           该用例由执行期探索追加生成，已确认；确认来自人工操作或历史投影，确认来源以实时事件为准。
         </p>

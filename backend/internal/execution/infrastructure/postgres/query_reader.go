@@ -6,8 +6,22 @@ import (
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// fourStateCaseRunStatuses is the VERDICT denominator of the execution quality
+// ratios: the four verdict states, NOT the whole terminal set (skipped and
+// superseded are terminal process states, not verdicts, and must not dilute the
+// pass rate). It mirrors CaseRunStatus.FourState() as a query parameter and is
+// pinned against that predicate by TestFourStateCaseRunSetMatchesDomain, so a new
+// verdict state cannot join the domain without joining the denominator.
+var fourStateCaseRunStatuses = statusStrings([]execution.CaseRunStatus{
+	execution.CaseRunPassed,
+	execution.CaseRunFailed,
+	execution.CaseRunBlocked,
+	execution.CaseRunInconclusive,
+})
 
 // DeadWorkItemLister is the agent context's application read surface consumed by
 // the execution reader. work_item is owned by the agent context, so the reader
@@ -50,12 +64,12 @@ func (r *QueryReader) CountExecutionPass(ctx context.Context, versionID *int64) 
 	var num, denom int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
-			count(*) FILTER (WHERE cr.status = 'passed'),
-			count(*) FILTER (WHERE cr.status IN ('passed', 'failed', 'blocked', 'inconclusive'))
+			count(*) FILTER (WHERE cr.status = $2),
+			count(*) FILTER (WHERE cr.status = ANY($3::text[]))
 		FROM case_run cr
 		JOIN run_wave w ON w.id = cr.wave_id
 		WHERE $1::bigint IS NULL OR w.version_id = $1
-	`, versionID).Scan(&num, &denom); err != nil {
+	`, versionID, string(execution.CaseRunPassed), fourStateCaseRunStatuses).Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("count execution pass: %w", err)
 	}
 	return num, denom, nil
@@ -73,9 +87,9 @@ func (r *QueryReader) CountEvidenceCompleteness(ctx context.Context, versionID *
 			count(*)
 		FROM case_run cr
 		JOIN run_wave w ON w.id = cr.wave_id
-		WHERE cr.status IN ('passed', 'failed', 'blocked', 'inconclusive')
+		WHERE cr.status = ANY($2::text[])
 		  AND ($1::bigint IS NULL OR w.version_id = $1)
-	`, versionID).Scan(&num, &denom); err != nil {
+	`, versionID, fourStateCaseRunStatuses).Scan(&num, &denom); err != nil {
 		return 0, 0, fmt.Errorf("count evidence completeness: %w", err)
 	}
 	return num, denom, nil
@@ -95,24 +109,27 @@ func (r *QueryReader) ListOpenHumanRequests(ctx context.Context, includeTakeover
 			kind,
 			version_id,
 			COALESCE(
-				NULLIF(payload->>'reason', ''),
+				NULLIF(payload->>$9, ''),
 				CASE kind
-					WHEN 'login_takeover' THEN '登录接管'
-					WHEN 'approval' THEN '审批'
-					WHEN 'blocked_recovery' THEN '阻塞恢复'
-					WHEN 'conflict' THEN '冲突处理'
+					WHEN $3 THEN '登录接管'
+					WHEN $4 THEN '审批'
+					WHEN $5 THEN '阻塞恢复'
+					WHEN $6 THEN '冲突处理'
 					ELSE '人工请求'
 				END
 			),
 			created_at,
 			expires_at
 		FROM human_request
-		WHERE status = 'pending'
-		  AND kind IN ('login_takeover', 'approval', 'blocked_recovery', 'conflict')
-		  AND ($1::boolean OR kind <> 'login_takeover')
-		ORDER BY (kind = 'login_takeover') DESC, created_at DESC, id DESC
-		LIMIT $2
-	`, includeTakeover, limit)
+		WHERE status = $1
+		  AND kind = ANY($2::text[])
+		  AND ($7::boolean OR kind <> $3)
+		ORDER BY (kind = $3) DESC, created_at DESC, id DESC
+		LIMIT $8
+	`, string(execution.HumanPending), statusStrings(humanTodoKinds),
+		string(execution.HumanLoginTakeover), string(execution.HumanApproval),
+		string(execution.HumanBlockedRecovery), string(execution.HumanConflict),
+		includeTakeover, limit, execution.HumanPayloadReason)
 	if err != nil {
 		return nil, fmt.Errorf("list open human requests: %w", err)
 	}

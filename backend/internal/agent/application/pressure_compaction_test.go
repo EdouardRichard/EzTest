@@ -95,7 +95,8 @@ func TestRunnerPressureCompactionPreservesInFlightHistory(t *testing.T) {
 	fixture.conv.snapshot.Messages = pressureHistory(811)
 	fixture.requirement.detail = tools.RequirementDetail{
 		RequirementSummary: tools.RequirementSummary{ID: 501, Title: "登录功能"},
-		Description:        "支持手机号登录",
+		UserStory:          tools.RequirementUserStory{AsA: "用户", IWant: "支持手机号登录", SoThat: "无需记住密码"},
+		SutDescription:     "登录页",
 	}
 	fixture.chat.responses = []llmapp.ChatResponse{
 		pressureToolCallResponse(),
@@ -174,7 +175,8 @@ func TestRunnerPressureCompactionNoOpKeepsTranscriptAndSummary(t *testing.T) {
 	}
 	fixture.requirement.detail = tools.RequirementDetail{
 		RequirementSummary: tools.RequirementSummary{ID: 501, Title: "登录功能"},
-		Description:        "支持手机号登录",
+		UserStory:          tools.RequirementUserStory{AsA: "用户", IWant: "支持手机号登录", SoThat: "无需记住密码"},
+		SutDescription:     "登录页",
 	}
 	fixture.chat.responses = []llmapp.ChatResponse{
 		pressureToolCallResponse(),

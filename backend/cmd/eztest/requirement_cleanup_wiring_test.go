@@ -28,7 +28,7 @@ func (absentVersionReader) Get(context.Context, int64) (versionapp.VersionView, 
 func (absentVersionReader) MarkRunning(context.Context, int64) error { return nil }
 
 func TestNewRequirementServiceRequiresVersionReader(t *testing.T) {
-	service, err := newRequirementService(nil, nil, nil, nil, nil, nil, nil, nil)
+	service, err := newRequirementService(nil, nil, nil, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("requirement service wired without a version reader")
 	}
@@ -42,7 +42,7 @@ func TestNewRequirementServiceRequiresVersionReader(t *testing.T) {
 // touching the repository: the repository is nil here, so skipping the version
 // check would panic instead of returning the typed 404.
 func TestNewRequirementServiceChecksVersionExistence(t *testing.T) {
-	service, err := newRequirementService(nil, absentVersionReader{}, nil, nil, nil, nil, nil, nil)
+	service, err := newRequirementService(nil, absentVersionReader{}, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("wire requirement service: %v", err)
 	}

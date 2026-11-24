@@ -93,7 +93,7 @@ func TestWorkQueueAdapterMapsExecutionTask(t *testing.T) {
 	}
 }
 
-func TestGapEnsurerMatchesP2Dedupe(t *testing.T) {
+func TestGapEnsurerMatchesDesignDedupe(t *testing.T) {
 	queue := &fakeWorkItemEnsurer{}
 	adapter := NewGapEnsurer(queue, &fakeRequirementReader{currentVersionID: 601})
 	if err := adapter.EnsureGap(context.Background(), 10, 501, 0, "execution_not_run"); err != nil {

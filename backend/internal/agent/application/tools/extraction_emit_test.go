@@ -376,15 +376,15 @@ func TestEmitExecuteUsesInjectedSegmentText(t *testing.T) {
 
 func TestExtractionEmitToolRegisteredOnlyWithSink(t *testing.T) {
 	sink := &fakeExtractionSink{}
-	registry := NewP7Registry(Deps{Extraction: ExtractionDeps{Sink: sink}})
+	registry := NewKnowledgeRegistry(Deps{Extraction: ExtractionDeps{Sink: sink}})
 	tool, ok := registry.Get(ToolRequirementExtractionEmit)
 	if !ok {
-		t.Fatalf("NewP7Registry is missing %q when the sink is wired", ToolRequirementExtractionEmit)
+		t.Fatalf("NewKnowledgeRegistry is missing %q when the sink is wired", ToolRequirementExtractionEmit)
 	}
 	if tool.Name() != ToolRequirementExtractionEmit {
 		t.Fatalf("tool name = %q", tool.Name())
 	}
-	if _, ok := NewP7Registry(Deps{}).Get(ToolRequirementExtractionEmit); ok {
+	if _, ok := NewKnowledgeRegistry(Deps{}).Get(ToolRequirementExtractionEmit); ok {
 		t.Fatalf("%q must stay unregistered until the sink is wired", ToolRequirementExtractionEmit)
 	}
 	var schema map[string]any

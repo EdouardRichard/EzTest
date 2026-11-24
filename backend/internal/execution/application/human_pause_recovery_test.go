@@ -57,7 +57,7 @@ func TestPauseWaveGracefulAndImmediate(t *testing.T) {
 		f.seedRun(500, 1, execution.CaseRunRunning)
 		f.seedRun(501, 2, execution.CaseRunPending)
 		if err := f.contexts.Create(ctx, execution.CaseRunSUTContext{
-			ID: 900, CaseRunID: 500, VersionSUTID: 5001, BrowserContextID: "ctx-1",
+			ID: 900, CaseRunID: 500, SUTID: 5001, SessionID: "ctx-1",
 			Status: execution.SUTContextActive, CreatedAt: f.clock.Now(), UpdatedAt: f.clock.Now(),
 		}); err != nil {
 			t.Fatalf("seed context: %v", err)
@@ -203,6 +203,10 @@ func TestHumanTimeoutFailsCase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateFromTool: %v", err)
 	}
+	// The paused run recorded evidence before the takeover request; seed it so
+	// the evidence gate keeps the failed(session) settlement (a zero-evidence
+	// failed degrades inconclusive, art.1.2).
+	_ = f.evidence.Insert(ctx, execution.Evidence{CaseRunID: 500, Kind: execution.EvidenceText})
 
 	f.clock.now = f.clock.Now().Add(2 * time.Hour)
 	count, err := f.human.Expire(ctx, f.clock.Now())
@@ -312,6 +316,10 @@ func TestExecutorOfflineRedispatch(t *testing.T) {
 	exhausted.Attempts = 3
 	exhausted.OwnerExecutorID = int64PtrValue(1)
 	f2.runs.byID[500] = exhausted
+	// The exhausted run recorded failure evidence before its executor went
+	// offline; seed it so the evidence gate keeps the failed(executor_lost)
+	// settlement (a zero-evidence failed degrades inconclusive, art.1.2).
+	_ = f2.evidence.Insert(ctx, execution.Evidence{CaseRunID: 500, Kind: execution.EvidenceText})
 	f2.executors.byID[1] = offline
 	f2.cases.cases[300] = task6Snapshot(300, 5001)
 	if err := f2.recovery.Reconcile(ctx); err != nil {
@@ -477,6 +485,7 @@ func TestRecoveryLogsClaimedLeaseExpiryAsLeaseExpired(t *testing.T) {
 	}
 	f.runs.byID[500] = run
 	f.cases.cases[300] = task6Snapshot(300, 5001)
+	_ = f.evidence.Insert(ctx, execution.Evidence{CaseRunID: 500, Kind: execution.EvidenceText})
 	logs := captureSchedulerSlog(t)
 
 	if err := f.recovery.Reconcile(ctx); err != nil {
@@ -527,7 +536,7 @@ func TestCancelWaveAndIntent(t *testing.T) {
 	f.seedRun(500, 1, execution.CaseRunRunning)
 	f.seedRun(501, 2, execution.CaseRunPending)
 	if err := f.intents.Create(ctx, execution.ExecutionIntent{
-		ID: 2, VersionID: 100, CaseVersionID: 301, VersionSUTIDs: []int64{5001},
+		ID: 2, VersionID: 100, CaseVersionID: 301, SUTIDs: []int64{5001},
 		EnvironmentFingerprint: testFingerprintForTask9, Purpose: execution.PurposeManual, Status: execution.IntentRunning,
 	}); err != nil {
 		t.Fatalf("seed intent 2: %v", err)
@@ -564,7 +573,7 @@ func TestCancelWaveCancelsActiveIntents(t *testing.T) {
 	f.seedRun(501, 2, execution.CaseRunFailed)
 	// An intent that already reached a terminal state must not be rewritten.
 	if err := f.intents.Create(ctx, execution.ExecutionIntent{
-		ID: 3, VersionID: 100, CaseVersionID: 302, VersionSUTIDs: []int64{5001},
+		ID: 3, VersionID: 100, CaseVersionID: 302, SUTIDs: []int64{5001},
 		EnvironmentFingerprint: testFingerprintForTask9, Purpose: execution.PurposeInitial,
 		Status: execution.IntentDone,
 	}); err != nil {
@@ -661,20 +670,20 @@ func TestRecoveryCleansStaleAndOrphanContexts(t *testing.T) {
 	f.cases.cases[300] = task6Snapshot(300, 5001)
 	old := f.clock.Now().Add(-10 * time.Minute)
 	if err := f.contexts.Create(ctx, execution.CaseRunSUTContext{
-		ID: 900, CaseRunID: 500, VersionSUTID: 5001, BrowserContextID: "ctx-old",
+		ID: 900, CaseRunID: 500, SUTID: 5001, SessionID: "ctx-old",
 		Status: execution.SUTContextActive, CreatedAt: old, UpdatedAt: old,
 	}); err != nil {
 		t.Fatalf("seed stale context: %v", err)
 	}
 	if err := f.contexts.Create(ctx, execution.CaseRunSUTContext{
-		ID: 901, CaseRunID: 500, VersionSUTID: 5002, BrowserContextID: "ctx-known",
+		ID: 901, CaseRunID: 500, SUTID: 5002, SessionID: "ctx-known",
 		Status: execution.SUTContextActive, CreatedAt: f.clock.Now(), UpdatedAt: f.clock.Now(),
 	}); err != nil {
 		t.Fatalf("seed known context: %v", err)
 	}
-	f.control.live = []ExecutorContext{
-		{ID: "ctx-known", Key: "run:500:vs:5002:role:"},
-		{ID: "ctx-orphan", Key: "run:999:vs:5001:role:"},
+	f.control.live = []ExecutorSession{
+		{ID: "ctx-known", Key: "run:500:sut:5002:role:"},
+		{ID: "ctx-orphan", Key: "run:999:sut:5001:role:"},
 		{ID: "foreign-ctx", Key: "other:1"},
 	}
 
@@ -850,6 +859,7 @@ func TestOnlineExecutorRecordedLostCauseKeepsExecutorLost(t *testing.T) {
 	run.Attempts = 3
 	run.Summary.RetryReason = string(execution.FailureClassExecutorLost) + ": executor transport failed"
 	f.runs.byID[500] = run
+	_ = f.evidence.Insert(ctx, execution.Evidence{CaseRunID: 500, Kind: execution.EvidenceText})
 	heartbeat := f.clock.Now().Add(-time.Second)
 	f.executors.byID[1] = execution.ExecutorInstance{
 		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,
@@ -885,6 +895,7 @@ func TestOnlineExecutorExhaustedLeaseKeepsTypedCause(t *testing.T) {
 	run.Attempts = 3
 	run.Summary.LastError = "executor_timeout: executor request timed out while creating the browser context"
 	f.runs.byID[500] = run
+	_ = f.evidence.Insert(ctx, execution.Evidence{CaseRunID: 500, Kind: execution.EvidenceText})
 	heartbeat := f.clock.Now().Add(-time.Second)
 	f.executors.byID[1] = execution.ExecutorInstance{
 		ID: 1, Name: "executor", Endpoint: "http://x", Status: execution.ExecutorActive, LastHeartbeat: &heartbeat,

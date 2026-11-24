@@ -10,6 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// indexActiveStatuses is the single active-index status set, bound as a query
+// parameter so the SQL can never drift from the domain authority
+// (constitution 五.1; R-H10/T11e-3).
+func indexActiveStatuses() []string {
+	return []string{string(codeintel.IndexQueued), string(codeintel.IndexRunning)}
+}
+
 // IndexRunRepository stores code_index_run rows.
 type IndexRunRepository struct {
 	pool *pgxpool.Pool
@@ -72,10 +79,10 @@ func (r *IndexRunRepository) LatestRun(ctx context.Context, repoID int64) (codei
 func (r *IndexRunRepository) LatestDoneForVersion(ctx context.Context, versionID, repoID int64) (codeintel.IndexRun, error) {
 	run, err := scanIndexRun(r.pool.QueryRow(ctx, `
 		SELECT `+indexRunColumns+` FROM code_index_run
-		WHERE version_id = $1 AND repo_id = $2 AND status = 'done'
+		WHERE version_id = $1 AND repo_id = $2 AND status = $3
 		ORDER BY finished_at DESC NULLS LAST, created_at DESC, id DESC
 		LIMIT 1
-	`, versionID, repoID))
+	`, versionID, repoID, string(codeintel.IndexDone)))
 	if err != nil {
 		return codeintel.IndexRun{}, wrapDB("latest done code index run for version", err)
 	}
@@ -106,10 +113,10 @@ func (r *IndexRunRepository) UpdateRun(ctx context.Context, run codeintel.IndexR
 func (r *IndexRunRepository) ActiveRun(ctx context.Context, repoID int64) (codeintel.IndexRun, bool, error) {
 	run, err := scanIndexRun(r.pool.QueryRow(ctx, `
 		SELECT `+indexRunColumns+` FROM code_index_run
-		WHERE repo_id = $1 AND status IN ('queued', 'running')
+		WHERE repo_id = $1 AND status = ANY($2)
 		ORDER BY id DESC
 		LIMIT 1
-	`, repoID))
+	`, repoID, indexActiveStatuses()))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return codeintel.IndexRun{}, false, nil
@@ -124,10 +131,10 @@ func (r *IndexRunRepository) ActiveRun(ctx context.Context, repoID int64) (codei
 func (r *IndexRunRepository) DoneRunByCommit(ctx context.Context, repoID int64, commitSHA string) (codeintel.IndexRun, bool, error) {
 	run, err := scanIndexRun(r.pool.QueryRow(ctx, `
 		SELECT `+indexRunColumns+` FROM code_index_run
-		WHERE repo_id = $1 AND commit_sha = $2 AND status = 'done'
+		WHERE repo_id = $1 AND commit_sha = $2 AND status = $3
 		ORDER BY id DESC
 		LIMIT 1
-	`, repoID, commitSHA))
+	`, repoID, commitSHA, string(codeintel.IndexDone)))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return codeintel.IndexRun{}, false, nil

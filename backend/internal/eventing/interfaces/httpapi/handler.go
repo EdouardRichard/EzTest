@@ -70,6 +70,12 @@ func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Invalid("channel", "unsupported event channel"))
 		return
 	}
+	// SC-D3/R-D4: a run transcript channel is admin-only, on the snapshot path
+	// as well as on the live stream below.
+	if err := requireChannelAdmin(r, channel); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
 	after, err := parseCursor(query.Get("after"))
 	if err != nil {
 		httpx.Error(w, r, err)
@@ -112,6 +118,12 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 	}
 	if !eventingapp.ValidChannel(channel) {
 		httpx.Error(w, r, platform.Invalid("channel", "unsupported event channel"))
+		return
+	}
+	// SC-D3/R-D4: the live transcript subscription is admin-only too; the gate
+	// runs before Subscribe so a refused caller never reaches the hub.
+	if err := requireChannelAdmin(r, channel); err != nil {
+		httpx.Error(w, r, err)
 		return
 	}
 	cursor, err := requestCursor(r)

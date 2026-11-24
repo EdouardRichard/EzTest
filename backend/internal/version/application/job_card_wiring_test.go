@@ -193,8 +193,9 @@ func TestPartsJobCardUpsert(t *testing.T) {
 		t.Fatalf("conversation messages = %d, want one card per job", got)
 	}
 
-	// Conversation work types are accepted as card kinds (the parenthetical
-	// requirement: chat.turn/requirement.curate/design.round).
+	// Conversation work types are accepted as card kinds (chat.turn/
+	// requirement.curate; design.round is a historical read-only value, not a
+	// writable kind — see version.DesignRoundJobCardKind).
 	chatTurn := start
 	chatTurn.JobID = 503
 	chatTurn.JobKind = "chat.turn"

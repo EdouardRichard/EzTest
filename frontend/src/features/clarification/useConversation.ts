@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 
-import type { JobStatus } from "@/features/conversation/types"
+import type { JobStatus, MessageDelta, MessagePart } from "@/features/conversation/types"
+import { STREAMING_PART_TYPES } from "@/features/conversation/types"
 import type { ApiPage } from "@/lib/api-client"
 
 import {
@@ -20,6 +21,21 @@ import type { ConversationMessage, NewMessagePart, SendOptions } from "./types"
 
 /** Matches the messages endpoint default: a full page implies another page. */
 const MESSAGES_PAGE_SIZE = 100
+
+/**
+ * How many authoritative snapshot re-reads a lagging streaming head may force
+ * within one load generation before the thread stops re-reading and waits for
+ * the terminal full frame to heal (bounded: never a refetch storm). Mirrors the
+ * drawer's MAX_STALE_REREADS budget.
+ */
+export const MAX_FORWARD_GAP_REREADS = 2
+
+/**
+ * Debounce before a forward-offset-gap snapshot re-read. It must be at least one
+ * bounded-flush period (coalesced persistence every 250ms) so the refetch reads
+ * the text the live increment's offset refers to.
+ */
+export const FORWARD_GAP_REREAD_DELAY_MS = 300
 
 /** Stable empty value for a conversation without a persisted question snapshot. */
 const NO_QUESTIONS: QuestionBatch[] = []
@@ -51,34 +67,578 @@ function seqOf(part: unknown): number | null {
 }
 
 /**
+ * Detects a `conversation.message.delta` carrier (T5 §2.3) among incoming
+ * items: a positive `seq` plus a string `part_type`. Full parts carry `type`
+ * instead, so the two shapes never collide.
+ */
+function deltaOf(item: unknown): MessageDelta | null {
+  if (typeof item !== "object" || item === null) return null
+  const record = item as Record<string, unknown>
+  if (typeof record.part_type !== "string" || seqOf(record) === null) return null
+  return record as unknown as MessageDelta
+}
+
+/**
+ * Validates the two delta modes of T5 §2.3. Replace mode needs a full part
+ * snapshot (an object with a string `type`); append mode is text/thinking only,
+ * with a non-empty increment and a non-negative integer offset. Anything else
+ * is malformed and must not change the accumulated part.
+ */
+function deltaMode(delta: MessageDelta): "append" | "replace" | null {
+  if (isRecord(delta.part) && typeof delta.part.type === "string") return "replace"
+  if (
+    typeof delta.increment === "string" &&
+    delta.increment.length > 0 &&
+    (delta.part_type === "text" || delta.part_type === "thinking")
+  ) {
+    const offset = delta.offset ?? 0
+    if (Number.isInteger(offset) && offset >= 0) return "append"
+  }
+  return null
+}
+
+/**
+ * Applies one delta to the part accumulated at its seq (T5 §2.3). Returns the
+ * next part, or `undefined` when the delta must change nothing:
+ * - replace mode (`part`): the snapshot replaces the part wholesale;
+ * - append mode (`increment`): cur = accumulated text length in UTF-16 code
+ *   units (`String.length`, the server's offset unit). The increment appends
+ *   ONLY when `cur === offset` (strict equality). Any other accumulated length —
+ *   a replayed frame (cur > offset), an out-of-order gap (cur < offset), or a
+ *   partial overlap — leaves the part untouched and heals from the next full
+ *   frame; this accumulation never splices partial text. An append against a
+ *   different-type part is likewise left untouched (the server sends replace mode
+ *   on type changes, so this means a missed frame).
+ */
+function applyDelta(current: unknown, delta: MessageDelta): unknown | undefined {
+  const mode = deltaMode(delta)
+  if (mode === "replace") {
+    return { ...(delta.part as MessagePart), seq: delta.seq }
+  }
+  if (mode !== "append") return undefined
+  let curText = ""
+  let base: Record<string, unknown> = { type: delta.part_type }
+  if (current !== undefined) {
+    if (
+      !isRecord(current) ||
+      current.type !== delta.part_type ||
+      typeof current.text !== "string"
+    ) {
+      return undefined
+    }
+    curText = current.text
+    base = current
+  }
+  const offset = delta.offset ?? 0
+  const increment = delta.increment as string
+  if (curText.length !== offset) return undefined
+  if (delta.part_type === "thinking" && base.duration_ms === undefined) {
+    // duration_ms arrives via replace-mode deltas and the terminal full frame,
+    // never per text increment; the streaming block reads "思考了 0s" until then.
+    base = { ...base, duration_ms: 0 }
+  }
+  return { ...base, text: curText + increment, seq: delta.seq }
+}
+
+/** A rendered part must carry a string `type`; a seq-less delta carrier does not. */
+function asPart<T>(item: unknown): T | null {
+  if (!isRecord(item)) return null
+  return typeof (item as { type?: unknown }).type === "string" ? (item as T) : null
+}
+
+/**
+ * Content key for an unsequenced part. Snapshot-only parts (image,
+ * rollback_proposal) are carried through the seq merge untouched, so a snapshot
+ * seeded from an overlapping live projection must render each one once, not
+ * twice; content-addressed parts are equal exactly when their JSON is.
+ */
+function partContentKey(part: unknown): string {
+  try {
+    return JSON.stringify(part)
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * A snapshot-only part: a real part whose type is OUTSIDE the streaming enum
+ * (`image`/`rollback_proposal`). These never get a seq, so a seq merge carries
+ * them through untouched. An unsequenced STREAMING-type part is instead a legacy
+ * raw snapshot copy of a part that got a seq in the live projection; the
+ * sequenced copy supersedes it and must not be rendered a second time. (The
+ * vocabulary is the pinned shared list, never a second copy; evaluated at call
+ * time, after module init.)
+ */
+function isSnapshotOnlyPart(item: unknown): boolean {
+  if (!isRecord(item)) return false
+  const type = (item as { type?: unknown }).type
+  return typeof type === "string" && !STREAMING_PART_TYPE_SET.has(type)
+}
+
+/**
  * Merges streamed message parts by their 1-based `seq` (OpenAPI
- * `MessagePartView.seq`). A later payload for the same seq wins and the result
- * is ordered by seq, so a repeated SSE frame never renders the same part twice.
+ * `MessagePartView.seq`). A later full payload for the same seq wins and the
+ * result is ordered by seq, so a repeated SSE frame never renders the same part
+ * twice.
  *
- * Without any seq (the `conversation.message` full snapshot, P1 shape) the
+ * Incoming items may also be `conversation.message.delta` carriers (T5 §2.3):
+ * a replace-mode delta swaps the part at seq wholesale, an append-mode delta
+ * accumulates the text suffix at its offset (replay/gap-safe, see applyDelta).
+ * This is the single accumulation rule for incremental Host replies.
+ *
+ * Parts WITHOUT a seq that are snapshot-only types (the server never assigns a
+ * seq to `image`/`rollback_proposal`) are NOT touched by a delta and must
+ * survive the merge: sequenced parts come first (sorted by seq), then the
+ * snapshot-only parts in their original relative order (H-E18). An unsequenced
+ * item of a STREAMING type is a legacy raw snapshot copy of a part that the
+ * sequenced projection supersedes (not carried twice), and a seq-less item that
+ * is not even a part (a malformed delta carrier) is dropped — never cast into the
+ * result.
+ *
+ * Without any seq at all (the `conversation.message` full snapshot, P1 shape) the
  * newer snapshot replaces the older one; this also makes a duplicate frame
  * idempotent instead of appending a second copy.
  */
-export function mergePartsBySeq<T>(existing: readonly T[], incoming: readonly T[]): T[] {
+export function mergePartsBySeq<T>(
+  existing: readonly T[],
+  incoming: readonly (T | MessageDelta)[],
+): T[] {
   const incomingSequenced = incoming.some((part) => seqOf(part) !== null)
   if (!incomingSequenced) {
-    return incoming.length >= existing.length ? [...incoming] : [...existing]
+    const parts: T[] = []
+    for (const item of incoming) {
+      const part = asPart<T>(item)
+      if (part !== null) parts.push(part)
+    }
+    return parts.length >= existing.length ? parts : [...existing]
   }
 
   const bySeq = new Map<number, T>()
   for (const part of existing) {
     const seq = seqOf(part)
-    if (seq !== null) bySeq.set(seq, part)
+    if (seq === null) continue
+    const narrowed = asPart<T>(part)
+    if (narrowed !== null) bySeq.set(seq, narrowed)
   }
   for (const part of incoming) {
     const seq = seqOf(part)
-    if (seq !== null) bySeq.set(seq, part)
+    if (seq === null) continue
+    const delta = deltaOf(part)
+    if (delta !== null) {
+      const next = applyDelta(bySeq.get(seq), delta)
+      if (next !== undefined) {
+        const narrowed = asPart<T>(next)
+        if (narrowed !== null) bySeq.set(seq, narrowed)
+      }
+      continue
+    }
+    const narrowed = asPart<T>(part)
+    if (narrowed !== null) bySeq.set(seq, narrowed)
   }
   const sequenced = [...bySeq.entries()]
     .sort(([leftSeq], [rightSeq]) => leftSeq - rightSeq)
     .map(([, part]) => part)
-  const unsequenced = incoming.filter((part) => seqOf(part) === null)
+  const unsequenced: T[] = []
+  const seenParts = new Set<string>()
+  for (const part of existing) {
+    if (seqOf(part) !== null) continue
+    const narrowed = asPart<T>(part)
+    if (narrowed === null || !isSnapshotOnlyPart(narrowed)) continue
+    unsequenced.push(narrowed)
+    seenParts.add(partContentKey(narrowed))
+  }
+  for (const part of incoming) {
+    if (seqOf(part) !== null) continue
+    const narrowed = asPart<T>(part)
+    if (narrowed === null || !isSnapshotOnlyPart(narrowed)) continue
+    const key = partContentKey(narrowed)
+    if (seenParts.has(key)) continue
+    seenParts.add(key)
+    unsequenced.push(narrowed)
+  }
   return [...sequenced, ...unsequenced]
+}
+
+/* ---------------------- conversation stream projection ---------------------- */
+
+/**
+ * One accumulated streaming message. `fullFrame` marks the last update as a
+ * full `conversation.message` snapshot (authoritative parts, wholesale heal);
+ * delta updates merge by seq instead.
+ */
+export type ConversationStreamEntry = {
+  message: ConversationMessage
+  fullFrame: boolean
+}
+
+type ConversationStreamListener = (versionId: string, entry: ConversationStreamEntry) => void
+
+// The version channel has documented-intentional concurrent subscriptions
+// (page-level header projection + tab workspace). Only the workspace owner —
+// the useVersionEvents instance whose handlers include onConversationMessage —
+// publishes here (defect 039): one accumulator per (version, message, seq) with
+// offset dedup, so a replayed or double-delivered frame never appends twice.
+const conversationStreams = new Map<string, Map<string, ConversationStreamEntry>>()
+const conversationStreamListeners = new Set<ConversationStreamListener>()
+/** Mirrors the workspace liveMessages cap so the projection cannot grow unbounded. */
+const CONVERSATION_STREAM_LIMIT = 200
+
+/** Subscribes a thread owner to changed streaming entries of any version. */
+export function subscribeConversationStream(listener: ConversationStreamListener): () => void {
+  conversationStreamListeners.add(listener)
+  return () => {
+    conversationStreamListeners.delete(listener)
+  }
+}
+
+function storeConversationStreamEntry(versionId: string, entry: ConversationStreamEntry): void {
+  let stream = conversationStreams.get(versionId)
+  if (stream === undefined) {
+    stream = new Map()
+    conversationStreams.set(versionId, stream)
+  }
+  stream.set(entry.message.id, entry)
+  while (stream.size > CONVERSATION_STREAM_LIMIT) {
+    const oldest = stream.keys().next().value
+    if (oldest === undefined) break
+    stream.delete(oldest)
+  }
+  for (const listener of conversationStreamListeners) listener(versionId, entry)
+}
+
+/**
+ * Stores one full `conversation.message` frame (Begin placeholder / terminal
+ * snapshot). The frame is the server's authoritative parts snapshot: it replaces
+ * the accumulated parts wholesale, healing any offset gap a delta left behind.
+ * Deltas buffered before any head was known are replayed onto it, so a frame that
+ * was read before those increments does not drop them.
+ */
+export function publishConversationFrame(versionId: string, message: ConversationMessage): void {
+  const parts = replayPendingDeltas(versionId, message.id, message.parts)
+  storeConversationStreamEntry(versionId, { message: { ...message, parts }, fullFrame: true })
+}
+
+/* ------------------------- snapshot resume (I-1) --------------------------- */
+
+/** Runtime membership set derived from the pinned shared vocabulary. */
+const STREAMING_PART_TYPE_SET: ReadonlySet<string> = new Set(STREAMING_PART_TYPES)
+
+/**
+ * Assigns the server's streaming seq to an HTTP snapshot's parts. This mirrors
+ * the ONE server rule (`publishMessageEvent` / `assistantStreamParts` in
+ * backend/internal/version/application/conversation.go): for an assistant
+ * message, every part whose type is in the streaming enum gets the next 1-based
+ * seq in part order; snapshot-only types (image/rollback_proposal) stay
+ * unsequenced. The vocabulary is the pinned shared list, not a second copy.
+ *
+ * Without this, a thread loaded over HTTP has parts with no seq, so the next
+ * `conversation.message.delta` finds no accumulated part at its seq, compares the
+ * server's accumulated offset against empty text and skips every increment —
+ * the live reply freezes until the turn's terminal frame.
+ *
+ * Exported (pure function) so the cross-language seq gate
+ * (`conversation-seq.authority.test.ts`) evaluates THIS mirror against the shared
+ * fixture the Go authority is also checked against (H-E19).
+ */
+export function streamingSnapshotParts(message: ConversationMessage): ConversationMessage["parts"] {
+  if (message.role !== "assistant") return message.parts
+  let seq = 0
+  return message.parts.map((part) => {
+    const type = (part as { type?: unknown }).type
+    if (typeof type !== "string" || !STREAMING_PART_TYPE_SET.has(type)) return part
+    seq += 1
+    return { ...part, seq }
+  })
+}
+
+/**
+ * Deltas that arrived for a head this client has never seen (page reload, second
+ * tab, `stream.reset` mid-reply). They cannot be applied yet — their offset is
+ * the server's accumulated length, and there is nothing to accumulate onto — so
+ * they wait for the HTTP snapshot instead of being dropped. Bounded: the queue
+ * only lives until a snapshot or a full frame lands, and both caps below keep a
+ * never-resolved head from growing without limit.
+ */
+const pendingConversationDeltas = new Map<string, Map<string, MessageDelta[]>>()
+/**
+ * Per-head queue cap for a never-resolved head (page reload / second tab /
+ * `stream.reset` mid-reply). It is a BACKSTOP only: contiguous same-seq appends
+ * coalesce to one entry, so a healthy stream stays at most one entry per seq
+ * (well under this cap). It bounds a pathological non-contiguous flood.
+ */
+const PENDING_DELTA_LIMIT = 4096
+
+/** The append range (offset) of a delta; null for replace-mode or a malformed carrier. */
+function pendingAppendOffset(delta: MessageDelta): number | null {
+  if (delta.part !== undefined) return null
+  if (delta.part_type !== "text" && delta.part_type !== "thinking") return null
+  if (typeof delta.increment !== "string" || delta.increment.length === 0) return null
+  const offset = delta.offset ?? 0
+  return Number.isInteger(offset) && offset >= 0 ? offset : null
+}
+
+/**
+ * Losslessly compacts one delta into a head's pre-snapshot queue instead of
+ * dropping the newest past a cap (H-E25, Ruling T15-R1):
+ * - a contiguous same-seq, same-type append (`next.offset === prev.offset +
+ *   prev.increment.length`, UTF-16 code units) coalesces into the existing
+ *   entry, keeping the first offset and concatenating increments. The merged
+ *   offset equals the first entry's and the concatenated length is unchanged, so
+ *   `applyDelta`'s strict `curText.length !== offset` check still holds;
+ * - an exact replay of an already-queued increment is dropped (applying it twice
+ *   is a no-op under offset dedup);
+ * - anything else (a gap, or a cross-type change) stays independent for the
+ *   existing gap semantics.
+ *
+ * The pre-snapshot buffer only ever carries APPEND-mode deltas:
+ * `publishConversationDelta` buffers a delta only when `part === undefined` and
+ * its offset is positive, so replace-mode supersession has no production caller
+ * here and is deliberately not implemented (no unwired branch).
+ */
+function compactPendingDelta(queue: MessageDelta[], delta: MessageDelta): void {
+  const nextOffset = pendingAppendOffset(delta)
+  if (nextOffset === null) {
+    queue.push(delta)
+    return
+  }
+  const index = queue.findIndex((entry) => entry.seq === delta.seq)
+  if (index < 0) {
+    queue.push(delta)
+    return
+  }
+  const prev = queue[index]
+  if (
+    prev.part === undefined &&
+    prev.part_type === delta.part_type &&
+    (prev.offset ?? 0) === nextOffset &&
+    prev.increment === delta.increment
+  ) {
+    return
+  }
+  const prevOffset = pendingAppendOffset(prev)
+  if (
+    prevOffset !== null &&
+    prev.part_type === delta.part_type &&
+    nextOffset === prevOffset + (prev.increment as string).length
+  ) {
+    queue[index] = { ...prev, increment: (prev.increment as string) + (delta.increment as string) }
+    return
+  }
+  queue.push(delta)
+}
+
+function bufferPendingDelta(versionId: string, delta: MessageDelta): void {
+  let stream = pendingConversationDeltas.get(versionId)
+  if (stream === undefined) {
+    stream = new Map()
+    pendingConversationDeltas.set(versionId, stream)
+  }
+  let queue = stream.get(delta.message_id)
+  if (queue === undefined) {
+    queue = []
+    stream.set(delta.message_id, queue)
+  }
+  compactPendingDelta(queue, delta)
+  // Backstop (unreachable for a contiguous server stream, which coalesces to one
+  // entry per seq): bound a pathological non-contiguous flood to the applicable
+  // prefix instead of growing without limit.
+  if (queue.length > PENDING_DELTA_LIMIT) queue.length = PENDING_DELTA_LIMIT
+  while (stream.size > CONVERSATION_STREAM_LIMIT) {
+    const oldest = stream.keys().next().value
+    if (oldest === undefined) break
+    stream.delete(oldest)
+  }
+}
+
+function takePendingDeltas(versionId: string, messageId: string): MessageDelta[] {
+  const stream = pendingConversationDeltas.get(versionId)
+  const queue = stream?.get(messageId)
+  if (queue === undefined) return []
+  stream?.delete(messageId)
+  if (stream?.size === 0) pendingConversationDeltas.delete(versionId)
+  return queue
+}
+
+function replayPendingDeltas(
+  versionId: string,
+  messageId: string,
+  parts: ConversationMessage["parts"],
+): ConversationMessage["parts"] {
+  let merged = parts
+  for (const delta of takePendingDeltas(versionId, messageId)) {
+    merged = mergePartsBySeq<unknown>(merged, [delta]) as ConversationMessage["parts"]
+  }
+  return merged
+}
+
+/**
+ * A terminal head never goes back to streaming: if the projection already saw the
+ * terminal frame, an older HTTP snapshot (read before that frame landed) must not
+ * revive the generating state.
+ */
+function resumedStreamState(
+  existing: ConversationStreamEntry | undefined,
+  snapshot: ConversationMessage,
+): ConversationMessage["stream_state"] {
+  const seen = existing?.message.stream_state
+  if (seen === "complete" || seen === "interrupted") return seen
+  return snapshot.stream_state
+}
+
+/**
+ * Seeds the live stream projection from an HTTP message snapshot, so incremental
+ * rendering RESUMES from the stored reply instead of freezing (v0.2.4-D fix wave,
+ * I-1/#24). Called by the thread owner after every snapshot fetch for a head the
+ * server still reports as `streaming`.
+ *
+ * The projection wins per seq over the snapshot (it is the newer accumulator);
+ * the snapshot supplies the parts/seqs the projection has not seen. Deltas that
+ * arrived before the snapshot are then replayed in arrival order, which fills the
+ * band between the stored text and the live edge exactly.
+ */
+export function seedConversationSnapshot(versionId: string, message: ConversationMessage): void {
+  const snapshotParts = streamingSnapshotParts(message)
+  const existing = conversationStreams.get(versionId)?.get(message.id)
+  const baseParts =
+    existing === undefined
+      ? snapshotParts
+      : (mergePartsBySeq<unknown>(
+          snapshotParts,
+          existing.message.parts,
+        ) as ConversationMessage["parts"])
+  const pending = takePendingDeltas(versionId, message.id)
+  let parts = baseParts
+  for (const delta of pending) {
+    parts = mergePartsBySeq<unknown>(parts, [delta]) as ConversationMessage["parts"]
+  }
+  storeConversationStreamEntry(versionId, {
+    message: { ...message, stream_state: resumedStreamState(existing, message), parts },
+    // A pure snapshot is authoritative (wholesale heal); a snapshot extended by
+    // replayed increments merges by seq like any other delta update.
+    fullFrame: existing === undefined && pending.length === 0,
+  })
+}
+
+/** Validates one raw delta payload against the T5 §2.3 schema (MessageDelta). */
+function normalizeMessageDelta(payload: Record<string, unknown>): MessageDelta | null {
+  const messageId = payload.message_id
+  const conversationId = payload.conversation_id
+  const seq = payload.seq
+  const partType = payload.part_type
+  if (typeof messageId !== "string" || !/^[0-9]+$/.test(messageId)) return null
+  if (typeof conversationId !== "string" || !/^[0-9]+$/.test(conversationId)) return null
+  if (typeof seq !== "number" || !Number.isInteger(seq) || seq <= 0) return null
+  if (typeof partType !== "string" || partType.length === 0) return null
+  const delta: MessageDelta = {
+    message_id: messageId,
+    conversation_id: conversationId,
+    seq,
+    part_type: partType as MessageDelta["part_type"],
+  }
+  if (typeof payload.offset === "number") delta.offset = payload.offset
+  if (typeof payload.increment === "string") delta.increment = payload.increment
+  if (isRecord(payload.part)) delta.part = payload.part as unknown as MessagePart
+  return deltaMode(delta) === null ? null : delta
+}
+
+/**
+ * Accumulates one `conversation.message.delta` into the stored head by
+ * (message_id, seq) — the T5 §2.3 rule via mergePartsBySeq's increment branch.
+ * A replayed or gap delta changes nothing and notifies nothing (the next full
+ * frame heals); a valid first append against an unseen head creates a skeleton
+ * so a missed Begin frame cannot stall the live render. An increment that cannot
+ * be applied because the head is unknown (its offset is already past 0) is
+ * BUFFERED for the HTTP snapshot to resume from, never dropped (I-1).
+ */
+export function publishConversationDelta(
+  versionId: string,
+  payload: Record<string, unknown>,
+): void {
+  const delta = normalizeMessageDelta(payload)
+  if (delta === null) return
+  let entry = conversationStreams.get(versionId)?.get(delta.message_id)
+  if (entry !== undefined && isForwardOffsetGap(entry, delta)) {
+    // The stored projection lags the published offset (bounded DB flush; T28c).
+    // The strict-equality append would drop every increment until the turn
+    // seals. Drop the stale head so the owner's debounced authoritative snapshot
+    // refetch rebuilds it from stored truth, and buffer this increment to replay.
+    conversationStreams.get(versionId)?.delete(delta.message_id)
+    notifyForwardGap(versionId, delta.conversation_id, delta.message_id)
+    entry = undefined
+  }
+  if (entry === undefined && delta.part === undefined && (delta.offset ?? 0) > 0) {
+    // The head exists on the server but not in this client (reload / second tab /
+    // stream.reset). Keep the increment for seedConversationSnapshot.
+    bufferPendingDelta(versionId, delta)
+    return
+  }
+  const base: ConversationMessage = entry?.message ?? {
+    id: delta.message_id,
+    conversation_id: delta.conversation_id,
+    role: "assistant",
+    parts: [],
+    refs: [],
+    created_at: "",
+  }
+  const parts = mergePartsBySeq<unknown>(base.parts, [delta]) as ConversationMessage["parts"]
+  const changed =
+    parts.length !== base.parts.length || parts.some((part, index) => part !== base.parts[index])
+  if (!changed) return
+  storeConversationStreamEntry(versionId, { message: { ...base, parts }, fullFrame: false })
+}
+
+/* ------------------------ forward offset gap re-read ----------------------- */
+
+type ForwardGapListener = (versionId: string, conversationId: string, messageId: string) => void
+
+const forwardGapListeners = new Set<ForwardGapListener>()
+
+/**
+ * Subscribes a thread owner to forward-offset-gap notifications. This is the
+ * module→hook hand-off: `publishConversationDelta` detects the lag, but only the
+ * `useConversation` owner knows the reload budget and can refetch.
+ */
+export function subscribeForwardGap(listener: ForwardGapListener): () => void {
+  forwardGapListeners.add(listener)
+  return () => {
+    forwardGapListeners.delete(listener)
+  }
+}
+
+function notifyForwardGap(versionId: string, conversationId: string, messageId: string): void {
+  for (const listener of forwardGapListeners) listener(versionId, conversationId, messageId)
+}
+
+/**
+ * True when an APPEND delta targets a part whose locally accumulated text is
+ * SHORTER than the delta's offset — the server's published text is ahead of the
+ * stored projection. That happens when the thread is opened mid-turn: the HTTP
+ * snapshot (and the seeded projection) lags the published text by the bounded DB
+ * flush, so the next increments carry offsets past the local length and the
+ * strict-equality append drops them until the turn seals. Only a STREAMING
+ * assistant head is eligible; a replay (offset <= local length), a terminal head,
+ * a replace-mode delta and a non-creatable seq jump are not.
+ */
+function isForwardOffsetGap(entry: ConversationStreamEntry, delta: MessageDelta): boolean {
+  const state = entry.message.stream_state
+  if (state === "complete" || state === "interrupted") return false
+  if (entry.message.role !== "assistant") return false
+  if (deltaMode(delta) !== "append") return false
+  const parts = entry.message.parts
+  const partIndex = delta.seq - 1
+  if (partIndex < 0) return false
+  const part: unknown = parts[partIndex]
+  let localLength = 0
+  if (part === undefined) {
+    // Only the next slot is creatable; a jump past it is not an offset gap.
+    if (partIndex !== parts.length) return false
+  } else {
+    if (!isRecord(part) || part.type !== delta.part_type) return false
+    const text = (part as { text?: unknown }).text
+    if (text !== undefined && typeof text !== "string") return false
+    localLength = typeof text === "string" ? text.length : 0
+  }
+  return (delta.offset ?? 0) > localLength
 }
 
 /* ------------------------------ stream resets ------------------------------ */
@@ -97,6 +657,13 @@ export function subscribeStreamReset(listener: StreamResetListener): () => void 
 
 /** Called by the single SSE owner (`useVersionEvents`) on `stream.reset`. */
 export function publishStreamReset(versionId: string, data: unknown): void {
+  // The cursor fell out of the event window: the accumulated stream state can
+  // no longer be trusted to be complete. Drop it; the HTTP snapshot refetch and
+  // the next full frames rebuild the thread (gaps heal wholesale, never splice).
+  // Buffered pre-snapshot increments survive: the refetch seeds the projection
+  // from the stored reply and replays them, so the reply resumes instead of
+  // freezing until the turn ends (I-1).
+  conversationStreams.delete(versionId)
   for (const listener of streamResetListeners) listener(versionId, data)
 }
 
@@ -569,6 +1136,12 @@ export function useConversation({
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<unknown>(null)
   const [reloadToken, setReloadToken] = useState(0)
+  // Bounded forward-offset-gap re-read budget. It mirrors the drawer handshake:
+  // an internal re-read keeps its count across the reload via
+  // gapRereadInFlightRef; any external (re)load starts a fresh budget.
+  const gapRereadCountRef = useRef(0)
+  const gapRereadInFlightRef = useRef(false)
+  const gapRereadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<unknown>(null)
   // Persisted structured-question state of this conversation. The thread
@@ -613,6 +1186,19 @@ export function useConversation({
     }
     historyCursorRef.current = ""
 
+    // An internal forward-gap re-read keeps its count across the reload; any
+    // other (re)load — initial mount, conversation switch, stream.reset, retry —
+    // resets the budget. Any queued gap re-read is cancelled here.
+    if (gapRereadInFlightRef.current) {
+      gapRereadInFlightRef.current = false
+    } else {
+      gapRereadCountRef.current = 0
+    }
+    if (gapRereadTimerRef.current !== null) {
+      clearTimeout(gapRereadTimerRef.current)
+      gapRereadTimerRef.current = null
+    }
+
     if (conversationId === null) {
       loadedIdentityRef.current = ""
       historyDirectionRef.current = "older"
@@ -656,6 +1242,15 @@ export function useConversation({
         historyDirectionRef.current = direction
         oldestLoadedIdRef.current = oldest
         setMessages(sorted)
+        // Resume incremental rendering from the stored reply (I-1): a head the
+        // server still reports as streaming seeds the live projection with its
+        // snapshot parts (and their server seq), so the next delta continues the
+        // text instead of gapping against an empty accumulator.
+        for (const message of sorted) {
+          if (message.role === "assistant" && message.stream_state === "streaming") {
+            seedConversationSnapshot(versionId, message)
+          }
+        }
         if (direction === "older") {
           // API-8 default page: the cursor (when the server sends one) points
           // before the oldest loaded message. A full page also implies more
@@ -690,6 +1285,36 @@ export function useConversation({
     if (relevant.length === 0) return
     setMessages((current) => mergeConversationMessages(current, relevant))
   }, [liveMessages, conversationId])
+
+  // Incremental Host replies (v0.2.4-D, SC-D2): the workspace SSE owner
+  // accumulates `conversation.message.delta` into the stream projection and
+  // publishes full frames there too (the workspace liveMessages prop dedupes by
+  // id, so the terminal frame would otherwise never reach the thread). A full
+  // frame replaces the parts wholesale (server truth, gap heal); a delta entry
+  // merges by seq so an unrelated part's update never regresses a newer HTTP
+  // snapshot of another part.
+  useEffect(
+    () =>
+      subscribeConversationStream((streamVersionId, entry) => {
+        if (streamVersionId !== versionId) return
+        if (conversationId === null || entry.message.conversation_id !== conversationId) return
+        setMessages((current) => {
+          const existing = current.find((message) => message.id === entry.message.id)
+          if (existing === undefined) return sortMessages([...current, entry.message])
+          if (entry.fullFrame) {
+            return current.map((message) =>
+              message.id === entry.message.id ? { ...message, ...entry.message } : message,
+            )
+          }
+          return current.map((message) =>
+            message.id === entry.message.id
+              ? { ...message, parts: mergePartsBySeq(message.parts, entry.message.parts) }
+              : message,
+          )
+        })
+      }),
+    [versionId, conversationId],
+  )
 
   // Question state comes from the questions API (Task 23), not from local
   // component state: a reload/refresh must restore pending batches and the
@@ -741,6 +1366,49 @@ export function useConversation({
         if (resetVersionId === versionId) setReloadToken((token) => token + 1)
       }),
     [versionId],
+  )
+
+  /**
+   * Schedules ONE debounced authoritative snapshot refetch for a forward offset
+   * gap. A burst of gap frames collapses to a single fetch (timer guard) and the
+   * per-generation budget can never be exceeded (no refetch storm). The delay is
+   * at least one bounded-flush period, so the DB has caught up.
+   */
+  const scheduleForwardGapReread = useCallback(() => {
+    if (gapRereadTimerRef.current !== null) return
+    if (gapRereadInFlightRef.current) return
+    if (gapRereadCountRef.current >= MAX_FORWARD_GAP_REREADS) return
+    gapRereadTimerRef.current = setTimeout(() => {
+      gapRereadTimerRef.current = null
+      if (gapRereadCountRef.current >= MAX_FORWARD_GAP_REREADS) return
+      gapRereadCountRef.current += 1
+      gapRereadInFlightRef.current = true
+      setReloadToken((token) => token + 1)
+    }, FORWARD_GAP_REREAD_DELAY_MS)
+  }, [])
+
+  // A streaming assistant head whose local text lags the server's published
+  // offset (bounded DB flush) triggers the debounced re-read above; the terminal
+  // full frame heals any remaining gap once the budget is spent.
+  useEffect(
+    () =>
+      subscribeForwardGap((gapVersionId, gapConversationId) => {
+        if (gapVersionId !== versionId) return
+        if (conversationId === null || gapConversationId !== conversationId) return
+        scheduleForwardGapReread()
+      }),
+    [versionId, conversationId, scheduleForwardGapReread],
+  )
+
+  // Cancel a queued forward-gap re-read on unmount.
+  useEffect(
+    () => () => {
+      if (gapRereadTimerRef.current !== null) {
+        clearTimeout(gapRereadTimerRef.current)
+        gapRereadTimerRef.current = null
+      }
+    },
+    [],
   )
 
   const loadMore = useCallback(async (): Promise<void> => {

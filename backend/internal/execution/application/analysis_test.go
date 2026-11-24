@@ -17,8 +17,10 @@ func TestAnalyzeWaveClassifiesFailures(t *testing.T) {
 	f.addCase(302, 900, 901, "P2")
 	f.addRun(500, 1, 300, execution.CaseRunFailed, "")
 	f.addFailedAssertion(500, 1, 1)
+	f.addEvidenceRows(500, 1)
 	f.addRun(501, 2, 301, execution.CaseRunFailed, "")
 	f.addFailedStep(501, 1)
+	f.addEvidenceRows(501, 1)
 	f.addRun(502, 3, 302, execution.CaseRunFailed, execution.FailureClassApplication)
 
 	if err := f.analysis.AnalyzeWave(ctx, f.wave.ID); err != nil {
@@ -51,8 +53,10 @@ func TestFailureCandidateOnlyApplication(t *testing.T) {
 	f.addCase(301, 900, 901, "P2")
 	f.addRun(500, 1, 300, execution.CaseRunFailed, "")
 	f.addFailedAssertion(500, 1, 1)
+	f.addEvidenceRows(500, 1)
 	f.addRun(501, 2, 301, execution.CaseRunFailed, "")
 	f.addFailedStep(501, 1)
+	f.addEvidenceRows(501, 1)
 
 	if err := f.analysis.AnalyzeWave(ctx, f.wave.ID); err != nil {
 		t.Fatalf("AnalyzeWave: %v", err)

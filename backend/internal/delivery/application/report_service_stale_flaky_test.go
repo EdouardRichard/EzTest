@@ -4,6 +4,10 @@ package deliveryapp
 // changed (for example the issue triage finished after publication and turned
 // the failure into flaky) must be detected as stale and regenerated on the next
 // ensure pass. Otherwise the first publication keeps claiming a product defect.
+//
+// v0.2.4-G T11: stale DETECTION moved out of EnsureReports into the causal
+// watcher + complete sweep (MarkStaleIfChanged). This test simulates that
+// detection step, then asserts EnsureReports regenerates the stale wave report.
 
 import (
 	"context"
@@ -18,6 +22,10 @@ func TestEnsureReportsRegeneratesStaleWaveReport(t *testing.T) {
 	fixture.data.version[versionID] = reportTestVersionSnapshot(versionID)
 	report, _ := fixture.seedPublishedWaveReport(versionID, 12, reportTestFingerprint("a"))
 
+	// The causal watcher/sweep detects the changed input and marks it stale.
+	if _, err := fixture.svc.MarkStaleIfChanged(context.Background(), versionID); err != nil {
+		t.Fatalf("MarkStaleIfChanged: %v", err)
+	}
 	if err := fixture.svc.EnsureReports(context.Background(), versionID); err != nil {
 		t.Fatalf("EnsureReports: %v", err)
 	}

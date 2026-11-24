@@ -53,8 +53,7 @@ func (t *proposeTx) RequirementSnapshot(ctx context.Context, versionID, requirem
 	snapshot := design.RequirementSnapshot{RequirementVersionID: requirementVersionID}
 	rows, err := t.tx.Query(ctx, `
 		SELECT id, version_id, requirement_id, requirement_version_id, name, description,
-		       COALESCE(version_sut_ids, '[]'::jsonb), COALESCE(page_ids, '[]'::jsonb),
-		       COALESCE(api_ids, '[]'::jsonb), sort_order, created_at, updated_at
+		       sort_order, created_at, updated_at
 		FROM case_scenario
 		WHERE version_id = $1 AND requirement_id = $2 AND requirement_version_id = $3
 		ORDER BY sort_order, id
@@ -83,18 +82,10 @@ func (t *proposeTx) RequirementSnapshot(ctx context.Context, versionID, requirem
 		snapshot.Cases = []design.CaseWithCurrent{}
 		return snapshot, nil
 	}
-	caseRows, err := t.tx.Query(ctx, `
-		SELECT ce.id, ce.scenario_id, ce.current_version_id, ce.status,
-		       ce.created_by, ce.created_by_run_id, ce.created_at, ce.updated_at,
-		       cv.id, cv.revision, cv.title, cv.description, cv.preconditions, cv.test_data, cv.priority,
-		       cv.default_version_sut_id, COALESCE(cv.version_sut_ids, '[]'::jsonb),
-		       COALESCE(cv.page_ids, '[]'::jsonb), COALESCE(cv.api_ids, '[]'::jsonb),
-		       cv.status, cv.content_hash, cv.created_at,
-		       (SELECT count(*) FROM case_step step WHERE step.case_version_id = cv.id),
-		       (SELECT count(*) FROM case_assertion assertion WHERE assertion.case_version_id = cv.id),
-		       (SELECT count(*) FROM case_source source WHERE source.case_version_id = cv.id)
-		FROM case_entity ce
-		JOIN case_version cv ON cv.id = ce.current_version_id
+	// Reuses the shared projection (caseWithCurrentQuery) rather than a second
+	// near-identical column list, so the snapshot the proposal gate validates
+	// against and the confirmation/stale reads can never drift apart.
+	caseRows, err := t.tx.Query(ctx, caseWithCurrentQuery+`
 		WHERE ce.scenario_id = ANY($1)
 		ORDER BY ce.id
 	`, scenarioIDs)
@@ -121,29 +112,15 @@ func (t *proposeTx) RequirementSnapshot(ctx context.Context, versionID, requirem
 
 // InsertScenario writes one scenario row.
 func (t *proposeTx) InsertScenario(ctx context.Context, scenario design.Scenario) (design.Scenario, error) {
-	suts, err := encodeIDArray(scenario.VersionSUTIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
-	pages, err := encodeIDArray(scenario.PageIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
-	apis, err := encodeIDArray(scenario.APIIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
-	err = t.tx.QueryRow(ctx, `
+	err := t.tx.QueryRow(ctx, `
 		INSERT INTO case_scenario (
 			id, version_id, requirement_id, requirement_version_id, name, description,
-			version_sut_ids, page_ids, api_ids, sort_order, created_by, created_by_run_id,
-			created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14)
+			sort_order, created_by, created_by_run_id, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		RETURNING id
 	`, scenario.ID, scenario.VersionID, scenario.RequirementID, scenario.RequirementVersionID,
-		scenario.Name, scenario.Description, string(suts), string(pages), string(apis),
-		scenario.SortOrder, scenario.CreatedBy, scenario.CreatedByRunID,
-		scenario.CreatedAt, scenario.UpdatedAt).Scan(&scenario.ID)
+		scenario.Name, scenario.Description, scenario.SortOrder, scenario.CreatedBy,
+		scenario.CreatedByRunID, scenario.CreatedAt, scenario.UpdatedAt).Scan(&scenario.ID)
 	if err != nil {
 		return design.Scenario{}, fmt.Errorf("insert scenario: %w", err)
 	}
@@ -152,25 +129,12 @@ func (t *proposeTx) InsertScenario(ctx context.Context, scenario design.Scenario
 
 // UpdateScenario rewrites the mutable scenario fields.
 func (t *proposeTx) UpdateScenario(ctx context.Context, scenario design.Scenario) (design.Scenario, error) {
-	suts, err := encodeIDArray(scenario.VersionSUTIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
-	pages, err := encodeIDArray(scenario.PageIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
-	apis, err := encodeIDArray(scenario.APIIDs)
-	if err != nil {
-		return design.Scenario{}, err
-	}
 	tag, err := t.tx.Exec(ctx, `
 		UPDATE case_scenario
-		SET name = $3, description = $4, version_sut_ids = $5::jsonb,
-		    page_ids = $6::jsonb, api_ids = $7::jsonb, sort_order = $8, updated_at = $9
+		SET name = $3, description = $4, sort_order = $5, updated_at = $6
 		WHERE id = $1 AND version_id = $2
 	`, scenario.ID, scenario.VersionID, scenario.Name, scenario.Description,
-		string(suts), string(pages), string(apis), scenario.SortOrder, scenario.UpdatedAt)
+		scenario.SortOrder, scenario.UpdatedAt)
 	if err != nil {
 		return design.Scenario{}, fmt.Errorf("update scenario: %w", err)
 	}
@@ -201,33 +165,26 @@ func (t *proposeTx) InsertCaseVersion(ctx context.Context, version design.CaseVe
 	if err != nil {
 		return design.CaseVersion{}, err
 	}
-	suts, err := encodeIDArray(version.VersionSUTIDs)
-	if err != nil {
-		return design.CaseVersion{}, err
-	}
-	pages, err := encodeIDArray(version.PageIDs)
-	if err != nil {
-		return design.CaseVersion{}, err
-	}
-	apis, err := encodeIDArray(version.APIIDs)
+	coveredACs, err := encodeIDStrings(design.NormalizeACIDSet(version.CoveredACs))
 	if err != nil {
 		return design.CaseVersion{}, err
 	}
 	err = t.tx.QueryRow(ctx, `
 		INSERT INTO case_version (
-			id, case_id, revision, title, description, preconditions, test_data, priority,
-			default_version_sut_id, version_sut_ids, page_ids, api_ids, status, content_hash,
+			id, case_id, revision, title, description, sut_description, preconditions,
+			covered_acs, test_data, priority, status, content_hash,
 			trigger, source_observation_id, auto_confirmed_by, rollback_of,
 			created_by, created_by_run_id, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13,$14,
-		          COALESCE(NULLIF($15,''), 'normal'), $16, NULLIF($17,''), $18,
-		          $19,$20,$21,$22)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,
+		          COALESCE(NULLIF($13,''), $21), $14, NULLIF($15,''), $16,
+		          $17,$18,$19,$20)
 		RETURNING id
 	`, version.ID, version.CaseID, version.Revision, version.Title, version.Description,
-		version.Preconditions, string(testData), version.Priority, version.DefaultVersionSUTID,
-		string(suts), string(pages), string(apis), version.Status, version.ContentHash,
+		version.SutDescription, version.Preconditions, string(coveredACs), string(testData),
+		version.Priority, version.Status, version.ContentHash,
 		version.Trigger, version.SourceObservationID, version.AutoConfirmedBy, version.RollbackOf,
-		version.CreatedBy, version.CreatedByRunID, version.CreatedAt, version.UpdatedAt).Scan(&version.ID)
+		version.CreatedBy, version.CreatedByRunID, version.CreatedAt, version.UpdatedAt,
+		string(design.CaseTriggerNormal)).Scan(&version.ID)
 	if err != nil {
 		return design.CaseVersion{}, fmt.Errorf("insert case version: %w", err)
 	}
@@ -241,12 +198,12 @@ func (t *proposeTx) InsertCaseVersion(ctx context.Context, version design.CaseVe
 		step.Data = data
 		if _, err := t.tx.Exec(ctx, `
 			INSERT INTO case_step (
-				id, case_version_id, seq, action, expected, target_version_sut_id,
-				target_page_id, target_api_id, account_role, data, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
+				id, case_version_id, seq, action, expected, target_description,
+				account_role, data, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)
 		`, step.ID, step.CaseVersionID, step.Seq, step.Action, step.Expected,
-			step.TargetVersionSUTID, step.TargetPageID, step.TargetAPIID, step.AccountRole,
-			string(data), step.CreatedAt, step.CreatedAt); err != nil {
+			step.TargetDescription, step.AccountRole, string(data),
+			step.CreatedAt, step.CreatedAt); err != nil {
 			return design.CaseVersion{}, fmt.Errorf("insert case step: %w", err)
 		}
 	}
@@ -256,11 +213,11 @@ func (t *proposeTx) InsertCaseVersion(ctx context.Context, version design.CaseVe
 		if _, err := t.tx.Exec(ctx, `
 			INSERT INTO case_assertion (
 				id, case_version_id, step_seq, kind, target, expected,
-				target_version_sut_id, target_api_id, database_id, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+				sut_id, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		`, assertion.ID, assertion.CaseVersionID, assertion.StepSeq, assertion.Kind,
-			assertion.Target, assertion.Expected, assertion.TargetVersionSUTID,
-			assertion.TargetAPIID, assertion.DatabaseID, assertion.CreatedAt, assertion.CreatedAt); err != nil {
+			assertion.Target, assertion.Expected, assertion.SUTID,
+			assertion.CreatedAt, assertion.CreatedAt); err != nil {
 			return design.CaseVersion{}, fmt.Errorf("insert case assertion: %w", err)
 		}
 	}
@@ -295,46 +252,46 @@ func (t *proposeTx) SetCurrentVersion(ctx context.Context, caseID, caseVersionID
 	return nil
 }
 
-// scanCaseWithCurrent scans the shared case+current-version projection.
+// scanCaseWithCurrent scans the shared case+current-version projection. The
+// column order must match caseWithCurrentQuery exactly.
 func scanCaseWithCurrent(row pgx.Row) (design.CaseWithCurrent, error) {
 	var item design.CaseWithCurrent
 	var current design.CaseVersion
-	var defaultSUT *int64
-	var testData, suts, pages, apis []byte
+	var testData, coveredACs []byte
 	if err := row.Scan(
 		&item.Case.ID, &item.Case.ScenarioID, &item.Case.CurrentVersionID, &item.Case.Status,
 		&item.Case.CreatedBy, &item.Case.CreatedByRunID, &item.Case.CreatedAt, &item.Case.UpdatedAt,
-		&current.ID, &current.Revision, &current.Title, &current.Description, &current.Preconditions,
-		&testData, &current.Priority, &defaultSUT, &suts, &pages, &apis,
+		&current.ID, &current.Revision, &current.Title, &current.Description,
+		&current.SutDescription, &current.Preconditions, &coveredACs,
+		&testData, &current.Priority,
 		&current.Status, &current.ContentHash, &current.CreatedAt,
 		&current.StepCount, &current.AssertionCount, &current.SourceCount,
 	); err != nil {
 		return design.CaseWithCurrent{}, err
 	}
 	current.CaseID = item.Case.ID
-	current.DefaultVersionSUTID = defaultSUT
 	current.TestData = testData
 	var err error
-	if current.VersionSUTIDs, err = decodeIDArray(suts); err != nil {
-		return design.CaseWithCurrent{}, err
-	}
-	if current.PageIDs, err = decodeIDArray(pages); err != nil {
-		return design.CaseWithCurrent{}, err
-	}
-	if current.APIIDs, err = decodeIDArray(apis); err != nil {
+	if current.CoveredACs, err = decodeStringArray(coveredACs); err != nil {
 		return design.CaseWithCurrent{}, err
 	}
 	item.Current = &current
 	return item, nil
 }
 
-// caseWithCurrentQuery is the projection shared by confirmation/stale reads.
+// caseWithCurrentQuery is the projection shared by the proposal snapshot and the
+// confirmation/stale reads. v0.2.4-B: default_version_sut_id / version_sut_ids /
+// page_ids / api_ids are replaced by sut_description / covered_acs.
+//
+// sut_description and preconditions are NOT NULL with an empty-string default
+// (design_0004, C10 lesson) so they scan straight into strings; covered_acs is a
+// NOT NULL JSONB array and the COALESCE only guards a hand-written NULL.
 const caseWithCurrentQuery = `
 	SELECT ce.id, ce.scenario_id, ce.current_version_id, ce.status,
 	       ce.created_by, ce.created_by_run_id, ce.created_at, ce.updated_at,
-	       cv.id, cv.revision, cv.title, cv.description, cv.preconditions, cv.test_data, cv.priority,
-	       cv.default_version_sut_id, COALESCE(cv.version_sut_ids, '[]'::jsonb),
-	       COALESCE(cv.page_ids, '[]'::jsonb), COALESCE(cv.api_ids, '[]'::jsonb),
+	       cv.id, cv.revision, cv.title, cv.description,
+	       cv.sut_description, cv.preconditions, COALESCE(cv.covered_acs, '[]'::jsonb),
+	       cv.test_data, cv.priority,
 	       cv.status, cv.content_hash, cv.created_at,
 	       (SELECT count(*) FROM case_step step WHERE step.case_version_id = cv.id),
 	       (SELECT count(*) FROM case_assertion assertion WHERE assertion.case_version_id = cv.id),

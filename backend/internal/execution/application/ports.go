@@ -38,6 +38,14 @@ type BatchSelectionReader interface {
 // IntentRepository persists execution_intent rows.
 type IntentRepository interface {
 	Create(ctx context.Context, intent execution.ExecutionIntent) error
+	// CreateAndTransition atomically creates the intent (with its given active
+	// status) and applies the guarded status transition in ONE transaction: no
+	// reader ever observes the intermediate open row, and a failed transition
+	// rolls the insert back (no orphan open intent the planner could claim).
+	// The transition still goes through the state machine's from->to guard —
+	// this is not a born-terminal write (constitution art.3.6). It returns
+	// execution.ErrStateConflict when the from-guard does not match.
+	CreateAndTransition(ctx context.Context, intent execution.ExecutionIntent, from []execution.IntentStatus, to execution.IntentStatus) error
 	Get(ctx context.Context, id int64) (execution.ExecutionIntent, error)
 	// List returns one descending-ID page. status filters when non-empty.
 	List(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]execution.ExecutionIntent, bool, error)
@@ -84,17 +92,44 @@ type CaseRunRepository interface {
 	// ListRunning returns every running case_run for quota accounting.
 	ListRunning(ctx context.Context) ([]execution.CaseRun, error)
 	Create(ctx context.Context, caseRun execution.CaseRun) error
+	// CreateAndTransition atomically creates the case_run (with its given
+	// process status) and applies the guarded, fenced status transition in ONE
+	// transaction: no scheduler tick ever observes the intermediate pending row,
+	// and a failed transition rolls the insert back (no orphan anchor). The
+	// transition still goes through the from->to guard and the dispatch fence —
+	// not a born-terminal write (constitution art.3.6). It returns
+	// execution.ErrStateConflict when the guard/fence does not match.
+	CreateAndTransition(ctx context.Context, caseRun execution.CaseRun, from []execution.CaseRunStatus, to execution.CaseRunStatus, epoch int64, token string) error
 	// UpdateCAS applies mutate to the row and writes it back only when the
 	// row still carries the given dispatch epoch and token (both are checked
 	// when non-zero). It returns false,nil on a fence mismatch.
 	UpdateCAS(ctx context.Context, id int64, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error)
+	// ReclassifyTerminal applies mutate under a row lock ONLY to an already
+	// terminal failed/blocked/inconclusive verdict row whose result stays in
+	// that reclassifiable set (domain CanReclassifyTo), fenced by the given
+	// epoch/token when non-zero. It is the guarded primitive of the single
+	// terminal entry's terminal->terminal reclassification mode (V-0022);
+	// UpdateCAS keeps refusing terminal rows. false,nil means the row is not
+	// reclassifiable or the fence was lost; an illegal target is a loud
+	// execution.ErrStateConflict.
+	ReclassifyTerminal(ctx context.Context, id int64, epoch int64, token string, mutate func(*execution.CaseRun) error) (bool, error)
 	// Update persists a server-side state change without a dispatch fence.
+	// It can never move a row into or out of a terminal status (V-0022 single
+	// terminal entry): only non-terminal -> non-terminal changes and
+	// same-status rewrites are allowed; a refused terminal transition returns
+	// execution.ErrStateConflict.
 	Update(ctx context.Context, caseRun execution.CaseRun) (bool, error)
 	// Transition applies a guarded status change with an optional fence.
 	Transition(ctx context.Context, id int64, from []execution.CaseRunStatus, to execution.CaseRunStatus, epoch int64, token string) (bool, error)
 	// ClaimLease extends the run lease for the given dispatch epoch.
 	ClaimLease(ctx context.Context, id int64, epoch int64, until time.Time) (bool, error)
 	ListRunningByExecutor(ctx context.Context, executorID int64) ([]execution.CaseRun, error)
+	// AddEvidenceDrop atomically increments the run's evidence-drop fact and
+	// returns the new total. It is deliberately NOT a CAS write: a drop is an
+	// append-only observation about the run, not a state transition, and it must
+	// be recorded even by a terminal capture whose dispatch fence is already
+	// gone (constitution art.4.5 / art.5.7).
+	AddEvidenceDrop(ctx context.Context, id int64, delta int64) (int64, error)
 	// LatestByCaseVersions returns the newest non-superseded case_run per
 	// case_version_id of a version (coverage analysis). Superseded process
 	// rows carry no result and never shadow an earlier run.
@@ -197,7 +232,7 @@ type SUTContextRepository interface {
 
 // DiscoveryObservationWriter persists normalized execution-time discovery
 // observations (spec DB-29, R-EX-1). It is optional: a nil writer skips the
-// observation write while the sanitized network evidence still flows through
+// observation write while the raw network evidence still flows through
 // EvidenceRepository. DiscoveryIngest implements the normalization/filtering/
 // dedupe on top of DiscoveryObservationStore (W1-11).
 type DiscoveryObservationWriter interface {
@@ -212,7 +247,7 @@ type DiscoveryObservationWriter interface {
 // created_at and updated_at; the fingerprint deliberately stays DB-only.
 type DiscoveryObservationRow struct {
 	ID               int64
-	VersionSUTID     int64
+	SUTID            int64
 	EnvironmentID    *int64
 	WaveID           *int64
 	CaseRunID        *int64
@@ -326,22 +361,40 @@ type ExecutorAuthChecker interface {
 type ExecutorRegistry interface {
 	// Select returns nil,nil when no active executor is registered.
 	Select(ctx context.Context) (*execution.ExecutorInstance, error)
+	// MaxDispatchableCapacity returns the largest Capacity among the executors
+	// that could ever be dispatched to -- status dispatchable and not degraded,
+	// but WITHOUT Select's fullness filter and without its endpoint restriction.
+	//
+	// It exists because Select's answer is not the fleet's answer (review round
+	// 4, Important 1): Select drops full and degraded rows before sorting the
+	// survivors by capacity DESC, and in endpoint-less single mode it sorts by ID
+	// ascending and ignores capacity entirely. So the selected executor can be a
+	// small idle one while a much larger one is merely momentarily full or
+	// degraded -- both transient conditions. Any decision that is PERMANENT (a
+	// terminal blocked verdict) must be taken against this fleet maximum, never
+	// against the selected row, or a run is terminally blocked and the wave
+	// completes with a settled, wrong verdict while another executor would have
+	// served it seconds later.
+	//
+	// Returns 0 when nothing is dispatchable. Callers must treat an error or a
+	// zero as "cannot prove impossibility" and fall back to the transient path.
+	MaxDispatchableCapacity(ctx context.Context) (int, error)
 }
 
-// ExecutorContext is one executor-side browser context as listed by the
+// ExecutorSession is one executor-side session as listed by the
 // executor client. ExecutorID identifies which endpoint returned it.
-type ExecutorContext struct {
+type ExecutorSession struct {
 	ExecutorID int64
 	ID         string
 	Key        string
 }
 
-// ExecutorControl is the executor control port used by pause/cancel/context
+// ExecutorControl is the executor control port used by pause/cancel/session
 // cleanup. executorID selects the owning endpoint (0 = primary fallback).
 type ExecutorControl interface {
-	CancelContext(ctx context.Context, executorID int64, contextID string) error
-	DeleteContext(ctx context.Context, executorID int64, contextID string) error
-	ListContexts(ctx context.Context) ([]ExecutorContext, error)
+	CancelSession(ctx context.Context, executorID int64, sessionID string) error
+	DeleteSession(ctx context.Context, executorID int64, sessionID string) error
+	ListSessions(ctx context.Context) ([]ExecutorSession, error)
 }
 
 // RunCanceller interrupts in-flight API-side case executor runs. CaseRunner

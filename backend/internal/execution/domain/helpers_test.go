@@ -41,16 +41,14 @@ func TestStepAndAssertionVerdictValidity(t *testing.T) {
 
 func TestEvidenceMIMEAndOwnerKinds(t *testing.T) {
 	cases := map[EvidenceKind]string{
-		EvidenceScreenshot:   "image/png",
-		EvidenceSnapshot:     "text/plain; charset=utf-8",
-		EvidenceConsole:      "application/json",
-		EvidenceNetwork:      "application/json",
-		EvidenceHTTP:         "application/json",
-		EvidenceDB:           "text/plain; charset=utf-8",
-		EvidenceText:         "text/plain; charset=utf-8",
-		EvidenceDownload:     "application/octet-stream",
-		EvidenceVisualActual: "image/png",
-		EvidenceVisualDiff:   "image/png",
+		EvidenceScreenshot: "image/png",
+		EvidenceSnapshot:   "text/plain; charset=utf-8",
+		EvidenceConsole:    "application/json",
+		EvidenceNetwork:    "application/json",
+		EvidenceHTTP:       "application/json",
+		EvidenceDB:         "text/plain; charset=utf-8",
+		EvidenceText:       "text/plain; charset=utf-8",
+		EvidenceDownload:   "application/octet-stream",
 	}
 	for kind, want := range cases {
 		if got := kind.MIME(); got != want {
@@ -73,8 +71,8 @@ func TestEvidenceMIMEAndOwnerKinds(t *testing.T) {
 func TestWaveCountsNormalizeAndPauseMode(t *testing.T) {
 	var counts WaveCounts
 	normalized := counts.Normalize()
-	if normalized.ByVersionSUT == nil {
-		t.Fatal("normalize must allocate the by_version_sut map")
+	if normalized.BySUT == nil {
+		t.Fatal("normalize must allocate the by_sut map")
 	}
 	if (RunWave{}).PauseModeOrDefault() != PauseModeGraceful {
 		t.Fatal("empty pause mode must default to graceful")
@@ -87,14 +85,16 @@ func TestWaveCountsNormalizeAndPauseMode(t *testing.T) {
 	}
 }
 
+// TestQuotaFromSettingsDefaults pins the design-P5 contract: the single global
+// limit defaults to 0 = unlimited; the retired 3/2/1 fallback must not return.
 func TestQuotaFromSettingsDefaults(t *testing.T) {
-	quota := QuotaFromSettings(0, 0, 0)
-	if quota.Global != 3 || quota.PerSUT != 2 || quota.CrossSystem != 1 {
-		t.Fatalf("default quota = %+v", quota)
+	quota := QuotaFromSettings(0)
+	if quota.Global != 0 {
+		t.Fatalf("default quota = %+v, want Global 0 (unlimited)", quota)
 	}
-	custom := QuotaFromSettings(5, 4, 2)
-	if custom.Global != 5 || custom.PerSUT != 4 || custom.CrossSystem != 2 {
-		t.Fatalf("custom quota = %+v", custom)
+	custom := QuotaFromSettings(5)
+	if custom.Global != 5 {
+		t.Fatalf("custom quota = %+v, want Global 5", custom)
 	}
 }
 
@@ -174,8 +174,9 @@ func TestAggregateSkippedRequiredAssertionIsIncomplete(t *testing.T) {
 
 func TestAggregateNonApplicationFailureWithoutResults(t *testing.T) {
 	in := VerdictInput{
-		Case:   caseSnapshotForVerdict(1),
-		Finish: &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassEnvironment},
+		Case:          caseSnapshotForVerdict(1),
+		Finish:        &FinishCandidate{Verdict: CaseRunFailed, FailureClass: FailureClassEnvironment},
+		EvidenceCount: 1,
 	}
 	status, class, summary, err := Aggregate(in)
 	if err != nil || status != CaseRunFailed || class != FailureClassEnvironment {
@@ -188,8 +189,9 @@ func TestAggregateNonApplicationFailureWithoutResults(t *testing.T) {
 
 func TestAggregateUnknownAgentFailure(t *testing.T) {
 	status, class, _, err := Aggregate(VerdictInput{
-		Case:         caseSnapshotForVerdict(1),
-		AgentFailure: FailureClassUnknown,
+		Case:          caseSnapshotForVerdict(1),
+		AgentFailure:  FailureClassUnknown,
+		EvidenceCount: 1,
 	})
 	if err != nil || status != CaseRunFailed || class != FailureClassUnknown {
 		t.Fatalf("aggregate = %s/%s err=%v", status, class, err)

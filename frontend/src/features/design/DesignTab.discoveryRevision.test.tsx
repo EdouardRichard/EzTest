@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -85,19 +85,22 @@ function mockWorkspace() {
   clarificationApi.getTeamRoom.mockResolvedValue({ team: "design", digest: null, posts: [] })
 }
 
-function autoConfirmedEvent(caseId: string, caseVersionId: string) {
+// R-E2r (release notes E §3): the event's only producer is now the Rollback
+// path, announcing a DRAFT replacement (trigger=rollback, rollback_of nonzero).
+// The discovery auto-confirm path no longer emits this event.
+function rollbackDraftEvent(caseId: string, caseVersionId: string, rollbackOf: string) {
   return {
     type: "case.revision.auto_confirmed",
     payload: {
       version_id: "2001",
       case_id: caseId,
       case_version_id: caseVersionId,
-      trigger: "discovery_delta",
+      trigger: "rollback",
       source_observation_id: "501",
       resource_id: "2301",
-      rollback_of: "0",
+      rollback_of: rollbackOf,
       confidence: "high",
-      actor: "system",
+      actor: "1",
     },
   }
 }
@@ -115,42 +118,34 @@ describe("DesignTab discovery revisions", () => {
 
   afterEach(cleanup)
 
-  it("shows an auto-confirmed revision for a case that is not selected", async () => {
+  it("shows a rollback draft revision for a case that is not selected", async () => {
     render(<DesignTab versionId="2001" />)
     await screen.findByTestId("design-mindmap")
 
     act(() => {
-      sse.handlers?.onDesignCaseChanged?.(autoConfirmedEvent("7003", "7004"))
+      sse.handlers?.onDesignCaseChanged?.(rollbackDraftEvent("7003", "7004", "7002"))
     })
 
-    expect(await screen.findByText(/自动确认/)).toBeInTheDocument()
+    expect(await screen.findByText(/已回滚到替代 revision 7004/)).toBeInTheDocument()
     expect(screen.getByText(/用例 7003/)).toBeInTheDocument()
+    // R-E2r: the event never renders an auto-confirm anymore.
+    expect(screen.queryByText("自动确认")).not.toBeInTheDocument()
   })
 
-  it("refreshes the selected case and graph after a rollback", async () => {
-    api.rollbackCaseVersion.mockResolvedValue({
-      case_id: "7001",
-      case_version_id: "7011",
-      rolled_back_from: "7002",
-      revision: 3,
-      status: "confirmed",
-      trigger: "rollback",
-    })
+  it("refreshes the selected case and graph after a rollback event", async () => {
     render(<DesignTab versionId="2001" initialCaseId="7001" />)
     await screen.findByText("退款 T+1 到账")
 
-    act(() => {
-      sse.handlers?.onDesignCaseChanged?.(autoConfirmedEvent("7001", "7002"))
-    })
-
-    expect(await screen.findByText(/自动确认/)).toBeInTheDocument()
     const graphCalls = api.getDesignGraph.mock.calls.length
     const detailCalls = api.getDesignCase.mock.calls.length
 
-    fireEvent.click(screen.getByRole("button", { name: "回滚" }))
+    act(() => {
+      sse.handlers?.onDesignCaseChanged?.(rollbackDraftEvent("7001", "7011", "7002"))
+    })
 
-    await waitFor(() => expect(api.rollbackCaseVersion).toHaveBeenCalledWith("2001", "7002"))
     expect(await screen.findByText(/已回滚到替代 revision 7011/)).toBeInTheDocument()
+    expect(screen.getByText(/原 revision 7002/)).toBeInTheDocument()
+    expect(screen.queryByText("自动确认")).not.toBeInTheDocument()
     await waitFor(() => expect(api.getDesignGraph.mock.calls.length).toBeGreaterThan(graphCalls))
     await waitFor(() => expect(api.getDesignCase.mock.calls.length).toBeGreaterThan(detailCalls))
   })

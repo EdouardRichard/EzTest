@@ -190,12 +190,7 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		cases: map[int64]*fakeCase{},
 		version: design.VersionContext{
-			VersionID:          1001,
-			Status:             "initial",
-			AllowedVersionSUTs: []int64{9001, 9002},
-			PageToSUT:          map[int64]int64{6001: 9001, 6002: 9002},
-			APIToSUT:           map[int64]int64{4001: 9001, 4002: 9002},
-			DBTOSUT:            map[int64]int64{8001: 9002},
+			VersionID: 1001,
 		},
 		requirement: design.RequirementRef{
 			ID:               3001,
@@ -204,6 +199,11 @@ func newFakeRepo() *fakeRepo {
 			Revision:         1,
 			Title:            "登录",
 			Status:           "clarified",
+			SutDescription:   "商城前台登录页与登录接口。",
+			// The AC id set a proposal's covered_acs is validated against. It
+			// reaches ProposalContext through RequirementContext, exactly as the
+			// PostgreSQL adapter loads it (T8 handoff).
+			ACIDs: []string{"AC-1", "AC-2", "AC-10"},
 		},
 	}
 }
@@ -226,7 +226,6 @@ func (f *fakeRepo) ReadGraph(_ context.Context, versionID int64) (design.GraphDa
 	graph := f.graph
 	graph.VersionID = versionID
 	graph.PendingDesignCount = f.pending
-	graph.AutoDesignNewRequirements = f.version.AutoDesignNewRequirements
 	requirements := make([]design.RequirementGraph, 0)
 	if f.requirement.ID > 0 {
 		requirementGraph := design.RequirementGraph{

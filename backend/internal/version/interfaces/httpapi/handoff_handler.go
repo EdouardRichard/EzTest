@@ -100,18 +100,35 @@ type handoffDTO struct {
 	Resources    handoffResourcesDTO     `json:"resources"`
 }
 
+type handoffUserStoryDTO struct {
+	AsA    string `json:"as_a"`
+	IWant  string `json:"i_want"`
+	SoThat string `json:"so_that"`
+}
+
+type handoffAcceptanceCriterionDTO struct {
+	ID    string `json:"id"`
+	Given string `json:"given"`
+	When  string `json:"when"`
+	Then  string `json:"then"`
+}
+
 type handoffRequirementDTO struct {
-	ID                 string   `json:"id"`
-	CurrentVersionID   string   `json:"current_version_id"`
-	Revision           int      `json:"revision"`
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	AcceptanceCriteria string   `json:"acceptance_criteria"`
-	Priority           string   `json:"priority"`
-	Status             string   `json:"status"`
-	SourceQuote        string   `json:"source_quote"`
-	Confidence         *float64 `json:"confidence,omitempty"`
-	ConfirmedAt        *string  `json:"confirmed_at,omitempty"`
+	ID                 string                          `json:"id"`
+	CurrentVersionID   string                          `json:"current_version_id"`
+	Revision           int                             `json:"revision"`
+	Title              string                          `json:"title"`
+	UserStory          handoffUserStoryDTO             `json:"user_story"`
+	Rules              string                          `json:"rules"`
+	AcceptanceCriteria []handoffAcceptanceCriterionDTO `json:"acceptance_criteria"`
+	Priority           string                          `json:"priority"`
+	SutDescription     string                          `json:"sut_description"`
+	ScopeOut           string                          `json:"scope_out"`
+	AccountRolesHint   []string                        `json:"account_roles_hint"`
+	Status             string                          `json:"status"`
+	SourceQuote        string                          `json:"source_quote"`
+	Confidence         *float64                        `json:"confidence,omitempty"`
+	ConfirmedAt        *string                         `json:"confirmed_at,omitempty"`
 }
 
 type handoffQAOptionDTO struct {
@@ -171,29 +188,33 @@ type handoffPlanDTO struct {
 	Next    *handoffPlanItemDTO `json:"next"`
 }
 
+type handoffEnvironmentDTO struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
 type handoffSUTDTO struct {
-	VersionSUTID  string `json:"version_sut_id"`
-	SUTID         string `json:"sut_id"`
-	Name          string `json:"name"`
-	EnvironmentID string `json:"environment_id"`
-	Environment   string `json:"environment"`
-	BaseURL       string `json:"base_url"`
+	SUTID     string               `json:"sut_id"`
+	Name      string               `json:"name"`
+	BaseURL   string               `json:"base_url"`
+	Pages     []handoffPageDTO     `json:"pages"`
+	APIs      []handoffAPIDTO      `json:"apis"`
+	Databases []handoffDatabaseDTO `json:"databases"`
 }
 
 type handoffPageDTO struct {
 	ID            string `json:"id"`
-	VersionSUTID  string `json:"version_sut_id,omitempty"`
 	Name          string `json:"name"`
 	URL           string `json:"url"`
 	RouteTemplate string `json:"route_template,omitempty"`
 }
 
 type handoffAPIDTO struct {
-	ID           string `json:"id"`
-	VersionSUTID string `json:"version_sut_id,omitempty"`
-	Name         string `json:"name"`
-	Method       string `json:"method"`
-	Path         string `json:"path"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
 }
 
 type handoffAccountDTO struct {
@@ -205,6 +226,7 @@ type handoffAccountDTO struct {
 
 type handoffDatabaseDTO struct {
 	ID       string `json:"id"`
+	SUTID    string `json:"sut_id"`
 	Name     string `json:"name"`
 	Kind     string `json:"kind"`
 	ReadOnly bool   `json:"read_only"`
@@ -219,12 +241,11 @@ type handoffRepositoryDTO struct {
 }
 
 type handoffResourcesDTO struct {
+	Environment  handoffEnvironmentDTO  `json:"environment"`
 	SUTs         []handoffSUTDTO        `json:"suts"`
-	Pages        []handoffPageDTO       `json:"pages"`
-	APIs         []handoffAPIDTO        `json:"apis"`
 	Accounts     []handoffAccountDTO    `json:"accounts"`
-	Databases    []handoffDatabaseDTO   `json:"databases"`
 	Repositories []handoffRepositoryDTO `json:"repositories"`
+	Truncated    bool                   `json:"truncated"`
 }
 
 func toHandoffDTO(document versionapp.Handoff) handoffDTO {
@@ -240,19 +261,7 @@ func toHandoffDTO(document versionapp.Handoff) handoffDTO {
 		Resources:    toHandoffResourcesDTO(document.Resources),
 	}
 	for _, item := range document.Requirements {
-		dto.Requirements = append(dto.Requirements, handoffRequirementDTO{
-			ID:                 formatDecimal(item.ID),
-			CurrentVersionID:   formatDecimal(item.CurrentVersionID),
-			Revision:           item.Revision,
-			Title:              item.Title,
-			Description:        item.Description,
-			AcceptanceCriteria: item.AcceptanceCriteria,
-			Priority:           item.Priority,
-			Status:             item.Status,
-			SourceQuote:        item.SourceQuote,
-			Confidence:         item.Confidence,
-			ConfirmedAt:        formatOptionalTime(item.ConfirmedAt),
-		})
+		dto.Requirements = append(dto.Requirements, toHandoffRequirementDTO(item))
 	}
 	for _, item := range document.QA {
 		options := make([]handoffQAOptionDTO, 0, len(item.Options))
@@ -302,6 +311,39 @@ func toHandoffDTO(document versionapp.Handoff) handoffDTO {
 	return dto
 }
 
+func toHandoffRequirementDTO(item versionapp.HandoffRequirement) handoffRequirementDTO {
+	criteria := make([]handoffAcceptanceCriterionDTO, 0, len(item.AcceptanceCriteria))
+	for _, criterion := range item.AcceptanceCriteria {
+		criteria = append(criteria, handoffAcceptanceCriterionDTO{
+			ID:    criterion.ID,
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
+	}
+	return handoffRequirementDTO{
+		ID:               formatDecimal(item.ID),
+		CurrentVersionID: formatDecimal(item.CurrentVersionID),
+		Revision:         item.Revision,
+		Title:            item.Title,
+		UserStory: handoffUserStoryDTO{
+			AsA:    item.UserStory.AsA,
+			IWant:  item.UserStory.IWant,
+			SoThat: item.UserStory.SoThat,
+		},
+		Rules:              item.Rules,
+		AcceptanceCriteria: criteria,
+		Priority:           item.Priority,
+		SutDescription:     item.SutDescription,
+		ScopeOut:           item.ScopeOut,
+		AccountRolesHint:   nonNil(item.AccountRolesHint),
+		Status:             item.Status,
+		SourceQuote:        item.SourceQuote,
+		Confidence:         item.Confidence,
+		ConfirmedAt:        formatOptionalTime(item.ConfirmedAt),
+	}
+}
+
 func toHandoffPlanDTO(plan versionapp.HandoffPlan) handoffPlanDTO {
 	return handoffPlanDTO{
 		Stage:   plan.Stage,
@@ -325,40 +367,18 @@ func toHandoffPlanItemDTO(item *versionapp.HandoffPlanItem) *handoffPlanItemDTO 
 
 func toHandoffResourcesDTO(resources versionapp.HandoffResources) handoffResourcesDTO {
 	dto := handoffResourcesDTO{
+		Environment: handoffEnvironmentDTO{
+			ID:     formatDecimal(resources.Environment.ID),
+			Name:   resources.Environment.Name,
+			Status: resources.Environment.Status,
+		},
 		SUTs:         make([]handoffSUTDTO, 0, len(resources.SUTs)),
-		Pages:        make([]handoffPageDTO, 0, len(resources.Pages)),
-		APIs:         make([]handoffAPIDTO, 0, len(resources.APIs)),
 		Accounts:     make([]handoffAccountDTO, 0, len(resources.Accounts)),
-		Databases:    make([]handoffDatabaseDTO, 0, len(resources.Databases)),
 		Repositories: make([]handoffRepositoryDTO, 0, len(resources.Repositories)),
+		Truncated:    resources.Truncated,
 	}
-	for _, item := range resources.SUTs {
-		dto.SUTs = append(dto.SUTs, handoffSUTDTO{
-			VersionSUTID:  formatDecimal(item.VersionSUTID),
-			SUTID:         formatDecimal(item.SUTID),
-			Name:          item.Name,
-			EnvironmentID: formatDecimal(item.EnvironmentID),
-			Environment:   item.Environment,
-			BaseURL:       item.BaseURL,
-		})
-	}
-	for _, item := range resources.Pages {
-		dto.Pages = append(dto.Pages, handoffPageDTO{
-			ID:            formatDecimal(item.ID),
-			VersionSUTID:  formatOptionalID(item.VersionSUTID),
-			Name:          item.Name,
-			URL:           item.URL,
-			RouteTemplate: item.RouteTemplate,
-		})
-	}
-	for _, item := range resources.APIs {
-		dto.APIs = append(dto.APIs, handoffAPIDTO{
-			ID:           formatDecimal(item.ID),
-			VersionSUTID: formatOptionalID(item.VersionSUTID),
-			Name:         item.Name,
-			Method:       item.Method,
-			Path:         item.Path,
-		})
+	for _, sut := range resources.SUTs {
+		dto.SUTs = append(dto.SUTs, toHandoffSUTDTO(sut))
 	}
 	for _, item := range resources.Accounts {
 		dto.Accounts = append(dto.Accounts, handoffAccountDTO{
@@ -368,14 +388,6 @@ func toHandoffResourcesDTO(resources versionapp.HandoffResources) handoffResourc
 			Role:     item.Role,
 		})
 	}
-	for _, item := range resources.Databases {
-		dto.Databases = append(dto.Databases, handoffDatabaseDTO{
-			ID:       formatDecimal(item.ID),
-			Name:     item.Name,
-			Kind:     item.Kind,
-			ReadOnly: item.ReadOnly,
-		})
-	}
 	for _, item := range resources.Repositories {
 		dto.Repositories = append(dto.Repositories, handoffRepositoryDTO{
 			ID:     formatDecimal(item.ID),
@@ -383,6 +395,43 @@ func toHandoffResourcesDTO(resources versionapp.HandoffResources) handoffResourc
 			Role:   item.Role,
 			Branch: item.Branch,
 			Source: item.Source,
+		})
+	}
+	return dto
+}
+
+func toHandoffSUTDTO(sut versionapp.HandoffSUT) handoffSUTDTO {
+	dto := handoffSUTDTO{
+		SUTID:     formatDecimal(sut.SUTID),
+		Name:      sut.Name,
+		BaseURL:   sut.BaseURL,
+		Pages:     make([]handoffPageDTO, 0, len(sut.Pages)),
+		APIs:      make([]handoffAPIDTO, 0, len(sut.APIs)),
+		Databases: make([]handoffDatabaseDTO, 0, len(sut.Databases)),
+	}
+	for _, item := range sut.Pages {
+		dto.Pages = append(dto.Pages, handoffPageDTO{
+			ID:            formatDecimal(item.ID),
+			Name:          item.Name,
+			URL:           item.URL,
+			RouteTemplate: item.RouteTemplate,
+		})
+	}
+	for _, item := range sut.APIs {
+		dto.APIs = append(dto.APIs, handoffAPIDTO{
+			ID:     formatDecimal(item.ID),
+			Name:   item.Name,
+			Method: item.Method,
+			Path:   item.Path,
+		})
+	}
+	for _, item := range sut.Databases {
+		dto.Databases = append(dto.Databases, handoffDatabaseDTO{
+			ID:       formatDecimal(item.ID),
+			SUTID:    formatDecimal(item.SUTID),
+			Name:     item.Name,
+			Kind:     item.Kind,
+			ReadOnly: item.ReadOnly,
 		})
 	}
 	return dto

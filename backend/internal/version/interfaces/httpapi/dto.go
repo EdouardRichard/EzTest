@@ -7,11 +7,13 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
-	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // ---------- response DTOs ----------
 
+// versionDTO is the version detail projection. v0.2.4-B: the version binds one
+// environment directly, so the derived bindings array is replaced by
+// environment_id plus the resolved environment catalog in binding.
 type versionDTO struct {
 	ID                        string               `json:"id"`
 	Title                     string               `json:"title"`
@@ -19,13 +21,16 @@ type versionDTO struct {
 	Goal                      string               `json:"goal"`
 	Status                    string               `json:"status"`
 	AutoDesignNewRequirements bool                 `json:"auto_design_new_requirements"`
-	Bindings                  []bindingDTO         `json:"bindings"`
+	EnvironmentID             string               `json:"environment_id"`
+	Binding                   bindingDTO           `json:"binding"`
 	RequirementCounts         requirementCountsDTO `json:"requirement_counts"`
 	ConversationCount         int                  `json:"conversation_count"`
 	PendingDesignCount        int                  `json:"pending_design_count"`
 	CaseCounts                caseCountsDTO        `json:"case_counts"`
 	ClosedAt                  *string              `json:"closed_at"`
 	CloseReason               *string              `json:"close_reason"`
+	ClosureKind               string               `json:"closure_kind"`
+	Unverified                bool                 `json:"unverified"`
 	CreatedBy                 string               `json:"created_by"`
 	CreatedAt                 string               `json:"created_at"`
 	UpdatedAt                 string               `json:"updated_at"`
@@ -47,32 +52,28 @@ type requirementCountsDTO struct {
 	Obsolete  int `json:"obsolete"`
 }
 
+// bindingDTO is the resolved environment catalog of one version: the bound
+// environment with its SUT catalog, the flattened asset unions, the version
+// account subset, the environment code pool and the pinned baseline commit.
+// code_baseline_commit is omitted while the baseline is unresolved.
 type bindingDTO struct {
-	ID                 string                 `json:"id"`
-	CodeBaselineCommit *string                `json:"codeBaselineCommit,omitempty"`
-	SUT                sutDTO                 `json:"sut"`
 	Environment        environmentDTO         `json:"environment"`
-	Repository         *codeRepositoryDTO     `json:"repository"`
-	Repositories       []bindingRepositoryDTO `json:"repositories"`
-	ScopeExclude       scopeExcludeDTO        `json:"scope_exclude"`
 	Pages              []pageDTO              `json:"pages"`
 	APIs               []apiDTO               `json:"apis"`
 	Databases          []databaseDTO          `json:"databases"`
 	Accounts           []accountDTO           `json:"accounts"`
+	Repositories       []bindingRepositoryDTO `json:"repositories"`
+	CodeBaselineCommit *string                `json:"code_baseline_commit,omitempty"`
 }
 
-// scopeExcludeDTO is the v0.22 environment-level exclusion document (DB-11).
-type scopeExcludeDTO struct {
-	Pages     []string `json:"pages"`
-	APIs      []string `json:"apis"`
-	Databases []string `json:"databases"`
-}
-
-// bindingRepositoryDTO is one effective repository of a version binding.
+// bindingRepositoryDTO is one repository of the environment code pool (GD-03).
+// SUTID names the SUT whose association supplied the row, which is also the key
+// the resolved code baseline is stored under.
 type bindingRepositoryDTO struct {
-	Repository codeRepositoryDTO `json:"repository"`
-	Role       string            `json:"role"`
-	Source     string            `json:"source"`
+	Repository         codeRepositoryDTO `json:"repository"`
+	SUTID              string            `json:"sut_id"`
+	Role               string            `json:"role"`
+	CodeBaselineCommit *string           `json:"code_baseline_commit"`
 }
 
 type versionSummaryDTO struct {
@@ -84,34 +85,35 @@ type versionSummaryDTO struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-type sutDTO struct {
-	ID           string           `json:"id"`
-	Name         string           `json:"name"`
-	Intro        string           `json:"intro"`
-	Environments []environmentDTO `json:"environments"`
-	CreatedAt    string           `json:"created_at"`
-	UpdatedAt    string           `json:"updated_at"`
+// environmentDTO is one top-level environment (v0.2.4-B): it owns SUTs and no
+// longer carries base_url or assets.
+type environmentDTO struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Status      string   `json:"status"`
+	SUTs        []sutDTO `json:"suts"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
 }
 
-type environmentDTO struct {
-	ID        string        `json:"id"`
-	SUTID     string        `json:"sut_id"`
-	Name      string        `json:"name"`
-	BaseURL   string        `json:"base_url"`
-	IsDefault bool          `json:"is_default"`
-	Status    string        `json:"status"`
-	Pages     []pageDTO     `json:"pages"`
-	APIs      []apiDTO      `json:"apis"`
-	Databases []databaseDTO `json:"databases"`
-	Accounts  []accountDTO  `json:"accounts"`
-	CreatedAt string        `json:"created_at"`
-	UpdatedAt string        `json:"updated_at"`
+type sutDTO struct {
+	ID            string        `json:"id"`
+	EnvironmentID string        `json:"environment_id"`
+	Name          string        `json:"name"`
+	Intro         string        `json:"intro"`
+	BaseURL       string        `json:"base_url"`
+	Family        *string       `json:"family"`
+	Pages         []pageDTO     `json:"pages"`
+	APIs          []apiDTO      `json:"apis"`
+	Databases     []databaseDTO `json:"databases"`
+	CreatedAt     string        `json:"created_at"`
+	UpdatedAt     string        `json:"updated_at"`
 }
 
 type pageDTO struct {
 	ID            string `json:"id"`
 	SUTID         string `json:"sut_id"`
-	EnvironmentID string `json:"environment_id"`
 	Name          string `json:"name"`
 	URL           string `json:"url"`
 	RouteTemplate string `json:"route_template"`
@@ -125,45 +127,44 @@ type pageDTO struct {
 }
 
 type apiDTO struct {
-	ID            string `json:"id"`
-	SUTID         string `json:"sut_id"`
-	EnvironmentID string `json:"environment_id"`
-	Method        string `json:"method"`
-	PathTemplate  string `json:"path_template"`
-	Name          string `json:"name"`
-	AuthRole      string `json:"auth_role"`
-	Source        string `json:"source"`
-	Status        string `json:"status"`
-	SchemaRef     string `json:"schema_ref"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ID           string `json:"id"`
+	SUTID        string `json:"sut_id"`
+	Method       string `json:"method"`
+	PathTemplate string `json:"path_template"`
+	Name         string `json:"name"`
+	AuthRole     string `json:"auth_role"`
+	Source       string `json:"source"`
+	Status       string `json:"status"`
+	SchemaRef    string `json:"schema_ref"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 type databaseDTO struct {
-	ID            string `json:"id"`
-	SUTID         string `json:"sut_id"`
-	EnvironmentID string `json:"environment_id"`
-	Name          string `json:"name"`
-	DSN           string `json:"dsn"`
-	Username      string `json:"username"`
-	PasswordSet   bool   `json:"password_set"`
-	ReadOnly      bool   `json:"read_only"`
-	Status        string `json:"status"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ID          string `json:"id"`
+	SUTID       string `json:"sut_id"`
+	Name        string `json:"name"`
+	DSN         string `json:"dsn"`
+	Username    string `json:"username"`
+	PasswordSet bool   `json:"password_set"`
+	ReadOnly    bool   `json:"read_only"`
+	Status      string `json:"status"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
+// accountDTO is one row of the global test-account pool. SUTID is the optional
+// affinity hint and is omitted when the account has none.
 type accountDTO struct {
-	ID            string   `json:"id"`
-	SUTID         string   `json:"sut_id"`
-	EnvironmentID string   `json:"environment_id"`
-	Username      string   `json:"username"`
-	Roles         []string `json:"roles"`
-	Notes         string   `json:"notes"`
-	Status        string   `json:"status"`
-	PasswordSet   bool     `json:"password_set"`
-	CreatedAt     string   `json:"created_at"`
-	UpdatedAt     string   `json:"updated_at"`
+	ID          string   `json:"id"`
+	SUTID       string   `json:"sut_id,omitempty"`
+	Username    string   `json:"username"`
+	Roles       []string `json:"roles"`
+	Notes       string   `json:"notes"`
+	Status      string   `json:"status"`
+	PasswordSet bool     `json:"password_set"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
 }
 
 type codeRepositoryDTO struct {
@@ -180,10 +181,6 @@ type codeRepositoryDTO struct {
 }
 
 func toVersionDTO(view versionapp.VersionView) versionDTO {
-	bindings := make([]bindingDTO, 0, len(view.Bindings))
-	for _, binding := range view.Bindings {
-		bindings = append(bindings, toBindingDTO(binding))
-	}
 	return versionDTO{
 		ID:                        strconv.FormatInt(view.ID, 10),
 		Title:                     view.Title,
@@ -191,7 +188,8 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 		Goal:                      view.Goal,
 		Status:                    view.Status,
 		AutoDesignNewRequirements: view.AutoDesignNewRequirements,
-		Bindings:                  bindings,
+		EnvironmentID:             strconv.FormatInt(view.EnvironmentID, 10),
+		Binding:                   toBindingDTO(view.Binding),
 		RequirementCounts: requirementCountsDTO{
 			Total:     view.RequirementCounts.Total,
 			Draft:     view.RequirementCounts.Draft,
@@ -208,69 +206,35 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 		},
 		ClosedAt:    formatOptionalTime(view.ClosedAt),
 		CloseReason: formatOptionalString(view.CloseReason),
+		ClosureKind: view.ClosureKind,
+		Unverified:  view.Unverified,
 		CreatedBy:   strconv.FormatInt(view.CreatedBy, 10),
 		CreatedAt:   formatTime(view.CreatedAt),
 		UpdatedAt:   formatTime(view.UpdatedAt),
 	}
 }
 
-func toBindingDTO(view versionapp.BindingView) bindingDTO {
-	pages := make([]pageDTO, 0, len(view.Pages))
-	for _, page := range view.Pages {
-		pages = append(pages, toPageDTO(page))
-	}
-	apis := make([]apiDTO, 0, len(view.APIs))
-	for _, api := range view.APIs {
-		apis = append(apis, toAPIDTO(api))
-	}
-	databases := make([]databaseDTO, 0, len(view.Databases))
-	for _, database := range view.Databases {
-		databases = append(databases, toDatabaseDTO(database))
-	}
-	accounts := make([]accountDTO, 0, len(view.Accounts))
-	for _, account := range view.Accounts {
-		accounts = append(accounts, toAccountDTO(account))
-	}
-	var repository *codeRepositoryDTO
-	if view.Repository != nil {
-		converted := toCodeRepositoryDTO(*view.Repository)
-		repository = &converted
-	}
-	repositories := make([]bindingRepositoryDTO, 0, len(view.Repositories))
-	for _, item := range view.Repositories {
-		repositories = append(repositories, bindingRepositoryDTO{
-			Repository: toCodeRepositoryDTO(item.Repository),
-			Role:       item.Role,
-			Source:     item.Source,
-		})
-	}
+func toBindingDTO(catalog versionapp.EnvironmentSUTCatalog) bindingDTO {
 	return bindingDTO{
-		ID:                 strconv.FormatInt(view.ID, 10),
-		CodeBaselineCommit: formatOptionalString(view.CodeBaselineCommit),
-		SUT:                toSUTDTO(view.SUT),
-		Environment:        toEnvironmentDTO(view.Environment),
-		Repository:         repository,
-		Repositories:       repositories,
-		ScopeExclude:       toScopeExcludeDTO(view.ScopeExclude),
-		Pages:              pages,
-		APIs:               apis,
-		Databases:          databases,
-		Accounts:           accounts,
+		Environment:        toEnvironmentDTO(catalog.Environment),
+		Pages:              toPageDTOs(catalog.Pages),
+		APIs:               toAPIDTOs(catalog.APIs),
+		Databases:          toDatabaseDTOs(catalog.Databases),
+		Accounts:           toAccountDTOs(catalog.Accounts),
+		Repositories:       toBindingRepositoryDTOs(catalog.Repositories),
+		CodeBaselineCommit: formatOptionalString(catalog.CodeBaselineCommit),
 	}
 }
 
-func toScopeExcludeDTO(scope version.ScopeExclude) scopeExcludeDTO {
-	return scopeExcludeDTO{
-		Pages:     decimalIDs(scope.Pages),
-		APIs:      decimalIDs(scope.APIs),
-		Databases: decimalIDs(scope.Databases),
-	}
-}
-
-func decimalIDs(ids []int64) []string {
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, strconv.FormatInt(id, 10))
+func toBindingRepositoryDTOs(rows []versionapp.BindingRepository) []bindingRepositoryDTO {
+	out := make([]bindingRepositoryDTO, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bindingRepositoryDTO{
+			Repository:         toCodeRepositoryDTO(row.Repository),
+			SUTID:              strconv.FormatInt(row.SUTID, 10),
+			Role:               row.Role,
+			CodeBaselineCommit: formatOptionalString(row.CodeBaselineCommit),
+		})
 	}
 	return out
 }
@@ -286,59 +250,74 @@ func toVersionSummaryDTO(view versionapp.VersionSummary) versionSummaryDTO {
 	}
 }
 
-func toSUTDTO(view resourceapp.SUTView) sutDTO {
-	environments := make([]environmentDTO, 0, len(view.Environments))
-	for _, environment := range view.Environments {
-		environments = append(environments, toEnvironmentDTO(environment))
+func toEnvironmentDTO(view resourceapp.EnvironmentView) environmentDTO {
+	suts := make([]sutDTO, 0, len(view.SUTs))
+	for _, sut := range view.SUTs {
+		suts = append(suts, toSUTDTO(sut))
 	}
-	return sutDTO{
-		ID:           view.ID,
-		Name:         view.Name,
-		Intro:        view.Intro,
-		Environments: environments,
-		CreatedAt:    formatTime(view.CreatedAt),
-		UpdatedAt:    formatTime(view.UpdatedAt),
+	return environmentDTO{
+		ID:          view.ID,
+		Name:        view.Name,
+		Description: view.Description,
+		Status:      view.Status,
+		SUTs:        suts,
+		CreatedAt:   formatTime(view.CreatedAt),
+		UpdatedAt:   formatTime(view.UpdatedAt),
 	}
 }
 
-func toEnvironmentDTO(view resourceapp.EnvironmentView) environmentDTO {
-	pages := make([]pageDTO, 0, len(view.Pages))
-	for _, page := range view.Pages {
-		pages = append(pages, toPageDTO(page))
+func toSUTDTO(view resourceapp.SUTView) sutDTO {
+	return sutDTO{
+		ID:            view.ID,
+		EnvironmentID: view.EnvironmentID,
+		Name:          view.Name,
+		Intro:         view.Intro,
+		BaseURL:       view.BaseURL,
+		Family:        view.Family,
+		Pages:         toPageDTOs(view.Pages),
+		APIs:          toAPIDTOs(view.APIs),
+		Databases:     toDatabaseDTOs(view.Databases),
+		CreatedAt:     formatTime(view.CreatedAt),
+		UpdatedAt:     formatTime(view.UpdatedAt),
 	}
-	apis := make([]apiDTO, 0, len(view.APIs))
-	for _, api := range view.APIs {
-		apis = append(apis, toAPIDTO(api))
+}
+
+func toPageDTOs(views []resourceapp.PageView) []pageDTO {
+	out := make([]pageDTO, 0, len(views))
+	for _, view := range views {
+		out = append(out, toPageDTO(view))
 	}
-	databases := make([]databaseDTO, 0, len(view.Databases))
-	for _, database := range view.Databases {
-		databases = append(databases, toDatabaseDTO(database))
+	return out
+}
+
+func toAPIDTOs(views []resourceapp.APIView) []apiDTO {
+	out := make([]apiDTO, 0, len(views))
+	for _, view := range views {
+		out = append(out, toAPIDTO(view))
 	}
-	accounts := make([]accountDTO, 0, len(view.Accounts))
-	for _, account := range view.Accounts {
-		accounts = append(accounts, toAccountDTO(account))
+	return out
+}
+
+func toDatabaseDTOs(views []resourceapp.DatabaseView) []databaseDTO {
+	out := make([]databaseDTO, 0, len(views))
+	for _, view := range views {
+		out = append(out, toDatabaseDTO(view))
 	}
-	return environmentDTO{
-		ID:        view.ID,
-		SUTID:     view.SUTID,
-		Name:      view.Name,
-		BaseURL:   view.BaseURL,
-		IsDefault: view.IsDefault,
-		Status:    view.Status,
-		Pages:     pages,
-		APIs:      apis,
-		Databases: databases,
-		Accounts:  accounts,
-		CreatedAt: formatTime(view.CreatedAt),
-		UpdatedAt: formatTime(view.UpdatedAt),
+	return out
+}
+
+func toAccountDTOs(views []resourceapp.AccountView) []accountDTO {
+	out := make([]accountDTO, 0, len(views))
+	for _, view := range views {
+		out = append(out, toAccountDTO(view))
 	}
+	return out
 }
 
 func toPageDTO(view resourceapp.PageView) pageDTO {
 	return pageDTO{
 		ID:            view.ID,
 		SUTID:         view.SUTID,
-		EnvironmentID: view.EnvironmentID,
 		Name:          view.Name,
 		URL:           view.URL,
 		RouteTemplate: view.RouteTemplate,
@@ -354,34 +333,32 @@ func toPageDTO(view resourceapp.PageView) pageDTO {
 
 func toAPIDTO(view resourceapp.APIView) apiDTO {
 	return apiDTO{
-		ID:            view.ID,
-		SUTID:         view.SUTID,
-		EnvironmentID: view.EnvironmentID,
-		Method:        view.Method,
-		PathTemplate:  view.PathTemplate,
-		Name:          view.Name,
-		AuthRole:      view.AuthRole,
-		Source:        view.Source,
-		Status:        view.Status,
-		SchemaRef:     view.SchemaRef,
-		CreatedAt:     formatTime(view.CreatedAt),
-		UpdatedAt:     formatTime(view.UpdatedAt),
+		ID:           view.ID,
+		SUTID:        view.SUTID,
+		Method:       view.Method,
+		PathTemplate: view.PathTemplate,
+		Name:         view.Name,
+		AuthRole:     view.AuthRole,
+		Source:       view.Source,
+		Status:       view.Status,
+		SchemaRef:    view.SchemaRef,
+		CreatedAt:    formatTime(view.CreatedAt),
+		UpdatedAt:    formatTime(view.UpdatedAt),
 	}
 }
 
 func toDatabaseDTO(view resourceapp.DatabaseView) databaseDTO {
 	return databaseDTO{
-		ID:            view.ID,
-		SUTID:         view.SUTID,
-		EnvironmentID: view.EnvironmentID,
-		Name:          view.Name,
-		DSN:           view.DSN,
-		Username:      view.Username,
-		PasswordSet:   view.PasswordSet,
-		ReadOnly:      view.ReadOnly,
-		Status:        view.Status,
-		CreatedAt:     formatTime(view.CreatedAt),
-		UpdatedAt:     formatTime(view.UpdatedAt),
+		ID:          view.ID,
+		SUTID:       view.SUTID,
+		Name:        view.Name,
+		DSN:         view.DSN,
+		Username:    view.Username,
+		PasswordSet: view.PasswordSet,
+		ReadOnly:    view.ReadOnly,
+		Status:      view.Status,
+		CreatedAt:   formatTime(view.CreatedAt),
+		UpdatedAt:   formatTime(view.UpdatedAt),
 	}
 }
 
@@ -391,16 +368,15 @@ func toAccountDTO(view resourceapp.AccountView) accountDTO {
 		roles = []string{}
 	}
 	return accountDTO{
-		ID:            view.ID,
-		SUTID:         view.SUTID,
-		EnvironmentID: view.EnvironmentID,
-		Username:      view.Username,
-		Roles:         roles,
-		Notes:         view.Notes,
-		Status:        view.Status,
-		PasswordSet:   view.PasswordSet,
-		CreatedAt:     formatTime(view.CreatedAt),
-		UpdatedAt:     formatTime(view.UpdatedAt),
+		ID:          view.ID,
+		SUTID:       view.SUTID,
+		Username:    view.Username,
+		Roles:       roles,
+		Notes:       view.Notes,
+		Status:      view.Status,
+		PasswordSet: view.PasswordSet,
+		CreatedAt:   formatTime(view.CreatedAt),
+		UpdatedAt:   formatTime(view.UpdatedAt),
 	}
 }
 
@@ -429,9 +405,9 @@ func toCodeRepositoryDTO(view resourceapp.CodeRepositoryView) codeRepositoryDTO 
 
 // ---------- request payloads ----------
 
-// createVersionRequest is the v0.22 API-15 environment-only version payload.
-// The SUT is derived from the environment; pages, APIs, databases, accounts and
-// repositories are no longer accepted at creation (R-C3-2).
+// createVersionRequest is the environment-only version payload (API-15). The
+// shape is unchanged by v0.2.4-B: the version binds the environment directly and
+// nothing is derived into a per-version SUT row any more.
 type createVersionRequest struct {
 	Title         string `json:"title"`
 	Description   string `json:"description"`

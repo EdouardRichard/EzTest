@@ -12,9 +12,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func p6DeliveryInt64Ptr(value int64) *int64 { return &value }
+func deliveryInt64Ptr(value int64) *int64 { return &value }
 
-func p6SeedDeliveryIssue(t *testing.T, pool *pgxpool.Pool, id, versionID int64, title, status, category, severity string, createdAt, updatedAt time.Time) {
+func readModelSeedDeliveryIssue(t *testing.T, pool *pgxpool.Pool, id, versionID int64, title, status, category, severity string, createdAt, updatedAt time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO delivery_issue (
@@ -25,7 +25,7 @@ func p6SeedDeliveryIssue(t *testing.T, pool *pgxpool.Pool, id, versionID int64, 
 	}
 }
 
-func p6SeedDeliveryReport(t *testing.T, pool *pgxpool.Pool, id, versionID int64, waveID *int64, kind, status string, createdAt, updatedAt time.Time) {
+func readModelSeedDeliveryReport(t *testing.T, pool *pgxpool.Pool, id, versionID int64, waveID *int64, kind, status string, createdAt, updatedAt time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO delivery_report (id, version_id, wave_id, kind, status, created_at, updated_at)
@@ -35,7 +35,7 @@ func p6SeedDeliveryReport(t *testing.T, pool *pgxpool.Pool, id, versionID int64,
 	}
 }
 
-func TestP6DeliveryQueryReaderCountIssueValidity(t *testing.T) {
+func TestDeliveryQueryReaderCountIssueValidity(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -44,11 +44,11 @@ func TestP6DeliveryQueryReaderCountIssueValidity(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedDeliveryIssue(t, pool, 7001, 1001, "confirmed issue", "confirmed", "ui", "major", base, base)
-	p6SeedDeliveryIssue(t, pool, 7002, 1001, "dismissed issue", "dismissed", "api", "minor", base, base)
-	p6SeedDeliveryIssue(t, pool, 7003, 1001, "open issue", "open", "db", "trivial", base, base)
-	p6SeedDeliveryIssue(t, pool, 7004, 1001, "merged issue", "merged", "ui", "major", base, base)
-	p6SeedDeliveryIssue(t, pool, 7011, 1002, "other confirmed", "confirmed", "ui", "major", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7001, 1001, "confirmed issue", "confirmed", "ui", "major", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7002, 1001, "dismissed issue", "dismissed", "api", "minor", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7003, 1001, "open issue", "open", "db", "trivial", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7004, 1001, "merged issue", "merged", "ui", "major", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7011, 1002, "other confirmed", "confirmed", "ui", "major", base, base)
 
 	num, denom, err := reader.CountIssueValidity(ctx, nil)
 	if err != nil {
@@ -58,7 +58,7 @@ func TestP6DeliveryQueryReaderCountIssueValidity(t *testing.T) {
 		t.Fatalf("global counts = %d/%d, want 2/3 (open/merged excluded)", num, denom)
 	}
 
-	num, denom, err = reader.CountIssueValidity(ctx, p6DeliveryInt64Ptr(1001))
+	num, denom, err = reader.CountIssueValidity(ctx, deliveryInt64Ptr(1001))
 	if err != nil {
 		t.Fatalf("CountIssueValidity version: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestP6DeliveryQueryReaderCountIssueValidity(t *testing.T) {
 		t.Fatalf("version counts = %d/%d, want 1/2", num, denom)
 	}
 
-	num, denom, err = reader.CountIssueValidity(ctx, p6DeliveryInt64Ptr(1003))
+	num, denom, err = reader.CountIssueValidity(ctx, deliveryInt64Ptr(1003))
 	if err != nil {
 		t.Fatalf("CountIssueValidity empty version: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestP6DeliveryQueryReaderCountIssueValidity(t *testing.T) {
 	}
 }
 
-func TestP6DeliveryQueryReaderSearchIssues(t *testing.T) {
+func TestDeliveryQueryReaderSearchIssues(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -84,10 +84,10 @@ func TestP6DeliveryQueryReaderSearchIssues(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedDeliveryIssue(t, pool, 7001, 1001, "Login button 500", "open", "ui", "major", base, base.Add(time.Hour))
-	p6SeedDeliveryIssue(t, pool, 7002, 1001, "Login crash", "confirmed", "api", "minor", base, base.Add(2*time.Hour))
-	p6SeedDeliveryIssue(t, pool, 7003, 1001, "Checkout copy", "open", "ui", "trivial", base, base.Add(3*time.Hour))
-	p6SeedDeliveryIssue(t, pool, 7011, 1002, "Login v2", "open", "ui", "major", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7001, 1001, "Login button 500", "open", "ui", "major", base, base.Add(time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7002, 1001, "Login crash", "confirmed", "api", "minor", base, base.Add(2*time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7003, 1001, "Checkout copy", "open", "ui", "trivial", base, base.Add(3*time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7011, 1002, "Login v2", "open", "ui", "major", base, base)
 
 	rows, err := reader.SearchIssues(ctx, "login", 2)
 	if err != nil {
@@ -115,7 +115,7 @@ func TestP6DeliveryQueryReaderSearchIssues(t *testing.T) {
 	}
 }
 
-func TestP6DeliveryQueryReaderSearchReports(t *testing.T) {
+func TestDeliveryQueryReaderSearchReports(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -125,10 +125,10 @@ func TestP6DeliveryQueryReaderSearchReports(t *testing.T) {
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 	waveID := int64(3001)
 
-	p6SeedDeliveryReport(t, pool, 9001, 1001, &waveID, "wave", "published", base, base.Add(time.Hour))
-	p6SeedDeliveryReport(t, pool, 9002, 1001, nil, "version", "draft", base, base.Add(2*time.Hour))
+	readModelSeedDeliveryReport(t, pool, 9001, 1001, &waveID, "wave", "published", base, base.Add(time.Hour))
+	readModelSeedDeliveryReport(t, pool, 9002, 1001, nil, "version", "draft", base, base.Add(2*time.Hour))
 	otherWaveID := int64(3002)
-	p6SeedDeliveryReport(t, pool, 9003, 1002, &otherWaveID, "wave", "stale", base, base.Add(3*time.Hour))
+	readModelSeedDeliveryReport(t, pool, 9003, 1002, &otherWaveID, "wave", "stale", base, base.Add(3*time.Hour))
 
 	rows, err := reader.SearchReports(ctx, "波次", 10)
 	if err != nil {
@@ -165,7 +165,7 @@ func TestP6DeliveryQueryReaderSearchReports(t *testing.T) {
 	}
 }
 
-func TestP6DeliveryQueryReaderListOpenIssues(t *testing.T) {
+func TestDeliveryQueryReaderListOpenIssues(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -174,10 +174,10 @@ func TestP6DeliveryQueryReaderListOpenIssues(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedDeliveryIssue(t, pool, 7001, 1001, "Open one", "open", "ui", "major", base, base)
-	p6SeedDeliveryIssue(t, pool, 7002, 1001, "Open two", "open", "api", "minor", base.Add(time.Hour), base.Add(time.Hour))
-	p6SeedDeliveryIssue(t, pool, 7003, 1001, "Confirmed", "confirmed", "db", "trivial", base.Add(2*time.Hour), base.Add(2*time.Hour))
-	p6SeedDeliveryIssue(t, pool, 7011, 1002, "Open other version", "open", "ui", "major", base.Add(3*time.Hour), base.Add(3*time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7001, 1001, "Open one", "open", "ui", "major", base, base)
+	readModelSeedDeliveryIssue(t, pool, 7002, 1001, "Open two", "open", "api", "minor", base.Add(time.Hour), base.Add(time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7003, 1001, "Confirmed", "confirmed", "db", "trivial", base.Add(2*time.Hour), base.Add(2*time.Hour))
+	readModelSeedDeliveryIssue(t, pool, 7011, 1002, "Open other version", "open", "ui", "major", base.Add(3*time.Hour), base.Add(3*time.Hour))
 
 	rows, err := reader.ListOpenIssues(ctx, 10)
 	if err != nil {
@@ -202,7 +202,7 @@ func TestP6DeliveryQueryReaderListOpenIssues(t *testing.T) {
 	}
 }
 
-func TestP6DeliveryQueryReaderRequiresPool(t *testing.T) {
+func TestDeliveryQueryReaderRequiresPool(t *testing.T) {
 	if _, err := NewQueryReader(nil); err == nil {
 		t.Fatal("expected an error for a nil pool")
 	}

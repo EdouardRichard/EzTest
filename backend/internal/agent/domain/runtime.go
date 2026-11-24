@@ -7,6 +7,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // AgentProfile is a seeded runtime role (Host/Curator/Scout in P1).
@@ -40,10 +41,17 @@ type ProfileBudgets struct {
 // budgets still equal the legacy triple, so an administrator edit that lands
 // between the backfill snapshot and the write is never overwritten. It never
 // carries a prompt body: prompt upgrades are append-only revision writes.
+//
+// RemoveAllowedTools (v0.2.4-C seed 3) drops exact tool names from the live row
+// in the SAME fenced UPDATE as the union, so a retired tool (the 13 browser.*
+// atomic actions) is removed and the domain-level increment added atomically.
+// Removal is exact-name only: the caller derives the names from the stored row,
+// and an administrator tool outside the removal list is never touched.
 type ProfileSeedBackfill struct {
-	AddAllowedTools []string
-	BudgetUpgrade   *ProfileBudgetUpgrade
-	SeedVersion     int
+	AddAllowedTools    []string
+	RemoveAllowedTools []string
+	BudgetUpgrade      *ProfileBudgetUpgrade
+	SeedVersion        int
 }
 
 // ProfileBudgetUpgrade raises one legacy budget envelope to the current one.
@@ -177,6 +185,31 @@ func (r MessageRole) Valid() bool {
 	}
 }
 
+// Agent transcript stream_state (v0.2.4-D T8, SC-D3). The project has ONE
+// stream-state authority — version.MessageStreamStates() — shared by the Host
+// conversation head and the agent transcript. These are DERIVED aliases, not a
+// second enum (constitution 五.1/五.3): a change to the authority changes both
+// surfaces at once, and db/agent_stream_state_enum_test.go pins the DB CHECK
+// against the same authority. The cross-context domain import is ratified under
+// R-H9 (pure-vocabulary reuse: no entity state, no side effects, compile-time
+// alias + delegation) — see docs/design/architecture-constraints.md §5.1 and its
+// ratification register (v0.2.4-H T14).
+const (
+	MessageStreamStateStreaming   = version.MessageStreamStateStreaming
+	MessageStreamStateComplete    = version.MessageStreamStateComplete
+	MessageStreamStateInterrupted = version.MessageStreamStateInterrupted
+)
+
+// MessageStreamStates returns the agent_message.stream_state enum, derived from
+// the shared authority. The DB CHECK and migration gates compare against it.
+func MessageStreamStates() []string { return version.MessageStreamStates() }
+
+// NormalizeMessageStreamState maps the empty legacy value to complete: a row
+// written without an explicit state is a finished batch/legacy message.
+func NormalizeMessageStreamState(state string) string {
+	return version.NormalizeMessageStreamState(state)
+}
+
 // MessagePart is one content part of an agent message.
 type MessagePart struct {
 	Type string `json:"type"`
@@ -190,7 +223,10 @@ type ToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
-// AgentMessage is one immutable LLM transcript row (system/user/assistant/tool).
+// AgentMessage is one LLM transcript row (system/user/assistant/tool). It is
+// immutable once terminal: a row written by the batch path is complete on
+// insert, while a streaming assistant row (v0.2.4-D T8) is rewritten in place
+// until its turn seals it complete or interrupted.
 type AgentMessage struct {
 	ID             int64
 	RunID          *int64
@@ -200,13 +236,17 @@ type AgentMessage struct {
 	ToolCalls      []ToolCall
 	ToolCallID     *string
 	Usage          map[string]int
+	StreamState    string
 	CreatedAt      time.Time
 }
 
-// Validate checks the transcript role and tool-call identity.
+// Validate checks the transcript role, tool-call identity and stream state.
 func (m AgentMessage) Validate() error {
 	if !m.Role.Valid() {
 		return platform.Invalid("role", "must be one of system, user, assistant, tool")
+	}
+	if err := version.ValidateMessageStreamState(NormalizeMessageStreamState(m.StreamState)); err != nil {
+		return err
 	}
 	if m.Role == MessageRoleTool {
 		if m.ToolCallID == nil || strings.TrimSpace(*m.ToolCallID) == "" {

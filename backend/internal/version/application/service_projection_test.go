@@ -95,7 +95,7 @@ func TestMarkRunningProjectsVersionOnce(t *testing.T) {
 	}
 }
 
-func TestGetIncludesP1Counts(t *testing.T) {
+func TestGetIncludesRequirementCounts(t *testing.T) {
 	env := newTestEnv(t)
 	env.repo.stats = version.VersionStats{
 		Requirements:      version.RequirementCounts{Total: 5, Draft: 2, Clarified: 3},

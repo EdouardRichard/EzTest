@@ -16,9 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func p6AgentInt64Ptr(value int64) *int64 { return &value }
+func agentInt64Ptr(value int64) *int64 { return &value }
 
-func p6SeedWorkItem(t *testing.T, pool *pgxpool.Pool, id, versionID int64, workType, status string, attempts int, createdAt time.Time) {
+func readModelSeedWorkItem(t *testing.T, pool *pgxpool.Pool, id, versionID int64, workType, status string, attempts int, createdAt time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO work_item (id, version_id, team, type, status, attempts, max_attempts, dedupe_key, created_at, updated_at)
@@ -28,7 +28,7 @@ func p6SeedWorkItem(t *testing.T, pool *pgxpool.Pool, id, versionID int64, workT
 	}
 }
 
-func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
+func TestAgentQueryReaderCountTaskRetries(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -37,11 +37,11 @@ func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedWorkItem(t, pool, 8001, 1001, "execute.case", "open", 0, base)
-	p6SeedWorkItem(t, pool, 8002, 1001, "execute.case", "done", 1, base)
-	p6SeedWorkItem(t, pool, 8003, 1001, "execute.case", "failed", 2, base)
-	p6SeedWorkItem(t, pool, 8004, 1001, "execute.case", "dead", 5, base)
-	p6SeedWorkItem(t, pool, 8011, 1002, "design.plan", "done", 1, base)
+	readModelSeedWorkItem(t, pool, 8001, 1001, "execute.case", "open", 0, base)
+	readModelSeedWorkItem(t, pool, 8002, 1001, "execute.case", "done", 1, base)
+	readModelSeedWorkItem(t, pool, 8003, 1001, "execute.case", "failed", 2, base)
+	readModelSeedWorkItem(t, pool, 8004, 1001, "execute.case", "dead", 5, base)
+	readModelSeedWorkItem(t, pool, 8011, 1002, "design.plan", "done", 1, base)
 
 	num, denom, err := reader.CountTaskRetries(ctx, nil)
 	if err != nil {
@@ -51,7 +51,7 @@ func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
 		t.Fatalf("global counts = %d/%d, want 2/4", num, denom)
 	}
 
-	num, denom, err = reader.CountTaskRetries(ctx, p6AgentInt64Ptr(1001))
+	num, denom, err = reader.CountTaskRetries(ctx, agentInt64Ptr(1001))
 	if err != nil {
 		t.Fatalf("CountTaskRetries version: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
 		t.Fatalf("version counts = %d/%d, want 2/3", num, denom)
 	}
 
-	num, denom, err = reader.CountTaskRetries(ctx, p6AgentInt64Ptr(1002))
+	num, denom, err = reader.CountTaskRetries(ctx, agentInt64Ptr(1002))
 	if err != nil {
 		t.Fatalf("CountTaskRetries version 1002: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
 		t.Fatalf("version 1002 counts = %d/%d, want 0/1", num, denom)
 	}
 
-	num, denom, err = reader.CountTaskRetries(ctx, p6AgentInt64Ptr(1003))
+	num, denom, err = reader.CountTaskRetries(ctx, agentInt64Ptr(1003))
 	if err != nil {
 		t.Fatalf("CountTaskRetries empty version: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestP6AgentQueryReaderCountTaskRetries(t *testing.T) {
 	}
 }
 
-func TestP6AgentQueryReaderListDeadWorkItems(t *testing.T) {
+func TestAgentQueryReaderListDeadWorkItems(t *testing.T) {
 	pool := testutil.NewDB(t)
 	reader, err := NewQueryReader(pool)
 	if err != nil {
@@ -85,10 +85,10 @@ func TestP6AgentQueryReaderListDeadWorkItems(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)
 
-	p6SeedWorkItem(t, pool, 8001, 1001, "execute.case", "dead", 3, base.Add(time.Hour))
-	p6SeedWorkItem(t, pool, 8002, 1002, "design.plan", "dead", 3, base.Add(2*time.Hour))
-	p6SeedWorkItem(t, pool, 8003, 1001, "execute.case", "failed", 2, base.Add(3*time.Hour))
-	p6SeedWorkItem(t, pool, 8004, 1001, "execute.case", "open", 0, base.Add(4*time.Hour))
+	readModelSeedWorkItem(t, pool, 8001, 1001, "execute.case", "dead", 3, base.Add(time.Hour))
+	readModelSeedWorkItem(t, pool, 8002, 1002, "design.plan", "dead", 3, base.Add(2*time.Hour))
+	readModelSeedWorkItem(t, pool, 8003, 1001, "execute.case", "failed", 2, base.Add(3*time.Hour))
+	readModelSeedWorkItem(t, pool, 8004, 1001, "execute.case", "open", 0, base.Add(4*time.Hour))
 
 	rows, err := reader.ListDeadWorkItems(ctx, 10)
 	if err != nil {
@@ -116,7 +116,7 @@ func TestP6AgentQueryReaderListDeadWorkItems(t *testing.T) {
 	}
 }
 
-func TestP6AgentQueryReaderRequiresPool(t *testing.T) {
+func TestAgentQueryReaderRequiresPool(t *testing.T) {
 	if _, err := NewQueryReader(nil); err == nil {
 		t.Fatal("expected an error for a nil pool")
 	}
@@ -124,9 +124,9 @@ func TestP6AgentQueryReaderRequiresPool(t *testing.T) {
 
 /* ------------------- Task 62 fix round 1: read SQL coverage ------------------ */
 
-// p62WorkItemSeed is one 0.2.1 work_item fixture row. An empty Kind seeds a
+// readModelWorkItemSeed is one 0.2.1 work_item fixture row. An empty Kind seeds a
 // legacy pre-0.2.1 row (the column defaults to the empty string).
-type p62WorkItemSeed struct {
+type readModelWorkItemSeed struct {
 	ID        int64
 	VersionID int64
 	Kind      string
@@ -141,7 +141,7 @@ type p62WorkItemSeed struct {
 	CreatedAt time.Time
 }
 
-func p62SeedWorkItem(t *testing.T, pool *pgxpool.Pool, seed p62WorkItemSeed) {
+func structuredSeedWorkItem(t *testing.T, pool *pgxpool.Pool, seed readModelWorkItemSeed) {
 	t.Helper()
 	createdBy := seed.CreatedBy
 	if createdBy == "" {
@@ -176,7 +176,7 @@ func p62SeedWorkItem(t *testing.T, pool *pgxpool.Pool, seed p62WorkItemSeed) {
 	}
 }
 
-func p62ReadWorkItems(t *testing.T, reader *QueryReader, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool) {
+func readModelReadWorkItems(t *testing.T, reader *QueryReader, query agentapp.WorkItemQuery) ([]agent.WorkItem, bool) {
 	t.Helper()
 	items, hasMore, err := reader.ListWorkItems(context.Background(), query)
 	if err != nil {
@@ -185,7 +185,7 @@ func p62ReadWorkItems(t *testing.T, reader *QueryReader, query agentapp.WorkItem
 	return items, hasMore
 }
 
-func p62WorkItemIDs(items []agent.WorkItem) []int64 {
+func readModelWorkItemIDs(items []agent.WorkItem) []int64 {
 	ids := make([]int64, 0, len(items))
 	for _, item := range items {
 		ids = append(ids, item.ID)
@@ -207,16 +207,16 @@ func TestVersionReadWorkItemsSQL(t *testing.T) {
 	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 	cancelMarker := agentapp.JobCanceledReason
 
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8301, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "done", Attempts: 1, CreatedAt: base})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8302, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "failed", CreatedBy: "planner", LastError: "boom", Attempts: 1, CreatedAt: base.Add(time.Minute)})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8303, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "failed", CreatedBy: "planner", LastError: cancelMarker, Attempts: 1, CreatedAt: base.Add(2 * time.Minute)})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8304, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "dead", Attempts: 3, CreatedAt: base.Add(3 * time.Minute)})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8305, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "dead", CreatedBy: "planner", LastError: cancelMarker, Attempts: 3, CreatedAt: base.Add(4 * time.Minute)})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8306, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "open", CreatedBy: "trigger", CreatedAt: base.Add(5 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8301, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "done", Attempts: 1, CreatedAt: base})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8302, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "failed", CreatedBy: "planner", LastError: "boom", Attempts: 1, CreatedAt: base.Add(time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8303, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "failed", CreatedBy: "planner", LastError: cancelMarker, Attempts: 1, CreatedAt: base.Add(2 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8304, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "dead", Attempts: 3, CreatedAt: base.Add(3 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8305, VersionID: 1001, Kind: agent.WorkItemKindDesignCases, Status: "dead", CreatedBy: "planner", LastError: cancelMarker, Attempts: 3, CreatedAt: base.Add(4 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8306, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch, Status: "open", CreatedBy: "trigger", CreatedAt: base.Add(5 * time.Minute)})
 	// Legacy pre-0.2.1 row: empty kind, different status and created_by.
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8307, VersionID: 1001, Kind: "", Status: "done", CreatedBy: "planner", CreatedAt: base.Add(6 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8307, VersionID: 1001, Kind: "", Status: "done", CreatedBy: "planner", CreatedAt: base.Add(6 * time.Minute)})
 	// Same-kind row of another version.
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{ID: 8401, VersionID: 1002, Kind: agent.WorkItemKindExecuteBatch, Status: "done", Attempts: 1, CreatedAt: base.Add(7 * time.Minute)})
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{ID: 8401, VersionID: 1002, Kind: agent.WorkItemKindExecuteBatch, Status: "done", Attempts: 1, CreatedAt: base.Add(7 * time.Minute)})
 
 	scope := func(query agentapp.WorkItemQuery) agentapp.WorkItemQuery {
 		query.VersionID = 1001
@@ -227,40 +227,40 @@ func TestVersionReadWorkItemsSQL(t *testing.T) {
 	}
 
 	// kind filter is version scoped and fences the legacy empty kind.
-	items, hasMore := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Kind: agent.WorkItemKindExecuteBatch}))
-	if ids := p62WorkItemIDs(items); !slices.Equal(ids, []int64{8306, 8302, 8301}) || hasMore {
+	items, hasMore := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Kind: agent.WorkItemKindExecuteBatch}))
+	if ids := readModelWorkItemIDs(items); !slices.Equal(ids, []int64{8306, 8302, 8301}) || hasMore {
 		t.Fatalf("kind filter = %v has_more=%v, want [8306 8302 8301] false", ids, hasMore)
 	}
-	if ids := p62WorkItemIDs(mustP62List(t, reader, scope(agentapp.WorkItemQuery{}))); !slices.Equal(ids, []int64{8306, 8305, 8304, 8303, 8302, 8301}) {
+	if ids := readModelWorkItemIDs(mustReadModelList(t, reader, scope(agentapp.WorkItemQuery{}))); !slices.Equal(ids, []int64{8306, 8305, 8304, 8303, 8302, 8301}) {
 		t.Fatalf("unfiltered ids = %v, want legacy 8307 fenced out", ids)
 	}
 
 	// created_by filter.
-	planner, _ := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{CreatedBy: "planner"}))
-	if ids := p62WorkItemIDs(planner); !slices.Equal(ids, []int64{8305, 8303, 8302}) {
+	planner, _ := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{CreatedBy: "planner"}))
+	if ids := readModelWorkItemIDs(planner); !slices.Equal(ids, []int64{8305, 8303, 8302}) {
 		t.Fatalf("created_by filter = %v, want [8305 8303 8302]", ids)
 	}
 
 	// state filters: the cancel marker is cancelled; failed covers stored
 	// failed rows without the marker AND every dead row (dead+marker included,
 	// because the projection only reclassifies failed+marker as cancelled).
-	failed, _ := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "failed"}))
-	if ids := p62WorkItemIDs(failed); !slices.Equal(ids, []int64{8305, 8304, 8302}) {
+	failed, _ := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "failed"}))
+	if ids := readModelWorkItemIDs(failed); !slices.Equal(ids, []int64{8305, 8304, 8302}) {
 		t.Fatalf("state=failed = %v, want [8305 8304 8302] (dead rows project as failed)", ids)
 	}
-	designFailed, _ := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Kind: agent.WorkItemKindDesignCases, State: "failed"}))
-	if ids := p62WorkItemIDs(designFailed); !slices.Equal(ids, []int64{8305, 8304}) {
+	designFailed, _ := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Kind: agent.WorkItemKindDesignCases, State: "failed"}))
+	if ids := readModelWorkItemIDs(designFailed); !slices.Equal(ids, []int64{8305, 8304}) {
 		t.Fatalf("design.cases failed = %v, want [8305 8304]", ids)
 	}
-	cancelled, _ := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "cancelled"}))
-	if ids := p62WorkItemIDs(cancelled); !slices.Equal(ids, []int64{8303}) {
+	cancelled, _ := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "cancelled"}))
+	if ids := readModelWorkItemIDs(cancelled); !slices.Equal(ids, []int64{8303}) {
 		t.Fatalf("state=cancelled = %v, want [8303] (cancel marker only)", ids)
 	}
-	open, _ := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "open"}))
-	if ids := p62WorkItemIDs(open); !slices.Equal(ids, []int64{8306}) {
+	open, _ := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "open"}))
+	if ids := readModelWorkItemIDs(open); !slices.Equal(ids, []int64{8306}) {
 		t.Fatalf("state=open = %v, want [8306]", ids)
 	}
-	if ids := p62WorkItemIDs(mustP62List(t, reader, scope(agentapp.WorkItemQuery{State: "done"}))); !slices.Equal(ids, []int64{8301}) {
+	if ids := readModelWorkItemIDs(mustReadModelList(t, reader, scope(agentapp.WorkItemQuery{State: "done"}))); !slices.Equal(ids, []int64{8301}) {
 		t.Fatalf("state=done = %v, want [8301] (legacy 8307 fenced)", ids)
 	}
 
@@ -290,36 +290,36 @@ func TestVersionReadWorkItemsSQL(t *testing.T) {
 	}
 
 	// Page boundary: limit+1 read reports has_more and the cursor resumes.
-	page, more := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Limit: 2}))
-	if ids := p62WorkItemIDs(page); !slices.Equal(ids, []int64{8306, 8305}) || !more {
+	page, more := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{Limit: 2}))
+	if ids := readModelWorkItemIDs(page); !slices.Equal(ids, []int64{8306, 8305}) || !more {
 		t.Fatalf("first page = %v has_more=%v, want [8306 8305] true", ids, more)
 	}
 	cursor := page[len(page)-1].ID
-	page, more = p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{BeforeID: &cursor, Limit: 2}))
-	if ids := p62WorkItemIDs(page); !slices.Equal(ids, []int64{8304, 8303}) || !more {
+	page, more = readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{BeforeID: &cursor, Limit: 2}))
+	if ids := readModelWorkItemIDs(page); !slices.Equal(ids, []int64{8304, 8303}) || !more {
 		t.Fatalf("second page = %v has_more=%v, want [8304 8303] true", ids, more)
 	}
 	later := page[len(page)-1].ID
-	page, more = p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{BeforeID: &later, Limit: 2}))
-	if ids := p62WorkItemIDs(page); !slices.Equal(ids, []int64{8302, 8301}) || more {
+	page, more = readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{BeforeID: &later, Limit: 2}))
+	if ids := readModelWorkItemIDs(page); !slices.Equal(ids, []int64{8302, 8301}) || more {
 		t.Fatalf("last page = %v has_more=%v, want [8302 8301] false", ids, more)
 	}
 	// A failed page that fills the limit exactly must not report has_more.
-	exact, more := p62ReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "failed", Limit: 3}))
+	exact, more := readModelReadWorkItems(t, reader, scope(agentapp.WorkItemQuery{State: "failed", Limit: 3}))
 	if len(exact) != 3 || more {
 		t.Fatalf("exact failed page rows = %d has_more=%v, want 3 false", len(exact), more)
 	}
 
 	// Empty version: empty non-nil page, no has_more.
-	empty, more := p62ReadWorkItems(t, reader, agentapp.WorkItemQuery{VersionID: 1003, Limit: 10})
+	empty, more := readModelReadWorkItems(t, reader, agentapp.WorkItemQuery{VersionID: 1003, Limit: 10})
 	if empty == nil || len(empty) != 0 || more {
 		t.Fatalf("empty page = %#v has_more=%v, want empty false", empty, more)
 	}
 }
 
-func mustP62List(t *testing.T, reader *QueryReader, query agentapp.WorkItemQuery) []agent.WorkItem {
+func mustReadModelList(t *testing.T, reader *QueryReader, query agentapp.WorkItemQuery) []agent.WorkItem {
 	t.Helper()
-	items, _ := p62ReadWorkItems(t, reader, query)
+	items, _ := readModelReadWorkItems(t, reader, query)
 	return items
 }
 
@@ -334,16 +334,16 @@ func TestVersionReadSingleWorkItemSQL(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
 
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{
 		ID: 8308, VersionID: 1001, Kind: agent.WorkItemKindExecuteBatch,
 		Goal: "执行批次", Status: "claimed", CreatedBy: "planner",
 		Target: `{"case_ids":["11"]}`, DependsOn: []int64{8301},
 		ClaimedBy: "worker-1", Attempts: 2, CreatedAt: base,
 	})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{
 		ID: 8307, VersionID: 1001, Kind: "", Status: "done", CreatedAt: base,
 	})
-	p62SeedWorkItem(t, pool, p62WorkItemSeed{
+	structuredSeedWorkItem(t, pool, readModelWorkItemSeed{
 		ID: 8401, VersionID: 1002, Kind: agent.WorkItemKindExecuteBatch, Status: "done", CreatedAt: base,
 	})
 

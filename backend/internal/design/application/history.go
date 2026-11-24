@@ -2,6 +2,8 @@ package designapp
 
 import (
 	"context"
+
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 )
 
 // CaseVersionHistoryView is one case-version row read by ID regardless of its
@@ -9,12 +11,21 @@ import (
 // row keeps the historical title; Status may be draft/confirmed/stale/
 // superseded. Revision is int32 to match the wire/report projection. CaseID is
 // the owning logical case, used by the execution terminal-run projection.
+//
+// v0.2.4-G R-G8b: the view carries the immutable row's natural-language context
+// (Description/Preconditions/SutDescription/Steps) so a report card of a run
+// referencing a historical version keeps the full NL context — the versioned
+// row carries these; the gap was read-port width, not data absence.
 type CaseVersionHistoryView struct {
-	ID       int64
-	CaseID   int64
-	Revision int32
-	Title    string
-	Status   string
+	ID             int64
+	CaseID         int64
+	Revision       int32
+	Title          string
+	Status         string
+	Description    string
+	Preconditions  string
+	SutDescription string
+	Steps          []ExecutableStepView
 }
 
 // ReadCaseVersionsByIDs is the historical case-version reader of the
@@ -43,14 +54,36 @@ func (s *GraphService) ReadCaseVersionsByIDs(ctx context.Context, versionID int6
 			continue
 		}
 		views = append(views, CaseVersionHistoryView{
-			ID:       row.ID,
-			CaseID:   row.CaseID,
-			Revision: int32(row.Revision),
-			Title:    row.Title,
-			Status:   row.Status,
+			ID:             row.ID,
+			CaseID:         row.CaseID,
+			Revision:       int32(row.Revision),
+			Title:          row.Title,
+			Status:         row.Status,
+			Description:    row.Description,
+			Preconditions:  row.Preconditions,
+			SutDescription: row.SutDescription,
+			Steps:          executableStepViews(row.Steps),
 		})
 	}
 	return views, nil
+}
+
+// executableStepViews projects domain case steps onto the executable step view
+// shared with the current+confirmed reader (same NL fields the report card
+// consumes).
+func executableStepViews(steps []design.CaseStep) []ExecutableStepView {
+	views := make([]ExecutableStepView, 0, len(steps))
+	for _, step := range steps {
+		views = append(views, ExecutableStepView{
+			Seq:               step.Seq,
+			Action:            step.Action,
+			Expected:          step.Expected,
+			TargetDescription: step.TargetDescription,
+			AccountRole:       step.AccountRole,
+			Data:              append([]byte(nil), step.Data...),
+		})
+	}
+	return views
 }
 
 // uniquePositiveIDs dedupes the requested case-version IDs, drops non-positive

@@ -69,11 +69,18 @@ describe("DesignMindmap", () => {
     expect(props.onSelectCase).toHaveBeenCalledWith("7001")
   })
 
-  it("shows SUT chips, page chips and the cross-system marker", async () => {
+  it("shows covered AC chips and the SUT description on the case card", async () => {
     renderMindmap()
 
     await screen.findByTestId("case-card-7003")
-    expect(screen.getByTestId("case-card-7003")).toHaveTextContent("跨系统")
+    // v0.2.4-B: the card renders covered_acs chips + prose sut_description. The
+    // SUT/page id chips and the cross-system marker are deleted (cross-system has
+    // no design-time source). Assert the real rendered content — not the old
+    // "跨系统" check, which only matched the case title/sut_description substring.
+    expect(screen.getByTestId("case-card-7003")).toHaveTextContent("订单中心与支付网关跨系统退款")
+    expect(screen.getByTestId("case-card-7003")).toHaveTextContent("AC-1")
+    expect(screen.getByTestId("case-card-7001")).toHaveTextContent("支付网关退款页面")
+    expect(screen.getByTestId("case-card-7001")).toHaveTextContent("AC-1")
     expect(screen.getByTestId("case-card-7001")).toHaveTextContent("P1")
     expect(screen.getByTestId("case-card-7001")).toHaveTextContent("draft")
   })

@@ -62,7 +62,7 @@ func (f *task6Fixture) schedulerWithDelta(delta DiscoveryDeltaEvaluator) *Schedu
 		Versions:    f.versions,
 		Executors:   f.registry,
 		WorkQueue:   f.queue,
-		Quota:       domainQuota(3, 2, 1),
+		Settings:    &fakeSettings{values: map[string]any{SettingMaxConcurrentCaseRuns: int64(3), settingAgentMaxConcurrentRuns: int64(4)}},
 		QuotaReader: f.quota,
 		Analyzer:    f.analysis,
 		Replanner:   f.intent,
@@ -105,9 +105,10 @@ func finishTask6Wave(t *testing.T, f *task6Fixture) (int64, int64) {
 	run, _ := f.runs.Get(ctx, runs[0].ID)
 	run.Status = execution.CaseRunPassed
 	run.FailureClass = ""
-	if ok, err := f.runs.Update(ctx, run); err != nil || !ok {
-		t.Fatalf("finish run: %v %v", ok, err)
-	}
+	// Fixture seeding of a terminal state: the production Update primitive
+	// refuses terminal transitions (V-0022 single terminal entry), so the
+	// fixture writes the stored row directly.
+	f.runs.byID[run.ID] = run
 	return 100, wave.ID
 }
 
@@ -156,7 +157,7 @@ func TestSchedulerTriggersDiscoveryDeltaOnEmptyWaveFailure(t *testing.T) {
 	// failEmptyWave without planning another wave (there are no open intents).
 	empty := execution.RunWave{
 		ID: 900, VersionID: 100, Status: execution.WavePlanned,
-		Counts:    execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}},
+		Counts:    execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}},
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := f.waves.CreateWithCaseRuns(ctx, empty, nil, nil); err != nil {

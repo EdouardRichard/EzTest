@@ -14,14 +14,14 @@ import (
 )
 
 // IssueFilter is one descending-ID issue page filter. Status/Category/Severity
-// filter when non-empty; VersionSUTID filters the issue refs' version SUT.
+// filter when non-empty; SUTID filters the issue refs' SUT.
 type IssueFilter struct {
-	Status       string
-	Category     string
-	Severity     string
-	VersionSUTID *int64
-	Before       int64
-	Limit        int
+	Status   string
+	Category string
+	Severity string
+	SUTID    *int64
+	Before   int64
+	Limit    int
 }
 
 // IssueStatusUpdate is one issue status transition request. ActorKind is
@@ -272,7 +272,7 @@ type ReportRepository interface {
 	ListReports(ctx context.Context, versionID int64, f ReportFilter) ([]delivery.Report, error)
 	NextRevision(ctx context.Context, reportID int64) (int32, error)
 	CreateRevision(ctx context.Context, r delivery.ReportRevision) (delivery.ReportRevision, error)
-	FinalizePublished(ctx context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string) error
+	FinalizePublished(ctx context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string, displayFingerprint ...string) error
 	MarkRenderMetadata(ctx context.Context, revisionID int64, status, errMsg string) error
 	MarkStale(ctx context.Context, reportID int64) (bool, error)
 	GetRevision(ctx context.Context, reportID int64, revision int32) (delivery.ReportRevision, error)
@@ -291,23 +291,17 @@ type AnalysisRepository interface {
 }
 
 // TaskEnsurer ensures the P4 agent work items. Every method is idempotent and
-// revision-aware: the caller passes the version, report revision, requirement
-// version or close round that the work-item dedupe key includes (spec §4.4), so
-// a stale ensure cannot reuse an item created for an earlier revision or round.
+// revision-aware: the caller passes the version or report revision that the
+// work-item dedupe key includes (spec §4.4), so a stale ensure cannot reuse an
+// item created for an earlier revision. GD-17 (v0.2.4-G) removed the
+// requirement.close/version.close ensure methods: closure is a deterministic
+// reconciler action, not an agent work item.
 type TaskEnsurer interface {
 	// EnsureIssueTriage ensures issue.triage for the issue's own version.
 	EnsureIssueTriage(ctx context.Context, issueID, versionID int64) error
 	// EnsureReportTask ensures report.wave or report.version for one report
 	// revision, selected by the report's kind.
 	EnsureReportTask(ctx context.Context, reportID int64, revision int32) error
-	// EnsureRequirementClose ensures requirement.close for one requirement
-	// version and close round. Its dedupe key is
-	// req-close:{requirement_id}:{requirement_version_id}:{close_round}, so a
-	// closure recorded at an earlier requirement version is never reused.
-	EnsureRequirementClose(ctx context.Context, requirementID, requirementVersionID int64, closeRound int32) error
-	// EnsureVersionClose ensures version.close for the current predicate
-	// fingerprint; a changed predicate naturally produces a new dedupe key.
-	EnsureVersionClose(ctx context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error
 }
 
 // ExecutionReader is the delivery context's read port into execution. It only
@@ -360,10 +354,10 @@ type Clock interface {
 // closure inputs of spec §6.1/§7.2 but stay in the delivery application layer:
 // IDs are int64 at this boundary and become decimal strings in the API layer.
 
-// CaseRunSnapshot is one case_run projection. VersionSUTID is the version SUT
-// that owns the failing step/assertion; VersionSUTIDs lists every SUT the case
-// version uses (report grouping and issue refs both use version SUT IDs, never
-// bare SUT IDs). RequirementID is the resolvable requirement reference used by
+// CaseRunSnapshot is one case_run projection. SUTID is the SUT
+// that owns the failing step/assertion; SUTIDs lists every SUT the case
+// version uses (report grouping and issue refs both use SUT IDs).
+// RequirementID is the resolvable requirement reference used by
 // issue refs and closure checks. Category/Severity carry the P3 deterministic
 // derivation (ui/api/db and major/minor/trivial).
 //
@@ -382,8 +376,8 @@ type CaseRunSnapshot struct {
 	CaseVersionID int64
 	RequirementID int64
 	CaseTitle     string
-	VersionSUTID  *int64
-	VersionSUTIDs []int64
+	SUTID         *int64
+	SUTIDs        []int64
 	Status        string
 	FailureClass  string
 	// ExecutorCapability marks a run blocked by an executor capability
@@ -419,7 +413,7 @@ type CaseRunSnapshot struct {
 type EvidenceSnapshot struct {
 	ID           int64
 	CaseRunID    int64
-	VersionSUTID *int64
+	SUTID        *int64
 	StepSeq      *int
 	AssertionSeq *int
 	Kind         string
@@ -430,20 +424,20 @@ type EvidenceSnapshot struct {
 // WaveSnapshot is one run_wave projection with its per-SUT counts and case-run
 // children (spec §6.1).
 type WaveSnapshot struct {
-	ID           int64
-	VersionID    int64
-	Status       string
-	Trigger      string
-	Counts       map[string]int
-	ByVersionSUT map[int64]SUTCounts
-	ReportID     *int64
-	StartedAt    *time.Time
-	FinishedAt   *time.Time
-	CaseRuns     []CaseRunSnapshot
-	Evidence     []EvidenceSnapshot
+	ID         int64
+	VersionID  int64
+	Status     string
+	Trigger    string
+	Counts     map[string]int
+	BySUT      map[int64]SUTCounts
+	ReportID   *int64
+	StartedAt  *time.Time
+	FinishedAt *time.Time
+	CaseRuns   []CaseRunSnapshot
+	Evidence   []EvidenceSnapshot
 }
 
-// SUTCounts is one version SUT's section of a wave's by_version_sut counts.
+// SUTCounts is one SUT's section of a wave's by_sut counts.
 type SUTCounts struct {
 	Total        int
 	Passed       int
@@ -472,9 +466,9 @@ type RequirementSnapshot struct {
 	ExecutionSettled bool
 }
 
-// VersionSUTSnapshot is one version SUT binding used to label report rows and
-// chain nodes (spec §6.1).
-type VersionSUTSnapshot struct {
+// SUTSnapshot is one SUT used to label report rows and
+// chain nodes (spec §6.1). Its ID equals SUTID (v0.2.4-B dropped the binding-row id).
+type SUTSnapshot struct {
 	ID              int64
 	SUTID           int64
 	SUTName         string
@@ -508,7 +502,7 @@ type VersionSnapshot struct {
 	CloseReason  string
 	CloseRunID   *int64
 	Requirements []RequirementSnapshot
-	VersionSUTs  []VersionSUTSnapshot
+	SUTs         []SUTSnapshot
 	Waves        []WaveSnapshot
 	CaseRuns     []CaseRunSnapshot
 	Coverage     CoverageSnapshot
@@ -526,7 +520,7 @@ type CaseVersionSnapshot struct {
 	Status               string
 	RequirementID        int64
 	RequirementVersionID int64
-	VersionSUTIDs        []int64
+	SUTIDs               []int64
 	UpdatedAt            time.Time
 }
 

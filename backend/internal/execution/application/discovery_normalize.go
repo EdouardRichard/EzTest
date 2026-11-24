@@ -4,6 +4,8 @@ import (
 	"net/url"
 	pathpkg "path"
 	"strings"
+
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // staticDiscoveryExtensions is the explicit static-resource denylist of R-EX-2
@@ -32,7 +34,7 @@ var staticDiscoveryExtensions = map[string]struct{}{
 // It is a pure function so tests and other callers can normalize without a DB.
 func NormalizeResourceTemplate(kind, method, rawURL string) (host, template string, ok bool) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
-	if kind != "page" && kind != "api" {
+	if kind != execution.ObservationKindPage && kind != execution.ObservationKindAPI {
 		return "", "", false
 	}
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
@@ -52,7 +54,7 @@ func NormalizeResourceTemplate(kind, method, rawURL string) (host, template stri
 		return "", "", false
 	}
 	host = strings.ToLower(parsed.Hostname())
-	if kind == "page" {
+	if kind == execution.ObservationKindPage {
 		template = path
 		if fragment := normalizeDiscoveryHashRoute(parsed.Fragment); fragment != "" {
 			template += "#" + fragment

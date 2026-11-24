@@ -178,8 +178,8 @@ export function ChainDetailSheet({ versionId, node, onClose }: ChainDetailSheetP
               {node.status !== null && node.status !== undefined && node.status.length > 0 ? (
                 <Badge tone={STATUS_TONE[node.status] ?? "neutral"}>{node.status}</Badge>
               ) : null}
-              {node.version_sut_id !== null && node.version_sut_id !== undefined ? (
-                <Badge tone="info">SUT {node.version_sut_id}</Badge>
+              {node.sut_id !== null && node.sut_id !== undefined ? (
+                <Badge tone="info">SUT {node.sut_id}</Badge>
               ) : null}
             </div>
           </div>

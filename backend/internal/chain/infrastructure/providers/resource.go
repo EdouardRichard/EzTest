@@ -46,35 +46,29 @@ func (p *ResourceProvider) PageNames(ctx context.Context, versionID int64) (map[
 	return pageNames, err
 }
 
-// ResourceSnapshot is the P6 one-read fast path: the version bindings are read
-// once and both the SUT labels and the page labels are resolved in the same
-// walk (each bound SUT is still fetched at most once).
+// ResourceSnapshot is the P6 one-read fast path: the version's environment
+// catalog is read once and both the SUT labels and the page labels are resolved
+// in the same walk (each SUT is still fetched at most once from the resource
+// catalog, which is the authority for the canonical name).
 func (p *ResourceProvider) ResourceSnapshot(ctx context.Context, versionID int64) (map[int64]string, map[int64]string, error) {
 	view, err := p.versions.Get(ctx, versionID)
 	if err != nil {
 		return nil, nil, err
 	}
-	sutNames := make(map[int64]string, len(view.Bindings))
+	bound := view.Binding.Environment.SUTs
+	sutNames := make(map[int64]string, len(bound))
 	pageNames := make(map[int64]string)
-	seenSUTs := make(map[int64]bool)
-	for _, binding := range view.Bindings {
-		if binding.ID <= 0 {
+	for _, item := range bound {
+		sutID, ok := decimalID(item.ID)
+		if !ok {
 			continue
 		}
-		name := strings.TrimSpace(binding.SUT.Name)
-		for _, page := range binding.Pages {
+		name := strings.TrimSpace(item.Name)
+		for _, page := range item.Pages {
 			if id, ok := decimalID(page.ID); ok && strings.TrimSpace(page.Name) != "" {
 				pageNames[id] = strings.TrimSpace(page.Name)
 			}
 		}
-		sutID, ok := decimalID(binding.SUT.ID)
-		if !ok || seenSUTs[sutID] {
-			if name != "" {
-				sutNames[binding.ID] = name
-			}
-			continue
-		}
-		seenSUTs[sutID] = true
 		sut, err := p.suts.GetSUT(ctx, sutID)
 		if err != nil {
 			return nil, nil, err
@@ -82,15 +76,13 @@ func (p *ResourceProvider) ResourceSnapshot(ctx context.Context, versionID int64
 		if strings.TrimSpace(sut.Name) != "" {
 			name = strings.TrimSpace(sut.Name)
 		}
-		for _, environment := range sut.Environments {
-			for _, page := range environment.Pages {
-				if id, ok := decimalID(page.ID); ok && strings.TrimSpace(page.Name) != "" {
-					pageNames[id] = strings.TrimSpace(page.Name)
-				}
+		for _, page := range sut.Pages {
+			if id, ok := decimalID(page.ID); ok && strings.TrimSpace(page.Name) != "" {
+				pageNames[id] = strings.TrimSpace(page.Name)
 			}
 		}
 		if name != "" {
-			sutNames[binding.ID] = name
+			sutNames[sutID] = name
 		}
 	}
 	return sutNames, pageNames, nil

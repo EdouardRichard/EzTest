@@ -296,14 +296,17 @@ type fakeCaseVersionSpec struct {
 }
 
 // fakeCaseVersion builds one immutable fake case version with deterministic
-// child rows.
+// child rows. It carries the v0.2.4-B natural-language contract fields so a
+// version built here would satisfy the proposal gate.
 func fakeCaseVersion(caseID int64, revision int, title string, steps, assertions int, status string) design.CaseVersion {
 	version := design.CaseVersion{
 		ID: caseID*10 + int64(revision), CaseID: caseID, Revision: revision,
 		Title: title, Status: status,
-		ContentHash:   fmt.Sprintf("hash-%s-%d", title, revision),
-		VersionSUTIDs: []int64{9001}, DefaultVersionSUTID: int64Ptr(9001),
-		StepCount: steps, AssertionCount: assertions,
+		ContentHash:    fmt.Sprintf("hash-%s-%d", title, revision),
+		SutDescription: "商城前台登录页与登录接口。",
+		Preconditions:  "已有可用账号",
+		CoveredACs:     []string{"AC-1"},
+		StepCount:      steps, AssertionCount: assertions,
 	}
 	for seq := 1; seq <= steps; seq++ {
 		version.Steps = append(version.Steps, design.CaseStep{

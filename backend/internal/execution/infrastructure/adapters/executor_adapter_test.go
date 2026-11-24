@@ -16,10 +16,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-// TestBrowserAdapterAttachesExecutorRouteDiagnostics pins the v0.2.3 X-01
-// requirement that a failed browser call names the routed owner, endpoint and
+// TestExecutionAdapterAttachesExecutorRouteDiagnostics pins the v0.2.3 X-01
+// requirement that a failed execution call names the routed owner, endpoint and
 // whether the registry supplied it, on top of the client's request diagnostics.
-func TestBrowserAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
+func TestExecutionAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(150 * time.Millisecond)
 		_, _ = io.WriteString(w, `{"ok":true,"result":{}}`)
@@ -31,9 +31,9 @@ func TestBrowserAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
 		4: {ID: 4, Endpoint: server.URL, Status: execution.ExecutorActive},
 	}}
 	router := NewExecutorRouter(resolver, lookup, "http://127.0.0.1:1")
-	adapter := NewBrowserAdapterWithRouter(router)
+	adapter := NewExecutionAdapterWithRouter(router)
 
-	_, err := adapter.Action(context.Background(), 4, "ctx_1", "goto", nil)
+	_, err := adapter.NetworkLog(context.Background(), 4, "sess_1", 200)
 	perr := platform.AsError(err)
 	if perr.Code != "executor_timeout" {
 		t.Fatalf("error = %+v, want executor_timeout", perr)
@@ -48,8 +48,8 @@ func TestBrowserAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
 	if got, _ := details["endpoint"].(string); got != server.URL {
 		t.Fatalf("details.endpoint = %q, want %q", got, server.URL)
 	}
-	if got, _ := details["context_id"].(string); got != "ctx_1" {
-		t.Fatalf("details.context_id = %q, want ctx_1", got)
+	if got, _ := details["session_id"].(string); got != "sess_1" {
+		t.Fatalf("details.session_id = %q, want sess_1", got)
 	}
 	if phase, _ := details["phase"].(string); phase == "" {
 		t.Fatalf("details.phase is empty: %#v", details)
@@ -60,12 +60,13 @@ func TestBrowserAdapterAttachesExecutorRouteDiagnostics(t *testing.T) {
 
 	// An unknown owner falls back to the primary endpoint with registry_hit=false
 	// and keeps the case_run correlation parsed from the create metadata.
-	fallback := NewBrowserAdapterWithRouter(NewExecutorRouter(resolver, lookup, server.URL))
-	_, err = fallback.CreateContext(context.Background(), executionapp.BrowserContextSpec{
-		ExecutorID:   9,
-		Key:          "run:3001:vs:7:role:admin",
-		AllowedHosts: []string{"127.0.0.1"},
-		Metadata:     map[string]any{"case_run_id": "3001", "attempt": 2},
+	fallback := NewExecutionAdapterWithRouter(NewExecutorRouter(resolver, lookup, server.URL))
+	_, err = fallback.CreateSession(context.Background(), executionapp.SessionSpec{
+		ExecutorID: 9,
+		Key:        "run:3001:sut:7:role:admin",
+		Workspace:  "/data/workspaces/run-3001/sut-7-admin",
+		Metadata:   map[string]any{"case_run_id": "3001", "attempt": 2},
+		LeaseEpoch: 3,
 	})
 	perr = platform.AsError(err)
 	if perr.Code != "executor_timeout" {
@@ -124,13 +125,12 @@ func TestInt64FromMetadataNormalizesNumericIDs(t *testing.T) {
 	}
 }
 
-// TestExecutorProbeMapsContextCreateDiagnostics proves the application port
-// carries the new /healthz creating/lastContextCreateError fields.
-func TestExecutorProbeMapsContextCreateDiagnostics(t *testing.T) {
-	const lastError = "executor_timeout: context creation exceeded its hard deadline"
+// TestExecutorProbeMapsSessionLifecycle proves the application port carries the
+// v2 /healthz session lifecycle fields (capacity/drain/reclaim observability).
+func TestExecutorProbeMapsSessionLifecycle(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, `{"status":"degraded","contexts":0,"maxContexts":2,"creating":1,"lastContextCreateError":"`+lastError+`"}`)
+		_, _ = io.WriteString(w, `{"status":"degraded","sessions":2,"maxSessions":4,"draining":true,"reclaimedSessions":3,"error":"executor is draining"}`)
 	}))
 	defer server.Close()
 	probe := NewExecutorProbe(executorinfra.NewClient(server.URL, "test", time.Second))
@@ -139,8 +139,12 @@ func TestExecutorProbeMapsContextCreateDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if health.Creating != 1 || health.LastContextCreateError != lastError {
-		t.Fatalf("ExecutorHealth = %+v, want creating=1 lastContextCreateError=%q", health, lastError)
+	if health.Sessions != 2 || health.MaxSessions != 4 || !health.Draining ||
+		health.ReclaimedSessions != 3 {
+		t.Fatalf("ExecutorHealth = %+v, want the v2 session lifecycle fields", health)
+	}
+	if health.Status != "degraded" || health.Error != "executor is draining" {
+		t.Fatalf("ExecutorHealth = %+v, want the degraded drain diagnostic", health)
 	}
 }
 
@@ -155,15 +159,15 @@ func TestExecutorSelfCheck(t *testing.T) {
 			method, path = r.Method, r.URL.Path
 			authorization = r.Header.Get("Authorization")
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"contexts":[]}`)
+			_, _ = io.WriteString(w, `{"sessions":[]}`)
 		}))
 		defer server.Close()
 
 		if err := NewExecutorSelfCheck(server.URL, "test").SelfCheck(context.Background()); err != nil {
 			t.Fatalf("SelfCheck() = %v, want nil", err)
 		}
-		if method != http.MethodGet || path != "/v1/contexts" {
-			t.Fatalf("request = %s %s, want GET /v1/contexts", method, path)
+		if method != http.MethodGet || path != "/v1/sessions" {
+			t.Fatalf("request = %s %s, want GET /v1/sessions", method, path)
 		}
 		if authorization != "Bearer test" {
 			t.Fatalf("Authorization = %q, want %q", authorization, "Bearer test")
@@ -174,8 +178,8 @@ func TestExecutorSelfCheck(t *testing.T) {
 		status := status
 		t.Run("unauthorized_"+http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/v1/contexts" {
-					t.Errorf("path = %q, want /v1/contexts", r.URL.Path)
+				if r.URL.Path != "/v1/sessions" {
+					t.Errorf("path = %q, want /v1/sessions", r.URL.Path)
 				}
 				w.WriteHeader(status)
 			}))

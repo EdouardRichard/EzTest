@@ -1,5 +1,15 @@
 import type { LucideIcon } from "lucide-react"
-import { BookOpen, Bot, Bug, Database, FileText, Gauge, Layers, Settings } from "lucide-react"
+import {
+  BookOpen,
+  Bot,
+  Bug,
+  Database,
+  FileText,
+  Gauge,
+  GraduationCap,
+  Layers,
+  Settings,
+} from "lucide-react"
 
 export type NavSectionId = "workspace" | "platform"
 
@@ -27,7 +37,7 @@ export const NAV_SECTIONS: NavSection[] = [
   { id: "platform", label: "平台" },
 ]
 
-/** The eight P0 navigation entries, in product order. */
+/** The global navigation entries, in product order. */
 export const NAV_ITEMS: NavItem[] = [
   { key: "versions", label: "版本", href: "/versions", icon: Layers, section: "workspace" },
   {
@@ -65,6 +75,14 @@ export const NAV_ITEMS: NavItem[] = [
     label: "Agent 中心",
     href: "/agents",
     icon: Bot,
+    section: "platform",
+    adminOnly: true,
+  },
+  {
+    key: "skills",
+    label: "技能库",
+    href: "/skills",
+    icon: GraduationCap,
     section: "platform",
     adminOnly: true,
   },

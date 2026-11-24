@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version stamped into the packages
-        required: true
-        default: "0.2.1"
+        description: Release version (leave empty to use the repository VERSION file)
+        required: false
+        default: ""
         type: string
       skip_smoke:
         description: Skip the package smoke test (the hosted Windows runner has no WSL/Linux PG)
@@ -32,6 +32,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # The repository-root VERSION file is the single authority; an explicit
+      # workflow input overrides it for a one-off build.
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = (Get-Content -LiteralPath VERSION -TotalCount 1).Trim()
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -58,7 +70,7 @@ jobs:
       - name: Build release packages
         shell: pwsh
         run: |
-          $params = @{ Version = "${{ inputs.version }}" }
+          $params = @{ Version = "${{ steps.ver.outputs.version }}" }
           if ("${{ inputs.skip_smoke }}" -eq "true") { $params.SkipSmoke = $true }
           ./scripts/build-release.ps1 @params
 
@@ -71,32 +83,32 @@ jobs:
       - name: Upload Windows package
         uses: actions/upload-artifact@v7
         with:
-          name: eztest-${{ inputs.version }}-windows-x64
-          path: .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
+          name: eztest-${{ steps.ver.outputs.version }}-windows-x64
+          path: .tmp/release/eztest-${{ steps.ver.outputs.version }}-windows-x64.zip
           if-no-files-found: error
 
       - name: Upload Linux package
         uses: actions/upload-artifact@v7
         with:
-          name: eztest-${{ inputs.version }}-linux-x64
-          path: .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
+          name: eztest-${{ steps.ver.outputs.version }}-linux-x64
+          path: .tmp/release/eztest-${{ steps.ver.outputs.version }}-linux-x64.tar.gz
           if-no-files-found: error
 
       - name: Upload checksums
         uses: actions/upload-artifact@v7
         with:
-          name: eztest-${{ inputs.version }}-checksums
+          name: eztest-${{ steps.ver.outputs.version }}-checksums
           path: .tmp/release/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ inputs.version }}
-          name: EzTest ${{ inputs.version }}
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: EzTest ${{ steps.ver.outputs.version }}
           prerelease: true
           generate_release_notes: true
           files: |
-            .tmp/release/eztest-${{ inputs.version }}-windows-x64.zip
-            .tmp/release/eztest-${{ inputs.version }}-linux-x64.tar.gz
+            .tmp/release/eztest-${{ steps.ver.outputs.version }}-windows-x64.zip
+            .tmp/release/eztest-${{ steps.ver.outputs.version }}-linux-x64.tar.gz
             .tmp/release/SHA256SUMS.txt

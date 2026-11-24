@@ -10,10 +10,12 @@ import type {
 
 export const FIXTURE_TIMESTAMP = "2026-10-31T10:00:00Z"
 
+// v0.2.4-B hierarchy inversion: assets carry only sut_id; a SUT owns its assets
+// and registration source/status; a top-level environment owns the SUT catalog.
+
 export const pageFixture: SutPage = {
   id: "1301",
   sut_id: "1001",
-  environment_id: "1101",
   name: "订单列表",
   url: "https://order.test/orders",
   route_template: "/orders",
@@ -29,7 +31,6 @@ export const pageFixture: SutPage = {
 export const apiFixture: SutApi = {
   id: "1401",
   sut_id: "1001",
-  environment_id: "1101",
   method: "GET",
   path_template: "/api/orders",
   name: "查询订单",
@@ -44,7 +45,6 @@ export const apiFixture: SutApi = {
 export const databaseFixture: TargetDatabase = {
   id: "1501",
   sut_id: "1001",
-  environment_id: "1101",
   name: "order_db",
   dsn: "postgres://order-db:5432/order",
   username: "order",
@@ -58,7 +58,6 @@ export const databaseFixture: TargetDatabase = {
 export const accountFixture: TestAccount = {
   id: "1601",
   sut_id: "1001",
-  environment_id: "1101",
   username: "buyer",
   roles: ["buyer"],
   notes: "",
@@ -68,17 +67,51 @@ export const accountFixture: TestAccount = {
   updated_at: FIXTURE_TIMESTAMP,
 }
 
-export const environmentFixture: SutEnvironment = {
-  id: "1101",
-  sut_id: "1001",
-  name: "测试环境",
+export const sutFixture: Sut = {
+  id: "1001",
+  environment_id: "1101",
+  name: "订单中心",
+  intro: "订单主链路",
   base_url: "https://order.test",
-  is_default: true,
-  status: "active",
+  family: "payments",
+  source: "admin",
+  status: "approved",
   pages: [pageFixture],
   apis: [apiFixture],
   databases: [databaseFixture],
-  accounts: [accountFixture],
+  created_at: FIXTURE_TIMESTAMP,
+  updated_at: FIXTURE_TIMESTAMP,
+}
+
+/** List projection: the SUT row without its nested asset catalog. */
+export const sutListItemFixture: Sut = {
+  ...sutFixture,
+  pages: [],
+  apis: [],
+  databases: [],
+}
+
+export const secondSutFixture: Sut = {
+  id: "1002",
+  environment_id: "1101",
+  name: "支付网关",
+  intro: "支付主链路",
+  base_url: "https://pay.test",
+  source: "admin",
+  status: "approved",
+  pages: [],
+  apis: [],
+  databases: [],
+  created_at: FIXTURE_TIMESTAMP,
+  updated_at: FIXTURE_TIMESTAMP,
+}
+
+export const environmentFixture: SutEnvironment = {
+  id: "1101",
+  name: "测试环境",
+  description: "订单与支付联调环境",
+  status: "active",
+  suts: [sutFixture, secondSutFixture],
   created_at: FIXTURE_TIMESTAMP,
   updated_at: FIXTURE_TIMESTAMP,
 }
@@ -87,36 +120,8 @@ export const secondEnvironmentFixture: SutEnvironment = {
   ...environmentFixture,
   id: "1102",
   name: "预发环境",
-  base_url: "https://pre.order.test",
-  is_default: false,
-  pages: [],
-  apis: [],
-  databases: [],
-  accounts: [],
-}
-
-export const sutFixture: Sut = {
-  id: "1001",
-  name: "订单中心",
-  intro: "订单主链路",
-  family: "payments",
-  environments: [environmentFixture, secondEnvironmentFixture],
-  created_at: FIXTURE_TIMESTAMP,
-  updated_at: FIXTURE_TIMESTAMP,
-}
-
-export const sutListItemFixture: Sut = {
-  ...sutFixture,
-  environments: [],
-}
-
-export const secondSutFixture: Sut = {
-  id: "1002",
-  name: "支付网关",
-  intro: "支付主链路",
-  environments: [],
-  created_at: FIXTURE_TIMESTAMP,
-  updated_at: FIXTURE_TIMESTAMP,
+  description: "预发联调环境",
+  suts: [],
 }
 
 export const repositoryFixture: CodeRepository = {

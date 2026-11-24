@@ -275,8 +275,13 @@ function errorMessage(error) {
  * Wires the push client from the executor process environment and starts it.
  * Returns null when push is disabled, when the token is missing or when the
  * listen address cannot be converted into an absolute endpoint.
+ *
+ * `active_contexts`/`capacity` reflect v2 SESSIONS (active sessions / max
+ * sessions). A draining executor reports `degraded` so the backend stops
+ * dispatching new work to it. The heartbeat never probes the browser: exec/shell
+ * /files do not need one, and a missing browser must not degrade the workstation.
  */
-export function startPushFromEnv({ env = process.env, manager = null, version = "0.0.0", logger = null, fetchImpl = globalThis.fetch } = {}) {
+export function startPushFromEnv({ env = process.env, sessions = null, version = "0.0.0", logger = null, fetchImpl = globalThis.fetch } = {}) {
   const config = parsePushConfig(env)
   if (config === null) {
     return null
@@ -290,11 +295,13 @@ export function startPushFromEnv({ env = process.env, manager = null, version = 
   const port = endpoint.slice(endpoint.lastIndexOf(":") + 1)
   const name = trimToBlank(env.EZTEST_EXECUTOR_NAME) || `${os.hostname()}:${port}`
   const snapshot = async () => {
-    const health = manager && typeof manager.health === "function" ? await manager.health() : { status: "ok" }
+    const activeContexts = sessions?.size ?? 0
+    const capacity = sessions?.maxSessions ?? 1
+    const degraded = sessions?.draining === true
     return {
-      activeContexts: manager?.size ?? 0,
-      capacity: manager?.maxContexts ?? 1,
-      status: health?.status === "degraded" ? "degraded" : "ok",
+      activeContexts,
+      capacity,
+      status: degraded ? "degraded" : "ok",
     }
   }
   const client = createPushClient({

@@ -163,9 +163,9 @@ func (t *rollbackTx) InsertCaseVersion(ctx context.Context, version design.CaseV
 func (t *rollbackTx) SupersedeCaseVersion(ctx context.Context, caseVersionID int64, at time.Time) error {
 	if _, err := t.tx.Exec(ctx, `
 		UPDATE case_version
-		SET status = 'superseded', updated_at = $2
-		WHERE id = $1 AND status = 'confirmed'
-	`, caseVersionID, at); err != nil {
+		SET status = $3, updated_at = $2
+		WHERE id = $1 AND status = $4
+	`, caseVersionID, at, design.CaseStatusSuperseded, design.CaseStatusConfirmed); err != nil {
 		return fmt.Errorf("supersede rolled-back case version: %w", err)
 	}
 	return nil
@@ -173,8 +173,4 @@ func (t *rollbackTx) SupersedeCaseVersion(ctx context.Context, caseVersionID int
 
 func (t *rollbackTx) SetCurrentVersion(ctx context.Context, caseID, caseVersionID int64, status string, at time.Time) error {
 	return (&proposeTx{tx: t.tx, versionID: t.versionID}).SetCurrentVersion(ctx, caseID, caseVersionID, status, at)
-}
-
-func (t *rollbackTx) InsertConfirmation(ctx context.Context, confirmation design.Confirmation) error {
-	return insertConfirmation(ctx, t.tx, confirmation)
 }

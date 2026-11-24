@@ -4,6 +4,7 @@ package versionapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -47,26 +48,46 @@ func requirementSourceKey(title string) string {
 	return "source:" + strings.ToUpper(match[1])
 }
 
+// ConfirmationSettings is the narrow settings-center port for the requirement
+// confirmation gate. The composition root satisfies it with the settings
+// service adapter (Int + Raw, the same read surface codeintel's SettingsReader
+// uses for JSON values); the domain gate itself stays pure and receives the
+// resolved values as parameters.
+type ConfirmationSettings interface {
+	Int(ctx context.Context, key string) (int64, error)
+	Raw(ctx context.Context, key string) (json.RawMessage, error)
+}
+
+// Confirmation-gate settings keys (registered in the settings catalog).
+const (
+	SettingPlaceholderTerms    = "validation.placeholder_terms"
+	SettingMinDescriptionChars = "validation.min_description_chars"
+)
+
 // RequirementService implements requirement draft lifecycle, immutable
 // revisions, single/batch confirmation, rollback and relations.
 type RequirementService struct {
-	repo      version.RequirementRepository
-	versions  VersionReader
-	resources ResourceCatalog
-	stale     CaseStaleHook
-	audit     auditapp.Recorder
-	events    eventingapp.Publisher
-	ids       platformid.Generator
-	clock     clock.Clock
-	reopener  RequirementVersionReopener
+	repo     version.RequirementRepository
+	versions VersionReader
+	stale    CaseStaleHook
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
+	ids      platformid.Generator
+	clock    clock.Clock
+	reopener RequirementVersionReopener
+	settings ConfirmationSettings
 }
 
 // NewRequirementService wires the requirement use cases. audit and events may
 // be nil in unit tests; stale defaults to the P1 no-op hook.
+//
+// The requirement contract of design v1.3.1 §5.1 has no resource targets, so
+// the service resolves nothing against the resource catalog: the former
+// ResourceCatalog port and its constructor parameter were removed (v0.2.4-H
+// H-B3) once no caller needed to pass a catalog.
 func NewRequirementService(
 	repo version.RequirementRepository,
 	versions VersionReader,
-	resources ResourceCatalog,
 	stale CaseStaleHook,
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
@@ -77,7 +98,7 @@ func NewRequirementService(
 		stale = NoopCaseStaleHook{}
 	}
 	return &RequirementService{
-		repo: repo, versions: versions, resources: resources, stale: stale,
+		repo: repo, versions: versions, stale: stale,
 		audit: audit, events: events, ids: ids, clock: clk,
 	}
 }
@@ -89,6 +110,53 @@ func (s *RequirementService) SetVersionReopener(reopener RequirementVersionReope
 		s.reopener = reopener
 	}
 	return s
+}
+
+// SetConfirmationSettings wires the settings-center reader for the
+// confirmation gate (validation.placeholder_terms /
+// validation.min_description_chars). It returns the service for fluent wiring.
+// An unwired reader fails closed at confirm time: the gate never silently
+// confirms without its configured increment.
+func (s *RequirementService) SetConfirmationSettings(settings ConfirmationSettings) *RequirementService {
+	if s != nil {
+		s.settings = settings
+	}
+	return s
+}
+
+// confirmationRules reads the confirmation-gate settings at confirm time, so a
+// settings change applies to the next confirmation (never a value cached at
+// startup). An unwired reader, an unreadable key, a terms value that is not a
+// JSON string array, or a floor below the catalog minimum (1) fails closed
+// with an explicit error instead of silently relaxing the gate.
+func (s *RequirementService) confirmationRules(ctx context.Context) ([]string, int, error) {
+	if s == nil || s.settings == nil {
+		return nil, 0, platform.Unavailable("the settings reader is not wired for requirement confirmation")
+	}
+	raw, err := s.settings.Raw(ctx, SettingPlaceholderTerms)
+	if err != nil {
+		return nil, 0, err
+	}
+	var terms []string
+	if err := json.Unmarshal(raw, &terms); err != nil {
+		return nil, 0, platform.Unavailable(SettingPlaceholderTerms + " must be a JSON array of strings")
+	}
+	// Drop empty/whitespace-only terms: a term normalizing to "" would
+	// whole-value-match any empty optional field via IsPlaceholder.
+	sanitized := make([]string, 0, len(terms))
+	for _, term := range terms {
+		if version.NormalizePlaceholderTerm(term) != "" {
+			sanitized = append(sanitized, term)
+		}
+	}
+	minChars, err := s.settings.Int(ctx, SettingMinDescriptionChars)
+	if err != nil {
+		return nil, 0, err
+	}
+	if minChars < 1 {
+		return nil, 0, platform.Unavailable(SettingMinDescriptionChars + " must be at least 1")
+	}
+	return sanitized, int(minChars), nil
 }
 
 // reopenCompleted applies the §7.5 requirement_created/requirement_reopened
@@ -107,15 +175,11 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 	if versionID <= 0 {
 		return RequirementDetail{}, platform.Invalid("id", "must be a positive decimal ID")
 	}
-	versionView, err := s.versions.Get(ctx, versionID)
-	if err != nil {
+	if _, err := s.versions.Get(ctx, versionID); err != nil {
 		return RequirementDetail{}, err
 	}
-	revision, err := normalizeDraft(in)
+	revision, err := normalizeDraft(in, nil)
 	if err != nil {
-		return RequirementDetail{}, err
-	}
-	if err := s.validateTargets(ctx, versionView, revision); err != nil {
 		return RequirementDetail{}, err
 	}
 
@@ -130,20 +194,19 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 	revision.CreatedAt = now
 
 	requirement := version.Requirement{
-		ID:                  requirementID,
-		VersionID:           versionID,
-		CurrentVersionID:    &revisionID,
-		Status:              version.RequirementDraft,
-		TargetVersionSUTIDs: append([]string{}, revision.TargetVersionSUTs...),
-		SourceKey:           requirementSourceKey(revision.Title),
-		CreatedBy:           optionalActor(actorID),
-		CreatedByRunID:      agentRunID(ctx),
-		CreatedAt:           now,
-		UpdatedAt:           now,
+		ID:               requirementID,
+		VersionID:        versionID,
+		CurrentVersionID: &revisionID,
+		Status:           version.RequirementDraft,
+		SourceKey:        requirementSourceKey(revision.Title),
+		CreatedBy:        optionalActor(actorID),
+		CreatedByRunID:   agentRunID(ctx),
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 	if err := s.repo.Create(ctx, requirement, revision); err != nil {
 		if errors.Is(err, version.ErrRequirementDuplicate) && requirement.SourceKey != "" {
-			return s.resolveDuplicateDraft(ctx, versionID, requirement.SourceKey, revision, actorID)
+			return s.resolveDuplicateDraft(ctx, versionID, requirement.SourceKey, in, actorID)
 		}
 		return RequirementDetail{}, mapRequirementRepositoryError(err)
 	}
@@ -173,11 +236,16 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 }
 
 // resolveDuplicateDraft turns a duplicate-source Create into an update/no-op on
-// the existing requirement instead of a second row. An empty-target create never
-// replaces populated targets; a richer target set enriches an empty draft. A
+// the existing requirement instead of a second row. A create that says no more
+// than the draft already there never replaces it; a richer one enriches it. A
 // clarified/closed requirement is never rewritten by a draft_create (the
 // Curator must use requirement.reopen_propose).
-func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionID int64, sourceKey string, incoming version.RequirementVersion, actorID int64) (RequirementDetail, error) {
+//
+// The draft is normalized HERE rather than in Create, because acceptance-
+// criterion ids are inherited from the revision that already exists: a re-emit
+// of the same criteria must keep their ids (and therefore the same
+// ContentHash) instead of minting new ones.
+func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionID int64, sourceKey string, in RequirementDraft, actorID int64) (RequirementDetail, error) {
 	existing, err := s.repo.GetBySourceKey(ctx, versionID, sourceKey)
 	if err != nil {
 		return RequirementDetail{}, mapRequirementRepositoryError(err)
@@ -186,8 +254,14 @@ func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionI
 	if !ok {
 		return RequirementDetail{}, platform.StateConflict("requirement has no current revision")
 	}
-	if existing.Requirement.Status != version.RequirementDraft ||
-		requirementTargetCount(incoming) <= requirementTargetCount(current) {
+	if existing.Requirement.Status != version.RequirementDraft {
+		return s.detailFromAggregate(existing)
+	}
+	incoming, err := normalizeDraft(in, current.AcceptanceCriteria)
+	if err != nil {
+		return RequirementDetail{}, err
+	}
+	if requirementContentCount(incoming) <= requirementContentCount(current) {
 		return s.detailFromAggregate(existing)
 	}
 
@@ -204,7 +278,6 @@ func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionI
 	requirement := existing.Requirement
 	requirement.Status = version.RequirementDraft
 	requirement.CurrentVersionID = &revisionID
-	requirement.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
 	requirement.UpdatedAt = now
 	if err := s.repo.AddRevision(ctx, requirement, revision); err != nil {
 		if errors.Is(err, version.ErrStateConflict) || errors.Is(err, version.ErrRequirementDuplicate) {
@@ -230,17 +303,30 @@ func (s *RequirementService) resolveDuplicateDraft(ctx context.Context, versionI
 	s.recordAudit(ctx, actorID, "requirement.updated", "requirement", requirementIDString, map[string]any{
 		"requirement_version_id": revisionIDString,
 		"revision":               revision.Revision,
-		"reason":                 "duplicate draft create enriched targets",
+		"reason":                 "duplicate draft create enriched the requirement",
 		"source_key":             sourceKey,
 	})
 	s.markRunning(ctx, versionID)
-	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, "duplicate draft create enriched targets")
+	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, "duplicate draft create enriched the requirement")
 	return s.Get(ctx, versionID, requirement.ID)
 }
 
-// requirementTargetCount counts bound target IDs on one revision.
-func requirementTargetCount(revision version.RequirementVersion) int {
-	return len(revision.TargetVersionSUTs) + len(revision.TargetPages) + len(revision.TargetAPIs)
+// requirementContentCount measures how much of the §5.1 contract one revision
+// fills in. It is the duplicate-draft enrichment measure that replaced the old
+// target-ID count: a draft_create repeating an existing source key only adds a
+// revision when it says strictly more than the draft already there, so a bare
+// re-emit can never overwrite a richer clarification.
+func requirementContentCount(revision version.RequirementVersion) int {
+	count := len(revision.AcceptanceCriteria) + len(revision.AccountRolesHint)
+	for _, text := range []string{revision.Rules, revision.ScopeOut, revision.SutDescription} {
+		if strings.TrimSpace(text) != "" {
+			count++
+		}
+	}
+	if !revision.UserStory.Empty() {
+		count++
+	}
+	return count
 }
 
 // CountClarifiedRequirements reports whether the version has at least one
@@ -283,15 +369,14 @@ func (s *RequirementService) Update(ctx context.Context, versionID, requirementI
 	if !ok {
 		return RequirementDetail{}, platform.StateConflict("requirement has no current revision")
 	}
-	versionView, err := s.versions.Get(ctx, versionID)
-	if err != nil {
+	if _, err := s.versions.Get(ctx, versionID); err != nil {
 		return RequirementDetail{}, err
 	}
-	revision, err := normalizeDraft(in)
+	// The previous revision's criteria are the inheritance source for the AC
+	// ids: an unchanged criterion keeps its id, a changed one retires it into a
+	// hole and appends a new one (design v1.3.1 §3.6).
+	revision, err := normalizeDraft(in, current.AcceptanceCriteria)
 	if err != nil {
-		return RequirementDetail{}, err
-	}
-	if err := s.validateTargets(ctx, versionView, revision); err != nil {
 		return RequirementDetail{}, err
 	}
 
@@ -305,7 +390,6 @@ func (s *RequirementService) Update(ctx context.Context, versionID, requirementI
 
 	requirement.Status = version.RequirementDraft
 	requirement.CurrentVersionID = &revisionID
-	requirement.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
 	requirement.SourceKey = requirementSourceKey(revision.Title)
 	requirement.UpdatedAt = now
 	if err := s.repo.AddRevision(ctx, requirement, revision); err != nil {
@@ -417,14 +501,20 @@ func (s *RequirementService) Confirm(ctx context.Context, versionID, requirement
 	if requirement.Status != version.RequirementDraft {
 		return ConfirmResult{}, platform.StateConflict("requirement is not confirmable")
 	}
-	if err := current.ValidateConfirmed(); err != nil {
-		return ConfirmResult{}, err
-	}
-	versionView, err := s.versions.Get(ctx, versionID)
+	// The confirmation gate reads validation.placeholder_terms /
+	// validation.min_description_chars from the settings center at confirm
+	// time and passes them to the pure domain gate (SC-E1).
+	terms, minDescChars, err := s.confirmationRules(ctx)
 	if err != nil {
 		return ConfirmResult{}, err
 	}
-	if err := s.validateTargets(ctx, versionView, current); err != nil {
+	if err := current.ValidateConfirmed(terms, minDescChars); err != nil {
+		return ConfirmResult{}, err
+	}
+	// v0.2.4-B: the version lookup stays as the scope guard it always was, but
+	// there is no target validation left to feed it -- the requirement contract
+	// names its subject in prose (design v1.3.1 §5.1).
+	if _, err := s.versions.Get(ctx, versionID); err != nil {
 		return ConfirmResult{}, err
 	}
 
@@ -484,10 +574,21 @@ func (s *RequirementService) BatchConfirm(ctx context.Context, versionID int64, 
 	}
 
 	now := s.clock.Now()
-	versionView, err := s.versions.Get(ctx, versionID)
-	if err != nil {
+	// Scope guard only: the requirement contract has no resource targets left
+	// to validate against the version's bound environment (§5.1).
+	if _, err := s.versions.Get(ctx, versionID); err != nil {
 		return BatchConfirmResult{}, err
 	}
+	// One settings snapshot validates the whole batch: every draft is checked
+	// against the same terms/floor, read at confirm time like the single path.
+	// H-F10b #23: the read is LAZY, symmetric with Confirm — that path returns a
+	// clarified requirement's idempotent replay before it ever touches settings.
+	// An all-clarified batch is likewise a no-op replay and must not fail with a
+	// settings 503 it never needed. The snapshot is still taken once, at the first
+	// draft, so a mid-batch settings change cannot validate two drafts differently.
+	var terms []string
+	var minDescChars int
+	rulesLoaded := false
 	confirmed := make([]int64, 0, len(items))
 	skipped := make([]int64, 0, len(items))
 	toConfirm := make([]version.Requirement, 0, len(items))
@@ -497,10 +598,15 @@ func (s *RequirementService) BatchConfirm(ctx context.Context, versionID int64, 
 		case version.RequirementClarified:
 			skipped = append(skipped, item.Requirement.ID)
 		case version.RequirementDraft:
-			if err := item.Current.ValidateConfirmed(); err != nil {
-				return BatchConfirmResult{}, withRequirementID(err, item.Requirement.ID)
+			if !rulesLoaded {
+				var rulesErr error
+				terms, minDescChars, rulesErr = s.confirmationRules(ctx)
+				if rulesErr != nil {
+					return BatchConfirmResult{}, rulesErr
+				}
+				rulesLoaded = true
 			}
-			if err := s.validateTargets(ctx, versionView, item.Current); err != nil {
+			if err := item.Current.ValidateConfirmed(terms, minDescChars); err != nil {
 				return BatchConfirmResult{}, withRequirementID(err, item.Requirement.ID)
 			}
 			requirement := item.Requirement
@@ -569,10 +675,11 @@ func (s *RequirementService) BatchConfirm(ctx context.Context, versionID int64, 
 }
 
 // Dedupe collapses duplicate draft requirements of one version. Two drafts are
-// duplicates when their normalized titles match, or when both their normalized
-// description and acceptance text match (a refined title is still the same
-// requirement). The lowest id of each group survives; the rest become obsolete
-// without adding a revision. Clarified requirements are never touched.
+// duplicates when their normalized titles match, or when their normalized
+// content matches -- user story, rules, system under test and acceptance
+// criteria (a refined title is still the same requirement). The lowest id of
+// each group survives; the rest become obsolete without adding a revision.
+// Clarified requirements are never touched.
 func (s *RequirementService) Dedupe(ctx context.Context, versionID int64, actorID int64) (RequirementDedupeResult, error) {
 	if versionID <= 0 {
 		return RequirementDedupeResult{}, platform.Invalid("id", "must be a positive decimal ID")
@@ -594,8 +701,8 @@ func (s *RequirementService) Dedupe(ctx context.Context, versionID int64, actorI
 	for _, item := range items {
 		requirementID := item.Requirement.ID
 		titleKey := normalizeRequirementText(item.Current.Title)
-		contentKey := normalizeRequirementText(item.Current.Description) + "|" + normalizeRequirementText(item.Current.AcceptanceCriteria)
-		hasContentKey := strings.TrimSpace(item.Current.Description) != "" || strings.TrimSpace(item.Current.AcceptanceCriteria) != ""
+		contentKey := requirementContentKey(item.Current)
+		hasContentKey := contentKey != ""
 		if survivor, duplicate := byTitle[titleKey]; duplicate {
 			if err := s.obsoleteRequirement(ctx, versionID, requirementID, "duplicate_title", actorID, now); err != nil {
 				return RequirementDedupeResult{}, err
@@ -669,10 +776,13 @@ func (s *RequirementService) Delete(ctx context.Context, versionID, requirementI
 // Merge folds duplicate draft requirements into one canonical target. The
 // target must still be a draft: absorbing duplicates rewrites the target and
 // un-confirms it, so a clarified requirement must be rolled back first. The
-// target's content absorbs the sources' description/acceptance text (deduped by
-// text and priority), sources are retired as obsolete and a relation records the
-// merge. The target gets a new draft revision only when its content actually
-// changed; a target that already contains the sources just retires them.
+// canonical target keeps its own title, user story, system description and
+// scope_out, and absorbs each source's rules text, account-role hints and
+// acceptance criteria (criteria deduped by normalized content, roles by value,
+// rules by text) plus the highest priority; sources are retired as obsolete and
+// a relation records the merge. The target gets a new draft revision only when
+// its content actually changed; a target that already contains the sources just
+// retires them.
 func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int64, sourceIDs []int64, actorID int64) (RequirementMergeResult, error) {
 	if err := validateIDs(versionID, targetID); err != nil {
 		return RequirementMergeResult{}, err
@@ -707,7 +817,43 @@ func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int6
 		return RequirementMergeResult{}, platform.StateConflict("merge target has no current revision")
 	}
 
-	merged := targetCurrent
+	// The canonical target keeps its own title, user story, system description
+	// and scope_out; a source folds in as extra rules text, extra account-role
+	// hints and extra acceptance criteria, and the highest priority wins.
+	// Scope_out is deliberately NOT concatenated: appending two out-of-scope
+	// lists would easily push the merged revision past RequirementScopeOutMax
+	// and fail its own length bound.
+	merged := RequirementDraft{
+		Title:            targetCurrent.Title,
+		UserStory:        toUserStoryView(targetCurrent.UserStory),
+		Rules:            targetCurrent.Rules,
+		Priority:         targetCurrent.Priority,
+		Constraints:      targetCurrent.Constraints,
+		SutDescription:   targetCurrent.SutDescription,
+		ScopeOut:         targetCurrent.ScopeOut,
+		AccountRolesHint: append([]string{}, targetCurrent.AccountRolesHint...),
+	}
+	criteria := make([]RequirementAcceptanceCriterionInput, 0, len(targetCurrent.AcceptanceCriteria))
+	seenCriteria := make(map[string]struct{}, len(targetCurrent.AcceptanceCriteria))
+	// appendCriteria unions by normalized content, so a source that repeats one
+	// of the target's criteria cannot add a second copy -- and, because the ids
+	// are re-derived from the target's revision below, cannot smuggle in a
+	// second id for content the target already has.
+	appendCriteria := func(source []version.AcceptanceCriterion) {
+		for _, criterion := range source {
+			key := version.AcceptanceCriterionKey(criterion)
+			if _, duplicate := seenCriteria[key]; duplicate {
+				continue
+			}
+			seenCriteria[key] = struct{}{}
+			criteria = append(criteria, RequirementAcceptanceCriterionInput{
+				Given: criterion.Given,
+				When:  criterion.When,
+				Then:  criterion.Then,
+			})
+		}
+	}
+	appendCriteria(targetCurrent.AcceptanceCriteria)
 	for _, sourceID := range kept {
 		sourceAggregate, err := s.repo.Get(ctx, versionID, sourceID)
 		if err != nil {
@@ -721,26 +867,16 @@ func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int6
 		if !ok {
 			return RequirementMergeResult{}, platform.StateConflict("merge source has no current revision")
 		}
-		merged.Description = appendUniqueText(merged.Description, sourceCurrent.Description)
-		merged.AcceptanceCriteria = appendUniqueText(merged.AcceptanceCriteria, sourceCurrent.AcceptanceCriteria)
-		merged.TargetVersionSUTs = appendUniqueStrings(merged.TargetVersionSUTs, sourceCurrent.TargetVersionSUTs)
-		merged.TargetPages = appendUniqueStrings(merged.TargetPages, sourceCurrent.TargetPages)
-		merged.TargetAPIs = appendUniqueStrings(merged.TargetAPIs, sourceCurrent.TargetAPIs)
+		merged.Rules = appendUniqueText(merged.Rules, sourceCurrent.Rules)
+		merged.AccountRolesHint = appendUniqueStrings(merged.AccountRolesHint, sourceCurrent.AccountRolesHint)
+		appendCriteria(sourceCurrent.AcceptanceCriteria)
 		if priorityRank(sourceCurrent.Priority) < priorityRank(merged.Priority) {
 			merged.Priority = sourceCurrent.Priority
 		}
 	}
+	merged.AcceptanceCriteria = criteria
 	now := s.clock.Now()
-	revision, err := normalizeDraft(RequirementDraft{
-		Title:              merged.Title,
-		Description:        merged.Description,
-		AcceptanceCriteria: merged.AcceptanceCriteria,
-		Priority:           merged.Priority,
-		Constraints:        merged.Constraints,
-		TargetVersionSUTs:  merged.TargetVersionSUTs,
-		TargetPages:        merged.TargetPages,
-		TargetAPIs:         merged.TargetAPIs,
-	})
+	revision, err := normalizeDraft(merged, targetCurrent.AcceptanceCriteria)
 	if err != nil {
 		return RequirementMergeResult{}, err
 	}
@@ -753,7 +889,6 @@ func (s *RequirementService) Merge(ctx context.Context, versionID, targetID int6
 		revision.CreatedAt = now
 		target.Status = version.RequirementDraft
 		target.CurrentVersionID = &revision.ID
-		target.TargetVersionSUTIDs = append([]string{}, revision.TargetVersionSUTs...)
 		target.UpdatedAt = now
 		if err := s.repo.AddRevision(ctx, target, revision); err != nil {
 			return RequirementMergeResult{}, mapRequirementRepositoryError(err)
@@ -844,6 +979,36 @@ func normalizeRequirementText(value string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
 }
 
+// requirementContentKey renders the dedupe identity of one revision: the user
+// story, the rules, the system under test and every acceptance criterion,
+// normalized and joined. It replaced the old description+acceptance-text pair
+// when the flat description was split into user_story/rules/sut_description
+// (design v1.3.1 §5.1). Criteria are taken in id order so two revisions holding
+// the same criteria in a different order still collide.
+//
+// An empty result means the revision carries no comparable content, and the
+// caller then never treats it as a duplicate of another empty one.
+func requirementContentKey(revision version.RequirementVersion) string {
+	parts := make([]string, 0, 5+len(revision.AcceptanceCriteria))
+	parts = append(parts,
+		normalizeRequirementText(revision.UserStory.AsA),
+		normalizeRequirementText(revision.UserStory.IWant),
+		normalizeRequirementText(revision.UserStory.SoThat),
+		normalizeRequirementText(revision.Rules),
+		normalizeRequirementText(revision.SutDescription),
+	)
+	for _, criterion := range version.SortAcceptanceCriteria(revision.AcceptanceCriteria) {
+		parts = append(parts, normalizeRequirementText(criterion.Given)+">"+
+			normalizeRequirementText(criterion.When)+">"+
+			normalizeRequirementText(criterion.Then))
+	}
+	joined := strings.Join(parts, "|")
+	if strings.Trim(joined, "|") == "" {
+		return ""
+	}
+	return joined
+}
+
 // appendUniqueText appends extra unless it is empty or already contained.
 func appendUniqueText(base, extra string) string {
 	extra = strings.TrimSpace(extra)
@@ -918,18 +1083,23 @@ func (s *RequirementService) Rollback(ctx context.Context, versionID, requiremen
 
 	now := s.clock.Now()
 	revisionID := s.ids.Next()
+	// A rollback copies the confirmed content verbatim, acceptance-criterion ids
+	// included: the criteria are unchanged, so AssignACIDs would return the same
+	// ids anyway, and copying makes the "same revision, new number" intent
+	// explicit instead of relying on the inheritance rule.
 	revision := version.RequirementVersion{
 		ID:                 revisionID,
 		RequirementID:      requirementID,
 		Revision:           current.Revision + 1,
 		Title:              current.Title,
-		Description:        current.Description,
-		AcceptanceCriteria: current.AcceptanceCriteria,
+		UserStory:          current.UserStory,
+		Rules:              current.Rules,
+		AcceptanceCriteria: append([]version.AcceptanceCriterion{}, current.AcceptanceCriteria...),
 		Priority:           current.Priority,
 		Constraints:        current.Constraints,
-		TargetVersionSUTs:  append([]string{}, current.TargetVersionSUTs...),
-		TargetPages:        append([]string{}, current.TargetPages...),
-		TargetAPIs:         append([]string{}, current.TargetAPIs...),
+		SutDescription:     current.SutDescription,
+		ScopeOut:           current.ScopeOut,
+		AccountRolesHint:   append([]string{}, current.AccountRolesHint...),
 		CreatedBy:          optionalActor(actorID),
 		CreatedByRunID:     agentRunID(ctx),
 		CreatedAt:          now,
@@ -1010,7 +1180,7 @@ func (s *RequirementService) CreateRelation(ctx context.Context, versionID int64
 		return RelationView{}, platform.Invalid("kind", "must be one of depends_on, conflicts_with, overlaps, shares_scope")
 	}
 	description := strings.TrimSpace(in.Description)
-	if err := validationStringMax("description", description, 2000); err != nil {
+	if err := validationStringMax("description", description, version.RequirementRelationDescriptionMax); err != nil {
 		return RelationView{}, err
 	}
 	if in.SourceRevisionID != nil && *in.SourceRevisionID <= 0 {
@@ -1076,16 +1246,28 @@ func (s *RequirementService) ListRelations(ctx context.Context, versionID, requi
 
 // ---------- helpers ----------
 
-func normalizeDraft(in RequirementDraft) (version.RequirementVersion, error) {
+// normalizeDraft canonicalizes one incoming draft into the revision that gets
+// persisted, validated and hashed. prev is the previous revision's acceptance
+// criteria -- the inheritance source for the AC ids -- and is nil for a brand
+// new requirement.
+//
+// Everything the ContentHash depends on is normalized here, so a revision read
+// back from storage always hashes to the value stored with it: whitespace in
+// the title, the story, the rules, the criteria and the role hints is collapsed
+// before validation, not after.
+func normalizeDraft(in RequirementDraft, prev []version.AcceptanceCriterion) (version.RequirementVersion, error) {
 	revision := version.RequirementVersion{
-		Title:              strings.TrimSpace(in.Title),
-		Description:        in.Description,
-		AcceptanceCriteria: in.AcceptanceCriteria,
-		Priority:           in.Priority,
-		Constraints:        in.Constraints,
-		TargetVersionSUTs:  in.TargetVersionSUTs,
-		TargetPages:        in.TargetPages,
-		TargetAPIs:         in.TargetAPIs,
+		Title: strings.TrimSpace(in.Title),
+		UserStory: version.UserStory{
+			AsA:    in.UserStory.AsA,
+			IWant:  in.UserStory.IWant,
+			SoThat: in.UserStory.SoThat,
+		}.Normalize(),
+		Rules:          strings.TrimSpace(in.Rules),
+		Priority:       in.Priority,
+		Constraints:    in.Constraints,
+		SutDescription: strings.TrimSpace(in.SutDescription),
+		ScopeOut:       strings.TrimSpace(in.ScopeOut),
 	}
 	priority, err := version.NormalizePriority(revision.Priority)
 	if err != nil {
@@ -1097,21 +1279,16 @@ func normalizeDraft(in RequirementDraft) (version.RequirementVersion, error) {
 		return version.RequirementVersion{}, err
 	}
 	revision.Constraints = constraints
-	targetSUTs, err := version.NormalizeTargetIDs("targets.version_suts", revision.TargetVersionSUTs)
-	if err != nil {
-		return version.RequirementVersion{}, err
-	}
-	revision.TargetVersionSUTs = targetSUTs
-	targetPages, err := version.NormalizeTargetIDs("targets.pages", revision.TargetPages)
-	if err != nil {
-		return version.RequirementVersion{}, err
-	}
-	revision.TargetPages = targetPages
-	targetAPIs, err := version.NormalizeTargetIDs("targets.apis", revision.TargetAPIs)
-	if err != nil {
-		return version.RequirementVersion{}, err
-	}
-	revision.TargetAPIs = targetAPIs
+	revision.AccountRolesHint = version.NormalizeAccountRolesHint(in.AccountRolesHint)
+	// Normalize, then de-duplicate, then assign ids -- in that order. Ids come
+	// last so the inheritance match runs on the same canonical text the hash
+	// will use, and de-duplication comes before that so one statement can never
+	// occupy two ids (which would churn on every revision). This is the single
+	// write-path rule; Merge applies the same content de-duplication when it
+	// unions two revisions' criteria.
+	revision.AcceptanceCriteria = version.AssignACIDs(prev,
+		version.DedupeAcceptanceCriteria(
+			version.NormalizeAcceptanceCriteria(toAcceptanceCriteria(in.AcceptanceCriteria))))
 	if err := revision.ValidateDraft(); err != nil {
 		return version.RequirementVersion{}, err
 	}
@@ -1121,59 +1298,6 @@ func normalizeDraft(in RequirementDraft) (version.RequirementVersion, error) {
 	}
 	revision.ContentHash = hash
 	return revision, nil
-}
-
-func (s *RequirementService) validateTargets(ctx context.Context, versionView VersionView, revision version.RequirementVersion) error {
-	boundSUTs := make(map[string]struct{}, len(versionView.Bindings))
-	pages := make(map[string]struct{})
-	apis := make(map[string]struct{})
-	for _, binding := range versionView.Bindings {
-		boundSUTs[platformid.Format(binding.ID)] = struct{}{}
-		for _, page := range binding.Pages {
-			pages[page.ID] = struct{}{}
-		}
-		for _, api := range binding.APIs {
-			apis[api.ID] = struct{}{}
-		}
-	}
-	for _, target := range revision.TargetVersionSUTs {
-		if _, ok := boundSUTs[target]; !ok {
-			return platform.Invalid("targets.version_suts", fmt.Sprintf("version_sut %s is not bound to the version", target))
-		}
-	}
-	for _, target := range revision.TargetPages {
-		if _, ok := pages[target]; ok {
-			continue
-		}
-		if s.resources != nil {
-			id, _ := platformid.Parse(target)
-			if _, err := s.resources.GetPage(ctx, id); err != nil {
-				return targetCatalogError(err, "targets.pages", "page", target)
-			}
-		}
-		return platform.Invalid("targets.pages", fmt.Sprintf("page %s is outside the version scope", target))
-	}
-	for _, target := range revision.TargetAPIs {
-		if _, ok := apis[target]; ok {
-			continue
-		}
-		if s.resources != nil {
-			id, _ := platformid.Parse(target)
-			if _, err := s.resources.GetAPI(ctx, id); err != nil {
-				return targetCatalogError(err, "targets.apis", "api", target)
-			}
-		}
-		return platform.Invalid("targets.apis", fmt.Sprintf("api %s is outside the version scope", target))
-	}
-	return nil
-}
-
-func targetCatalogError(err error, field, kind, rawID string) error {
-	var apiErr *platform.Error
-	if errors.As(err, &apiErr) && apiErr.Status == 404 {
-		return platform.Invalid(field, fmt.Sprintf("%s %s does not exist", kind, rawID))
-	}
-	return err
 }
 
 func (s *RequirementService) detailFromAggregate(aggregate version.RequirementAggregate) (RequirementDetail, error) {
@@ -1222,17 +1346,15 @@ func requirementViewFromListItem(item version.RequirementListItem) RequirementVi
 
 func requirementViewFromRequirement(requirement version.Requirement, current version.RequirementVersion, confirmations []version.Confirmation) RequirementView {
 	view := RequirementView{
-		ID:                requirement.ID,
-		CurrentVersionID:  current.ID,
-		Revision:          current.Revision,
-		Title:             current.Title,
-		Status:            string(requirement.Status),
-		Priority:          current.Priority,
-		TargetVersionSUTs: nonNilStrings(current.TargetVersionSUTs),
-		TargetPages:       nonNilStrings(current.TargetPages),
-		TargetAPIs:        nonNilStrings(current.TargetAPIs),
-		UpdatedAt:         requirement.UpdatedAt,
-		ClosedAt:          requirement.ClosedAt,
+		ID:               requirement.ID,
+		CurrentVersionID: current.ID,
+		Revision:         current.Revision,
+		Title:            current.Title,
+		Status:           string(requirement.Status),
+		Priority:         current.Priority,
+		UpdatedAt:        requirement.UpdatedAt,
+		ClosedAt:         requirement.ClosedAt,
+		Waived:           requirement.Waived,
 	}
 	for _, confirmation := range confirmations {
 		if confirmation.RequirementVersionID == current.ID {

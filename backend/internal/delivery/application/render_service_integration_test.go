@@ -218,8 +218,8 @@ func TestReportPDFPipelineIntegration(t *testing.T) {
 	}
 	immutableBefore := revision
 
-	if err := fixture.ensurer.ReconcileP7(ctx); err != nil {
-		t.Fatalf("ReconcileP7: %v", err)
+	if err := fixture.ensurer.ReconcileReportRenders(ctx); err != nil {
+		t.Fatalf("ReconcileReportRenders: %v", err)
 	}
 	dedupeKey := fmt.Sprintf("report:%d:rev:%d", revision.ReportID, revision.Revision)
 	var (
@@ -430,8 +430,8 @@ func TestReportPDFFailureIntegration(t *testing.T) {
 	}
 	// The ensurer must not silently revive a revision whose attempts are spent
 	// or that is terminally failed (defensive list filter + attempts bound).
-	if err := fixture.ensurer.ReconcileP7(ctx); err != nil {
-		t.Fatalf("ReconcileP7 after failure: %v", err)
+	if err := fixture.ensurer.ReconcileReportRenders(ctx); err != nil {
+		t.Fatalf("ReconcileReportRenders after failure: %v", err)
 	}
 	var workCount int
 	if err := fixture.pool.QueryRow(ctx, `

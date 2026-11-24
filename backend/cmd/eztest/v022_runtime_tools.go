@@ -69,7 +69,7 @@ func (s windowTokensSettings) Float(ctx context.Context, key string) (float64, e
 // only materializes when the per-run CompletionDeps are present, so a run whose
 // completion target could not be resolved never exposes task.complete.
 func init() {
-	tools.RegisterP4ToolGroup(tools.TaskCompleteTools)
+	tools.RegisterToolGroup(tools.TaskCompleteTools)
 }
 
 // planWriterAdapter maps the plan.update tool's write port onto
@@ -475,7 +475,7 @@ func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.Compl
 	}
 	inProgress := make([]versiondomain.PlanItem, 0, 1)
 	for _, item := range items {
-		if strings.EqualFold(strings.TrimSpace(item.Status), "in_progress") {
+		if strings.EqualFold(strings.TrimSpace(item.Status), versiondomain.PlanItemStatusInProgress) {
 			inProgress = append(inProgress, item)
 		}
 	}
@@ -488,14 +488,16 @@ func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.Compl
 			// wired for Host turns. Create one item per work item so the
 			// completion criterion (task.complete + server validation) is
 			// reachable; the work-item link makes later resolution stable.
-			phase := "clarifying"
+			// The plan phase mirrors the stage the round belongs to, so it is
+			// sourced from the stage enum authority (V-0017), not a literal.
+			phase := string(versiondomain.StageClarifying)
 			title := "Host 回合"
 			switch run.ProfileKey {
 			case agentapp.ProfileKeyDesignHost, agentapp.ProfileKeyDesignAuthor, agentapp.ProfileKeyDesignCritic:
-				phase = "designing"
+				phase = string(versiondomain.StageDesigning)
 				title = "设计 Host 回合"
 			case agentapp.ProfileKeyCaseExecutor:
-				phase = "executing"
+				phase = string(versiondomain.StageExecuting)
 				title = "执行回合"
 			}
 			workItemID := run.WorkItemID
@@ -503,7 +505,7 @@ func (b completionBuilder) resolveTarget(ctx context.Context, run agentapp.Compl
 				VersionID:  run.VersionID,
 				Phase:      phase,
 				Title:      fmt.Sprintf("%s #%d", title, workItemID),
-				Status:     "in_progress",
+				Status:     versiondomain.PlanItemStatusInProgress,
 				WorkItemID: &workItemID,
 			})
 			if createErr != nil {

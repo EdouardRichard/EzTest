@@ -160,10 +160,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toVersionDTO(view))
 }
 
-// RegisterP4 mounts the P4 version/requirement reopen routes on mux. The
+// RegisterReopenRoutes mounts the P4 version/requirement reopen routes on mux. The
 // routes must be mounted behind the server's bearer authentication middleware
 // (Task 23 wiring); the handlers never parse credentials themselves.
-func RegisterP4(mux *http.ServeMux, versions *Handler, requirements *RequirementHandler) {
+func RegisterReopenRoutes(mux *http.ServeMux, versions *Handler, requirements *RequirementHandler) {
 	mux.HandleFunc("POST /api/versions/{versionId}/reopen", versions.Reopen)
 	mux.HandleFunc(
 		"POST /api/versions/{versionId}/requirements/{requirementId}/reopen",

@@ -43,6 +43,13 @@ func (f *fakeVisionGateway) Chat(_ context.Context, request llmapp.ChatRequest) 
 	return f.chatResponse, nil
 }
 
+// Stream satisfies the extended ChatGateway port. The vision captioner only
+// uses the non-streaming Chat path; a Stream call here means the consumer
+// changed, so fail loudly instead of supplying a fiat zero value.
+func (f *fakeVisionGateway) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	panic("fakeVisionGateway.Stream must not be called: the vision captioner uses non-streaming Chat")
+}
+
 func TestVisionCaptionerCaptionsImage(t *testing.T) {
 	gateway := &fakeVisionGateway{
 		resolveModel: llmapp.ModelInfo{Model: "vision-llm"},
@@ -372,6 +379,10 @@ type fakeVisionChatTransport struct{}
 
 func (*fakeVisionChatTransport) Chat(context.Context, llmdomain.Config, llmapp.ChatRequest) (llmapp.ChatResponse, error) {
 	return llmapp.ChatResponse{}, errors.New("unexpected Chat")
+}
+
+func (*fakeVisionChatTransport) Stream(context.Context, llmdomain.Config, llmapp.ChatRequest, func(llmapp.Delta)) error {
+	return errors.New("unexpected Stream")
 }
 
 // TestVisionCaptionerClassifiesRealLLMResolveErrors is the coupling test for

@@ -41,8 +41,9 @@ import (
 // Extraction milestone contract constants.
 const (
 	// ExtractionPlanPhase is the plan phase of the document-parse milestone
-	// (phase=clarifying, R-A7-10).
-	ExtractionPlanPhase = "clarifying"
+	// (phase=clarifying, R-A7-10). It mirrors the clarifying stage, so it is
+	// sourced from the stage enum authority (V-0017), not a hand-written literal.
+	ExtractionPlanPhase = string(version.StageClarifying)
 	// ExtractionPlanStatusRunning is the plan status while the run is open.
 	ExtractionPlanStatusRunning = "in_progress"
 	// ExtractionPlanStatusDone is the plan status of a completed run.

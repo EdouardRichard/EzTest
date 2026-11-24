@@ -10,40 +10,46 @@ import (
 // contentHashPayload is the canonical, order-independent projection of a case
 // version's editable content. Identity, state, revision and timestamps are
 // deliberately excluded: the hash answers "is this the same content?".
+//
+// v0.2.4-B (§3.6): default_version_sut_id / version_sut_ids / page_ids /
+// api_ids are gone and sut_description / covered_acs take their place. Field
+// ORDER is part of the contract -- encoding/json emits struct fields in
+// declaration order, so reordering these changes every hash. The authoritative
+// order is:
+//
+//	title, description, sut_description, preconditions, covered_acs,
+//	test_data, priority, steps, assertions, sources
 type contentHashPayload struct {
-	Title               string                 `json:"title"`
-	Description         string                 `json:"description"`
-	Preconditions       string                 `json:"preconditions"`
-	TestData            json.RawMessage        `json:"test_data"`
-	Priority            string                 `json:"priority"`
-	DefaultVersionSUTID *int64                 `json:"default_version_sut_id"`
-	VersionSUTIDs       []int64                `json:"version_sut_ids"`
-	PageIDs             []int64                `json:"page_ids"`
-	APIIDs              []int64                `json:"api_ids"`
-	Steps               []contentHashStep      `json:"steps"`
-	Assertions          []contentHashAssertion `json:"assertions"`
-	Sources             []contentHashSource    `json:"sources"`
+	Title          string                 `json:"title"`
+	Description    string                 `json:"description"`
+	SutDescription string                 `json:"sut_description"`
+	Preconditions  string                 `json:"preconditions"`
+	CoveredACs     []string               `json:"covered_acs"`
+	TestData       json.RawMessage        `json:"test_data"`
+	Priority       string                 `json:"priority"`
+	Steps          []contentHashStep      `json:"steps"`
+	Assertions     []contentHashAssertion `json:"assertions"`
+	Sources        []contentHashSource    `json:"sources"`
 }
 
+// contentHashStep order: seq, action, expected, target_description,
+// account_role, data.
 type contentHashStep struct {
-	Seq                int             `json:"seq"`
-	Action             string          `json:"action"`
-	Expected           string          `json:"expected"`
-	TargetVersionSUTID *int64          `json:"target_version_sut_id"`
-	TargetPageID       *int64          `json:"target_page_id"`
-	TargetAPIID        *int64          `json:"target_api_id"`
-	AccountRole        string          `json:"account_role"`
-	Data               json.RawMessage `json:"data"`
+	Seq               int             `json:"seq"`
+	Action            string          `json:"action"`
+	Expected          string          `json:"expected"`
+	TargetDescription string          `json:"target_description"`
+	AccountRole       string          `json:"account_role"`
+	Data              json.RawMessage `json:"data"`
 }
 
+// contentHashAssertion order: step_seq, kind, target, expected, sut_id.
 type contentHashAssertion struct {
-	StepSeq            int    `json:"step_seq"`
-	Kind               string `json:"kind"`
-	Target             string `json:"target"`
-	Expected           string `json:"expected"`
-	TargetVersionSUTID *int64 `json:"target_version_sut_id"`
-	TargetAPIID        *int64 `json:"target_api_id"`
-	DatabaseID         *int64 `json:"database_id"`
+	StepSeq  int    `json:"step_seq"`
+	Kind     string `json:"kind"`
+	Target   string `json:"target"`
+	Expected string `json:"expected"`
+	SutID    *int64 `json:"sut_id"`
 }
 
 type contentHashSource struct {
@@ -57,6 +63,11 @@ type contentHashSource struct {
 // ComputeCaseContentHash returns the stable sha256 hex of one case version's
 // content. Set-valued fields are sorted and JSON object keys canonicalized, so
 // equivalent content always hashes identically (spec §4.1 content_hash).
+//
+// GD-05: the v0.2.4-B payload shape and ID domain both changed, so every hash
+// computed before design_0004 differs from the one computed after. That is
+// expected and there is no backfill -- the legacy rows it would apply to were
+// already discarded by version_0016.
 func ComputeCaseContentHash(version CaseVersion) (string, error) {
 	testData, err := NormalizeJSONObject(version.TestData)
 	if err != nil {
@@ -66,18 +77,7 @@ func ComputeCaseContentHash(version CaseVersion) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	versionSUTIDs, err := NormalizeIDSet(version.VersionSUTIDs)
-	if err != nil {
-		return "", err
-	}
-	pageIDs, err := NormalizeIDSet(version.PageIDs)
-	if err != nil {
-		return "", err
-	}
-	apiIDs, err := NormalizeIDSet(version.APIIDs)
-	if err != nil {
-		return "", err
-	}
+	coveredACs := NormalizeACIDSet(version.CoveredACs)
 
 	steps := make([]contentHashStep, 0, len(version.Steps))
 	for _, step := range version.Steps {
@@ -86,14 +86,12 @@ func ComputeCaseContentHash(version CaseVersion) (string, error) {
 			return "", err
 		}
 		steps = append(steps, contentHashStep{
-			Seq:                step.Seq,
-			Action:             step.Action,
-			Expected:           step.Expected,
-			TargetVersionSUTID: step.TargetVersionSUTID,
-			TargetPageID:       step.TargetPageID,
-			TargetAPIID:        step.TargetAPIID,
-			AccountRole:        step.AccountRole,
-			Data:               data,
+			Seq:               step.Seq,
+			Action:            step.Action,
+			Expected:          step.Expected,
+			TargetDescription: step.TargetDescription,
+			AccountRole:       step.AccountRole,
+			Data:              data,
 		})
 	}
 	sort.SliceStable(steps, func(i, j int) bool { return steps[i].Seq < steps[j].Seq })
@@ -101,13 +99,11 @@ func ComputeCaseContentHash(version CaseVersion) (string, error) {
 	assertions := make([]contentHashAssertion, 0, len(version.Assertions))
 	for _, assertion := range version.Assertions {
 		assertions = append(assertions, contentHashAssertion{
-			StepSeq:            assertion.StepSeq,
-			Kind:               assertion.Kind,
-			Target:             assertion.Target,
-			Expected:           assertion.Expected,
-			TargetVersionSUTID: assertion.TargetVersionSUTID,
-			TargetAPIID:        assertion.TargetAPIID,
-			DatabaseID:         assertion.DatabaseID,
+			StepSeq:  assertion.StepSeq,
+			Kind:     assertion.Kind,
+			Target:   assertion.Target,
+			Expected: assertion.Expected,
+			SutID:    assertion.SUTID,
 		})
 	}
 	sort.SliceStable(assertions, func(i, j int) bool {
@@ -124,7 +120,7 @@ func ComputeCaseContentHash(version CaseVersion) (string, error) {
 		if left.Expected != right.Expected {
 			return left.Expected < right.Expected
 		}
-		return optionalInt64String(left.TargetVersionSUTID) < optionalInt64String(right.TargetVersionSUTID)
+		return optionalInt64String(left.SutID) < optionalInt64String(right.SutID)
 	})
 
 	sources := make([]contentHashSource, 0, len(version.Sources))
@@ -152,18 +148,16 @@ func ComputeCaseContentHash(version CaseVersion) (string, error) {
 	})
 
 	payload := contentHashPayload{
-		Title:               version.Title,
-		Description:         version.Description,
-		Preconditions:       version.Preconditions,
-		TestData:            testData,
-		Priority:            priority,
-		DefaultVersionSUTID: version.DefaultVersionSUTID,
-		VersionSUTIDs:       versionSUTIDs,
-		PageIDs:             pageIDs,
-		APIIDs:              apiIDs,
-		Steps:               steps,
-		Assertions:          assertions,
-		Sources:             sources,
+		Title:          version.Title,
+		Description:    version.Description,
+		SutDescription: version.SutDescription,
+		Preconditions:  version.Preconditions,
+		CoveredACs:     coveredACs,
+		TestData:       testData,
+		Priority:       priority,
+		Steps:          steps,
+		Assertions:     assertions,
+		Sources:        sources,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

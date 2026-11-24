@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Recreates the deterministic P5 code-intelligence fixture repository.
@@ -24,8 +24,8 @@
     always deletes and rebuilds the repository (idempotent); acceptance callers
     may run it before every run.
 
-    It prints three machine-readable lines consumed by `scripts/p5-acceptance.ps1`
-    and `scripts/p5-e2e.ps1`:
+    It prints three machine-readable lines consumed by `scripts/code-intelligence-acceptance.ps1`
+    and `scripts/code-intelligence-e2e.ps1`:
       P5_FIXTURE_REPO=<absolute path with forward slashes>
       P5_FIXTURE_BASE_COMMIT=<40 hex sha>
       P5_FIXTURE_HEAD_COMMIT=<40 hex sha>

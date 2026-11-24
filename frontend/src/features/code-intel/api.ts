@@ -28,7 +28,6 @@ import type {
   CodeFileQuery,
   CodeFileWindowView,
   CodeImpactCandidateView,
-  CodeImpactView,
   CodeIndexInput,
   CodeIndexRunView,
   CodeProposalInput,
@@ -255,9 +254,14 @@ export function patchCandidate(
   )
 }
 
-/** `GET /api/versions/{id}/code/impact`: merged multi-repo impact view. */
-export function getCodeImpact(versionId: string, repoId?: string): Promise<CodeImpactView> {
-  return apiGet<CodeImpactView>(`${versionPath(versionId)}/code/impact${query({ repoId })}`)
+/** `GET /api/versions/{id}/code/impact`: merged multi-repo candidate list (httpx.List envelope). */
+export function getCodeImpact(
+  versionId: string,
+  repoId?: string,
+): Promise<CodeImpactCandidateView[]> {
+  return apiGet<CodeImpactCandidateView[]>(
+    `${versionPath(versionId)}/code/impact${query({ repoId })}`,
+  )
 }
 
 /* --------------------------------- anchors --------------------------------- */

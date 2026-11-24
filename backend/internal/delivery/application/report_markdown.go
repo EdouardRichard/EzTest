@@ -74,7 +74,7 @@ func renderReportMarkdown(snapshot delivery.ReportSnapshot, revision delivery.Re
 	writeMarkdownIssues(&builder, snapshot.Issues)
 	writeMarkdownEvidence(&builder, snapshot.CaseRuns)
 	writeMarkdownCoverage(&builder, snapshot.Coverage)
-	writeMarkdownVersionSUTs(&builder, snapshot.VersionSUTs)
+	writeMarkdownSUTs(&builder, snapshot.SUTs)
 	if len(snapshot.TruncatedSections) > 0 {
 		fmt.Fprintf(&builder, "## Truncation\n\n- Sections capped at the report input limit: %s\n",
 			strings.Join(snapshot.TruncatedSections, ", "))
@@ -226,11 +226,11 @@ func writeMarkdownCoverage(builder *strings.Builder, coverage delivery.CoverageS
 	builder.WriteString("\n")
 }
 
-func writeMarkdownVersionSUTs(builder *strings.Builder, rows []delivery.VersionSUTSnapshot) {
+func writeMarkdownSUTs(builder *strings.Builder, rows []delivery.SUTSnapshot) {
 	if len(rows) == 0 {
 		return
 	}
-	sorted := sortReportRows(rows, func(row delivery.VersionSUTSnapshot) int64 { return row.ID })
+	sorted := sortReportRows(rows, func(row delivery.SUTSnapshot) int64 { return row.ID })
 	builder.WriteString("## Environments\n\n")
 	builder.WriteString("| Version SUT | SUT | Environment |\n| --- | --- | --- |\n")
 	for _, row := range sorted {

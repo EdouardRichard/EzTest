@@ -16,9 +16,6 @@ vi.mock("@/features/clarification/useVersionEvents", () => versionEvents)
 const versionsApi = vi.hoisted(() => ({ listVersions: vi.fn(), getVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
-const visualApi = vi.hoisted(() => ({ getVisualMetrics: vi.fn() }))
-vi.mock("@/features/visual/api", () => visualApi)
-
 const auth = vi.hoisted(() => ({ isAdmin: false }))
 vi.mock("@/features/auth/useIsAdmin", () => ({ useIsAdmin: () => auth.isAdmin }))
 
@@ -26,7 +23,6 @@ const navigation = vi.hoisted(() => ({ replace: vi.fn() }))
 vi.mock("next/navigation", () => ({ useRouter: () => navigation }))
 
 import { versionFixture, versionSummaryFixture } from "@/features/versions/test-fixtures"
-import { visualMetricsFixture } from "@/features/visual/test-fixtures"
 import { ApiError } from "@/lib/api-client"
 
 import { QualityPage } from "./QualityPage"
@@ -184,7 +180,6 @@ describe("QualityPage", () => {
     qualityApi.getQualityTrends.mockReset()
     versionsApi.listVersions.mockReset()
     versionsApi.getVersion.mockReset()
-    visualApi.getVisualMetrics.mockReset()
     navigation.replace.mockReset()
     versionEvents.useVersionEvents.mockClear()
 
@@ -198,12 +193,11 @@ describe("QualityPage", () => {
       versionSummaryFixture,
       { ...versionSummaryFixture, id: "2002", title: "订单中心 · 2027 Q1 迭代" },
     ])
-    visualApi.getVisualMetrics.mockResolvedValue(visualMetricsFixture)
   })
 
   afterEach(cleanup)
 
-  it("renders operational metrics and the visual panel for every logged-in user without requesting eval runs", async () => {
+  it("renders operational metrics for every logged-in user without requesting eval runs", async () => {
     render(<QualityPage />)
 
     expect(await screen.findByRole("heading", { name: "质量" })).toBeInTheDocument()
@@ -218,11 +212,35 @@ describe("QualityPage", () => {
     const compaction = screen.getByTestId("quality-operational-context_compaction_count")
     expect(compaction).toHaveTextContent("12")
 
-    expect(await screen.findByTestId("quality-metrics-panel")).toHaveTextContent("基线覆盖率")
-    expect(visualApi.getVisualMetrics).toHaveBeenCalledWith(undefined)
-
     expect(screen.getByTestId("quality-eval-admin-only")).toHaveTextContent("评测看板仅管理员可见")
     expect(qualityApi.listEvalRuns).not.toHaveBeenCalled()
+  })
+
+  // GD-22: the page copy must not advertise the removed visual domain, and the
+  // snapshot metric count must match the contract (design_coverage /
+  // execution_pass_rate / case_coverage). An English-only "visual" grep cannot
+  // catch the Chinese 视觉, so pin the copy here instead.
+  it("describes the snapshot metrics without the removed visual domain", async () => {
+    render(<QualityPage />)
+
+    const header = await screen.findByText(/运营指标由服务端按只读口径派生/)
+    expect(header).toHaveTextContent("快照评测（3 项指标）")
+    expect(header.textContent).not.toContain("视觉")
+    expect(header.textContent).not.toContain("4 项指标")
+
+    const permissionNote = screen.getByTestId("quality-eval-admin-only")
+    expect(permissionNote).toHaveTextContent("普通用户可查看运营指标；评测 run 列表与样本不返回。")
+    expect(permissionNote.textContent).not.toContain("视觉")
+  })
+
+  it("pins the admin eval-board snapshot metric count to the contract", async () => {
+    auth.isAdmin = true
+    render(<QualityPage />)
+
+    const board = await screen.findByTestId("quality-eval-board")
+    expect(board).toHaveTextContent("服务端从版本真实数据派生 3 项指标")
+    expect(board.textContent).not.toContain("4 项指标")
+    expect(board.textContent).not.toContain("视觉")
   })
 
   it("shows the admin eval board with runs, thresholds and baselines", async () => {
@@ -257,6 +275,7 @@ describe("QualityPage", () => {
 
     expect(await screen.findByText("尚未运行评测")).toBeInTheDocument()
     expect(screen.getByTestId("quality-eval-empty")).toHaveTextContent("尚未运行评测")
+    expect(screen.getByTestId("quality-eval-empty")).toHaveTextContent("快照评测（3 项指标）")
     expect(screen.queryByTestId("quality-eval-metrics")).not.toBeInTheDocument()
   })
 
@@ -277,7 +296,6 @@ describe("QualityPage", () => {
 
     expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
     expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("2001")
-    expect(visualApi.getVisualMetrics).toHaveBeenCalledWith("2001")
 
     const selector = await screen.findByLabelText("版本")
     expect(selector).toHaveValue("2001")
@@ -300,7 +318,6 @@ describe("QualityPage", () => {
     const selector = await screen.findByLabelText("版本")
     fireEvent.change(selector, { target: { value: "2002" } })
     await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenLastCalledWith("2002"))
-    await waitFor(() => expect(visualApi.getVisualMetrics).toHaveBeenLastCalledWith("2002"))
     const overviewCalls = qualityApi.getQualityOverview.mock.calls.length
 
     // `router.replace` re-renders the server component with the selected id.
@@ -311,7 +328,6 @@ describe("QualityPage", () => {
     await waitFor(() => expect(versionsApi.getVersion).toHaveBeenCalledTimes(1))
     expect(screen.queryByText("正在确认版本…")).not.toBeInTheDocument()
     expect(qualityApi.getQualityOverview).toHaveBeenCalledTimes(overviewCalls)
-    expect(visualApi.getVisualMetrics).toHaveBeenCalledTimes(2)
   })
 
   it("keeps a valid deep-linked version outside the first list page selectable", async () => {
@@ -366,13 +382,12 @@ describe("QualityPage", () => {
     expect(await screen.findByText("正在确认版本…")).toBeInTheDocument()
     expect(qualityApi.getQualityOverview).not.toHaveBeenCalled()
     expect(qualityApi.getQualityTrends).not.toHaveBeenCalled()
-    expect(visualApi.getVisualMetrics).not.toHaveBeenCalled()
     expect(versionEvents.useVersionEvents).not.toHaveBeenCalled()
 
     resolveVersion(versionFixture)
 
     await waitFor(() => expect(qualityApi.getQualityOverview).toHaveBeenCalledWith("2001"))
-    expect(await screen.findByTestId("quality-metrics-panel")).toBeInTheDocument()
+    expect(await screen.findByTestId("quality-operational-metrics")).toBeInTheDocument()
     expect(versionEvents.useVersionEvents).toHaveBeenCalledWith("2001", expect.anything())
   })
 

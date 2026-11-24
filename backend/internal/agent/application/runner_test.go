@@ -1,11 +1,11 @@
 package agentapp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -48,7 +48,13 @@ type runnerFixture struct {
 	designRounds    *fakeDesignRoundStarter
 	batches         *fakeBatchStarter
 	load            *load.Counter
+	// logs captures the runner's logger output so "a degradation is never
+	// silent" (constitution VII.6) is assertable from an external test.
+	logs bytes.Buffer
 }
+
+// logOutput returns everything the runner logged during the fixture's run.
+func (f *runnerFixture) logOutput() string { return f.logs.String() }
 
 func newRunnerFixture(t *testing.T) *runnerFixture {
 	t.Helper()
@@ -125,7 +131,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Clarification:  fixture.clarification,
 		DesignRounds:   fixture.designRounds,
 		Batches:        fixture.batches,
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:         slog.New(slog.NewTextHandler(&fixture.logs, nil)),
 		Load:           fixture.load,
 		TaskProvider:   taskProvider,
 		ToolDeps: tools.Deps{
@@ -133,7 +139,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 			Attachment:  &fakeAttachmentPort{},
 			Resource:    &fakeResourcePort{},
 			Design:      fixture.design,
-			P7:          tools.P7Deps{Knowledge: fixture.knowledgeWriter},
+			Knowledge:   tools.KnowledgeDeps{Knowledge: fixture.knowledgeWriter},
 		},
 		InstanceID:        "instance-1",
 		CompactionSummary: &fakeCompactionSummaryStore{conversations: fixture.conv},
@@ -283,7 +289,7 @@ func TestRunnerRejectsToolsOutsideProfileAllowlist(t *testing.T) {
 func TestRunnerHostToolCallWritesRequirementCard(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	fixture.chat.responses = []llmapp.ChatResponse{
-		toolCall(tools.ToolRequirementDraftCreate, `{"title":"登录功能","description":"支持手机号登录","acceptance_criteria":"可登录","priority":"P1"}`),
+		toolCall(tools.ToolRequirementDraftCreate, `{"title":"登录功能","user_story":{"as_a":"用户","i_want":"支持手机号登录","so_that":"不必记密码"},"acceptance_criteria":[{"given":"已注册手机号","when":"提交验证码","then":"可登录"}],"sut_description":"登录页","priority":"P1"}`),
 		{Content: "已创建需求草案，请确认。"},
 	}
 
@@ -332,8 +338,8 @@ func TestRunnerRejectsRemovedBackgroundWorkTypes(t *testing.T) {
 	for _, workType := range []string{
 		agentapp.WorkTypeRequirementCurate,
 		"attachment.ingest",
-		agentapp.WorkTypeDesignRound,
-		agentapp.WorkTypeDesignDataPlan,
+		"design.round",
+		"design.data_plan",
 		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
 	} {
 		t.Run(workType, func(t *testing.T) {
@@ -664,7 +670,10 @@ func TestWorkItemPayloadParsesDecimalStringIDs(t *testing.T) {
 	}
 }
 
-const designProposalJSON = `{"requirement_id":"501","requirement_version_id":"700","scenarios":[{"ref":"s1","name":"正常登录","version_sut_ids":["9001"]}],"cases":[{"ref":"c1","scenario_ref":"s1","title":"账号密码登录成功","priority":"P1","default_version_sut_id":"9001","version_sut_ids":["9001"],"steps":[{"seq":1,"action":"打开登录页","expected":"显示表单"}],"assertions":[{"step_seq":1,"kind":"ui","target":"表单","expected":"可见"}],"sources":[{"kind":"requirement","ref_id":"700"}]}]}`
+// designProposalJSON is a minimal valid case.graph_propose payload on the
+// v0.2.4-B natural-language case contract: sut_description + preconditions +
+// covered_acs are required, step targets are prose, and no resource ids appear.
+const designProposalJSON = `{"requirement_id":"501","requirement_version_id":"700","scenarios":[{"ref":"s1","name":"正常登录"}],"cases":[{"ref":"c1","scenario_ref":"s1","title":"账号密码登录成功","priority":"P1","sut_description":"商城前台登录页与登录接口。","preconditions":"已注册账号","covered_acs":["AC-1"],"steps":[{"seq":1,"action":"打开登录页","expected":"显示表单","target_description":"登录页的手机号输入框"}],"assertions":[{"step_seq":1,"kind":"ui","target":"表单","expected":"可见"}],"sources":[{"kind":"requirement","ref_id":"700"}]}]}`
 
 func designRequirementItem() agent.WorkItem {
 	return fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
@@ -700,9 +709,6 @@ func TestRunnerDesignHostUsesDesignProfileAndTeamRoom(t *testing.T) {
 	prompt := requestPrompt(fixture.chat.request(0))
 	if !strings.Contains(prompt, "设计会话") || strings.Contains(prompt, "澄清会话的开场") {
 		t.Fatalf("design opening prompt = %q", prompt)
-	}
-	if !strings.Contains(prompt, "视觉基线") || !strings.Contains(prompt, "不要用 visual") {
-		t.Fatalf("design opening prompt must carry the non-visual assertion default: %q", prompt)
 	}
 	for _, definition := range fixture.chat.request(0).Tools {
 		if definition.Name == "case.confirm" {
@@ -785,8 +791,6 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 		{agentapp.WorkTypeAnalyzeCoverage, agentapp.ProfileKeyCoverageAnalyst},
 		{agentapp.WorkTypeIssueTriage, agentapp.ProfileKeyIssueTriager},
 		{agentapp.WorkTypeReportVersion, agentapp.ProfileKeyReportWriter},
-		{agentapp.WorkTypeRequirementClose, agentapp.ProfileKeyVersionSteward},
-		{agentapp.WorkTypeVersionClose, agentapp.ProfileKeyVersionSteward},
 		// 0.2.1 work-item kinds (contracts/task-types.md §9.1). The two
 		// stage-entry kinds also have a deterministic runner path; the mapping
 		// is still the profile that owns the produced artifact.
@@ -810,7 +814,7 @@ func TestRunnerAcceptsConversationKinds(t *testing.T) {
 	// seed (v0.22 D-B1/R-W1-5).
 	for _, removed := range []string{
 		agentapp.WorkTypeRequirementCurate, "attachment.ingest",
-		agentapp.WorkTypeDesignRound, agentapp.WorkTypeDesignDataPlan,
+		"design.round", "design.data_plan",
 		"explore.login", "explore.page", "explore.api", "explore.coverage", "explore.gap",
 	} {
 		if _, ok := agentapp.ProfileKeyForWorkType(removed); ok {
@@ -914,7 +918,7 @@ func TestDesignRoundProducesCases(t *testing.T) {
 		t.Fatalf("background case author appended assistant text: %#v", fixture.conv.appended)
 	}
 	prompt := requestPrompt(fixture.chat.request(0))
-	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id", "视觉基线", "不要用 visual"} {
+	for _, want := range []string{"design.requirement", "requirement_version_id=700", "requirement_version_id"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("case author prompt missing %q: %s", want, prompt)
 		}
@@ -968,6 +972,99 @@ func TestWorkItemPayloadParsesDesignIDs(t *testing.T) {
 	}
 }
 
+// TestJudgeCasesPayloadParsing pins the T14 consumption of the T8 judge
+// scheduling payload: cases[] (the pending draft set the judge must review)
+// and draft_case_version_ids (the full-draft-set generation anchor). The
+// planner writes IDs as decimal strings (platformid.Format); a JSON
+// round-trip through map[string]any would otherwise decode them as float64,
+// so the parser must accept the wire shape (string or number) exactly like
+// every other work-item ID field.
+func TestJudgeCasesPayloadParsing(t *testing.T) {
+	t.Run("decimal string ids (production wire shape)", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{
+			"requirement_id":         "501",
+			"requirement_version_id": "700",
+			"draft_case_version_ids": "8001,8002",
+			"cases": []map[string]any{
+				{"case_id": "7001", "case_version_id": "8001", "content_hash": strings.Repeat("a", 64)},
+				{"case_id": "7002", "case_version_id": "8002", "content_hash": strings.Repeat("b", 64)},
+			},
+		})
+		payload, err := agentapp.ParseWorkItemPayload(raw)
+		if err != nil {
+			t.Fatalf("ParseWorkItemPayload: %v", err)
+		}
+		if payload.DraftCaseVersionIDs != "8001,8002" {
+			t.Fatalf("DraftCaseVersionIDs = %q, want the full-set anchor", payload.DraftCaseVersionIDs)
+		}
+		if len(payload.JudgeCases) != 2 {
+			t.Fatalf("JudgeCases = %#v, want 2 pending drafts", payload.JudgeCases)
+		}
+		first, second := payload.JudgeCases[0], payload.JudgeCases[1]
+		if first.CaseID != 7001 || first.CaseVersionID != 8001 || first.ContentHash != strings.Repeat("a", 64) {
+			t.Fatalf("first case = %#v", first)
+		}
+		if second.CaseID != 7002 || second.CaseVersionID != 8002 || second.ContentHash != strings.Repeat("b", 64) {
+			t.Fatalf("second case = %#v", second)
+		}
+	})
+	t.Run("json number ids (round-trip wire shape)", func(t *testing.T) {
+		// Simulates a payload that survived a generic map[string]any JSON
+		// round-trip: numbers stay numbers, never re-stringified.
+		raw := json.RawMessage(`{"cases":[{"case_id":7001,"case_version_id":8001,"content_hash":"abc"}]}`)
+		payload, err := agentapp.ParseWorkItemPayload(raw)
+		if err != nil {
+			t.Fatalf("ParseWorkItemPayload: %v", err)
+		}
+		if len(payload.JudgeCases) != 1 || payload.JudgeCases[0].CaseID != 7001 || payload.JudgeCases[0].CaseVersionID != 8001 {
+			t.Fatalf("JudgeCases = %#v, want the numeric wire shape parsed", payload.JudgeCases)
+		}
+	})
+	t.Run("absent cases and anchor stay zero", func(t *testing.T) {
+		raw, _ := json.Marshal(map[string]any{"requirement_id": "501"})
+		payload, err := agentapp.ParseWorkItemPayload(raw)
+		if err != nil {
+			t.Fatalf("ParseWorkItemPayload: %v", err)
+		}
+		if len(payload.JudgeCases) != 0 || payload.DraftCaseVersionIDs != "" {
+			t.Fatalf("payload = %#v, want no judge scope for a non-judge item", payload)
+		}
+	})
+	t.Run("malformed cases entry is a typed error", func(t *testing.T) {
+		raw := json.RawMessage(`{"cases":[{"case_id":"not-a-number","case_version_id":"8001"}]}`)
+		if _, err := agentapp.ParseWorkItemPayload(raw); err == nil {
+			t.Fatal("expected a parse error for a non-decimal case_id")
+		}
+	})
+	t.Run("cases must be an array", func(t *testing.T) {
+		raw := json.RawMessage(`{"cases":{"case_id":"7001"}}`)
+		if _, err := agentapp.ParseWorkItemPayload(raw); err == nil {
+			t.Fatal("expected a parse error when cases is not an array")
+		}
+	})
+	// H-F10b #34: a review entry that names no real case version must fail closed
+	// at the parse boundary. Before this it parsed to zero ids and rendered a
+	// degenerate judge_case=case_id:0,case_version_id:0 scope line.
+	t.Run("entry without a case_id is rejected", func(t *testing.T) {
+		raw := json.RawMessage(`{"cases":[{"case_version_id":"8001"}]}`)
+		if _, err := agentapp.ParseWorkItemPayload(raw); err == nil {
+			t.Fatal("a judge review entry with no case_id must be rejected, not rendered as case_id:0")
+		}
+	})
+	t.Run("entry without a case_version_id is rejected", func(t *testing.T) {
+		raw := json.RawMessage(`{"cases":[{"case_id":"7001"}]}`)
+		if _, err := agentapp.ParseWorkItemPayload(raw); err == nil {
+			t.Fatal("a judge review entry with no case_version_id must be rejected")
+		}
+	})
+	t.Run("zero ids are rejected", func(t *testing.T) {
+		raw := json.RawMessage(`{"cases":[{"case_id":"0","case_version_id":"0"}]}`)
+		if _, err := agentapp.ParseWorkItemPayload(raw); err == nil {
+			t.Fatal("zero ids are not a real case version and must be rejected")
+		}
+	})
+}
+
 func TestProfileKeyForWorkType(t *testing.T) {
 	cases := map[string]string{
 		agentapp.WorkTypeChatTurn:          agentapp.ProfileKeyClarificationHost,
@@ -990,7 +1087,7 @@ func TestProfileKeyForWorkType(t *testing.T) {
 	// P3/P4 mappings live in their phase contract tests; an unregistered later
 	// work type must still not map to a P1/P2 profile.
 	if _, ok := agentapp.ProfileKeyForWorkType("report.render_pdf"); ok {
-		t.Fatal("P4+ work type must not map to a P1/P2 profile")
+		t.Fatal("delivery work type must not map to a clarification/design profile")
 	}
 }
 
@@ -1224,5 +1321,218 @@ func TestRunnerHostDoesNotConvergeOnClarifyingQuestion(t *testing.T) {
 	}
 	if len(fixture.clarification.calls) != 0 {
 		t.Fatalf("a clarifying question converged the version: %v", fixture.clarification.calls)
+	}
+}
+
+// TestRunnerStreamingUsageAndCacheParity pins SC-D1 telemetry parity at the
+// real loop: the streaming consumption of the same scripted responses must
+// store exactly the usage the non-streaming path stored (mergeUsage sums every
+// key) and the provider cache bookkeeping must still be applied
+// (applyProviderCacheStats: the first reported turn wins, one cache_stats
+// event). Expected values come from the mergeUsage/cache-stats contract, not
+// from observed output.
+func TestRunnerStreamingUsageAndCacheParity(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ToolCalls:    []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			FinishReason: "tool_calls",
+			Usage:        map[string]int{"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12, "cached_tokens": 5, "cache_hit": 1},
+		},
+		{
+			Content:      "流式回复",
+			FinishReason: "stop",
+			Usage:        map[string]int{"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13, "cached_tokens": 0, "cache_hit": 0},
+		},
+	}
+
+	result, err := mustRun(t, fixture, hostItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone || result.Turns != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	wantUsage := map[string]int{"prompt_tokens": 16, "completion_tokens": 9, "total_tokens": 25, "cached_tokens": 5, "cache_hit": 1}
+	for key, want := range wantUsage {
+		if result.Usage[key] != want {
+			t.Fatalf("usage[%s] = %d, want %d (full usage %#v)", key, result.Usage[key], want, result.Usage)
+		}
+	}
+	finished := fixture.repo.lastFinished(t)
+	if finished.Cache["cached_tokens"] != 5 || finished.Cache["cache_hit"] != 1 {
+		t.Fatalf("finished cache = %#v, want the first reported provider stats", finished.Cache)
+	}
+	if !containsEvent(fixture.events, "context.cache_stats") {
+		t.Fatalf("events = %v, want context.cache_stats", eventTypes(fixture.events))
+	}
+	if fixture.chat.requestCount() != 2 {
+		t.Fatalf("model calls = %d, want 2", fixture.chat.requestCount())
+	}
+	if fixture.chat.chatCallCount() != 0 {
+		t.Fatalf("runner used the non-streaming Chat path %d times", fixture.chat.chatCallCount())
+	}
+}
+
+// TestRunnerStreamOverflowBeforeFirstDeltaCompactsAndRetries pins the R-D7
+// pre-first-delta boundary: an overflow rejection before any delta keeps the
+// existing compaction rescue (handleOverflow) and the retried turn succeeds.
+func TestRunnerStreamOverflowBeforeFirstDeltaCompactsAndRetries(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.settings.ints["context.keep_recent_messages"] = 1
+	fixture.conv.snapshot.Summary = ""
+	fixture.conv.snapshot.PinnedFacts = nil
+	fixture.conv.snapshot.Messages = []agentapp.ConversationMessage{
+		{ID: 661, Role: "user", Text: "较早需求一"},
+		{ID: 662, Role: "user", Text: "较早需求二"},
+		{ID: 663, Role: "user", Text: "较早需求三"},
+		{ID: 664, Role: "user", Text: "最新需求"},
+	}
+	fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "恢复后的回复"}}
+
+	result, err := mustRun(t, fixture, hostItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v, want a done run after the compaction retry", result)
+	}
+	// stream(overflow) -> compaction summarizer Chat -> stream(retry)
+	if fixture.chat.requestCount() != 3 {
+		t.Fatalf("model calls = %d, want overflow + summary + retry", fixture.chat.requestCount())
+	}
+	// Port attribution: only the compaction summarizer may use Chat; both model
+	// turns must go through Stream (a Chat-retried mutant also counts 3).
+	if fixture.chat.chatCallCount() != 1 {
+		t.Fatalf("Chat calls = %d, want exactly 1 (the compaction summarizer)", fixture.chat.chatCallCount())
+	}
+	if !containsEvent(fixture.events, "context.compacted") {
+		t.Fatalf("events = %v, want context.compacted", eventTypes(fixture.events))
+	}
+}
+
+// TestRunnerStreamErrorAfterFirstDeltaKeepsPartialAndDoesNotRetry pins the
+// R-D7 post-first-delta boundary: once content reached the caller, any error
+// (transient or overflow) ends the turn without a retry or compaction, the
+// partial assistant content is preserved instead of silently dropped, and the
+// run fails with the unchanged model_error classification.
+func TestRunnerStreamErrorAfterFirstDeltaKeepsPartialAndDoesNotRetry(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "transient", err: fmt.Errorf("upstream: %w", llmapp.ErrTransient)},
+		{name: "overflow", err: fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			fixture.chat.streams = [][]llmapp.Delta{
+				{{Content: "partial "}, {Content: "answer"}},
+			}
+			fixture.chat.errors = []error{tc.err}
+
+			result, err := mustRun(t, fixture, hostItem())
+			if err == nil {
+				t.Fatal("expected the run to fail after the mid-stream error")
+			}
+			if result.Status != agent.AgentRunFailed || result.TerminalReason != "model_error" {
+				t.Fatalf("result = %#v, want failed/model_error", result)
+			}
+			// R-D7 at the work-item layer: a retryable RunError reopens the item
+			// (worker recordFailure -> queue.Fail -> reclaim) and would replay
+			// the same model turn one layer up, duplicating what the user saw.
+			if agentapp.IsRetryable(err) {
+				t.Fatalf("post-first-delta failure is retryable at the work-item level: %v", err)
+			}
+			if fixture.chat.requestCount() != 1 {
+				t.Fatalf("model calls = %d, want exactly 1 (no retry after the first delta)", fixture.chat.requestCount())
+			}
+			if fixture.chat.chatCallCount() != 0 {
+				t.Fatalf("runner fell back to Chat %d times", fixture.chat.chatCallCount())
+			}
+			if containsEvent(fixture.events, "context.compacted") {
+				t.Fatalf("post-first-delta %s triggered compaction: %v", tc.name, eventTypes(fixture.events))
+			}
+			var partial *agent.AgentMessage
+			for index := range fixture.repo.messages {
+				message := fixture.repo.messages[index]
+				if message.Role == agent.MessageRoleAssistant {
+					partial = &fixture.repo.messages[index]
+				}
+			}
+			if partial == nil || len(partial.Parts) == 0 || partial.Parts[0].Text != "partial answer" {
+				t.Fatalf("partial assistant turn not preserved: %#v", fixture.repo.messages)
+			}
+		})
+	}
+}
+
+// TestRunnerStreamReasoningItemsReplay pins the ReasoningItems parity gap at
+// the runner: the streamed first turn's provider reasoning items must be
+// replayed into the second turn's assistant history verbatim (the Responses
+// multi-turn reasoning contract, spec §7.2), exactly as the non-streaming
+// path did.
+func TestRunnerStreamReasoningItemsReplay(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	item := json.RawMessage(`{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"need the pack"}],"encrypted_content":"opaque-reasoning"}`)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ReasoningContent: "need the pack",
+			ReasoningItems:   []json.RawMessage{item},
+			ToolCalls:        []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			FinishReason:     "tool_calls",
+		},
+		{Content: "已读取上下文", FinishReason: "stop"},
+	}
+
+	result, err := mustRun(t, fixture, hostItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone || result.Turns != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	second := fixture.chat.request(1)
+	var assistant *llmapp.ChatMessage
+	for index := range second.Messages {
+		if second.Messages[index].Role == "assistant" && len(second.Messages[index].ToolCalls) > 0 {
+			assistant = &second.Messages[index]
+		}
+	}
+	if assistant == nil {
+		t.Fatalf("second request lost the assistant tool turn: %#v", second.Messages)
+	}
+	if assistant.ReasoningContent != "need the pack" {
+		t.Fatalf("replayed reasoning content = %q", assistant.ReasoningContent)
+	}
+	if len(assistant.ReasoningItems) != 1 || string(assistant.ReasoningItems[0]) != string(item) {
+		t.Fatalf("replayed reasoning items = %#v, want the provider item verbatim", assistant.ReasoningItems)
+	}
+}
+
+// TestRunnerStreamFailureNeverFallsBackToChat pins constitution VII.6 at the
+// runner: a streaming failure fails the run explicitly; the runner must not
+// silently re-issue the turn through the non-streaming Chat path. It also pins
+// the pre-first-delta side of the R-D7 boundary: nothing was shown yet, so the
+// existing work-item retry policy for a transient failure still applies.
+func TestRunnerStreamFailureNeverFallsBackToChat(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.errors = []error{errors.New("stream broke")}
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "非流式回退会成功"}}
+
+	_, err := mustRun(t, fixture, hostItem())
+	if err == nil {
+		t.Fatal("run succeeded despite the scripted stream failure")
+	}
+	if !agentapp.IsRetryable(err) {
+		t.Fatalf("pre-first-delta transient failure lost its retry policy: %v", err)
+	}
+	if fixture.chat.chatCallCount() != 0 {
+		t.Fatalf("runner silently fell back to Chat %d times", fixture.chat.chatCallCount())
+	}
+	if fixture.chat.requestCount() != 1 {
+		t.Fatalf("model calls = %d, want exactly 1", fixture.chat.requestCount())
 	}
 }

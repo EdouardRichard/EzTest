@@ -17,11 +17,28 @@ import {
   DefaultEnvironmentError,
   deleteEnvironment,
   deleteSut,
+  rejectSut,
   updateEnvironment,
   updateSut,
 } from "./api"
 import { ConfirmDialog, EnvironmentDialog, SutDialog } from "./dialogs"
-import type { ResourceScope, Sut, SutEnvironment, SutFormValues } from "./types"
+import type {
+  ResourceScope,
+  Sut,
+  SutEnvironment,
+  SutFormValues,
+  SutRegistrationStatus,
+} from "./types"
+
+/** Registration-status badge tone/label (v0.2.4-F R-B4: admin audits AI SUTs). */
+const SUT_STATUS_BADGE: Record<
+  SutRegistrationStatus,
+  { tone: "success" | "warning" | "danger"; label: string }
+> = {
+  approved: { tone: "success", label: "已批准" },
+  proposed: { tone: "warning", label: "待审计" },
+  rejected: { tone: "danger", label: "已驳回" },
+}
 
 export type SUTPanelProps = {
   scope: ResourceScope
@@ -31,19 +48,18 @@ export type SUTPanelProps = {
 }
 
 /**
- * SUT tab: lists SUTs, creates a SUT with its default environment, and manages
- * the environments of the selected SUT.
+ * SUT tab (v0.2.4-B): lists SUTs and creates a SUT under a freshly created
+ * top-level environment. Environments are managed top-level (they own SUTs), not
+ * per-SUT; base_url lives on each SUT.
  */
 export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelProps) {
   const [createSutOpen, setCreateSutOpen] = useState(false)
   const [editingSut, setEditingSut] = useState<Sut | null>(null)
   const [deletingSut, setDeletingSut] = useState<Sut | null>(null)
+  const [rejectingSut, setRejectingSut] = useState<Sut | null>(null)
   const [createEnvironmentOpen, setCreateEnvironmentOpen] = useState(false)
   const [editingEnvironment, setEditingEnvironment] = useState<SutEnvironment | null>(null)
   const [deletingEnvironment, setDeletingEnvironment] = useState<SutEnvironment | null>(null)
-
-  const selectedSut = scope.detail ?? scope.suts.find((sut) => sut.id === scope.sutId) ?? null
-  const environments = selectedSut?.environments ?? []
 
   async function handleCreateSut(values: SutFormValues): Promise<void> {
     try {
@@ -58,9 +74,9 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
       })
       await onRefresh(sut.id)
     } catch (caught) {
-      // The SUT exists even when its default environment failed; refresh so the
-      // user can add the environment from the environment section.
-      if (caught instanceof DefaultEnvironmentError) await onRefresh(caught.sut.id)
+      // The environment exists even when the SUT create failed; refresh so the
+      // user can add the SUT from the SUT list.
+      if (caught instanceof DefaultEnvironmentError) await onRefresh()
       throw caught
     }
   }
@@ -80,6 +96,10 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
               {sut.name}
             </button>
             {sut.id === scope.sutId ? <Badge tone="info">已选择</Badge> : null}
+            <Badge tone={SUT_STATUS_BADGE[sut.status].tone}>
+              {SUT_STATUS_BADGE[sut.status].label}
+            </Badge>
+            {sut.source === "ai" ? <Badge tone="neutral">AI 上报</Badge> : null}
             {sut.family !== null && sut.family !== undefined && sut.family.length > 0 ? (
               <Badge tone="neutral" className="font-mono">
                 {sut.family}
@@ -88,6 +108,11 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
           </div>
           {sut.intro.length > 0 ? (
             <p className="max-w-md truncate text-[11px] text-muted-foreground">{sut.intro}</p>
+          ) : null}
+          {sut.base_url.length > 0 ? (
+            <p className="max-w-md truncate font-mono text-[11px] text-muted-foreground">
+              {sut.base_url}
+            </p>
           ) : null}
         </div>
       ),
@@ -113,6 +138,16 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
           >
             编辑
           </Button>
+          {sut.status !== "rejected" ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={`驳回 SUT ${sut.name}`}
+              onClick={() => setRejectingSut(sut)}
+            >
+              驳回
+            </Button>
+          ) : null}
           <Button
             variant="ghost"
             size="sm"
@@ -133,28 +168,24 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
       render: (environment) => (
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-medium text-foreground">{environment.name}</span>
-          {environment.is_default ? <Badge tone="success">默认</Badge> : null}
           {environment.status === "disabled" ? <Badge tone="warning">停用</Badge> : null}
         </div>
       ),
     },
     {
-      key: "base_url",
-      header: "地址",
+      key: "description",
+      header: "描述",
       render: (environment) => (
-        <span className="block max-w-md truncate font-mono text-[11px] text-muted-foreground">
-          {environment.base_url}
+        <span className="block max-w-md truncate text-[11px] text-muted-foreground">
+          {environment.description || "—"}
         </span>
       ),
     },
     {
-      key: "resources",
-      header: "资源",
+      key: "suts",
+      header: "SUT",
       render: (environment) => (
-        <span className="text-[11px] text-muted-foreground">
-          {environment.pages.length} 页面 · {environment.apis.length} API ·{" "}
-          {environment.databases.length} 库 · {environment.accounts.length} 账号
-        </span>
+        <span className="text-[11px] text-muted-foreground">{environment.suts.length} 个</span>
       ),
     },
     {
@@ -190,7 +221,7 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
         <div>
           <h2 className="text-sm font-semibold text-foreground">SUT 列表</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            创建 SUT 时会同时创建默认环境；选择 SUT 后可维护它的环境。
+            创建 SUT 时会同时创建一个顶层环境并把 SUT 挂在它下面；base_url 属于 SUT。
           </p>
         </div>
         <Button onClick={() => setCreateSutOpen(true)}>
@@ -206,7 +237,7 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
       ) : scope.suts.length === 0 ? (
         <EmptyState
           title="还没有 SUT"
-          description="创建第一个 SUT 和它的默认环境，然后在页面/API、数据与代码仓 Tab 继续配置资源。"
+          description="创建第一个 SUT 和它的环境，然后在页面/API、数据与代码仓 Tab 继续配置资源。"
           action={
             <Button onClick={() => setCreateSutOpen(true)}>
               <Plus className="size-4" aria-hidden="true" />
@@ -223,51 +254,39 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
         />
       )}
 
-      {scope.sutId.length > 0 ? (
-        <section aria-label="环境管理" className="surface-card space-y-3 p-4">
-          <header className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-foreground">
-                环境{selectedSut ? ` · ${selectedSut.name}` : ""}
-              </h2>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                页面/API 与数据资源都挂在一个环境下；默认环境会被版本向导优先选中。
-              </p>
-            </div>
-            <Button
-              variant="secondary"
-              onClick={() => setCreateEnvironmentOpen(true)}
-              disabled={scope.detailLoading}
-            >
-              <Plus className="size-4" aria-hidden="true" />
-              新建环境
-            </Button>
-          </header>
+      <section aria-label="环境管理" className="surface-card space-y-3 p-4">
+        <header className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">环境</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              环境是顶层资源，拥有若干 SUT；版本直接绑定环境。
+            </p>
+          </div>
+          <Button variant="secondary" onClick={() => setCreateEnvironmentOpen(true)}>
+            <Plus className="size-4" aria-hidden="true" />
+            新建环境
+          </Button>
+        </header>
 
-          {scope.detailLoading ? (
-            <LoadingCard label="正在加载环境…" />
-          ) : scope.detailError ? (
-            <ErrorState error={scope.detailError} onRetry={onRetry} />
-          ) : environments.length === 0 ? (
-            <EmptyState
-              title="还没有环境"
-              description="SUT 至少需要一个环境，页面/API、目标库与测试账号都归属于环境。"
-              action={
-                <Button variant="secondary" onClick={() => setCreateEnvironmentOpen(true)}>
-                  新建环境
-                </Button>
-              }
-            />
-          ) : (
-            <Table
-              ariaLabel="环境列表"
-              columns={environmentColumns}
-              rows={environments}
-              rowKey={(environment) => environment.id}
-            />
-          )}
-        </section>
-      ) : null}
+        {scope.environments.length === 0 ? (
+          <EmptyState
+            title="还没有环境"
+            description="环境拥有 SUT；先创建环境，再在它下面创建 SUT 与页面/API、目标库。"
+            action={
+              <Button variant="secondary" onClick={() => setCreateEnvironmentOpen(true)}>
+                新建环境
+              </Button>
+            }
+          />
+        ) : (
+          <Table
+            ariaLabel="环境列表"
+            columns={environmentColumns}
+            rows={scope.environments}
+            rowKey={(environment) => environment.id}
+          />
+        )}
+      </section>
 
       {createSutOpen ? (
         <SutDialog onClose={() => setCreateSutOpen(false)} onSubmit={handleCreateSut} />
@@ -278,11 +297,14 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
           initial={editingSut}
           onClose={() => setEditingSut(null)}
           onSubmit={async (values) => {
-            const family = values.family?.trim() ?? ""
+            // The edit dialog always carries the current family (pre-filled, cleared
+            // to ""). Pass it through unconditionally so clearing reaches the API as
+            // family:"" (the backend clears on the empty string). Stripping the key
+            // here when blank made "clear family" a silent no-op (H-C2).
             await updateSut(editingSut.id, {
               name: values.name,
               intro: values.intro,
-              ...(family.length > 0 ? { family } : {}),
+              family: values.family?.trim() ?? "",
             })
             await onRefresh()
           }}
@@ -302,11 +324,24 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
         />
       ) : null}
 
+      {rejectingSut ? (
+        <ConfirmDialog
+          title={`驳回 SUT「${rejectingSut.name}」？`}
+          description="驳回后该 SUT 退出有效范围（含其代码仓关联），不再参与执行/指纹/代码基线；Agent 上报的新 SUT 经证据门自动转正后仍可事后驳回。"
+          confirmLabel="驳回 SUT"
+          onClose={() => setRejectingSut(null)}
+          onConfirm={async () => {
+            await rejectSut(rejectingSut.id)
+            await onRefresh()
+          }}
+        />
+      ) : null}
+
       {createEnvironmentOpen ? (
         <EnvironmentDialog
           onClose={() => setCreateEnvironmentOpen(false)}
           onSubmit={async (values) => {
-            await createEnvironment(scope.sutId, values)
+            await createEnvironment(values)
             await onRefresh()
           }}
         />

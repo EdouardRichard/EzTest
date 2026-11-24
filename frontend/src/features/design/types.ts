@@ -9,6 +9,8 @@
 
 import type { CaseRunVerdict } from "@/features/execution/types"
 
+import type { ReviewState } from "./judgment"
+
 /** Per-requirement projection shown on the requirement node (spec §4.6). */
 export type DesignStatus = "pending" | "in_design" | "draft" | "confirmed" | "stale"
 
@@ -35,10 +37,8 @@ export type DesignCaseSummary = {
   title: string
   priority: DesignPriority
   status: Exclude<CaseVersionStatus, "superseded">
-  default_version_sut_id: string
-  version_sut_ids: string[]
-  page_ids: string[]
-  api_ids: string[]
+  sut_description: string
+  covered_acs: string[]
   step_count: number
   assertion_count: number
   /**
@@ -47,6 +47,12 @@ export type DesignCaseSummary = {
    * frozen P2 graph contract, so older fixtures may omit it.
    */
   execution_verdict?: CaseRunVerdict
+  /**
+   * Judge review projection of the current case version (v0.2.4-E, spec SC-E5,
+   * T16). `""` when the judgment gate is unwired/unreadable (degraded) — the UI
+   * tolerates it as unknown. Additive; older fixtures may omit it.
+   */
+  review_state?: ReviewState | ""
   created_at: string
 }
 
@@ -55,9 +61,6 @@ export type DesignScenario = {
   requirement_version_id: string
   name: string
   description: string
-  version_sut_ids: string[]
-  page_ids: string[]
-  api_ids: string[]
   /** API name `sort`; DB column `sort_order` (spec §3.1/§7.2.1). */
   sort: number
   cases: DesignCaseSummary[]
@@ -70,7 +73,6 @@ export type DesignRequirement = {
   title: string
   status: DesignRequirementStatus
   design_status: DesignStatus
-  target_version_sut_ids: string[]
   scenarios: DesignScenario[]
 }
 
@@ -106,7 +108,12 @@ export type DesignOverview = {
 
 /* ----------------------------------- stage ---------------------------------- */
 
-/** 0.2.1 version stage-machine projection (spec §5.3). */
+/**
+ * 0.2.1 version stage-machine projection (spec §5.3). Single-source (V-0017):
+ * validated against the Go authority version/domain Stages() by
+ * backend/internal/version/domain/enum_authority_test.go. Do not add/remove a
+ * member here without updating the domain enum.
+ */
 export type VersionStage =
   | "created"
   | "clarifying"
@@ -142,27 +149,21 @@ export type DesignStep = {
   seq: number
   action: string
   expected: string
-  target_version_sut_id: string | null
-  target_page_id: string | null
-  target_api_id: string | null
+  target_description: string
   account_role: string
   data: Record<string, unknown>
 }
 
-export type DesignAssertionKind = "ui" | "api" | "db" | "text" | "visual"
+export type DesignAssertionKind = "ui" | "api" | "db" | "text"
 
 export type DesignAssertion = {
   step_seq: number
   kind: DesignAssertionKind
   target: string
   expected: string
-  target_version_sut_id: string | null
-  target_api_id: string | null
-  database_id: string | null
-  /**
-   * P2 `case_assertion` id. The frozen design view does not return it yet, so
-   * the visual config UI also falls back to existing visual_assertion rows.
-   */
+  /** v0.2.4-B: a db assertion names the SUT it reads; null for other kinds. */
+  sut_id: string | null
+  /** P2 `case_assertion` id. */
   case_assertion_id?: string
 }
 
@@ -181,13 +182,11 @@ export type DesignCaseVersionDetail = {
   revision: number
   title: string
   description: string
+  sut_description: string
   preconditions: string
+  covered_acs: string[]
   test_data: Record<string, unknown>
   priority: DesignPriority
-  default_version_sut_id: string
-  version_sut_ids: string[]
-  page_ids: string[]
-  api_ids: string[]
   status: CaseVersionStatus
   content_hash: string
   created_at: string
@@ -208,6 +207,11 @@ export type DesignCaseDetail = {
   versions: DesignCaseVersionSummary[]
   selected: DesignCaseVersionDetail
   confirmable: boolean
+  /**
+   * Judge review projection of the CURRENT case version (T16), independent of
+   * which historical revision `selected` shows. `""` degraded is tolerated.
+   */
+  review_state?: ReviewState | ""
 }
 
 /* -------------------------------- confirmation ------------------------------ */
@@ -251,7 +255,13 @@ export type CaseRevisionRollbackView = {
   case_version_id: string
   rolled_back_from: string
   revision: number
-  status: string
+  /**
+   * R-E2r (release notes E §2): a NEW replacement is `draft` (awaiting judge +
+   * human confirm); `confirmed` only on idempotent replay of a legacy/already
+   * confirmed replacement. The status is passed through as returned, never
+   * assumed.
+   */
+  status: CaseVersionStatus
   trigger: string
 }
 
@@ -275,6 +285,58 @@ export type CaseConfirmationResult = {
   confirmed: CaseConfirmationItem[]
   skipped: CaseConfirmationItem[]
   confirmed_at: string
+}
+
+/* --------------------------- judgment report (T16) -------------------------- */
+
+/** One judge finding against a case version (`judgmentFindingDTO`). */
+export type JudgmentFindingView = {
+  dimension: string
+  /** blocker/important/minor; typed loose for forward tolerance. */
+  severity: string
+  message: string
+  case_ref?: string
+}
+
+/** One immutable judge verdict on one case version (`judgmentDTO`). */
+export type JudgmentView = {
+  id: string
+  case_id: string
+  case_version_id: string
+  content_hash: string
+  round: number
+  /** pass/fail; typed loose for forward tolerance. */
+  verdict: string
+  findings: JudgmentFindingView[]
+  ac_coverage_matrix: Record<string, unknown>
+  created_at: string
+}
+
+/** One current case in the judgment report (`judgmentCaseDTO`). */
+export type JudgmentCaseView = {
+  case_id: string
+  current_version_id: string
+  /** `""` when the judgment gate is unwired/unreadable (degraded). */
+  review_state: ReviewState | ""
+  judgment: JudgmentView | null
+}
+
+/** `GET /api/versions/{id}/design/judgments` (`judgmentReportDTO`). */
+export type JudgmentReportView = {
+  cases: JudgmentCaseView[]
+}
+
+/** `POST /api/versions/{id}/design/judgments/{caseId}/override` (`judgmentOverrideDTO`). */
+export type JudgmentOverrideView = {
+  id: string
+  case_id: string
+  case_version_id: string
+  content_hash: string
+  judgment_id?: string | null
+  condition: string
+  actor_id: string
+  reason: string
+  created_at: string
 }
 
 /* ----------------------------------- export --------------------------------- */

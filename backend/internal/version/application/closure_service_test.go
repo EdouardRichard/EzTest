@@ -185,26 +185,6 @@ func (f *fakeVersionReopener) ReopenIfCompleted(_ context.Context, versionID int
 	return f.err
 }
 
-type closureTaskCall struct {
-	requirementID        int64
-	requirementVersionID int64
-	closeRound           int32
-}
-
-type fakeClosureTasks struct {
-	calls []closureTaskCall
-	err   error
-}
-
-func (f *fakeClosureTasks) EnsureRequirementClose(_ context.Context, requirementID, requirementVersionID int64, closeRound int32) error {
-	f.calls = append(f.calls, closureTaskCall{
-		requirementID:        requirementID,
-		requirementVersionID: requirementVersionID,
-		closeRound:           closeRound,
-	})
-	return f.err
-}
-
 // ---------- closure test environment ----------
 
 type closureEnv struct {
@@ -217,7 +197,6 @@ type closureEnv struct {
 	issues       *fakeClosureIssues
 	work         *fakeClosureWork
 	versions     *fakeVersionReopener
-	tasks        *fakeClosureTasks
 	audit        *fakeAudit
 	events       *fakePublisher
 }
@@ -236,7 +215,6 @@ func newClosureEnv(t *testing.T) *closureEnv {
 	issues := &fakeClosureIssues{refs: map[int64]map[int64][]int64{}}
 	work := &fakeClosureWork{counts: map[int64]versionapp.OpenWorkItemCounts{}}
 	versions := &fakeVersionReopener{}
-	tasks := &fakeClosureTasks{}
 	audit := &fakeAudit{}
 	events := &fakePublisher{}
 	svc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
@@ -248,7 +226,6 @@ func newClosureEnv(t *testing.T) *closureEnv {
 		Issues:       issues,
 		WorkItems:    work,
 		Versions:     versions,
-		Tasks:        tasks,
 		Audit:        audit,
 		Events:       events,
 		IDs:          &seqIDs{},
@@ -257,7 +234,7 @@ func newClosureEnv(t *testing.T) *closureEnv {
 	return &closureEnv{
 		svc: svc, requirements: requirements, closures: closures, cases: cases,
 		runs: runs, coverage: coverage, issues: issues, work: work,
-		versions: versions, tasks: tasks, audit: audit, events: events,
+		versions: versions, audit: audit, events: events,
 	}
 }
 
@@ -294,11 +271,11 @@ func seedP0ClosureRequirement(env *closureEnv, requirementID, versionID, current
 	return requirement
 }
 
-// configureInconclusiveVisualClosure reproduces the REL-Q3 execution state: one
+// configureInconclusiveClosure reproduces the REL-Q3 execution state: one
 // current+confirmed case whose latest run is a terminal but inconclusive
-// automation outcome (missing visual baseline), recorded coverage and only the
-// requirement's own close task open.
-func configureInconclusiveVisualClosure(env *closureEnv, requirementID int64) {
+// automation outcome (the run produced no verified result), recorded coverage
+// and no open work. The unverified run alone keeps the requirement open.
+func configureInconclusiveClosure(env *closureEnv, requirementID int64) {
 	env.cases.byRequirement[requirementID] = []version.CaseVersionSnapshot{{
 		CaseVersionID: 1101, CaseID: 1100, RequirementID: requirementID,
 		RequirementVersionID: 1002, Title: "FR-025 publishes an article",
@@ -310,11 +287,12 @@ func configureInconclusiveVisualClosure(env *closureEnv, requirementID int64) {
 		},
 	}
 	env.coverage.recorded[requirementID] = true
-	env.work.counts[requirementID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 1}
+	env.work.counts[requirementID] = versionapp.OpenWorkItemCounts{Total: 0}
 }
 
 // configurePassingClosure makes requirementID closable: one confirmed case with
-// a latest passed run, recorded coverage and only its own close task open.
+// a latest passed run, recorded coverage and no open work (GD-17 removed the
+// requirement.close self task, so there is nothing to subtract).
 func configurePassingClosure(env *closureEnv, requirementID int64) {
 	env.cases.byRequirement[requirementID] = []version.CaseVersionSnapshot{{
 		CaseVersionID: 1101, CaseID: 1100, RequirementID: requirementID,
@@ -324,7 +302,7 @@ func configurePassingClosure(env *closureEnv, requirementID int64) {
 		1101: {CaseRunID: 1201, CaseVersionID: 1101, Status: version.CaseRunPassed},
 	}
 	env.coverage.recorded[requirementID] = true
-	env.work.counts[requirementID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 1}
+	env.work.counts[requirementID] = versionapp.OpenWorkItemCounts{Total: 0}
 }
 
 func closureEventTypes(events []eventingapp.Event) []string {
@@ -411,7 +389,7 @@ func TestClosureServiceClosePredicateFailureKeepsState(t *testing.T) {
 		1101: {CaseRunID: 1201, CaseVersionID: 1101, Status: version.CaseRunFailed, FailureClass: version.FailureClassApplication},
 	}
 	env.coverage.recorded[requirement.ID] = false
-	env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 2, RequirementClose: 1}
+	env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 1}
 
 	_, err := env.svc.Close(requestContext(), requirement.ID, nil)
 	var predicateErr *version.ErrClosePredicateFailed
@@ -475,7 +453,7 @@ func TestClosureServiceCloseRechecksPredicateUnderLock(t *testing.T) {
 	// requirement row lock is granted. Only the in-transaction recheck can see
 	// it, so the close must be rejected instead of committing a stale closure.
 	env.closures.lockedHook = func(_ context.Context, _ version.Requirement) {
-		env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 2, RequirementClose: 1}
+		env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 1}
 	}
 
 	_, err := env.svc.Close(requestContext(), requirement.ID, nil)
@@ -670,7 +648,7 @@ func TestClosureServiceReopenBestEffortVersionProjection(t *testing.T) {
 	}
 }
 
-func TestClosureServiceEnsureClosuresEnsuresOnlyEligibleRequirements(t *testing.T) {
+func TestClosureServiceEnsureClosuresClosesOnlyEligibleRequirements(t *testing.T) {
 	env := newClosureEnv(t)
 	eligible := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
 	blocked := seedClosureRequirement(env, 1002, 701, 1003, version.RequirementClarified)
@@ -681,18 +659,25 @@ func TestClosureServiceEnsureClosuresEnsuresOnlyEligibleRequirements(t *testing.
 		2101: {CaseRunID: 2201, CaseVersionID: 2101, Status: version.CaseRunPassed},
 	}
 	env.coverage.recorded[blocked.ID] = true
-	env.work.counts[blocked.ID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 0}
+	env.work.counts[blocked.ID] = versionapp.OpenWorkItemCounts{Total: 1}
 	env.closures.closures[closed.ID] = []version.RequirementClosure{{ID: 3001, RequirementID: closed.ID, CloseRound: 1}}
 
 	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureClosures: %v", err)
 	}
-	if len(env.tasks.calls) != 1 {
-		t.Fatalf("task ensures = %#v, want one eligible call", env.tasks.calls)
+	// GD-17: the eligible requirement is closed DIRECTLY (one terminal Close call),
+	// the blocked one stays clarified and the already-closed one is untouched.
+	if env.closures.closeCalls != 1 {
+		t.Fatalf("close calls = %d, want 1 (only the eligible requirement)", env.closures.closeCalls)
 	}
-	want := closureTaskCall{requirementID: eligible.ID, requirementVersionID: 1002, closeRound: 1}
-	if call := env.tasks.calls[0]; call != want {
-		t.Fatalf("task ensure = %#v, want %#v", call, want)
+	if env.requirements.requirements[eligible.ID].Status != version.RequirementClosed {
+		t.Fatalf("eligible requirement was not closed directly")
+	}
+	if env.requirements.requirements[blocked.ID].Status != version.RequirementClarified {
+		t.Fatalf("blocked requirement was closed")
+	}
+	if len(env.closures.closures[closed.ID]) != 1 {
+		t.Fatalf("already-closed requirement gained a closure round")
 	}
 }
 
@@ -704,8 +689,9 @@ func TestClosureServiceEnsureClosuresUsesCurrentRequirementVersion(t *testing.T)
 	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureClosures: %v", err)
 	}
-	if len(env.tasks.calls) != 1 || env.tasks.calls[0].requirementVersionID != 1005 {
-		t.Fatalf("task ensures = %#v, want requirement version 1005", env.tasks.calls)
+	rounds := env.closures.closures[requirement.ID]
+	if len(rounds) != 1 || rounds[0].RequirementVersionID != 1005 {
+		t.Fatalf("closure rounds = %#v, want one targeting requirement version 1005", rounds)
 	}
 }
 
@@ -720,62 +706,39 @@ func TestClosureServiceEnsureClosuresUsesNextCloseRound(t *testing.T) {
 	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureClosures: %v", err)
 	}
-	if len(env.tasks.calls) != 1 || env.tasks.calls[0].closeRound != 2 {
-		t.Fatalf("task ensures = %#v, want close round 2", env.tasks.calls)
+	rounds := env.closures.closures[requirement.ID]
+	if len(rounds) != 2 || rounds[1].CloseRound != 2 {
+		t.Fatalf("closure rounds = %#v, want a second round numbered 2", rounds)
 	}
 }
 
 // TestClosureServiceEnsureClosuresSkipsUnverifiedRequirement is the auto-close
 // half of REL-Q3: the reconciler used to ensure the requirement.close steward
 // task as soon as a terminal (but inconclusive) run existed, which let the
-// steward close FR-025 with no visual verification. The reconciler must not
-// create the close task while the case has no definitive verification outcome.
+// steward close FR-025 with no visual verification. The direct-close reconciler
+// must not close the requirement while the case has no definitive verification.
 func TestClosureServiceEnsureClosuresSkipsUnverifiedRequirement(t *testing.T) {
 	env := newClosureEnv(t)
 	requirement := seedP0ClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
-	env.cases.byRequirement[requirement.ID] = []version.CaseVersionSnapshot{{
-		CaseVersionID: 1101, CaseID: 1100, RequirementID: requirement.ID,
-		RequirementVersionID: 1002, Title: "FR-025 publishes an article",
-	}}
-	env.runs.latest[requirement.ID] = map[int64]version.CaseRunSnapshot{
-		1101: {
-			CaseRunID: 1201, CaseVersionID: 1101,
-			Status: version.CaseRunInconclusive, FailureClass: "automation",
-		},
-	}
-	env.coverage.recorded[requirement.ID] = true
-	env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 1, RequirementClose: 1}
+	configureInconclusiveClosure(env, requirement.ID)
 
 	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureClosures: %v", err)
 	}
-	if len(env.tasks.calls) != 0 {
-		t.Fatalf("task ensures = %#v, want no close task for an unverified requirement", env.tasks.calls)
+	if env.closures.closeCalls != 0 {
+		t.Fatalf("close calls = %d, want 0 for an unverified requirement", env.closures.closeCalls)
+	}
+	if env.requirements.requirements[requirement.ID].Status != version.RequirementClarified {
+		t.Fatalf("unverified requirement was closed")
 	}
 }
 
-func TestClosureServiceEnsureClosuresReportsClosureLookupErrors(t *testing.T) {
+func TestClosureServiceEnsureClosuresReportsCloseErrors(t *testing.T) {
 	env := newClosureEnv(t)
 	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
 	configurePassingClosure(env, requirement.ID)
 	wantErr := errors.New("closure store down")
-	env.closures.latestErr = wantErr
-
-	err := env.svc.EnsureClosures(requestContext(), 701)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("EnsureClosures error = %v, want %v", err, wantErr)
-	}
-	if len(env.tasks.calls) != 0 {
-		t.Fatalf("task ensures = %#v, want none", env.tasks.calls)
-	}
-}
-
-func TestClosureServiceEnsureClosuresReportsTaskErrors(t *testing.T) {
-	env := newClosureEnv(t)
-	eligible := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
-	configurePassingClosure(env, eligible.ID)
-	wantErr := errors.New("task board down")
-	env.tasks.err = wantErr
+	env.closures.closeErr = wantErr
 
 	err := env.svc.EnsureClosures(requestContext(), 701)
 	if !errors.Is(err, wantErr) {

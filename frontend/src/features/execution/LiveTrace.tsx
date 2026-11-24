@@ -106,8 +106,8 @@ export function LiveTrace({ wave, caseRun, detail, loading, error, onRetry }: Li
                       >
                         {STEP_STATUS_LABEL[step.status]}
                       </Badge>
-                      {step.target_version_sut_id !== null ? (
-                        <Badge tone="info">SUT {step.target_version_sut_id}</Badge>
+                      {step.target_sut_id !== null ? (
+                        <Badge tone="info">SUT {step.target_sut_id}</Badge>
                       ) : null}
                       {evidenceCount > 0 ? (
                         <span className="text-muted-foreground">证据 {evidenceCount}</span>

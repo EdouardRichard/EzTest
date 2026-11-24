@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     EzTest v0.22 FA-5: the 12 typical requirements end to end on the FA stack.

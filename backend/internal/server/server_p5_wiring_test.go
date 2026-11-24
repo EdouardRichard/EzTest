@@ -9,7 +9,6 @@ import (
 	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
 	codeintelapi "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	resourceapi "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
-	visualapi "github.com/EdouardRichard/EzTest/backend/internal/visual/interfaces/httpapi"
 )
 
 // denyAdmin is the admin guard used by the wiring assertions: the route exists
@@ -20,9 +19,9 @@ func denyAdmin(next http.Handler) http.Handler {
 	})
 }
 
-// p5CodeIntelHandlers builds the handler set with zero-value services: the
+// codeIntelHandlers builds the handler set with zero-value services: the
 // wiring assertions only exercise route registration and middleware ordering.
-func p5CodeIntelHandlers() *CodeIntelHandlers {
+func codeIntelHandlers() *CodeIntelHandlers {
 	return &CodeIntelHandlers{
 		Index: codeintelapi.New(
 			&codeintelapp.IndexService{}, &codeintelapp.QueryService{},
@@ -35,11 +34,11 @@ func p5CodeIntelHandlers() *CodeIntelHandlers {
 	}
 }
 
-// TestP5WiringCodeIntelRoutesAreBehindAuthentication pins every spec §4.2
+// TestCodeIntelWiringRoutesAreBehindAuthentication pins every spec §4.2
 // code path (#1-#25) to the authenticated middleware.
-func TestP5WiringCodeIntelRoutesAreBehindAuthentication(t *testing.T) {
+func TestCodeIntelWiringRoutesAreBehindAuthentication(t *testing.T) {
 	mux := http.NewServeMux()
-	registerCodeIntelRoutes(mux, denyAuth, p5CodeIntelHandlers())
+	registerCodeIntelRoutes(mux, denyAuth, codeIntelHandlers())
 
 	cases := []struct {
 		method string
@@ -84,39 +83,9 @@ func TestP5WiringCodeIntelRoutesAreBehindAuthentication(t *testing.T) {
 	}
 }
 
-// TestP5WiringVisualRoutesUseRoleMiddleware pins the visual paths (#30-#38):
-// configuration/read routes require login, baseline approval requires admin.
-func TestP5WiringVisualRoutesUseRoleMiddleware(t *testing.T) {
-	mux := http.NewServeMux()
-	registerVisualRoutes(mux, denyAuth, denyAdmin, visualapi.New(visualapi.Deps{}))
-
-	authenticated := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/api/versions/1/visual/assertions"},
-		{http.MethodPut, "/api/versions/1/visual/assertions/2"},
-		{http.MethodGet, "/api/versions/1/visual/assertions/3"},
-		{http.MethodGet, "/api/versions/1/visual/assertions/3/baselines"},
-		{http.MethodGet, "/api/versions/1/visual/diffs"},
-		{http.MethodGet, "/api/versions/1/visual/diffs/4"},
-		{http.MethodGet, "/api/versions/1/visual/overview"},
-		{http.MethodGet, "/api/quality/visual-metrics"},
-	}
-	for _, tc := range authenticated {
-		if status := serve(mux, tc.method, tc.path); status != http.StatusUnauthorized {
-			t.Fatalf("%s %s status = %d, want 401", tc.method, tc.path, status)
-		}
-	}
-
-	if status := serve(mux, http.MethodPost, "/api/versions/1/visual/assertions/3/baselines"); status != http.StatusForbidden {
-		t.Fatalf("baseline approval status = %d, want 403 (admin middleware)", status)
-	}
-}
-
-// TestP5WiringResourceProposalConfirmRejectAreAdmin pins the four P5 resource
+// TestCodeIntelWiringResourceProposalConfirmRejectAreAdmin pins the four P5 resource
 // confirmation routes (#26-#29) to the admin middleware.
-func TestP5WiringResourceProposalConfirmRejectAreAdmin(t *testing.T) {
+func TestCodeIntelWiringResourceProposalConfirmRejectAreAdmin(t *testing.T) {
 	mux := http.NewServeMux()
 	registerResourceRoutes(mux, denyAuth, denyAdmin, resourceapi.New(nil))
 
@@ -132,9 +101,9 @@ func TestP5WiringResourceProposalConfirmRejectAreAdmin(t *testing.T) {
 	}
 }
 
-// TestP5WiringServerNilOptionalDeps pins that a P5 deployment can start with
+// TestCodeIntelWiringServerNilOptionalDeps pins that a P5 deployment can start with
 // only the base wiring and that the P5 surfaces are registered when provided.
-func TestP5WiringServerNilOptionalDeps(t *testing.T) {
+func TestCodeIntelWiringServerNilOptionalDeps(t *testing.T) {
 	handler := New(Deps{Version: "0.2.0-p8"})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
@@ -157,7 +126,6 @@ func TestP5WiringServerNilOptionalDeps(t *testing.T) {
 	// unmounted, exactly like the P4 delivery/chain handlers.
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/versions/1/code/repos"},
-		{http.MethodGet, "/api/versions/1/visual/overview"},
 	} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
@@ -167,21 +135,18 @@ func TestP5WiringServerNilOptionalDeps(t *testing.T) {
 	}
 }
 
-// TestP5WiringServerMountsP5Deps pins that the Deps fields are actually read by
+// TestCodeIntelWiringServerMountsCodeIntelDeps pins that the Deps fields are actually read by
 // New: a non-nil handler set makes the paths routable (401 without a bearer
 // instead of 404) and a nil set keeps them unmounted.
-func TestP5WiringServerMountsP5Deps(t *testing.T) {
+func TestCodeIntelWiringServerMountsCodeIntelDeps(t *testing.T) {
 	handler := New(Deps{
 		Version:   "0.2.0-p8",
-		CodeIntel: p5CodeIntelHandlers(),
-		Visual:    visualapi.New(visualapi.Deps{}),
+		CodeIntel: codeIntelHandlers(),
 	})
 
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/versions/1/code/anchors"},
 		{http.MethodGet, "/api/versions/1/code/impact"},
-		{http.MethodGet, "/api/versions/1/visual/assertions"},
-		{http.MethodGet, "/api/quality/visual-metrics"},
 	} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))

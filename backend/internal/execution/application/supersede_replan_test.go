@@ -101,7 +101,7 @@ func TestSupersedeIsSurfaced(t *testing.T) {
 	f.versions.bindings[100] = task6Binding(100, "running", 5001, 5002)
 	// A single global slot keeps case 301's run pending after the wave is
 	// planned and case 300 has taken the slot.
-	f.scheduler.quota = domainQuota(1, 2, 1)
+	f.scheduler = f.newSchedulerWithQuota(domainQuota(1), f.quota)
 	f.registry.executor = activeExecutor(f)
 
 	if _, err := f.intent.EnsureInitialIntentsForCases(ctx, 100, []int64{1300, 1301}); err != nil {

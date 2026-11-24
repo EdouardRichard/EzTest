@@ -59,7 +59,7 @@ func actorAuth(next http.Handler) http.Handler {
 
 // newW0Mux assembles the W0 route table behind denyAuth. It mirrors the
 // production registration calls (registerW0Routes/registerStageRoutes/
-// registerP6Routes/execution Register) without a database.
+// registerReadModelRoutes/execution Register) without a database.
 func newW0Mux(t *testing.T) *http.ServeMux {
 	t.Helper()
 	deps := Deps{
@@ -71,7 +71,7 @@ func newW0Mux(t *testing.T) *http.ServeMux {
 	mux := http.NewServeMux()
 	registerStageRoutes(mux, denyAuth, stageHandler)
 	registerW0Routes(mux, denyAuth, deps)
-	registerP6Routes(mux, denyAuth, denyAuth, &P6Handlers{
+	registerReadModelRoutes(mux, denyAuth, denyAuth, &ReadModelHandlers{
 		VersionRead: versionapi.NewVersionReadHandler(nil, nil),
 	})
 	executionhttp.New(executionhttp.Deps{}).Register(mux, denyAuth, denyAuth)

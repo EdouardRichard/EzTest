@@ -99,7 +99,7 @@ func newExportAppFixture(t *testing.T) (*ExportService, *fakeRepo, *fakeExportSt
 	repo.versionTitle = "登录版本"
 	repo.scenarios = []design.Scenario{{
 		ID: 5001, VersionID: 1001, RequirementID: 3001, RequirementVersionID: 3002,
-		Name: "正常登录", Description: "正常路径", VersionSUTIDs: []int64{9001},
+		Name: "正常登录", Description: "正常路径",
 	}}
 	seedFakeCase(t, repo, 7001, 5001, "账号密码登录成功", design.CaseStatusDraft)
 	seedFakeCase(t, repo, 7002, 5001, "旧用例", design.CaseStatusStale)

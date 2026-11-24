@@ -3,6 +3,7 @@ package llminfra_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -341,7 +342,7 @@ func writeResponsesCompletion(w http.ResponseWriter, content string) {
 
 // TestResponsesClientErrorIsProtocolError pins the 4xx classification: a
 // parameter/capability rejection is a typed ProtocolError, is not retried, and
-// never leaks the configured API key.
+// carries the provider message verbatim (GD-01: credentials are plaintext).
 func TestResponsesClientErrorIsProtocolError(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -372,8 +373,9 @@ func TestResponsesClientErrorIsProtocolError(t *testing.T) {
 	if !strings.Contains(message, "HTTP 400") || !strings.Contains(message, "invalid parameter") {
 		t.Fatalf("error = %q", message)
 	}
-	if strings.Contains(message, testAPIKey) {
-		t.Fatalf("api key leaked in error %q", message)
+	// GD-01 (Q05=B): the provider message, including the key, stays plaintext.
+	if !strings.Contains(message, testAPIKey) {
+		t.Fatalf("api key must appear verbatim in error (GD-01 plaintext): %q", message)
 	}
 }
 
@@ -687,5 +689,144 @@ func TestResponsesNormalizesPromptCacheUsage(t *testing.T) {
 				t.Fatalf("usage fabricated cache_hit: %#v", response.Usage)
 			}
 		})
+	}
+}
+
+// responsesReasoningStreamSSE is a Responses stream whose terminal
+// response.completed event carries the full output array, including the
+// provider-issued reasoning item (id + summary + encrypted content) that the
+// next tool turn must replay verbatim (spec §7.2).
+const responsesReasoningStreamSSE = `event: response.reasoning_summary.delta
+data: {"type":"response.reasoning_summary.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"I need the file."}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"path\":\"README.md\"}"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I need the file."}],"encrypted_content":"opaque-reasoning"},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"README.md\"}"}],"usage":{"input_tokens":17,"output_tokens":6,"total_tokens":23}}}
+
+`
+
+// TestResponsesStreamReasoningItemReplay pins the streaming half of the
+// ReasoningItems parity gap: the terminal delta must carry the provider
+// reasoning items captured from the completed output, and a second turn built
+// from the streamed first turn must replay them verbatim on the wire — exactly
+// like the non-streaming TestResponsesReasoningItemPreserved.
+func TestResponsesStreamReasoningItemReplay(t *testing.T) {
+	ctx := context.Background()
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodies = append(bodies, captureChatBody(t, r))
+		if len(bodies) == 1 {
+			writeResponsesSSE(t, w, responsesReasoningStreamSSE)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_2","object":"response","status":"completed",
+			"output":[{"type":"message","id":"msg_2","role":"assistant","content":[
+				{"type":"output_text","text":"the file says ok"}
+			]}]
+		}`)
+	}))
+	defer server.Close()
+
+	client := llminfra.NewClient()
+	cfg := responsesConfig(server.URL+"/v1", 0)
+	tools := []llmapp.ToolDefinition{{
+		Name:        "read_file",
+		Description: "read a file",
+		Parameters:  []byte(`{"type":"object","properties":{"path":{"type":"string"}}}`),
+	}}
+	user := llmapp.ChatMessage{Role: "user", Content: "read the README"}
+
+	var reasoning strings.Builder
+	var arguments strings.Builder
+	var callID, callName, finishReason string
+	var reasoningItems []json.RawMessage
+	streamErr := client.Stream(ctx, cfg, llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: []llmapp.ChatMessage{user},
+		Tools:    tools,
+	}, func(delta llmapp.Delta) {
+		reasoning.WriteString(delta.ReasoningContent)
+		if delta.ToolCall != nil {
+			if delta.ToolCall.ID != "" {
+				callID = delta.ToolCall.ID
+			}
+			if delta.ToolCall.Name != "" {
+				callName = delta.ToolCall.Name
+			}
+			arguments.WriteString(delta.ToolCall.Arguments)
+		}
+		if delta.FinishReason != "" {
+			finishReason = delta.FinishReason
+		}
+		if len(delta.ReasoningItems) > 0 {
+			reasoningItems = delta.ReasoningItems
+		}
+	})
+	if streamErr != nil {
+		t.Fatalf("Stream: %v", streamErr)
+	}
+	if reasoning.String() != "I need the file." {
+		t.Fatalf("reasoning = %q, want the reasoning summary text", reasoning.String())
+	}
+	if len(reasoningItems) != 1 {
+		t.Fatalf("terminal reasoning items = %#v, want the provider item preserved", reasoningItems)
+	}
+	if callID != "call_1" || callName != "read_file" || arguments.String() != `{"path":"README.md"}` {
+		t.Fatalf("tool call = id %q name %q arguments %q", callID, callName, arguments.String())
+	}
+	if finishReason != "tool_calls" {
+		t.Fatalf("finish reason = %q, want tool_calls", finishReason)
+	}
+
+	history := []llmapp.ChatMessage{
+		user,
+		{
+			Role:             "assistant",
+			ReasoningContent: reasoning.String(),
+			ReasoningItems:   reasoningItems,
+			ToolCalls:        []llmapp.ToolCall{{ID: callID, Name: callName, Arguments: arguments.String()}},
+		},
+		{Role: "tool", ToolCallID: callID, Content: `{"status":"ok"}`},
+	}
+	second, err := client.Chat(ctx, cfg, llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: history,
+		Tools:    tools,
+	})
+	if err != nil {
+		t.Fatalf("second Chat: %v", err)
+	}
+	if second.Content != "the file says ok" {
+		t.Fatalf("second content = %q", second.Content)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("requests = %d, want 2", len(bodies))
+	}
+	input, ok := bodies[1]["input"].([]any)
+	if !ok || len(input) != 4 {
+		t.Fatalf("second request input = %#v", bodies[1]["input"])
+	}
+	replayed, ok := input[1].(map[string]any)
+	if !ok || replayed["type"] != "reasoning" {
+		t.Fatalf("replayed reasoning item = %#v", input[1])
+	}
+	if replayed["id"] != "rs_1" || replayed["encrypted_content"] != "opaque-reasoning" {
+		t.Fatalf("replayed reasoning item = %#v, want the provider item verbatim", replayed)
+	}
+	call, ok := input[2].(map[string]any)
+	if !ok || call["type"] != "function_call" || call["call_id"] != "call_1" {
+		t.Fatalf("function_call item = %#v", input[2])
+	}
+	toolOutput, ok := input[3].(map[string]any)
+	if !ok || toolOutput["type"] != "function_call_output" {
+		t.Fatalf("function_call_output item = %#v", input[3])
 	}
 }

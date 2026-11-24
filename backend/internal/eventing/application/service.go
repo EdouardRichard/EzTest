@@ -3,6 +3,7 @@ package eventingapp
 import (
 	"context"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -17,12 +18,31 @@ const (
 	MaxSnapshotLimit = 200
 )
 
-var channelPattern = regexp.MustCompile(`^(?:system|version:[1-9][0-9]*|user:[1-9][0-9]*)$`)
+// runChannelPrefix is the ONE spelling of the run transcript channel prefix
+// (v0.2.4-D T8, R-D5). The whitelist pattern, the producer and the admin-gate
+// recognizer are all derived from it.
+const runChannelPrefix = "run:"
 
-// ValidChannel reports whether channel is one of the P0 channels:
-// system, version:{id} or user:{id}.
+var channelPattern = regexp.MustCompile(`^(?:system|version:[1-9][0-9]*|user:[1-9][0-9]*|` + runChannelPrefix + `[1-9][0-9]*)$`)
+
+// ValidChannel reports whether channel is one of the supported channels:
+// system, version:{id}, user:{id} or run:{id}.
 func ValidChannel(channel string) bool {
 	return channelPattern.MatchString(channel)
+}
+
+// RunChannel is the ONE producer of a run's transcript channel name. Publishers
+// and subscribers must both use it so the two can never disagree.
+func RunChannel(runID int64) string {
+	return runChannelPrefix + strconv.FormatInt(runID, 10)
+}
+
+// IsRunChannel reports whether channel carries a run transcript. Only these
+// channels are admin-only (SC-D3/R-D4); system/version/user stay open to any
+// logged-in user. An invalid channel is not a run channel: validation rejects it
+// first, so the role gate never answers for a malformed request.
+func IsRunChannel(channel string) bool {
+	return strings.HasPrefix(channel, runChannelPrefix) && ValidChannel(channel)
 }
 
 // Snapshot is one page of a channel's event log.

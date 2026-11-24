@@ -57,8 +57,8 @@ const (
 
 // LLMError is the application-level classified LLM failure: what kind of
 // failure it is, the upstream HTTP status (0 when the failure never reached the
-// wire), the redacted provider message and the actionable next step. An
-// unclassified infrastructure error is never represented by this type.
+// wire), the provider message (GD-01: plaintext) and the actionable next step.
+// An unclassified infrastructure error is never represented by this type.
 type LLMError struct {
 	Kind            LLMErrorKind
 	StatusCode      int
@@ -67,7 +67,7 @@ type LLMError struct {
 	Err             error
 }
 
-// Error renders the classified failure without adding secrets.
+// Error renders the classified failure from the provider message.
 func (e *LLMError) Error() string {
 	if e == nil {
 		return "llm request failed"
@@ -215,11 +215,12 @@ func classifyLLMError(err error) (*LLMError, bool) {
 // Every non-transient 4xx-of-the-upstream becomes a non-retryable 400 whose
 // message names the next action; transient failures stay a retryable 503
 // ai_unavailable (spec §5.6/§7.4).
-func classifiedPlatformError(classified *LLMError, secret string) error {
+func classifiedPlatformError(classified *LLMError) error {
 	if classified == nil {
 		return aiUnavailable("llm request failed")
 	}
-	message := redact(strings.TrimSpace(classified.ProviderMessage), secret)
+	// GD-01 (Q05=B): the provider message is kept verbatim (plaintext).
+	message := strings.TrimSpace(classified.ProviderMessage)
 	kind := normalizeLLMKind(classified)
 	action := classified.Action
 	details := map[string]any{

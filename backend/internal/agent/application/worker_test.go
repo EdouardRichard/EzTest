@@ -448,7 +448,6 @@ func TestWorkerClaimsOnlyAgentProductTeams(t *testing.T) {
 		agent.TeamDesign,
 		agent.TeamExecution,
 		agent.TeamDelivery,
-		agent.TeamSteward,
 	}
 	for _, teams := range queue.claimTeams {
 		if !slices.Equal(teams, productTeams) {

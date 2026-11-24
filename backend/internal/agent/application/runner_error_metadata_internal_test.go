@@ -20,9 +20,11 @@ func toolCallForTest(id, name string) llmapp.ToolCall {
 
 func TestAppendToolPartsForwardsStructuredErrorMetadata(t *testing.T) {
 	runner := &Runner{}
-	toolErr := tools.InvalidWithAllowed("cases[0].assertions[0].database_id",
-		"database_id is not bound to this version", []string{"11", "12"},
-		"call sut.database_list first")
+	// A v0.2.4-B contract error: covered_acs naming an id outside the
+	// requirement's AC set. The metadata plumbing under test is field-agnostic.
+	toolErr := tools.InvalidWithAllowed("cases[0].covered_acs",
+		"acceptance criterion AC-9 is not in this requirement version", []string{"AC-1", "AC-2"},
+		"copy the id from the requirement's acceptance_criteria")
 
 	state := &runState{}
 	runner.appendToolParts(state, toolCallForTest("call_meta", "case.graph_propose"), `{"error":{}}`, toolErr, 5)
@@ -36,11 +38,11 @@ func TestAppendToolPartsForwardsStructuredErrorMetadata(t *testing.T) {
 	if part.Data["field"] != toolErr.Field {
 		t.Fatalf("field = %#v, want %q", part.Data["field"], toolErr.Field)
 	}
-	if hint, _ := part.Data["hint"].(string); hint == "" || !strings.Contains(hint, "sut.database_list") {
+	if hint, _ := part.Data["hint"].(string); hint == "" || !strings.Contains(hint, "acceptance_criteria") {
 		t.Fatalf("hint = %#v", part.Data["hint"])
 	}
 	allowed, ok := part.Data["allowed"].([]string)
-	if !ok || len(allowed) != 2 || allowed[0] != "11" {
+	if !ok || len(allowed) != 2 || allowed[0] != "AC-1" {
 		t.Fatalf("allowed = %#v", part.Data["allowed"])
 	}
 

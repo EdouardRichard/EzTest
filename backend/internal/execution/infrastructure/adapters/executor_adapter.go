@@ -30,30 +30,26 @@ var (
 	ErrExecutorOffline = errors.New("executor is offline")
 )
 
-// BrowserAdapter adapts the executor protocol client to the execution browser
-// port. One client call maps one action; context lifecycle is owned by the
-// CaseRunner.
-type BrowserAdapter struct {
+// ExecutionAdapter adapts the executor protocol v2 client to the execution port.
+// One client call maps one protocol operation; the session lifecycle is owned by
+// the CaseRunner. Every write carries the session lease epoch so the executor
+// fences a stale dispatch.
+type ExecutionAdapter struct {
 	client executorinfra.Client
 	router *ExecutorRouter
 }
 
-// NewBrowserAdapterWithRouter wires the browser executor adapter with the P8
+// NewExecutionAdapterWithRouter wires the execution adapter with the
 // per-executor router. The router takes precedence over client.
-func NewBrowserAdapterWithRouter(router *ExecutorRouter) *BrowserAdapter {
-	return &BrowserAdapter{router: router}
+func NewExecutionAdapterWithRouter(router *ExecutorRouter) *ExecutionAdapter {
+	return &ExecutionAdapter{router: router}
 }
 
-var _ executionapp.BrowserExecutor = (*BrowserAdapter)(nil)
-
-func (a *BrowserAdapter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
-	client, _, err := a.clientForDiagnostics(ctx, executorID)
-	return client, err
-}
+var _ executionapp.ExecutionExecutor = (*ExecutionAdapter)(nil)
 
 // clientForDiagnostics also returns the routing provenance merged into the
 // client's structured error details/log line.
-func (a *BrowserAdapter) clientForDiagnostics(ctx context.Context, executorID int64) (executorinfra.Client, executorinfra.CallDiagnostics, error) {
+func (a *ExecutionAdapter) clientForDiagnostics(ctx context.Context, executorID int64) (executorinfra.Client, executorinfra.CallDiagnostics, error) {
 	diagnostics := executorinfra.CallDiagnostics{OwnerExecutorID: executorID}
 	if a.router != nil {
 		client, route, err := a.router.clientForDiagnostics(ctx, executorID)
@@ -70,8 +66,8 @@ func (a *BrowserAdapter) clientForDiagnostics(ctx context.Context, executorID in
 	return a.client, diagnostics, nil
 }
 
-// CreateContext creates one executor browser context and returns its id.
-func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.BrowserContextSpec) (string, error) {
+// CreateSession creates one executor session and returns its id.
+func (a *ExecutionAdapter) CreateSession(ctx context.Context, spec executionapp.SessionSpec) (string, error) {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, spec.ExecutorID)
 	if err != nil {
 		return "", err
@@ -81,11 +77,16 @@ func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.Br
 	diagnostics.CaseRunID = caseRunIDFromMetadata(spec.Metadata)
 	diagnostics.Attempt = attemptFromMetadata(spec.Metadata)
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	info, err := client.CreateContext(ctx, executorinfra.CreateContextInput{
-		Key:          spec.Key,
-		AllowedHosts: spec.AllowedHosts,
-		BaseURL:      spec.BaseURL,
-		Metadata:     spec.Metadata,
+	var lease *executorinfra.Lease
+	if spec.LeaseEpoch > 0 || spec.LeaseTTL > 0 {
+		lease = &executorinfra.Lease{Epoch: spec.LeaseEpoch, TTL: spec.LeaseTTL}
+	}
+	info, err := client.CreateSession(ctx, executorinfra.CreateSessionInput{
+		Key:       spec.Key,
+		Workspace: spec.Workspace,
+		BaseURL:   spec.BaseURL,
+		Metadata:  spec.Metadata,
+		Lease:     lease,
 	})
 	if err != nil {
 		return "", err
@@ -93,93 +94,237 @@ func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.Br
 	return info.ID, nil
 }
 
-// Action runs one executor action and maps its envelope. Only context_id (plus
-// the route provenance) is attached here: case_run_id/attempt are stamped on
-// the create metadata, so an Action (or Cancel/Close) transport failure carries
-// context_id but no attempt until a caller plumbs it.
-func (a *BrowserAdapter) Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
+// Exec runs one command in the session. A timed-out command still returns its
+// recorded result alongside the typed error so the caller can settle the evidence
+// of what actually ran.
+func (a *ExecutionAdapter) Exec(ctx context.Context, executorID int64, sessionID string, command executionapp.ExecCommand, leaseEpoch int64) (executionapp.ExecOutcome, error) {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
-		return executionapp.BrowserActionResult{}, err
+		return executionapp.ExecOutcome{}, err
 	}
-	diagnostics.ContextID = contextID
+	diagnostics.SessionID = sessionID
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	result, err := client.Action(ctx, contextID, action, args)
-	if err != nil {
-		return executionapp.BrowserActionResult{}, err
+	result, err := client.Exec(ctx, sessionID, executorinfra.ExecInput{
+		Argv:       command.Argv,
+		Shell:      command.Shell,
+		Stdin:      command.Stdin,
+		TimeoutMS:  command.TimeoutMS,
+		Background: command.Background,
+		Env:        command.Env,
+		LeaseEpoch: leaseEpoch,
+	})
+	outcome := executionapp.ExecOutcome{
+		SessionID:       sessionID,
+		CommandID:       result.CommandID,
+		Exit:            result.Exit,
+		Outcome:         result.Outcome,
+		DurationMS:      result.DurationMS,
+		Stdout:          result.Stdout,
+		Stderr:          result.Stderr,
+		StdoutTruncated: result.StdoutTruncated,
+		StderrTruncated: result.StderrTruncated,
+		StdoutRef:       result.StdoutRef,
+		StderrRef:       result.StderrRef,
+		Background:      result.Background,
+		TimedOut:        result.TimedOut,
+		Cancelled:       result.Cancelled,
 	}
-	artifacts := make([]executionapp.BrowserArtifact, 0, len(result.Artifacts))
-	for _, artifact := range result.Artifacts {
-		artifacts = append(artifacts, executionapp.BrowserArtifact{
-			Kind:     artifact.Kind,
-			MIME:     artifact.MIME,
-			Base64:   artifact.Base64,
-			SHA256:   artifact.SHA256,
-			Filename: artifact.Filename,
-			Bytes:    artifact.Bytes,
+	return outcome, err
+}
+
+// Shell runs one PTY shell operation in the session (create/write/read/close/
+// wait). The op vocabulary passes through verbatim: it is the protocol's own.
+func (a *ExecutionAdapter) Shell(ctx context.Context, executorID int64, sessionID string, op executionapp.ShellOperation, leaseEpoch int64) (executionapp.ShellOutcome, error) {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return executionapp.ShellOutcome{}, err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	result, err := client.Shell(ctx, sessionID, executorinfra.ShellRequest{
+		Op:         op.Op,
+		ShellID:    op.ShellID,
+		Argv:       op.Argv,
+		Cols:       op.Cols,
+		Rows:       op.Rows,
+		Env:        op.Env,
+		Data:       op.Data,
+		Since:      op.Since,
+		TimeoutMS:  op.TimeoutMS,
+		LeaseEpoch: leaseEpoch,
+	})
+	if err != nil {
+		return executionapp.ShellOutcome{}, err
+	}
+	return executionapp.ShellOutcome{
+		ShellID:    result.ShellID,
+		PID:        result.PID,
+		Status:     result.Status,
+		Data:       result.Data,
+		NextCursor: result.NextCursor,
+		TotalBytes: result.TotalBytes,
+		Truncated:  result.Truncated,
+		Exit:       result.Exit,
+		Outcome:    result.Outcome,
+		OK:         result.OK,
+	}, nil
+}
+
+// Files runs one workspace files operation in the session (upload/download/list).
+func (a *ExecutionAdapter) Files(ctx context.Context, executorID int64, sessionID string, op executionapp.FileOperation, leaseEpoch int64) (executionapp.FileOutcome, error) {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return executionapp.FileOutcome{}, err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	result, err := client.Files(ctx, sessionID, executorinfra.FileRequest{
+		Op:         op.Op,
+		Path:       op.Path,
+		Base64:     op.Base64,
+		LeaseEpoch: leaseEpoch,
+	})
+	if err != nil {
+		return executionapp.FileOutcome{}, err
+	}
+	files := make([]executionapp.FileEntry, 0, len(result.Files))
+	for _, entry := range result.Files {
+		files = append(files, executionapp.FileEntry{
+			Path:  entry.Path,
+			Bytes: entry.Bytes,
+			MIME:  entry.MIME,
+			Dir:   entry.Dir,
 		})
 	}
-	mapped := executionapp.BrowserActionResult{
-		OK:        result.OK,
-		Result:    result.Result,
-		Artifacts: artifacts,
-	}
-	if result.Error != nil {
-		mapped.Error = &executionapp.BrowserActionError{Code: result.Error.Code, Message: result.Error.Message}
-	}
-	return mapped, nil
+	return executionapp.FileOutcome{
+		Path:      result.Path,
+		Bytes:     result.Bytes,
+		SHA256:    result.SHA256,
+		MIME:      result.MIME,
+		Base64:    result.Base64,
+		Files:     files,
+		Truncated: result.Truncated,
+	}, nil
 }
 
-// Cancel aborts the in-flight action of one context (best-effort).
-func (a *BrowserAdapter) Cancel(ctx context.Context, executorID int64, contextID string) error {
+// Artifacts pulls the session recording ledger from an absolute cursor.
+func (a *ExecutionAdapter) Artifacts(ctx context.Context, executorID int64, sessionID string, since int64) (executionapp.ArtifactPage, error) {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return executionapp.ArtifactPage{}, err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	page, err := client.Artifacts(ctx, sessionID, since)
+	if err != nil {
+		return executionapp.ArtifactPage{}, err
+	}
+	artifacts := make([]executionapp.ExecutionArtifact, 0, len(page.Artifacts))
+	for _, artifact := range page.Artifacts {
+		artifacts = append(artifacts, executionapp.ExecutionArtifact{
+			Kind:            artifact.Kind,
+			CommandID:       artifact.CommandID,
+			Path:            artifact.Path,
+			SHA256:          artifact.SHA256,
+			Size:            artifact.Size,
+			MIME:            artifact.MIME,
+			Filename:        artifact.Filename,
+			Base64:          artifact.Base64,
+			ContentOmitted:  artifact.ContentOmitted,
+			ContentReason:   artifact.ContentReason,
+			RecordingFailed: artifact.RecordingFailed,
+			Error:           artifact.Error,
+		})
+	}
+	return executionapp.ArtifactPage{
+		Artifacts:      artifacts,
+		NextCursor:     page.NextCursor,
+		BaseCursor:     page.BaseCursor,
+		Evicted:        page.Evicted,
+		Gap:            page.Gap,
+		Missed:         page.Missed,
+		EvictionFailed: page.EvictionFailed,
+	}, nil
+}
+
+// Trace reads the session's trace file reference.
+func (a *ExecutionAdapter) Trace(ctx context.Context, executorID int64, sessionID string) (executionapp.TraceRef, error) {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return executionapp.TraceRef{}, err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	ref, err := client.Trace(ctx, sessionID)
+	if err != nil {
+		return executionapp.TraceRef{}, err
+	}
+	return executionapp.TraceRef{
+		Available: ref.Available,
+		Path:      ref.Path,
+		Bytes:     ref.Bytes,
+		SHA256:    ref.SHA256,
+		MIME:      ref.MIME,
+	}, nil
+}
+
+// RenewLease renews (or, with a higher epoch, takes over) one session lease.
+func (a *ExecutionAdapter) RenewLease(ctx context.Context, executorID int64, sessionID string, leaseEpoch int64) error {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
-	diagnostics.ContextID = contextID
+	diagnostics.SessionID = sessionID
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	_, err = client.Cancel(ctx, contextID)
-	if isContextNotFound(err) {
+	_, err = client.RenewLease(ctx, sessionID, leaseEpoch)
+	return err
+}
+
+// NetworkLog reads the session's recorded browser traffic log (pure CDP
+// recording, T16; design §4.3). The raw payload is returned verbatim for the
+// discovery capture to parse and store as network evidence.
+func (a *ExecutionAdapter) NetworkLog(ctx context.Context, executorID int64, sessionID string, tail int) (json.RawMessage, error) {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return nil, err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	return client.NetworkLog(ctx, sessionID, tail)
+}
+
+// Cancel aborts the in-flight command of one session (best-effort).
+func (a *ExecutionAdapter) Cancel(ctx context.Context, executorID int64, sessionID string) error {
+	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
+	if err != nil {
+		return err
+	}
+	diagnostics.SessionID = sessionID
+	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
+	_, err = client.Cancel(ctx, sessionID)
+	if isSessionNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// Close deletes one context (best-effort: a missing context is already gone).
-func (a *BrowserAdapter) Close(ctx context.Context, executorID int64, contextID string) error {
+// Close deletes one session (best-effort: a missing session is already gone).
+func (a *ExecutionAdapter) Close(ctx context.Context, executorID int64, sessionID string) error {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
-	diagnostics.ContextID = contextID
+	diagnostics.SessionID = sessionID
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	err = client.Close(ctx, contextID)
-	if isContextNotFound(err) {
+	err = client.CloseSession(ctx, sessionID)
+	if isSessionNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// ListContexts lists the executor contexts (orphan reconciliation).
-func (a *BrowserAdapter) ListContexts(ctx context.Context, executorID int64) ([]executionapp.BrowserContextRef, error) {
-	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
-	if err != nil {
-		return nil, err
-	}
-	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	contexts, err := client.ListContexts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]executionapp.BrowserContextRef, 0, len(contexts))
-	for _, contextInfo := range contexts {
-		refs = append(refs, executionapp.BrowserContextRef{ExecutorID: executorID, ID: contextInfo.ID, Key: contextInfo.Key})
-	}
-	return refs, nil
-}
-
-// ExecutorProbeAdapter adapts the executor client health/inventory surface to
-// the registry probe port.
+// ExecutorProbeAdapter adapts the executor client health surface to the registry
+// probe port.
 type ExecutorProbeAdapter struct {
 	client executorinfra.Client
 }
@@ -201,38 +346,24 @@ func (a *ExecutorProbeAdapter) Health(ctx context.Context) (executionapp.Executo
 		return executionapp.ExecutorHealth{}, err
 	}
 	return executionapp.ExecutorHealth{
-		Status:                 health.Status,
-		Version:                health.Version,
-		Contexts:               health.Contexts,
-		MaxContexts:            health.MaxContexts,
-		BrowserVersion:         health.BrowserVersion,
-		Error:                  health.Error,
-		Creating:               health.Creating,
-		LastContextCreateError: health.LastContextCreateError,
+		Status:            health.Status,
+		Version:           health.Version,
+		Sessions:          health.Sessions,
+		MaxSessions:       health.MaxSessions,
+		Draining:          health.Draining,
+		ReclaimedSessions: health.ReclaimedSessions,
+		Error:             health.Error,
 	}, nil
 }
 
-// ListContexts lists executor contexts for the pause/cleanup services.
-func (a *ExecutorProbeAdapter) ListContexts(ctx context.Context) ([]executionapp.ExecutorContextRef, error) {
-	contexts, err := a.client.ListContexts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]executionapp.ExecutorContextRef, 0, len(contexts))
-	for _, contextInfo := range contexts {
-		refs = append(refs, executionapp.ExecutorContextRef{ID: contextInfo.ID, Key: contextInfo.Key})
-	}
-	return refs, nil
-}
-
 // ExecutorControlAdapter adapts the executor client to the ExecutorControl port
-// used by pause/cancel/context-TTL cleanup.
+// used by pause/cancel/session-TTL cleanup.
 type ExecutorControlAdapter struct {
 	client executorinfra.Client
 	router *ExecutorRouter
 }
 
-// NewExecutorControlWithRouter wires the P8 per-executor control adapter.
+// NewExecutorControlWithRouter wires the per-executor control adapter.
 func NewExecutorControlWithRouter(router *ExecutorRouter) *ExecutorControlAdapter {
 	return &ExecutorControlAdapter{router: router}
 }
@@ -261,38 +392,38 @@ func (a *ExecutorControlAdapter) clientForDiagnostics(ctx context.Context, execu
 	return a.client, diagnostics, nil
 }
 
-// CancelContext aborts an in-flight action; a missing context is a no-op.
-func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, executorID int64, contextID string) error {
+// CancelSession aborts an in-flight command/action; a missing session is a no-op.
+func (a *ExecutorControlAdapter) CancelSession(ctx context.Context, executorID int64, sessionID string) error {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
-	diagnostics.ContextID = contextID
+	diagnostics.SessionID = sessionID
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	_, err = client.Cancel(ctx, contextID)
-	if isContextNotFound(err) {
+	_, err = client.Cancel(ctx, sessionID)
+	if isSessionNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// DeleteContext closes one executor context; a missing context is a no-op.
-func (a *ExecutorControlAdapter) DeleteContext(ctx context.Context, executorID int64, contextID string) error {
+// DeleteSession closes one executor session; a missing session is a no-op.
+func (a *ExecutorControlAdapter) DeleteSession(ctx context.Context, executorID int64, sessionID string) error {
 	client, diagnostics, err := a.clientForDiagnostics(ctx, executorID)
 	if err != nil {
 		return err
 	}
-	diagnostics.ContextID = contextID
+	diagnostics.SessionID = sessionID
 	ctx = executorinfra.WithCallDiagnostics(ctx, diagnostics)
-	err = client.Close(ctx, contextID)
-	if isContextNotFound(err) {
+	err = client.CloseSession(ctx, sessionID)
+	if isSessionNotFound(err) {
 		return nil
 	}
 	return err
 }
 
-// ListContexts lists every executor-side context (orphan reconciliation).
-func (a *ExecutorControlAdapter) ListContexts(ctx context.Context) ([]executionapp.ExecutorContext, error) {
+// ListSessions lists every executor-side session (orphan reconciliation).
+func (a *ExecutorControlAdapter) ListSessions(ctx context.Context) ([]executionapp.ExecutorSession, error) {
 	clients := []routedClient{}
 	if a.router != nil {
 		routed, err := a.router.clients(ctx)
@@ -307,38 +438,38 @@ func (a *ExecutorControlAdapter) ListContexts(ctx context.Context) ([]executiona
 		}
 		clients = []routedClient{{Client: client}}
 	}
-	refs := make([]executionapp.ExecutorContext, 0)
+	refs := make([]executionapp.ExecutorSession, 0)
 	for _, routed := range clients {
 		callCtx := executorinfra.WithCallDiagnostics(ctx, executorinfra.CallDiagnostics{OwnerExecutorID: routed.ExecutorID})
-		contexts, err := routed.Client.ListContexts(callCtx)
+		sessions, err := routed.Client.ListSessions(callCtx)
 		if err != nil {
 			return nil, err
 		}
-		for _, contextInfo := range contexts {
-			refs = append(refs, executionapp.ExecutorContext{
+		for _, session := range sessions {
+			refs = append(refs, executionapp.ExecutorSession{
 				ExecutorID: routed.ExecutorID,
-				ID:         contextInfo.ID,
-				Key:        contextInfo.Key,
+				ID:         session.ID,
+				Key:        session.Key,
 			})
 		}
 	}
 	return refs, nil
 }
 
-func isContextNotFound(err error) bool {
+func isSessionNotFound(err error) bool {
 	var apiErr *platform.Error
-	return errors.As(err, &apiErr) && apiErr.Code == "context_not_found"
+	return errors.As(err, &apiErr) && apiErr.Code == executorinfra.CodeSessionNotFound
 }
 
 // caseRunIDFromMetadata recovers the case_run correlation that the API stamps
-// in every browser context metadata (identity format string, but a numeric
-// value is accepted for direct callers/tests).
+// in every session metadata (identity format string, but a numeric value is
+// accepted for direct callers/tests).
 func caseRunIDFromMetadata(metadata map[string]any) int64 {
 	return int64FromMetadata(metadata, "case_run_id")
 }
 
 // attemptFromMetadata reads the dispatch attempt when the caller stamps it in
-// the browser context metadata.
+// the session metadata.
 func attemptFromMetadata(metadata map[string]any) int {
 	return int(int64FromMetadata(metadata, "attempt"))
 }

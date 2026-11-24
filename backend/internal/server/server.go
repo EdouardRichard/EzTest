@@ -37,7 +37,6 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
-	visualapi "github.com/EdouardRichard/EzTest/backend/internal/visual/interfaces/httpapi"
 	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -85,26 +84,34 @@ type Deps struct {
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
 	DesignStarter versionapp.DesignStarter
-	Execution     *executionhttp.Handler
-	// P4 delivery/chain/steward surfaces. They are optional (nil keeps a
+	// DesignJudgments is the T16 judgment application surface (override +
+	// read report). Optional: nil leaves the two judgment routes failing
+	// closed (503) instead of mounting a broken handler; the composition root
+	// always supplies it (T13's *designapp.JudgmentService).
+	DesignJudgments *designapp.JudgmentService
+	Execution       *executionhttp.Handler
+	// P4 delivery/chain/closure surfaces. They are optional (nil keeps a
 	// P0-P3 deployment unchanged) and are always mounted behind the bearer
 	// authentication middleware.
 	Delivery     *deliveryapi.Handler
 	Chain        *chainapi.Handler
 	Closure      *versionapp.ClosureService
 	VersionClose *versionapp.VersionCloseService
-	// P5 code-intelligence and visual surfaces. They are optional and are
-	// always mounted behind the bearer authentication middleware.
+	// Waivers is the two-level admin waiver surface (v0.2.4-G SC-G11). Optional:
+	// nil leaves the waiver routes unmounted; the composition root always wires
+	// it. The routes are admin-gated (Q7=A).
+	Waivers *versionapp.WaiverService
+	// P5 code-intelligence surface. It is optional and is always mounted behind
+	// the bearer authentication middleware.
 	CodeIntel *CodeIntelHandlers
-	Visual    *visualapi.Handler
 	// P6 quality/search/todos/global read surfaces. Optional; nil keeps a
 	// P0-P5 deployment unchanged.
-	P6 *P6Handlers
+	ReadModel *ReadModelHandlers
 	// P7 knowledge/orchestration/GC surfaces. Optional; nil keeps a P0-P6
 	// deployment unchanged and the internal executor push routes are mounted
 	// whenever the execution handler exists (the token middleware fails closed
 	// without a settings service).
-	P7 *P7Handlers
+	ControlPlane *ControlPlaneHandlers
 	// Jobs is the optional 0.2.1 job control surface (cancel/retry). Nil leaves
 	// both the direct and the version-scoped routes unmounted.
 	Jobs *agentapi.JobControlHandler
@@ -117,25 +124,28 @@ type Deps struct {
 	Load *load.Counter
 }
 
-// P7Handlers groups the optional P7 HTTP surfaces. The readiness probe is
+// ControlPlaneHandlers groups the optional P7 HTTP surfaces. The readiness probe is
 // registered by the orchestration handler itself (public), knowledge and GC
 // carry their own middleware classes, and the internal executor push routes are
-// mounted from the execution handler in registerP7Routes.
-type P7Handlers struct {
+// mounted from the execution handler in registerControlPlaneRoutes.
+type ControlPlaneHandlers struct {
 	Knowledge     *knowledgeapi.Handler
 	Orchestration *orchestrationapi.Handler
 	GC            *storageapi.GCHandler
 }
 
-// P6Handlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
+// ReadModelHandlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
 // added by the Agent Center wiring once that context lands.
-type P6Handlers struct {
+type ReadModelHandlers struct {
 	Quality     *qualityapi.Handler
 	Search      *searchapi.Handler
 	Todos       *workspaceapi.Handler
 	Global      *deliveryapi.GlobalHandler
 	AgentCenter *agentapi.AgentCenterHandler
 	Profiles    *agentapi.ProfileHandler
+	// Skills is the optional admin skill-library surface (v0.2.4-C). Nil
+	// leaves the /api/skills routes unmounted.
+	Skills *agentapi.SkillHandler
 	// VersionRead is the 0.2.1 version-scoped read surface (facts, plan items
 	// and work items). Nil leaves those routes unmounted so a P0-P5
 	// deployment keeps its route table.
@@ -210,16 +220,21 @@ func New(deps Deps) http.Handler {
 	if deps.Stage != nil {
 		designHandler.SetStageReader(deps.Stage)
 	}
-	registerDesignRoutes(mux, authenticated, designHandler)
+	if deps.DesignJudgments != nil {
+		designHandler.SetJudgmentService(deps.DesignJudgments)
+	}
+	registerDesignRoutes(mux, authenticated, admin, designHandler)
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
 	registerW0Routes(mux, authenticated, deps)
-	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
+	registerVersionReopenRoutes(mux, authenticated, versionHandler, requirementHandler)
+	if deps.Waivers != nil {
+		versionapi.RegisterWaiverRoutes(mux, admin, versionapi.NewWaiverHandler(deps.Waivers))
+	}
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
 	registerChainRoutes(mux, authenticated, deps.Chain)
 	registerCodeIntelRoutes(mux, authenticated, deps.CodeIntel)
-	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
-	registerP6Routes(mux, authenticated, admin, deps.P6)
-	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
+	registerReadModelRoutes(mux, authenticated, admin, deps.ReadModel)
+	registerControlPlaneRoutes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.ControlPlane)
 	registerJobRoutes(mux, authenticated, deps.Jobs)
 	registerContextPacketRoutes(mux, admin, deps.ContextPackets)
 
@@ -281,18 +296,18 @@ func normalizeDeps(deps Deps) Deps {
 	return deps
 }
 
-// registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration
+// registerControlPlaneRoutes mounts the optional P7 surfaces: knowledge, orchestration
 // (including the public GET /api/health/ready probe), storage GC admin routes
 // and the internal executor push endpoints. Nil handlers keep the route table
 // of a P0-P6 deployment unchanged. The internal routes need only the execution
 // handler; a nil settings service makes InternalTokenAuth fail closed (401)
 // instead of exposing them.
-func registerP7Routes(
+func registerControlPlaneRoutes(
 	mux *http.ServeMux,
 	authenticated, admin func(http.Handler) http.Handler,
 	execution *executionhttp.Handler,
 	settings *settingsapp.Service,
-	h *P7Handlers,
+	h *ControlPlaneHandlers,
 ) {
 	if h != nil {
 		if h.Knowledge != nil {
@@ -317,9 +332,9 @@ func registerP7Routes(
 	}
 }
 
-// registerP6Routes mounts the optional P6 read-model surfaces. A nil handler
+// registerReadModelRoutes mounts the optional P6 read-model surfaces. A nil handler
 // keeps the route table identical to a P0-P5 deployment.
-func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *P6Handlers) {
+func registerReadModelRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *ReadModelHandlers) {
 	if h == nil {
 		return
 	}
@@ -340,6 +355,9 @@ func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler
 	}
 	if h.Profiles != nil {
 		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
+	}
+	if h.Skills != nil {
+		agentapi.RegisterSkillRoutes(mux, admin, h.Skills)
 	}
 	if h.VersionRead != nil {
 		versionapi.RegisterVersionReadRoutes(mux, authenticated, h.VersionRead)
@@ -495,12 +513,17 @@ func registerTeamRoomRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("GET /api/versions/{id}/team-rooms/{team}", authenticated(http.HandlerFunc(h.Read)))
 }
 
-// registerDesignRoutes mounts the P2 design graph/confirmation/export API.
-func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *designapi.Handler) {
+// registerDesignRoutes mounts the P2 design graph/confirmation/export API
+// plus the T16 judgment override (admin-only) and read-report routes.
+func registerDesignRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *designapi.Handler) {
 	mux.Handle("GET /api/versions/{id}/design/graph", authenticated(http.HandlerFunc(h.ReadGraph)))
 	mux.Handle("GET /api/versions/{id}/design/overview", authenticated(http.HandlerFunc(h.Overview)))
 	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", authenticated(http.HandlerFunc(h.GetCase)))
 	mux.Handle("POST /api/versions/{id}/design/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	// T16: override is an admin management action (spec SC-E5); the judgment
+	// read report matches the graph/case read visibility (admin or user).
+	mux.Handle("POST /api/versions/{id}/design/judgments/{caseId}/override", admin(http.HandlerFunc(h.OverrideJudgment)))
+	mux.Handle("GET /api/versions/{id}/design/judgments", authenticated(http.HandlerFunc(h.ListJudgments)))
 	// W2-11 R-EX-6/API-41: rollback one auto-confirmed discovery case revision.
 	mux.Handle("POST /api/versions/{id}/case-versions/{caseVersionId}/rollback", authenticated(http.HandlerFunc(h.RollbackCaseVersion)))
 	mux.Handle("POST /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.CreateExport)))
@@ -510,31 +533,41 @@ func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) h
 }
 
 func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *resourceapi.Handler) {
-	// Catalog and SUT roots.
+	// v0.2.4-B inverted the hierarchy: environments are top-level, SUTs belong to
+	// an environment, and pages/APIs/databases belong to a SUT.
 	mux.Handle("GET /api/resources/catalog", authenticated(http.HandlerFunc(h.Catalog)))
-	mux.Handle("GET /api/resources/suts", authenticated(http.HandlerFunc(h.ListSUTs)))
-	mux.Handle("POST /api/resources/suts", admin(http.HandlerFunc(h.CreateSUT)))
-	mux.Handle("GET /api/resources/suts/{id}", authenticated(http.HandlerFunc(h.GetSUT)))
-	mux.Handle("PATCH /api/resources/suts/{id}", admin(http.HandlerFunc(h.UpdateSUT)))
-	mux.Handle("DELETE /api/resources/suts/{id}", admin(http.HandlerFunc(h.DeleteSUT)))
 
-	// Environments.
-	mux.Handle("GET /api/resources/suts/{id}/environments", authenticated(http.HandlerFunc(h.ListEnvironments)))
-	mux.Handle("POST /api/resources/suts/{id}/environments", admin(http.HandlerFunc(h.CreateEnvironment)))
+	// Environments (top-level).
+	mux.Handle("GET /api/resources/environments", authenticated(http.HandlerFunc(h.ListEnvironments)))
+	mux.Handle("POST /api/resources/environments", admin(http.HandlerFunc(h.CreateEnvironment)))
+	mux.Handle("GET /api/resources/environments/{id}", authenticated(http.HandlerFunc(h.GetEnvironment)))
 	mux.Handle("PATCH /api/resources/environments/{id}", admin(http.HandlerFunc(h.UpdateEnvironment)))
 	mux.Handle("DELETE /api/resources/environments/{id}", admin(http.HandlerFunc(h.DeleteEnvironment)))
 
+	// SUTs: created under an environment, listed globally.
+	mux.Handle("GET /api/resources/environments/{id}/suts", authenticated(http.HandlerFunc(h.ListEnvironmentSUTs)))
+	mux.Handle("POST /api/resources/environments/{id}/suts", admin(http.HandlerFunc(h.CreateSUT)))
+	mux.Handle("GET /api/resources/suts", authenticated(http.HandlerFunc(h.ListSUTs)))
+	mux.Handle("GET /api/resources/suts/{id}", authenticated(http.HandlerFunc(h.GetSUT)))
+	mux.Handle("PATCH /api/resources/suts/{id}", admin(http.HandlerFunc(h.UpdateSUT)))
+	mux.Handle("DELETE /api/resources/suts/{id}", admin(http.HandlerFunc(h.DeleteSUT)))
+	// R-B4: the admin read path for the append-only sut_registration fact table.
+	mux.Handle("GET /api/resources/suts/{id}/registrations", admin(http.HandlerFunc(h.ListSUTRegistrations)))
+	// R-B4/R-F1 (v0.2.4-F): the admin post-hoc audit/reject entry for an Agent-
+	// registered SUT (proposed/approved → rejected).
+	mux.Handle("POST /api/resources/suts/{id}/reject", admin(http.HandlerFunc(h.RejectSUT)))
+
 	// Pages.
-	mux.Handle("GET /api/resources/environments/{id}/pages", authenticated(http.HandlerFunc(h.ListPages)))
-	mux.Handle("POST /api/resources/environments/{id}/pages", admin(http.HandlerFunc(h.CreatePage)))
-	mux.Handle("POST /api/resources/environments/{id}/pages/import", admin(http.HandlerFunc(h.ImportPages)))
+	mux.Handle("GET /api/resources/suts/{id}/pages", authenticated(http.HandlerFunc(h.ListPages)))
+	mux.Handle("POST /api/resources/suts/{id}/pages", admin(http.HandlerFunc(h.CreatePage)))
+	mux.Handle("POST /api/resources/suts/{id}/pages/import", admin(http.HandlerFunc(h.ImportPages)))
 	mux.Handle("PATCH /api/resources/pages/{id}", admin(http.HandlerFunc(h.UpdatePage)))
 	mux.Handle("DELETE /api/resources/pages/{id}", admin(http.HandlerFunc(h.DeletePage)))
 
 	// APIs.
-	mux.Handle("GET /api/resources/environments/{id}/apis", authenticated(http.HandlerFunc(h.ListAPIs)))
-	mux.Handle("POST /api/resources/environments/{id}/apis", admin(http.HandlerFunc(h.CreateAPI)))
-	mux.Handle("POST /api/resources/environments/{id}/apis/import", admin(http.HandlerFunc(h.ImportAPIs)))
+	mux.Handle("GET /api/resources/suts/{id}/apis", authenticated(http.HandlerFunc(h.ListAPIs)))
+	mux.Handle("POST /api/resources/suts/{id}/apis", admin(http.HandlerFunc(h.CreateAPI)))
+	mux.Handle("POST /api/resources/suts/{id}/apis/import", admin(http.HandlerFunc(h.ImportAPIs)))
 	mux.Handle("PATCH /api/resources/apis/{id}", admin(http.HandlerFunc(h.UpdateAPI)))
 	mux.Handle("DELETE /api/resources/apis/{id}", admin(http.HandlerFunc(h.DeleteAPI)))
 
@@ -544,9 +577,9 @@ func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.H
 	mux.Handle("PATCH /api/resources/databases/{id}", admin(http.HandlerFunc(h.UpdateDatabase)))
 	mux.Handle("DELETE /api/resources/databases/{id}", admin(http.HandlerFunc(h.DeleteDatabase)))
 
-	// Test accounts.
-	mux.Handle("GET /api/resources/suts/{id}/accounts", authenticated(http.HandlerFunc(h.ListAccounts)))
-	mux.Handle("POST /api/resources/suts/{id}/accounts", admin(http.HandlerFunc(h.CreateAccount)))
+	// Test accounts: one global pool (v0.22 DB-15) with an optional SUT affinity.
+	mux.Handle("GET /api/resources/accounts", authenticated(http.HandlerFunc(h.ListAccounts)))
+	mux.Handle("POST /api/resources/accounts", admin(http.HandlerFunc(h.CreateAccount)))
 	mux.Handle("PATCH /api/resources/accounts/{id}", admin(http.HandlerFunc(h.UpdateAccount)))
 	mux.Handle("DELETE /api/resources/accounts/{id}", admin(http.HandlerFunc(h.DeleteAccount)))
 
@@ -576,10 +609,10 @@ func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.
 	h.Register(mux, authenticated, admin)
 }
 
-// registerVersionP4Routes mounts the P4 version/requirement reopen endpoints.
+// registerVersionReopenRoutes mounts the P4 version/requirement reopen endpoints.
 // They are always registered (an unwired service answers 500) so the contract
 // path is stable across deployments; the versions handler stays optional.
-func registerVersionP4Routes(
+func registerVersionReopenRoutes(
 	mux *http.ServeMux,
 	authenticated func(http.Handler) http.Handler,
 	versionHandler *versionapi.Handler,
@@ -656,18 +689,4 @@ func registerCodeIntelRoutes(mux *http.ServeMux, authenticated func(http.Handler
 	if h.Proposals != nil {
 		h.Proposals.Register(mux, authenticated)
 	}
-}
-
-// registerVisualRoutes mounts the P5 visual API (spec §4.2 ops #30-#38).
-// Configuration/read routes require a logged-in user; baseline approval is
-// admin-only. A nil handler leaves a P0-P4 deployment unchanged.
-func registerVisualRoutes(
-	mux *http.ServeMux,
-	authenticated, admin func(http.Handler) http.Handler,
-	h *visualapi.Handler,
-) {
-	if h == nil {
-		return
-	}
-	h.Register(mux, authenticated, admin)
 }

@@ -90,7 +90,7 @@ function buildListOptions(filters: IssueFilters): IssueListOptions {
   if (filters.status !== "all") options.status = filters.status
   if (filters.category !== "all") options.category = filters.category
   if (filters.severity !== "all") options.severity = filters.severity
-  if (filters.versionSutId !== "all") options.versionSutId = filters.versionSutId
+  if (filters.versionSutId !== "all") options.sutId = filters.versionSutId
   return options
 }
 
@@ -120,7 +120,7 @@ function sutLabel(issue: IssueView): string {
   const ids = Array.from(
     new Set(
       issue.refs
-        .map((ref) => ref.version_sut_id)
+        .map((ref) => ref.sut_id)
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     ),
   ).sort()
@@ -369,8 +369,8 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
     const values = new Set<string>()
     for (const issue of issues) {
       for (const ref of issue.refs) {
-        if (typeof ref.version_sut_id === "string" && ref.version_sut_id.length > 0) {
-          values.add(ref.version_sut_id)
+        if (typeof ref.sut_id === "string" && ref.sut_id.length > 0) {
+          values.add(ref.sut_id)
         }
       }
     }

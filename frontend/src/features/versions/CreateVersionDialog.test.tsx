@@ -67,9 +67,7 @@ describe("CreateVersionDialog", () => {
     })
     await waitFor(() =>
       expect(api.updateVersionBinding).toHaveBeenCalledWith("2001", {
-        repository_ids: [],
         account_ids: ["1601", "1602"],
-        scope_exclude: { pages: [], apis: [], databases: [] },
       }),
     )
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(versionFixture))

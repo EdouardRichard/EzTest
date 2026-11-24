@@ -35,20 +35,19 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 		versionID     = int64(7001)
 		sutID         = int64(7101)
 		environmentID = int64(7201)
-		versionSUTID  = int64(7301)
 		waveID        = int64(7401)
 		caseRunID     = int64(7501)
 	)
 	createVersion(t, pool, versionID)
+	// v0.2.4-B: the environment is top-level and the SUT belongs to it, so the
+	// observation is keyed by the SUT that owns the discovered page.
 	for _, statement := range []struct {
 		sql  string
 		args []any
 	}{
-		{`INSERT INTO sut (id, name, created_by) VALUES ($1, 'delta sut', 1)`, []any{sutID}},
-		{`INSERT INTO sut_environment (id, sut_id, name, base_url) VALUES ($1, $2, 'test', 'https://shop.example.com')`,
-			[]any{environmentID, sutID}},
-		{`INSERT INTO version_sut (id, version_id, sut_id, environment_id) VALUES ($1, $2, $3, $4)`,
-			[]any{versionSUTID, versionID, sutID, environmentID}},
+		{`INSERT INTO environment (id, name, status) VALUES ($1, 'test', 'active')`, []any{environmentID}},
+		{`INSERT INTO sut (id, environment_id, name, base_url, created_by)
+			VALUES ($1, $2, 'delta sut', 'https://shop.example.com', 1)`, []any{sutID, environmentID}},
 	} {
 		if _, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil {
 			t.Fatalf("seed %q: %v", statement.sql, err)
@@ -59,7 +58,7 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if err := executionRepo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
 		Kind: "page", Host: "shop.example.com", Path: "/orders/42",
 		ResourceTemplate: "/orders/{id}", MIME: "text/html",
-		VersionID: versionID, VersionSUTID: versionSUTID, EnvironmentID: environmentID,
+		VersionID: versionID, SUTID: sutID, EnvironmentID: environmentID,
 		WaveID: waveID, CaseRunID: caseRunID, Occurrences: 1,
 	}}); err != nil {
 		t.Fatalf("upsert observation: %v", err)
@@ -82,7 +81,7 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if len(result.New) != 1 {
 		t.Fatalf("delta new = %d, want 1: %+v", len(result.New), result)
 	}
-	page, found, err := resourceSvc.FindPageByRouteTemplate(ctx, environmentID, "/orders/{id}")
+	page, found, err := resourceSvc.FindPageByRouteTemplate(ctx, sutID, "/orders/{id}")
 	if err != nil || !found {
 		t.Fatalf("find proposed page found=%v err=%v", found, err)
 	}
@@ -96,8 +95,8 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("page facts = %d, want 1", len(facts))
 	}
-	if want := "page:env:7201:/orders/{id}"; facts[0].Key != want {
-		t.Fatalf("fact key = %q, want the P9 environment-qualified key %q", facts[0].Key, want)
+	if want := "page:sut:7101:/orders/{id}"; facts[0].Key != want {
+		t.Fatalf("fact key = %q, want the SUT-qualified key %q", facts[0].Key, want)
 	}
 	provenance, ok := facts[0].Payload["provenance"].(map[string]any)
 	if !ok || provenance["wave_id"] != "7401" || provenance["case_run_id"] != "7501" {
@@ -108,8 +107,8 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	var resourceID, factID *int64
 	if err := pool.QueryRow(ctx, `
 		SELECT decision, resource_id, fact_id FROM execution_discovery_observation
-		WHERE version_id = $1 AND version_sut_id = $2
-	`, versionID, versionSUTID).Scan(&decision, &resourceID, &factID); err != nil {
+		WHERE version_id = $1 AND sut_id = $2
+	`, versionID, sutID).Scan(&decision, &resourceID, &factID); err != nil {
 		t.Fatalf("read observation: %v", err)
 	}
 	if decision != "proposed" || resourceID == nil || factID == nil || *factID != facts[0].ID {
@@ -134,7 +133,7 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 		t.Fatalf("page facts after re-run = %d, want 1", len(factsAfter))
 	}
 	var pageCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE environment_id = $1`, environmentID).Scan(&pageCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE sut_id = $1`, sutID).Scan(&pageCount); err != nil {
 		t.Fatalf("count pages: %v", err)
 	}
 	if pageCount != 1 {
@@ -156,15 +155,15 @@ func TestDiscoveryDeltaWritesResourceFactAndObservation(t *testing.T) {
 	if len(rejected.New) != 0 || len(rejected.Rejected) != 1 {
 		t.Fatalf("delta after reject = new %d rejected %d: %+v", len(rejected.New), len(rejected.Rejected), rejected)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE environment_id = $1`, environmentID).Scan(&pageCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sut_page WHERE sut_id = $1`, sutID).Scan(&pageCount); err != nil {
 		t.Fatalf("count pages after reject: %v", err)
 	}
 	if pageCount != 1 {
 		t.Fatalf("rejected page was re-proposed: %d rows", pageCount)
 	}
 	if err := pool.QueryRow(ctx, `
-		SELECT decision FROM execution_discovery_observation WHERE version_id = $1 AND version_sut_id = $2
-	`, versionID, versionSUTID).Scan(&decision); err != nil {
+		SELECT decision FROM execution_discovery_observation WHERE version_id = $1 AND sut_id = $2
+	`, versionID, sutID).Scan(&decision); err != nil {
 		t.Fatalf("read decision after reject: %v", err)
 	}
 	if decision != "rejected" {

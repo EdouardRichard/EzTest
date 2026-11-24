@@ -33,33 +33,33 @@ func (f *fakeKnowledgeProposePort) ProposeKnowledge(_ context.Context, versionID
 
 func executeKnowledgePropose(t *testing.T, port *fakeKnowledgeProposePort, scope Scope, payload string) (any, error) {
 	t.Helper()
-	registry := NewP7Registry(Deps{P7: P7Deps{Knowledge: port}})
+	registry := NewKnowledgeRegistry(Deps{Knowledge: KnowledgeDeps{Knowledge: port}})
 	return registry.Execute(context.Background(), scope, ToolKnowledgePropose, json.RawMessage(payload))
 }
 
-func TestP7RegistryRegistersKnowledgePropose(t *testing.T) {
-	registry := NewP7Registry(Deps{})
+func TestKnowledgeRegistryRegistersKnowledgePropose(t *testing.T) {
+	registry := NewKnowledgeRegistry(Deps{})
 	if _, ok := registry.Get(ToolKnowledgePropose); !ok {
-		t.Fatalf("NewP7Registry is missing %q", ToolKnowledgePropose)
+		t.Fatalf("NewKnowledgeRegistry is missing %q", ToolKnowledgePropose)
 	}
 	// P1–P5 tools stay registered: profiles select their own subset.
-	for _, name := range append(P5ToolNames(), ToolContextTaskPack, ToolRequirementRead) {
+	for _, name := range append(CodeIntelToolNames(), ToolContextTaskPack, ToolRequirementRead) {
 		if _, ok := registry.Get(name); !ok {
-			t.Fatalf("NewP7Registry is missing base tool %q", name)
+			t.Fatalf("NewKnowledgeRegistry is missing base tool %q", name)
 		}
 	}
 	if _, ok := registry.Get("case.confirm"); ok {
-		t.Fatal("NewP7Registry must not register confirmation tools")
+		t.Fatal("NewKnowledgeRegistry must not register confirmation tools")
 	}
 	for _, name := range []string{ToolKnowledgeSearch, ToolKnowledgeRead} {
 		if _, ok := registry.Get(name); !ok {
-			t.Fatalf("NewP7Registry is missing the structured retrieval tool %q", name)
+			t.Fatalf("NewKnowledgeRegistry is missing the structured retrieval tool %q", name)
 		}
 	}
 }
 
 func TestKnowledgeProposeSchemaHidesServerControlledFields(t *testing.T) {
-	tool, ok := NewP7Registry(Deps{}).Get(ToolKnowledgePropose)
+	tool, ok := NewKnowledgeRegistry(Deps{}).Get(ToolKnowledgePropose)
 	if !ok {
 		t.Fatalf("%q is not registered", ToolKnowledgePropose)
 	}
@@ -221,7 +221,7 @@ func TestKnowledgeProposeRequiresVersionScopeAndWriter(t *testing.T) {
 		t.Fatalf("missing version scope error = %v, want invalid_argument", err)
 	}
 
-	registry := NewP7Registry(Deps{})
+	registry := NewKnowledgeRegistry(Deps{})
 	tool, _ := registry.Get(ToolKnowledgePropose)
 	if _, err := tool.Execute(context.Background(), Scope{VersionID: 10}, json.RawMessage(`{"title":"标题","content":"内容"}`)); err == nil {
 		t.Fatal("unwired knowledge writer must fail as an internal configuration error")

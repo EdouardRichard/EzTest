@@ -35,14 +35,5 @@
   },
   "supplement": {
     "ai_case_titles": ["筛选后空结果展示空态", "无权限用户直接访问退款链接被拒绝"]
-  },
-  "visual": {
-    "injected": 4,
-    "cases": [
-      { "case_title": "登录后展示订单列表", "classification": "passed" },
-      { "case_title": "按状态筛选订单", "classification": "failed" },
-      { "case_title": "订单详情展示退款入口", "classification": "passed" },
-      { "case_title": "无权限用户不显示退款入口", "classification": "passed" }
-    ]
   }
 }

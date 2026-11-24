@@ -15,12 +15,12 @@ import (
 	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
 )
 
-// TestP6WiringRoutes pins every P6 operation to its middleware class. The
+// TestReadModelWiringRoutes pins every P6 operation to its middleware class. The
 // handlers use zero-value services: the assertions only exercise registration
 // and middleware ordering, never the service bodies.
-func TestP6WiringRoutes(t *testing.T) {
+func TestReadModelWiringRoutes(t *testing.T) {
 	mux := http.NewServeMux()
-	registerP6Routes(mux, denyAuth, denyAdmin, &P6Handlers{
+	registerReadModelRoutes(mux, denyAuth, denyAdmin, &ReadModelHandlers{
 		Quality:     qualityapi.New(&qualityapp.Service{}),
 		Search:      searchapi.New(&searchapp.Service{}),
 		Todos:       workspaceapi.New(&workspaceapp.Service{}),

@@ -17,6 +17,7 @@ import (
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // resourceDecisionWriteTimeout bounds the detached write-back so a stalled
@@ -44,10 +45,10 @@ type resourceDecisionTarget struct {
 // proposed discovery observation to the DB-29 decision value and the observation
 // kind the event is about.
 var resourceDecisionEvents = map[string]resourceDecisionTarget{
-	"resource.page.confirmed": {kind: "page", decision: "approved"},
-	"resource.api.confirmed":  {kind: "api", decision: "approved"},
-	"resource.page.rejected":  {kind: "page", decision: "rejected"},
-	"resource.api.rejected":   {kind: "api", decision: "rejected"},
+	"resource.page.confirmed": {kind: execution.ObservationKindPage, decision: execution.ObservationDecisionApproved},
+	"resource.api.confirmed":  {kind: execution.ObservationKindAPI, decision: execution.ObservationDecisionApproved},
+	"resource.page.rejected":  {kind: execution.ObservationKindPage, decision: execution.ObservationDecisionRejected},
+	"resource.api.rejected":   {kind: execution.ObservationKindAPI, decision: execution.ObservationDecisionRejected},
 }
 
 // NewResourceDecisionObserver returns the system-channel observer that writes

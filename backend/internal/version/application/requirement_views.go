@@ -7,17 +7,47 @@ import (
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// RequirementDraft is the Create/Update payload. The OpenAPI contract requires
-// every content field; targets are optional decimal string arrays.
+// RequirementUserStoryView is the §5.1 three-part user story on a requirement
+// read face.
+type RequirementUserStoryView struct {
+	AsA    string
+	IWant  string
+	SoThat string
+}
+
+// RequirementAcceptanceCriterionView is one structured acceptance criterion
+// with its server-assigned, revision-stable id ("AC-<n>").
+type RequirementAcceptanceCriterionView struct {
+	ID    string
+	Given string
+	When  string
+	Then  string
+}
+
+// RequirementAcceptanceCriterionInput is one acceptance criterion as a caller
+// submits it. There is deliberately no ID field: ids are server-assigned by
+// version.AssignACIDs against the previous revision, so a caller can neither
+// pick an id nor resurrect one that a deleted criterion left behind.
+type RequirementAcceptanceCriterionInput struct {
+	Given string
+	When  string
+	Then  string
+}
+
+// RequirementDraft is the Create/Update payload: the design v1.3.1 §5.1 V1
+// clarification contract. There are no target resource IDs any more -- a
+// version binds an environment and the requirement names its subject in
+// SutDescription.
 type RequirementDraft struct {
 	Title              string
-	Description        string
-	AcceptanceCriteria string
+	UserStory          RequirementUserStoryView
+	Rules              string
+	AcceptanceCriteria []RequirementAcceptanceCriterionInput
 	Priority           string
 	Constraints        json.RawMessage
-	TargetVersionSUTs  []string
-	TargetPages        []string
-	TargetAPIs         []string
+	SutDescription     string
+	ScopeOut           string
+	AccountRolesHint   []string
 }
 
 // RequirementView is the current-revision summary returned by the list API and
@@ -25,19 +55,19 @@ type RequirementDraft struct {
 // are nil until the requirement closes and ClosedAt is cleared again by a
 // reopen (the newest closure round keeps the historical reopen count).
 type RequirementView struct {
-	ID                int64
-	CurrentVersionID  int64
-	Revision          int
-	Title             string
-	Status            string
-	Priority          string
-	TargetVersionSUTs []string
-	TargetPages       []string
-	TargetAPIs        []string
-	UpdatedAt         time.Time
-	ConfirmedAt       *time.Time
-	ClosedAt          *time.Time
-	Closure           *RequirementClosureView
+	ID               int64
+	CurrentVersionID int64
+	Revision         int
+	Title            string
+	Status           string
+	Priority         string
+	UpdatedAt        time.Time
+	ConfirmedAt      *time.Time
+	ClosedAt         *time.Time
+	Closure          *RequirementClosureView
+	// Waived carries the admin requirement-waiver flag (v0.2.4-G SC-G11); users
+	// can view it (Q7=A). Cleared by a requirement or version reopen.
+	Waived bool
 }
 
 // RequirementClosureView is the newest requirement_closure round summary
@@ -56,13 +86,14 @@ type RequirementVersionView struct {
 	RequirementID      int64
 	Revision           int
 	Title              string
-	Description        string
-	AcceptanceCriteria string
+	UserStory          RequirementUserStoryView
+	Rules              string
+	AcceptanceCriteria []RequirementAcceptanceCriterionView
 	Priority           string
 	Constraints        json.RawMessage
-	TargetVersionSUTs  []string
-	TargetPages        []string
-	TargetAPIs         []string
+	SutDescription     string
+	ScopeOut           string
+	AccountRolesHint   []string
 	ContentHash        string
 	CreatedBy          *int64
 	CreatedByRunID     *int64
@@ -159,18 +190,54 @@ func toRequirementVersionView(revision version.RequirementVersion) RequirementVe
 		RequirementID:      revision.RequirementID,
 		Revision:           revision.Revision,
 		Title:              revision.Title,
-		Description:        revision.Description,
-		AcceptanceCriteria: revision.AcceptanceCriteria,
+		UserStory:          toUserStoryView(revision.UserStory),
+		Rules:              revision.Rules,
+		AcceptanceCriteria: toAcceptanceCriterionViews(revision.AcceptanceCriteria),
 		Priority:           revision.Priority,
 		Constraints:        revision.Constraints,
-		TargetVersionSUTs:  nonNilStrings(revision.TargetVersionSUTs),
-		TargetPages:        nonNilStrings(revision.TargetPages),
-		TargetAPIs:         nonNilStrings(revision.TargetAPIs),
+		SutDescription:     revision.SutDescription,
+		ScopeOut:           revision.ScopeOut,
+		AccountRolesHint:   nonNilStrings(revision.AccountRolesHint),
 		ContentHash:        revision.ContentHash,
 		CreatedBy:          revision.CreatedBy,
 		CreatedByRunID:     revision.CreatedByRunID,
 		CreatedAt:          revision.CreatedAt,
 	}
+}
+
+func toUserStoryView(story version.UserStory) RequirementUserStoryView {
+	return RequirementUserStoryView{AsA: story.AsA, IWant: story.IWant, SoThat: story.SoThat}
+}
+
+// toAcceptanceCriterionViews projects the criteria in the order the revision
+// stores them. The ids are already canonical and unique, so a caller that wants
+// the AC set in hash order can sort by id itself (version.ACIDs does).
+func toAcceptanceCriterionViews(criteria []version.AcceptanceCriterion) []RequirementAcceptanceCriterionView {
+	views := make([]RequirementAcceptanceCriterionView, 0, len(criteria))
+	for _, criterion := range criteria {
+		views = append(views, RequirementAcceptanceCriterionView{
+			ID:    criterion.ID,
+			Given: criterion.Given,
+			When:  criterion.When,
+			Then:  criterion.Then,
+		})
+	}
+	return views
+}
+
+// toAcceptanceCriteria maps the caller-supplied criteria onto the domain shape.
+// Ids are left empty on purpose: AssignACIDs is the only place that hands one
+// out, and it needs the previous revision to do it.
+func toAcceptanceCriteria(inputs []RequirementAcceptanceCriterionInput) []version.AcceptanceCriterion {
+	criteria := make([]version.AcceptanceCriterion, 0, len(inputs))
+	for _, input := range inputs {
+		criteria = append(criteria, version.AcceptanceCriterion{
+			Given: input.Given,
+			When:  input.When,
+			Then:  input.Then,
+		})
+	}
+	return criteria
 }
 
 func toConfirmationView(confirmation version.Confirmation) ConfirmationView {

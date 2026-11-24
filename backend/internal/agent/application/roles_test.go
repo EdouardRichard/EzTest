@@ -40,20 +40,22 @@ func TestRoleCatalogComplete(t *testing.T) {
 		vision    bool
 		reasoning bool
 	}
-	// The six converged role keys, their product names, executor kinds and
-	// model requirements.
+	// The seven catalog keys, their product names, executor kinds and model
+	// requirements: the six converged v0.22 roles plus the v0.2.4-E design
+	// judge (type-path role, no kind-path work item kinds).
 	want := []wantRole{
 		{agentapp.RoleAssistant, "测试助手", []string{agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases}, true, true},
 		{agentapp.RoleCaseAuthor, "设计 Author", []string{agent.WorkItemKindDesignCases}, false, true},
 		{agentapp.RoleCaseReviewer, "用例评审员", []string{agent.WorkItemKindReviewCases}, false, true},
+		{agentapp.RoleCaseJudge, "用例裁判", nil, false, true},
 		{agentapp.RoleFailureAnalyst, "失败分析师", []string{agent.WorkItemKindAnalyzeFailure}, false, true},
 		{agentapp.RoleReportWriter, "报告撰写员", []string{agent.WorkItemKindReportVersion}, false, false},
 		{agentapp.RoleKnowledgeCurator, "知识维护员", []string{agent.WorkItemKindKnowledgePropose}, false, false},
 	}
 
 	catalog := agentapp.RoleCatalog()
-	if len(catalog) != 6 {
-		t.Fatalf("role catalog = %d roles, want 6", len(catalog))
+	if len(catalog) != 7 {
+		t.Fatalf("role catalog = %d roles, want 7", len(catalog))
 	}
 	keys := make([]agentapp.RoleKey, 0, len(catalog))
 	seenKeys := map[agentapp.RoleKey]bool{}
@@ -242,24 +244,24 @@ func TestRoleToolMatrix(t *testing.T) {
 	}
 	denied := map[agentapp.RoleKey][]string{
 		agentapp.RoleAssistant: {
-			"browser.goto", "execution.case_finish", "case.confirm", "add_intent",
-			tools.ToolReportDataRead, tools.ToolVersionClosePropose,
+			"exec.run", "execution.case_finish", "case.confirm", "add_intent",
+			tools.ToolReportDataRead, tools.ToolIssuePropose,
 		},
 		agentapp.RoleCaseAuthor: {
-			"browser.goto", "execution.step_record", "case.confirm",
+			"exec.run", "execution.step_record", "case.confirm",
 			tools.ToolDesignReviewSubmit, tools.ToolReportNarrativePropose,
 		},
 		agentapp.RoleCaseReviewer: {
 			tools.ToolCaseGraphPropose, "execution.case_finish", "case.confirm",
 		},
 		agentapp.RoleFailureAnalyst: {
-			"browser.goto", "execution.step_record", "case.confirm",
+			"exec.run", "execution.step_record", "case.confirm",
 		},
 		agentapp.RoleReportWriter: {
-			"browser.goto", "execution.step_record", tools.ToolCaseGraphPropose, "case.confirm",
+			"exec.run", "execution.step_record", tools.ToolCaseGraphPropose, "case.confirm",
 		},
 		agentapp.RoleKnowledgeCurator: {
-			tools.ToolRequirementDraftCreate, tools.ToolCaseGraphPropose, "browser.goto", "case.confirm",
+			tools.ToolRequirementDraftCreate, tools.ToolCaseGraphPropose, "exec.run", "case.confirm",
 		},
 	}
 
@@ -289,7 +291,7 @@ func TestRoleToolMatrix(t *testing.T) {
 	// Every role is a closed whitelist: unlisted registered tools and fully
 	// unknown names are denied.
 	for _, role := range agentapp.RoleKeys() {
-		for _, name := range []string{"confirm.*", "add_intent", "browser.goto", "execution.case_finish"} {
+		for _, name := range []string{"confirm.*", "add_intent", "exec.run", "execution.case_finish"} {
 			if agentapp.ToolAllowed(role, name) {
 				t.Fatalf("role %q must not allow %q", role, name)
 			}
@@ -304,9 +306,9 @@ func TestRoleToolMatrix(t *testing.T) {
 	// denied (but registered) tool without executing it.
 	versionPack := &roleToolSpy{name: tools.ToolContextVersionPack}
 	graphRead := &roleToolSpy{name: tools.ToolDesignGraphRead}
-	browserGoto := &roleToolSpy{name: "browser.goto"}
+	execRunSpy := &roleToolSpy{name: "exec.run"}
 	caseConfirm := &roleToolSpy{name: "case.confirm"}
-	registry := tools.NewRegistry(versionPack, graphRead, browserGoto, caseConfirm)
+	registry := tools.NewRegistry(versionPack, graphRead, execRunSpy, caseConfirm)
 
 	roleTools, ok := agentapp.RoleToolSet(agentapp.RoleAssistant)
 	if !ok {
@@ -320,17 +322,17 @@ func TestRoleToolMatrix(t *testing.T) {
 	if !seen[tools.ToolContextVersionPack] || !seen[tools.ToolDesignGraphRead] {
 		t.Fatalf("assistant definitions = %v, want its allowed registered tools", seen)
 	}
-	if seen["browser.goto"] || seen["case.confirm"] {
+	if seen["exec.run"] || seen["case.confirm"] {
 		t.Fatalf("assistant definitions leaked denied tools: %v", seen)
 	}
 
-	_, err := roleTools.Execute(context.Background(), registry, tools.Scope{}, "browser.goto", nil)
+	_, err := roleTools.Execute(context.Background(), registry, tools.Scope{}, "exec.run", nil)
 	var toolErr *tools.Error
 	if !errors.As(err, &toolErr) || toolErr.Code != tools.CodeForbidden {
 		t.Fatalf("denied tool error = %v, want typed %q", err, tools.CodeForbidden)
 	}
-	if browserGoto.calls != 0 {
-		t.Fatalf("denied tool executed %d times", browserGoto.calls)
+	if execRunSpy.calls != 0 {
+		t.Fatalf("denied tool executed %d times", execRunSpy.calls)
 	}
 	payload, err := roleTools.Execute(context.Background(), registry, tools.Scope{}, tools.ToolContextVersionPack, nil)
 	if err != nil {
@@ -374,9 +376,12 @@ func TestRoleToolMatrix(t *testing.T) {
 
 func TestRoleWorkItemMatrix(t *testing.T) {
 	want := map[agentapp.RoleKey][]string{
-		agentapp.RoleAssistant:        {agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases},
-		agentapp.RoleCaseAuthor:       {agent.WorkItemKindDesignCases},
-		agentapp.RoleCaseReviewer:     {agent.WorkItemKindReviewCases},
+		agentapp.RoleAssistant:    {agent.WorkItemKindDesignCases, agent.WorkItemKindReviewCases},
+		agentapp.RoleCaseAuthor:   {agent.WorkItemKindDesignCases},
+		agentapp.RoleCaseReviewer: {agent.WorkItemKindReviewCases},
+		// The judge consumes the TYPE-path design.judge/design.rework work; it
+		// owns no kind-path kinds and stays outside the creator matrix below.
+		agentapp.RoleCaseJudge:        nil,
 		agentapp.RoleFailureAnalyst:   {agent.WorkItemKindAnalyzeFailure},
 		agentapp.RoleReportWriter:     {agent.WorkItemKindReportVersion},
 		agentapp.RoleKnowledgeCurator: {agent.WorkItemKindKnowledgePropose},
@@ -496,14 +501,14 @@ func TestExploreWorkItemKindsRemoved(t *testing.T) {
 func TestAssistantCannotExecutor(t *testing.T) {
 	for _, name := range []string{
 		"execution.case_finish", "execution.step_record",
-		"browser.goto", "browser.snapshot", "case.confirm", "add_intent",
+		"exec.run", "shell.read", "case.confirm", "add_intent",
 	} {
 		if agentapp.ToolAllowed(agentapp.RoleAssistant, name) {
 			t.Fatalf("assistant may not call %q", name)
 		}
 	}
 	for _, tool := range []string{
-		tools.ToolExecutionCaseFinish, tools.ToolBrowserGoto, tools.ToolBrowserSnapshot,
+		tools.ToolExecutionCaseFinish, tools.ToolExecRun, tools.ToolShellRead,
 	} {
 		if agentapp.ToolAllowed(agentapp.RoleAssistant, tool) {
 			t.Fatalf("assistant may not call executor tool %q", tool)
@@ -544,5 +549,137 @@ func TestAssistantCannotExecutor(t *testing.T) {
 	}
 	if item.Kind != agent.WorkItemKindDesignCases || item.CreatedBy != agent.WorkItemCreatedByAssistant {
 		t.Fatalf("allowed job.start = %#v", item)
+	}
+}
+
+// TestDesignRolePromptsTeachTheNaturalLanguageCaseContract pins the two design
+// role prompts against the v0.2.4-B case contract.
+//
+// This is the roles.go equivalent of the mustSay table profiles_test.go uses for
+// the design profiles, and it exists because roles.go had no such guard: the
+// case_author and case_reviewer prompts are the exact twins of designAuthorPrompt
+// / designCriticPrompt, and they were left teaching the pre-B contract -- the
+// author was told a case must carry a "目标 SUT" while omitting all three now
+// required elements, and the reviewer was told to file findings against "目标 SUT
+// 错误", a field that no longer exists, while not checking covered_acs, the rule
+// that replaced it. Without this table the fix silently re-drifts.
+func TestDesignRolePromptsTeachTheNaturalLanguageCaseContract(t *testing.T) {
+	specs := map[agentapp.RoleKey]agentapp.RoleSpec{}
+	for _, spec := range agentapp.RoleCatalog() {
+		specs[spec.Key] = spec
+	}
+
+	want := map[agentapp.RoleKey]struct {
+		// mustSay are substrings the prompt must carry: the required contract
+		// elements and the replacement review rule.
+		mustSay []string
+		// mustNotSay are substrings that would mean the prompt is still teaching
+		// the retired resource-target contract.
+		mustNotSay []string
+	}{
+		agentapp.RoleCaseAuthor: {
+			mustSay: []string{
+				"sut_description", "preconditions", "covered_acs",
+				"target_description", "sut_id",
+				// The escape hatch has to be spelled out or the author leaves
+				// preconditions blank and the proposal gate rejects it.
+				"无",
+				// covered_acs must be drawn from the requirement's own set, or
+				// the author invents ids and the linkage gate rejects them.
+				"该需求当前的 AC 集",
+			},
+			mustNotSay: []string{"目标 SUT", "version_sut_ids", "default_version_sut_id", "database_id"},
+		},
+		agentapp.RoleCaseReviewer: {
+			mustSay: []string{
+				// The rule that replaced the retired ownership check.
+				"covered_acs", "sut_description",
+			},
+			mustNotSay: []string{"目标 SUT 错误", "version_sut", "database_id"},
+		},
+	}
+
+	for role, expectation := range want {
+		spec, ok := specs[role]
+		if !ok {
+			t.Fatalf("role %q is missing from the catalog", role)
+		}
+		for _, want := range expectation.mustSay {
+			if !strings.Contains(spec.SystemPrompt, want) {
+				t.Fatalf("role %q prompt no longer teaches %q -- the case contract has re-drifted:\n%s",
+					role, want, spec.SystemPrompt)
+			}
+		}
+		for _, gone := range expectation.mustNotSay {
+			if strings.Contains(spec.SystemPrompt, gone) {
+				t.Fatalf("role %q prompt still teaches the retired %q:\n%s", role, gone, spec.SystemPrompt)
+			}
+		}
+	}
+}
+
+// TestDesignRolePromptsAgreeWithTheDesignProfilePrompts pins the twin relationship
+// the audit found broken: roles.go case_author and profiles.go designAuthorPrompt
+// reach the same model on the same job, so a contract term present in one and
+// absent in the other means the model is being told two different things. The
+// check is per-pair (the author pair on four contract terms, the critic pair on
+// two) plus the retired "目标 SUT" phrase, which is enough to catch a one-sided
+// edit of either twin.
+func TestDesignRolePromptsAgreeWithTheDesignProfilePrompts(t *testing.T) {
+	roles := map[agentapp.RoleKey]agentapp.RoleSpec{}
+	for _, spec := range agentapp.RoleCatalog() {
+		roles[spec.Key] = spec
+	}
+	profiles := map[string]agent.AgentProfile{}
+	for _, profile := range agentapp.DesignProfiles() {
+		profiles[profile.Key] = profile
+	}
+
+	// Each pair carries its OWN term list, because the two roles legitimately
+	// teach different things: the author must state every contract element it has
+	// to produce, while the critic reviews coverage and consistency and has no
+	// reason to spell out preconditions or sut_id. One shared list would either
+	// under-check the author or demand text the critic should not carry.
+	pairs := []struct {
+		role    agentapp.RoleKey
+		profile string
+		terms   []string
+	}{
+		{agentapp.RoleCaseAuthor, agentapp.ProfileKeyDesignAuthor,
+			// All THREE required elements plus the db-assertion half. An earlier
+			// revision compared only sut_description and covered_acs while its
+			// comment claimed three, so a one-sided edit dropping preconditions
+			// survived; sut_id drifted one-sidedly once already (M-4).
+			[]string{"sut_description", "preconditions", "covered_acs", "sut_id"}},
+		{agentapp.RoleCaseReviewer, agentapp.ProfileKeyDesignCritic,
+			// The critic must check the rule that replaced the retired ownership
+			// check (covered_acs) and the consistency of the system under test.
+			[]string{"sut_description", "covered_acs"}},
+	}
+	for _, pair := range pairs {
+		roleSpec, ok := roles[pair.role]
+		if !ok {
+			t.Fatalf("role %q missing from the catalog", pair.role)
+		}
+		profile, ok := profiles[pair.profile]
+		if !ok {
+			t.Fatalf("profile %q missing from DesignProfiles()", pair.profile)
+		}
+		for _, term := range pair.terms {
+			roleHas := strings.Contains(roleSpec.SystemPrompt, term)
+			profileHas := strings.Contains(profile.SystemPrompt, term)
+			if roleHas != profileHas {
+				t.Fatalf("role %q (has %t) and profile %q (has %t) disagree about %q -- the model gets contradictory instructions",
+					pair.role, roleHas, pair.profile, profileHas, term)
+			}
+			if !roleHas {
+				t.Fatalf("neither role %q nor profile %q teaches the required %q", pair.role, pair.profile, term)
+			}
+		}
+		for _, gone := range []string{"目标 SUT"} {
+			if strings.Contains(roleSpec.SystemPrompt, gone) || strings.Contains(profile.SystemPrompt, gone) {
+				t.Fatalf("role %q / profile %q still teaches the retired %q", pair.role, pair.profile, gone)
+			}
+		}
 	}
 }

@@ -54,26 +54,26 @@ func newHandler() (*Handler, *fakeService) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	svc := &fakeService{
 		list: []settings.Setting{
-			{Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber, Value: json.RawMessage("3"), Version: 1, UpdatedAt: now},
+			{Key: "execution.max_concurrent_case_runs", Category: "execution", Type: settings.TypeNumber, Value: json.RawMessage("3"), Version: 1, UpdatedAt: now},
 			{Key: "llm.api_key", Category: "llm", Type: settings.TypeString, Value: json.RawMessage(`"super-secret"`), Secret: true, Version: 1, UpdatedAt: now},
 		},
 		get: map[string]settings.Setting{
-			"execution.global_concurrency": {Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber, Value: json.RawMessage("3"), Version: 1, UpdatedAt: now},
-			"llm.api_key":                  {Key: "llm.api_key", Category: "llm", Type: settings.TypeString, Value: json.RawMessage(`"super-secret"`), Secret: true, Version: 1, UpdatedAt: now},
-			"retention.gc_dry_run":         {Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Value: json.RawMessage("true"), Version: 1, UpdatedAt: now},
+			"execution.max_concurrent_case_runs": {Key: "execution.max_concurrent_case_runs", Category: "execution", Type: settings.TypeNumber, Value: json.RawMessage("3"), Version: 1, UpdatedAt: now},
+			"llm.api_key":                        {Key: "llm.api_key", Category: "llm", Type: settings.TypeString, Value: json.RawMessage(`"super-secret"`), Secret: true, Version: 1, UpdatedAt: now},
+			"retention.gc_dry_run":               {Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Value: json.RawMessage("true"), Version: 1, UpdatedAt: now},
 		},
 		revisions: map[string][]settings.Revision{
-			"execution.global_concurrency": {
-				{ID: 11, Key: "execution.global_concurrency", OldValue: json.RawMessage("3"), NewValue: json.RawMessage("5"), CreatedAt: now},
-				{ID: 10, Key: "execution.global_concurrency", OldValue: json.RawMessage("2"), NewValue: json.RawMessage("3"), CreatedAt: now},
-				{ID: 9, Key: "execution.global_concurrency", OldValue: json.RawMessage("1"), NewValue: json.RawMessage("2"), CreatedAt: now},
+			"execution.max_concurrent_case_runs": {
+				{ID: 11, Key: "execution.max_concurrent_case_runs", OldValue: json.RawMessage("3"), NewValue: json.RawMessage("5"), CreatedAt: now},
+				{ID: 10, Key: "execution.max_concurrent_case_runs", OldValue: json.RawMessage("2"), NewValue: json.RawMessage("3"), CreatedAt: now},
+				{ID: 9, Key: "execution.max_concurrent_case_runs", OldValue: json.RawMessage("1"), NewValue: json.RawMessage("2"), CreatedAt: now},
 			},
 			"llm.api_key": {
 				{ID: 12, Key: "llm.api_key", OldValue: json.RawMessage(`"old-secret"`), NewValue: json.RawMessage(`"new-secret"`), CreatedAt: now},
 			},
 		},
 		updated: settings.Setting{
-			Key: "execution.global_concurrency", Category: "execution", Type: settings.TypeNumber,
+			Key: "execution.max_concurrent_case_runs", Category: "execution", Type: settings.TypeNumber,
 			Value: json.RawMessage("5"), Version: 2, UpdatedAt: now,
 		},
 	}
@@ -120,35 +120,35 @@ func TestGetUnknownIsNotFound(t *testing.T) {
 func TestUpdateRequiresActorBodyAndValue(t *testing.T) {
 	handler, svc := newHandler()
 
-	req := httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", strings.NewReader(`{"value":5}`))
-	req.SetPathValue("key", "execution.global_concurrency")
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.max_concurrent_case_runs", strings.NewReader(`{"value":5}`))
+	req.SetPathValue("key", "execution.max_concurrent_case_runs")
 	rec := httptest.NewRecorder()
 	handler.Update(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("missing actor status = %d", rec.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", strings.NewReader(`{"value":`))
+	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.max_concurrent_case_runs", strings.NewReader(`{"value":`))
 	req = req.WithContext(platform.WithActor(req.Context(), platform.Actor{ID: 42, Role: "admin"}))
-	req.SetPathValue("key", "execution.global_concurrency")
+	req.SetPathValue("key", "execution.max_concurrent_case_runs")
 	rec = httptest.NewRecorder()
 	handler.Update(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad json status = %d", rec.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", strings.NewReader(`{"value":null}`))
+	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.max_concurrent_case_runs", strings.NewReader(`{"value":null}`))
 	req = req.WithContext(platform.WithActor(req.Context(), platform.Actor{ID: 42, Role: "admin"}))
-	req.SetPathValue("key", "execution.global_concurrency")
+	req.SetPathValue("key", "execution.max_concurrent_case_runs")
 	rec = httptest.NewRecorder()
 	handler.Update(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("null value status = %d", rec.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", strings.NewReader(`{"value":5}`))
+	req = httptest.NewRequest(http.MethodPatch, "/api/admin/settings/execution.max_concurrent_case_runs", strings.NewReader(`{"value":5}`))
 	req = req.WithContext(platform.WithActor(req.Context(), platform.Actor{ID: 42, Role: "admin"}))
-	req.SetPathValue("key", "execution.global_concurrency")
+	req.SetPathValue("key", "execution.max_concurrent_case_runs")
 	rec = httptest.NewRecorder()
 	handler.Update(rec, req)
 	if rec.Code != http.StatusOK {
@@ -162,7 +162,7 @@ func TestUpdateRequiresActorBodyAndValue(t *testing.T) {
 func TestRevisionsMasksSecretAndPaginates(t *testing.T) {
 	handler, _ := newHandler()
 
-	req := httptest.NewRequest(http.MethodGet, "/api/admin/settings/revisions?key=execution.global_concurrency&limit=2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/settings/revisions?key=execution.max_concurrent_case_runs&limit=2", nil)
 	rec := httptest.NewRecorder()
 	handler.Revisions(rec, req)
 	if rec.Code != http.StatusOK {
@@ -304,8 +304,8 @@ func TestAdminListHidesRemovedGCKeys(t *testing.T) {
 		}
 		seen[item.Key] = true
 	}
-	if len(body.Data) != 87 {
-		t.Fatalf("settings count = %d, want 87 (catalog keys only)", len(body.Data))
+	if len(body.Data) != 86 {
+		t.Fatalf("settings count = %d, want 86 (catalog keys only; v0.2.4-B removes 7 visual.* keys, v0.2.4-C adds evidence_max_per_case_run + max_case_turns, v0.2.4-E adds 4 quality-gate keys, v0.2.4-F removes the 3 quota keys and adds max_concurrent_case_runs, v0.2.4-G adds 2 report evidence display caps)", len(body.Data))
 	}
 	for _, key := range []string{
 		"retention.gc_dry_run", "retention.gc_grace_hours",

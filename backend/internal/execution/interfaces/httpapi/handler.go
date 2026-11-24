@@ -68,6 +68,10 @@ type Deps struct {
 	// assemblies answer 503 instead of panicking.
 	Discovery executionapp.DiscoveryQueryRepository
 
+	// SessionFixtures is the admin session-fixture listing surface (v0.2.4-F
+	// P18, SC-F5). It is optional so degraded assemblies answer 503.
+	SessionFixtures executionapp.SessionFixtureVersionReader
+
 	// AuthChecker performs the admin token-bearing executor probe (D8). It is
 	// optional so degraded assemblies answer 503 instead of panicking.
 	AuthChecker executionapp.ExecutorAuthChecker
@@ -81,16 +85,32 @@ type Deps struct {
 	// Planner starts a wave immediately for POST /versions/{id}/waves. It is
 	// optional so degraded assemblies answer 503 instead of panicking.
 	Planner WavePlanner
+
+	// Replay triggers a server-side command-log replay verification (EV-006).
+	// It is bound after construction (the case runner is wired later than the
+	// handler) via SetReplay; nil answers 503 instead of panicking.
+	Replay ReplayTrigger
 }
 
 // Handler serves the P3 execution endpoints.
 type Handler struct {
 	deps Deps
+	// quotaResolver shares the scheduler's read-failure semantics (ruling P12):
+	// a failed settings read retains the last-known-good limit instead of
+	// silently projecting 0 (unlimited), so the gate and the UI cannot diverge.
+	quotaResolver executionapp.QuotaResolver
 }
 
 // New builds the execution HTTP handler.
 func New(deps Deps) *Handler {
 	return &Handler{deps: deps}
+}
+
+// SetReplay binds the command-log replay trigger after construction. The case
+// runner is wired later than the handler in the composition root, so the replay
+// surface is attached once the runner exists (before the server starts serving).
+func (h *Handler) SetReplay(trigger ReplayTrigger) {
+	h.deps.Replay = trigger
 }
 
 /* --------------------------------- overview -------------------------------- */
@@ -210,12 +230,17 @@ func (h *Handler) executorStatus(ctx context.Context) (ExecutorStatusView, error
 	return toExecutorStatusView(nil, endpoint), nil
 }
 
+// quotas projects the single global concurrent-case-run limit (design P5,
+// v0.2.4-F). It reads the same settings key through the same QuotaResolver
+// implementation the scheduler enforces, but holds an INDEPENDENT resolver
+// instance (separate last-known-good state). The gate is authoritative; the
+// projection may momentarily differ on a read-failure (each retains its own
+// last-known-good value + WARN, ruling P12), converging on the next read.
+// settingInt is deliberately NOT used here: its value<=0 fallback would
+// rewrite the valid 0 (unlimited) into a positive default.
 func (h *Handler) quotas(ctx context.Context) ExecutionQuotas {
-	return ExecutionQuotas{
-		Global:      h.settingInt(ctx, "execution.global_concurrency", 3),
-		PerSUT:      h.settingInt(ctx, "execution.per_sut_concurrency", 2),
-		CrossSystem: h.settingInt(ctx, "execution.cross_system_concurrency", 1),
-	}
+	quota := h.quotaResolver.Resolve(ctx, h.deps.Settings)
+	return ExecutionQuotas{MaxConcurrentCaseRuns: int64(quota.Global)}
 }
 
 /* ---------------------------------- intents -------------------------------- */
@@ -741,7 +766,7 @@ func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	versionSUTID, err := optionalQueryID(r, "version_sut_id")
+	sutID, err := optionalQueryID(r, "sut_id")
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -752,11 +777,11 @@ func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items, hasMore, err := h.deps.Evidence.ListByVersion(ctx, versionID, execution.EvidenceFilter{
-		CaseRunID:    caseRunID,
-		VersionSUTID: versionSUTID,
-		Kind:         execution.EvidenceKind(kind),
-		BeforeID:     beforeID,
-		Limit:        limit,
+		CaseRunID: caseRunID,
+		SUTID:     sutID,
+		Kind:      execution.EvidenceKind(kind),
+		BeforeID:  beforeID,
+		Limit:     limit,
 	})
 	if err != nil {
 		httpx.Error(w, r, mapRepoError(err, "evidence"))
@@ -1435,19 +1460,19 @@ func (h *Handler) caseVersionProjection(ctx context.Context, versionID, caseVers
 
 // caseRunView projects one case_run with its display case metadata: the
 // executable read for current versions and the historical label read for
-// superseded/stale process rows (the intent carries the version_sut set).
+// superseded/stale process rows (the intent carries the SUT set).
 func (h *Handler) caseRunView(ctx context.Context, versionID int64, run execution.CaseRun) (CaseRunView, error) {
 	snapshot, meta := h.caseVersionProjection(ctx, versionID, run.CaseVersionID)
-	var versionSUTIDs []int64
+	var sutIDs []int64
 	if snapshot != nil {
-		versionSUTIDs = snapshot.VersionSUTIDs
+		sutIDs = snapshot.SUTIDs
 	}
 	intent, err := h.deps.Intents.Get(ctx, run.IntentID)
 	if err != nil && !errors.Is(err, execution.ErrNotFound) {
 		return CaseRunView{}, mapRepoError(err, "intent")
 	}
-	if err == nil && len(versionSUTIDs) == 0 {
-		versionSUTIDs = intent.VersionSUTIDs
+	if err == nil && len(sutIDs) == 0 {
+		sutIDs = intent.SUTIDs
 	}
 	evidenceCount := 0
 	if h.deps.Evidence != nil {
@@ -1455,7 +1480,7 @@ func (h *Handler) caseRunView(ctx context.Context, versionID int64, run executio
 			evidenceCount = count
 		}
 	}
-	return toCaseRunView(run, meta, versionSUTIDs, evidenceCount), nil
+	return toCaseRunView(run, meta, sutIDs, evidenceCount), nil
 }
 
 func (h *Handler) caseRunViews(ctx context.Context, versionID int64, runs []execution.CaseRun) ([]CaseRunView, error) {
@@ -1473,12 +1498,12 @@ func (h *Handler) caseRunViews(ctx context.Context, versionID int64, runs []exec
 			intents[run.IntentID] = intent
 		}
 		snapshot, meta := h.caseVersionProjection(ctx, versionID, run.CaseVersionID)
-		var versionSUTIDs []int64
+		var sutIDs []int64
 		if snapshot != nil {
-			versionSUTIDs = snapshot.VersionSUTIDs
+			sutIDs = snapshot.SUTIDs
 		}
-		if intent != nil && len(versionSUTIDs) == 0 {
-			versionSUTIDs = intent.VersionSUTIDs
+		if intent != nil && len(sutIDs) == 0 {
+			sutIDs = intent.SUTIDs
 		}
 		evidenceCount := 0
 		if h.deps.Evidence != nil {
@@ -1486,7 +1511,7 @@ func (h *Handler) caseRunViews(ctx context.Context, versionID int64, runs []exec
 				evidenceCount = count
 			}
 		}
-		views = append(views, toCaseRunView(run, meta, versionSUTIDs, evidenceCount))
+		views = append(views, toCaseRunView(run, meta, sutIDs, evidenceCount))
 	}
 	return views, nil
 }

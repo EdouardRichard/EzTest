@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     One-command development stack for EzTest: PostgreSQL + API + web + Playwright executor.
@@ -25,7 +25,7 @@
 
     Startup waits for real readiness before reporting the URLs:
       - API /api/health with db=ok (liveness alone is not enough),
-      - executor /healthz with a browserVersion (the browser must launch),
+      - executor /healthz with status=ok (v2 workstation; the browser is optional),
       - web /login returning 200.
     If any component fails, the already-started processes are stopped again and
     the recent log lines are printed.
@@ -419,10 +419,13 @@ function Wait-ExecutorReady {
             $response = Invoke-RawHttp -Url "$BaseUrl/healthz" -TimeoutSec 5
             if ($response.Status -eq 200) {
                 $json = $response.Body | ConvertFrom-Json
-                if ($json.status -eq "ok" -and -not [string]::IsNullOrWhiteSpace("$($json.browserVersion)")) {
+                # v2 (v0.2.4-C): healthz reports the SESSION service, not the browser.
+                # Readiness is status=ok; a missing browser no longer degrades the
+                # workstation (exec/shell/files need none). browserVersion was removed.
+                if ($json.status -eq "ok") {
                     return $json
                 }
-                $lastDetail = "status=$($json.status) browserVersion=$($json.browserVersion)"
+                $lastDetail = "status=$($json.status)"
             } else {
                 $body = $response.Body
                 if ($body.Length -gt 300) { $body = $body.Substring(0, 300) }
@@ -433,8 +436,8 @@ function Wait-ExecutorReady {
         }
         Start-Sleep -Milliseconds 500
     }
-    $message = "The Playwright executor did not become ready within $Seconds seconds (last: $lastDetail)." +
-        "$([Environment]::NewLine)A Chromium-based browser is required: install Playwright Chromium (cd executor; pnpm exec playwright install chromium) or Google Chrome / Microsoft Edge.$([Environment]::NewLine)$(Get-LogHint executor)"
+    $message = "The executor did not become ready within $Seconds seconds (last: $lastDetail)." +
+        "$([Environment]::NewLine)The executor is a general workstation (protocol v2); readiness is /healthz status=ok. The browser domain additionally needs the official CLI: npm install -g @playwright/cli@latest; playwright-cli install-browser chromium --with-deps.$([Environment]::NewLine)$(Get-LogHint executor)"
     throw $message
 }
 
@@ -559,7 +562,7 @@ if ($Status) {
             $response = Invoke-RawHttp -Url "$executorBaseUrl/healthz" -TimeoutSec 3
             $json = $response.Body | ConvertFrom-Json
             if ($response.Status -eq 200 -and $json.status -eq "ok") {
-                $detail = "healthy (browser=$($json.browserVersion))"
+                $detail = "healthy (sessions=$($json.sessions)/$($json.maxSessions))"
             } else {
                 $detail = "degraded (HTTP $($response.Status), $($json.status))"
                 $healthy = $false
@@ -728,19 +731,13 @@ try {
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     Write-Host "     building API binary (first run can take a while)..." -ForegroundColor DarkGray
-    $commit = ""
-    $gitExe = Get-CommandPath -Name "git.exe"
-    if ($null -eq $gitExe) { $gitExe = Get-CommandPath -Name "git" }
-    if ($null -ne $gitExe) {
-        try { $commit = (& $gitExe -C $repoRoot rev-parse --short HEAD 2>$null | Select-Object -First 1) } catch { $commit = "" }
-    }
-    $ldflags = "-X github.com/EdouardRichard/EzTest/backend/internal/server.Version=dev"
-    if (-not [string]::IsNullOrWhiteSpace("$commit")) {
-        $ldflags += " -X github.com/EdouardRichard/EzTest/backend/internal/server.Commit=$commit"
-    }
+    # The composition root defaults its version to "dev" and declares no commit
+    # variable, so a dev build needs no ldflags. The old
+    # internal/server.Version/.Commit targets did not exist and were silently
+    # ignored by the linker.
     Push-Location $backendDir
     try {
-        & $goExe build -o $apiBinary -ldflags $ldflags ./cmd/eztest
+        & $goExe build -o $apiBinary ./cmd/eztest
         if ($LASTEXITCODE -ne 0) { throw "go build ./cmd/eztest failed (exit code $LASTEXITCODE)." }
     } finally {
         Pop-Location
@@ -755,8 +752,8 @@ try {
         $tokenFallback = $true
     }
     [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_TOKEN", $executorToken, "Process")
-    if ([string]::IsNullOrWhiteSpace((Get-EnvValue -Name "EZTEST_EXECUTOR_MAX_CONTEXTS"))) {
-        [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_MAX_CONTEXTS", "8", "Process")
+    if ([string]::IsNullOrWhiteSpace((Get-EnvValue -Name "EZTEST_EXECUTOR_MAX_SESSIONS"))) {
+        [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_MAX_SESSIONS", "8", "Process")
     }
     if ([string]::IsNullOrWhiteSpace((Get-EnvValue -Name "EZTEST_AGENT_FILE_ROOT"))) {
         # Local development only: let the agent file tools read the repository.
@@ -781,8 +778,8 @@ try {
     Write-Host ""
     Write-Host "EzTest development stack is up." -ForegroundColor Green
     Write-Host ("  web        {0}   (open this exact URL; it must match EZTEST_WEB_ORIGIN)" -f $webBrowserUrl)
-    Write-Host ("  API        {0}   (/healthz, /api/health, /api/openapi.yaml; version {1})" -f $apiBaseUrl, $apiHealth.version)
-    Write-Host ("  executor   {0}   (internal only; browser {1})" -f $executorBaseUrl, $executorHealth.browserVersion)
+    Write-Host ("  API        {0}   (/healthz, /api/health; version {1})" -f $apiBaseUrl, $apiHealth.version)
+    Write-Host ("  executor   {0}   (internal only; cli {1})" -f $executorBaseUrl, $executorHealth.browserCli.cli_version)
     Write-Host ("  postgres   {0}:{1}" -f $databaseEndpoint.Host, $databaseEndpoint.Port)
     Write-Host ("  sign in    {0}   (password: EZTEST_INITIAL_ADMIN_PASSWORD from .env on the first start)" -f (Get-EnvValue -Name "EZTEST_ADMIN_USERNAME" -Default "admin"))
     if ($tokenFallback) {

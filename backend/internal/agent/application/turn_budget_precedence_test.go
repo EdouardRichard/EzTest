@@ -14,7 +14,7 @@ import (
 // execute.case therefore has a 59-turn fuse, and reaching that fuse reports the
 // concrete turn budget cause instead of an unnamed settlement.
 func TestTurnBudgetPrecedence(t *testing.T) {
-	runner := &Runner{settings: p3Settings{"agent.max_turns": 12}}
+	runner := &Runner{settings: executionSettings{"agent.max_turns": 12}}
 	executor := agent.AgentProfile{
 		Key:     ProfileKeyCaseExecutor,
 		Budgets: agent.ProfileBudgets{MaxTurns: 60, SoftSeconds: 780, HardSeconds: 900},
@@ -53,7 +53,7 @@ func TestTurnBudgetPrecedence(t *testing.T) {
 // specific source (Task 9). The live QA items declared {} so they never exercised
 // this path.
 func TestTurnBudgetDeclaredItemStillWins(t *testing.T) {
-	runner := &Runner{settings: p3Settings{"agent.max_turns": 12}}
+	runner := &Runner{settings: executionSettings{"agent.max_turns": 12}}
 	executor := agent.AgentProfile{
 		Key:     ProfileKeyCaseExecutor,
 		Budgets: agent.ProfileBudgets{MaxTurns: 60, SoftSeconds: 780, HardSeconds: 900},

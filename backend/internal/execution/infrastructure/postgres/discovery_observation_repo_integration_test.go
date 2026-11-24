@@ -26,7 +26,7 @@ func TestDiscoveryObservationUpsertIdempotentUniqueKey(t *testing.T) {
 		Path:             "/api/orders/42?token=secret",
 		ResourceTemplate: "/api/orders/{id}",
 		MIME:             "application/json",
-		VersionSUTID:     5001,
+		SUTID:            5001,
 		WaveID:           9101,
 		CaseRunID:        3001,
 		Occurrences:      1,
@@ -58,7 +58,7 @@ func TestDiscoveryObservationUpsertIdempotentUniqueKey(t *testing.T) {
 		       resource_template, source_kind, decision, occurrences,
 		       first_seen_at::text, last_seen_at::text
 		FROM execution_discovery_observation
-		WHERE version_sut_id = 5001
+		WHERE sut_id = 5001
 	`).Scan(&versionID, &environmentID, &waveID, &caseRunID, &method, &host,
 		&template, &sourceKind, &decision, &occurrences, &firstSeen, &lastSeen)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestDiscoveryObservationUpsertIdempotentUniqueKey(t *testing.T) {
 	if occurrences != 3 {
 		t.Fatalf("occurrences = %d, want 1+2 = 3", occurrences)
 	}
-	t.Logf("db row: version_id=%d version_sut_id=5001 kind=api method=%s host=%s resource_template=%s decision=%s source_kind=%s occurrences=%d",
+	t.Logf("db row: version_id=%d sut_id=5001 kind=api method=%s host=%s resource_template=%s decision=%s source_kind=%s occurrences=%d",
 		versionID, method, host, template, decision, sourceKind, occurrences)
 	if firstSeen == "" || lastSeen == "" {
 		t.Fatal("first_seen_at/last_seen_at must be set")
@@ -95,7 +95,7 @@ func TestDiscoveryObservationUpsertIdempotentUniqueKey(t *testing.T) {
 }
 
 // TestDiscoveryObservationUniqueKeyKeepsSUTsIsolated: the same template on two
-// version_sut bindings is two rows.
+// bound SUTs is two rows.
 func TestDiscoveryObservationUniqueKeyKeepsSUTsIsolated(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	ctx := context.Background()
@@ -103,12 +103,12 @@ func TestDiscoveryObservationUniqueKeyKeepsSUTsIsolated(t *testing.T) {
 
 	base := executionapp.DiscoveryObservation{
 		Kind: "page", Method: "", Host: "shop.example.com", ResourceTemplate: "/orders/{id}",
-		MIME: "text/html", VersionSUTID: 5001, WaveID: 9102, CaseRunID: 3002, Occurrences: 1,
+		MIME: "text/html", SUTID: 5001, WaveID: 9102, CaseRunID: 3002, Occurrences: 1,
 	}
 	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{base}); err != nil {
 		t.Fatalf("upsert sut 5001: %v", err)
 	}
-	base.VersionSUTID = 5002
+	base.SUTID = 5002
 	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{base}); err != nil {
 		t.Fatalf("upsert sut 5002: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestDiscoveryObservationUniqueKeyKeepsSUTsIsolated(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 2 {
-		t.Fatalf("rows = %d, want 2 (one per version_sut)", count)
+		t.Fatalf("rows = %d, want 2 (one per SUT)", count)
 	}
 }
 
@@ -127,7 +127,7 @@ func TestDiscoveryObservationMissingVersionIsSkipped(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	err := repo.Observations.UpsertObservations(context.Background(), []executionapp.DiscoveryObservation{{
 		Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home",
-		VersionSUTID: 5001, Occurrences: 1,
+		SUTID: 5001, Occurrences: 1,
 	}})
 	if err != nil {
 		t.Fatalf("upsert without version must not fail: %v", err)
@@ -154,12 +154,12 @@ func TestDiscoveryIngestStoresNoSensitiveFields(t *testing.T) {
 		Kind: "page",
 		// The raw-ish observation may still carry a query/fragment query; the
 		// ingest normalization must drop it before the insert.
-		Host:         "shop.example.com",
-		Path:         "/orders/42?token=secret#/receipt?token=secret",
-		MIME:         "text/html",
-		VersionSUTID: 5001,
-		WaveID:       9103,
-		CaseRunID:    3003,
+		Host:      "shop.example.com",
+		Path:      "/orders/42?token=secret#/receipt?token=secret",
+		MIME:      "text/html",
+		SUTID:     5001,
+		WaveID:    9103,
+		CaseRunID: 3003,
 	}})
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
@@ -207,7 +207,7 @@ func TestDiscoveryObservationUpsertKeepsExistingMIME(t *testing.T) {
 
 	observation := executionapp.DiscoveryObservation{
 		Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home",
-		MIME: "text/html", VersionSUTID: 5001, WaveID: 9105, Occurrences: 1,
+		MIME: "text/html", SUTID: 5001, WaveID: 9105, Occurrences: 1,
 	}
 	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{observation}); err != nil {
 		t.Fatalf("first upsert: %v", err)
@@ -218,7 +218,7 @@ func TestDiscoveryObservationUpsertKeepsExistingMIME(t *testing.T) {
 	}
 	var mime string
 	if err := pool.QueryRow(ctx, `
-		SELECT mime FROM execution_discovery_observation WHERE version_sut_id = 5001
+		SELECT mime FROM execution_discovery_observation WHERE sut_id = 5001
 	`).Scan(&mime); err != nil {
 		t.Fatalf("read mime: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestDiscoveryObservationDeltaReadAndMark(t *testing.T) {
 	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
 		Kind: "api", Method: "GET", Host: "shop.example.com",
 		ResourceTemplate: "/api/orders/{id}", MIME: "application/json",
-		StatusCode: intPtr(200), VersionSUTID: 5001, WaveID: 9106, CaseRunID: 3006, Occurrences: 1,
+		StatusCode: intPtr(200), SUTID: 5001, WaveID: 9106, CaseRunID: 3006, Occurrences: 1,
 	}}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -296,24 +296,32 @@ func TestDiscoveryObservationDeltaReadAndMark(t *testing.T) {
 
 func intPtr(value int) *int { return &value }
 
-// seedDiscoveryBinding inserts the logical catalog rows the repository and the
-// SUT host resolver read: one version/sut/environment binding plus one
-// registered page on a second host.
-func seedDiscoveryBinding(t *testing.T, pool *pgxpool.Pool, versionID, versionSUTID, environmentID int64) {
+// seedDiscoveryBinding inserts the catalog rows the repository and the SUT host
+// resolver read: one version bound to an environment, one SUT of that
+// environment carrying the base URL, and one registered page of that SUT on a
+// second host.
+//
+// v0.2.4-B (resource_0004 / version_0015): the hierarchy is inverted, so this no
+// longer seeds sut_environment or version_sut — both are dropped. The environment
+// is a top-level row, the SUT belongs to it and owns base_url, sut_page is owned
+// by sut_id alone, and version.environment_id is NOT NULL. The observation's
+// sut_id is now the sut row's own id (it used to be the version_sut binding-row
+// id, with sut.id a separate fixed 9001).
+func seedDiscoveryBinding(t *testing.T, pool *pgxpool.Pool, versionID, sutID, environmentID int64) {
 	t.Helper()
 	ctx := context.Background()
 	for _, statement := range []struct {
 		sql  string
 		args []any
 	}{
-		{`INSERT INTO version (id, title, status, created_by) VALUES ($1, 'v0.22', 'initial', 1)`, []any{versionID}},
-		{`INSERT INTO sut (id, name, created_by) VALUES ($1, 'shop', 1)`, []any{9001}},
-		{`INSERT INTO sut_environment (id, sut_id, name, base_url) VALUES ($1, 9001, 'test', 'https://shop.example.com')`, []any{environmentID}},
-		{`INSERT INTO version_sut (id, version_id, sut_id, environment_id) VALUES ($1, $2, 9001, $3)`,
-			[]any{versionSUTID, versionID, environmentID}},
-		{`INSERT INTO sut_page (id, sut_id, environment_id, name, url, route_template)
-		  VALUES ($1, 9001, $2, 'home', 'https://www.shop.example.com/home', '/home')`,
-			[]any{int64(7101), environmentID}},
+		{`INSERT INTO environment (id, name, status) VALUES ($1, 'test', 'active')`, []any{environmentID}},
+		{`INSERT INTO version (id, title, status, created_by, environment_id)
+		  VALUES ($1, 'v0.22', 'initial', 1, $2)`, []any{versionID, environmentID}},
+		{`INSERT INTO sut (id, environment_id, name, base_url, created_by)
+		  VALUES ($1, $2, 'shop', 'https://shop.example.com', 1)`, []any{sutID, environmentID}},
+		{`INSERT INTO sut_page (id, sut_id, name, url, route_template)
+		  VALUES ($1, $2, 'home', 'https://www.shop.example.com/home', '/home')`,
+			[]any{int64(7101), sutID}},
 	} {
 		if _, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil {
 			t.Fatalf("seed binding: %v (%s)", err, statement.sql)
@@ -322,24 +330,24 @@ func seedDiscoveryBinding(t *testing.T, pool *pgxpool.Pool, versionID, versionSU
 }
 
 // TestDiscoveryObservationResolvesEnvironmentFromBinding: an observation with no
-// environment_id is resolved through version_sut.
+// environment_id is resolved through the owning sut row.
 func TestDiscoveryObservationResolvesEnvironmentFromBinding(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	ctx := context.Background()
-	const versionID, versionSUTID, environmentID = int64(200), int64(5201), int64(7201)
-	seedDiscoveryBinding(t, pool, versionID, versionSUTID, environmentID)
+	const versionID, sutID, environmentID = int64(200), int64(5201), int64(7201)
+	seedDiscoveryBinding(t, pool, versionID, sutID, environmentID)
 
 	err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
 		Kind: "page", Host: "shop.example.com", ResourceTemplate: "/home",
-		VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1,
+		VersionID: versionID, SUTID: sutID, Occurrences: 1,
 	}})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	var got int64
 	if err := pool.QueryRow(ctx, `
-		SELECT environment_id FROM execution_discovery_observation WHERE version_sut_id = $1
-	`, versionSUTID).Scan(&got); err != nil {
+		SELECT environment_id FROM execution_discovery_observation WHERE sut_id = $1
+	`, sutID).Scan(&got); err != nil {
 		t.Fatalf("read environment_id: %v", err)
 	}
 	if got != environmentID {
@@ -373,16 +381,16 @@ func TestDiscoverySUTHostResolverIncludesBaseURLAndPages(t *testing.T) {
 func TestDiscoveryObservationListByVersion(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	ctx := context.Background()
-	const versionID, versionSUTID, environmentID = int64(210), int64(5210), int64(7210)
-	seedDiscoveryBinding(t, pool, versionID, versionSUTID, environmentID)
+	const versionID, sutID, environmentID = int64(210), int64(5210), int64(7210)
+	seedDiscoveryBinding(t, pool, versionID, sutID, environmentID)
 
 	batch := []executionapp.DiscoveryObservation{
 		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}", MIME: "text/html",
-			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9201, CaseRunID: 3201, Occurrences: 2},
+			StatusCode: intPtr(200), VersionID: versionID, SUTID: sutID, WaveID: 9201, CaseRunID: 3201, Occurrences: 2},
 		{Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}", MIME: "application/json",
-			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9201, CaseRunID: 3201, Occurrences: 5},
+			StatusCode: intPtr(200), VersionID: versionID, SUTID: sutID, WaveID: 9201, CaseRunID: 3201, Occurrences: 5},
 		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/login", MIME: "text/html",
-			StatusCode: intPtr(200), VersionID: versionID, VersionSUTID: versionSUTID, WaveID: 9202, CaseRunID: 3202, Occurrences: 1},
+			StatusCode: intPtr(200), VersionID: versionID, SUTID: sutID, WaveID: 9202, CaseRunID: 3202, Occurrences: 1},
 	}
 	if err := repo.Observations.UpsertObservations(ctx, batch); err != nil {
 		t.Fatalf("upsert: %v", err)
@@ -454,7 +462,7 @@ func TestDiscoveryObservationListForDeltaSnowflakeWaveID(t *testing.T) {
 	mustCreateWave(t, repo, waveID, versionID)
 	if err := repo.Observations.UpsertObservations(ctx, []executionapp.DiscoveryObservation{{
 		Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/v1/posts",
-		VersionID: versionID, VersionSUTID: 5001, WaveID: waveID, Occurrences: 1,
+		VersionID: versionID, SUTID: 5001, WaveID: waveID, Occurrences: 1,
 	}}); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -476,18 +484,18 @@ func TestDiscoveryObservationListForDeltaSnowflakeWaveID(t *testing.T) {
 func TestDiscoveryObservationMarkDecisionByResource(t *testing.T) {
 	repo, pool := newTestRepository(t)
 	ctx := context.Background()
-	const versionID, versionSUTID, environmentID = int64(211), int64(5211), int64(7211)
-	seedDiscoveryBinding(t, pool, versionID, versionSUTID, environmentID)
+	const versionID, sutID, environmentID = int64(211), int64(5211), int64(7211)
+	seedDiscoveryBinding(t, pool, versionID, sutID, environmentID)
 
 	batch := []executionapp.DiscoveryObservation{
 		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/orders/{id}",
-			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+			VersionID: versionID, SUTID: sutID, Occurrences: 1},
 		{Kind: "api", Method: "GET", Host: "shop.example.com", ResourceTemplate: "/api/orders/{id}",
-			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+			VersionID: versionID, SUTID: sutID, Occurrences: 1},
 		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/login",
-			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+			VersionID: versionID, SUTID: sutID, Occurrences: 1},
 		{Kind: "page", Host: "shop.example.com", ResourceTemplate: "/settled",
-			VersionID: versionID, VersionSUTID: versionSUTID, Occurrences: 1},
+			VersionID: versionID, SUTID: sutID, Occurrences: 1},
 	}
 	if err := repo.Observations.UpsertObservations(ctx, batch); err != nil {
 		t.Fatalf("upsert: %v", err)

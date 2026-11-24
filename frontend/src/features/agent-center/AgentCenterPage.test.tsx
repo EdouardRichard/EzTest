@@ -24,6 +24,17 @@ vi.mock("./ProfileEditor", () => ({
   ),
 }))
 
+vi.mock("./RunTranscriptDrawer", () => ({
+  RunTranscriptDrawer: ({ run, onClose }: { run: { id: string }; onClose: () => void }) => (
+    <div data-testid="agent-center-run-transcript">
+      transcript:{run.id}
+      <button type="button" onClick={onClose}>
+        关闭转录
+      </button>
+    </div>
+  ),
+}))
+
 import { AgentCenterPage } from "./AgentCenterPage"
 import type { AgentCatalog, AgentCenterQuality, AgentRunView, ProfileView } from "./types"
 
@@ -41,7 +52,7 @@ function catalogFixture(): AgentCatalog {
       "coverage_analyst",
       "issue_triager",
       "report_writer",
-      "version_steward",
+      "design_judge",
       "knowledge_curator",
     ],
   }
@@ -186,14 +197,16 @@ describe("AgentCenterPage", () => {
       "coverage_analyst",
       "issue_triager",
       "report_writer",
-      "version_steward",
+      "design_judge",
       "knowledge_curator",
     ]) {
       expect(within(execution).getByTestId(`agent-center-profile-${key}`)).toBeInTheDocument()
     }
     expect(within(execution).queryByText("对话 Host")).not.toBeInTheDocument()
 
-    // Removed Scout/Curator/Planner/case_author profiles never surface.
+    // Removed Scout/Curator/Planner/case_author profiles never surface. The
+    // retired version-closure team profile is pinned absent by the frontend
+    // steward-surface gate (v0.2.4-G T5, GD-17); design_judge replaces it above.
     expect(
       screen.queryByText(
         /context_scout|requirement_curator|design_planner|data_planner|case_author/,
@@ -286,5 +299,31 @@ describe("AgentCenterPage", () => {
     agentCenterApi.listAgentRuns.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     render(<AgentCenterPage initialTab="runs" />)
     expect(await screen.findByTestId("agent-center-runs-empty")).toHaveTextContent("尚无运行记录")
+  })
+
+  it("opens the admin transcript drawer from a runs row and closes it", async () => {
+    auth.isAdmin = true
+    render(<AgentCenterPage initialTab="runs" />)
+
+    const row = await screen.findByTestId("agent-center-run-31")
+    expect(screen.queryByTestId("agent-center-run-transcript")).not.toBeInTheDocument()
+    fireEvent.click(row)
+
+    expect(await screen.findByTestId("agent-center-run-transcript")).toHaveTextContent(
+      "transcript:31",
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭转录" }))
+    expect(screen.queryByTestId("agent-center-run-transcript")).not.toBeInTheDocument()
+  })
+
+  it("offers no transcript entry on runs rows for a normal user", async () => {
+    auth.isAdmin = false
+    render(<AgentCenterPage initialTab="runs" />)
+
+    const row = await screen.findByTestId("agent-center-run-31")
+    expect(row).not.toHaveAttribute("role", "button")
+    fireEvent.click(row)
+    expect(screen.queryByTestId("agent-center-run-transcript")).not.toBeInTheDocument()
   })
 })

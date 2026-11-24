@@ -2,15 +2,22 @@
 "use strict";
 
 // Deterministic OpenAI-compatible fake LLM upstream for EzTest 0.2 P0 + P1 + P2,
-// plus the legacy P3-P7 scenario dispatchers used by the 0.2 regression suites.
+// the current case_executor execution scenario (v0.2.4-C T13), and the legacy
+// P3-P7 scenario dispatchers used by the 0.2 regression suites.
 //
 // P0 only needs configuration / model catalog / connectivity tests and the
 // acceptance flow. P1 adds a deterministic agent mode used by the clarification
 // runtime; P2 adds the design team profiles. Without a profile marker the P0
-// behaviour is unchanged. The legacy P3-P7 scenario dispatchers live in
-// scripts/fake-llm-legacy.cjs (ported from the pre-0.2.1 upstream) and are
-// called before the current profile dispatcher; see that module for the
-// scenario rules and the [profile:...] marker mapping.
+// behaviour is unchanged. The scenario dispatchers live in
+// scripts/fake-llm-legacy.cjs and are called before the current profile
+// dispatcher; see that module for the scenario rules and the [profile:...]
+// marker mapping. The P6 execution scenario answers the seeded
+// "[profile:case_executor]" marker with the CURRENT capability-domain tool
+// surface (context.task_pack / sut.read / exec.run / browser.cli / http.request /
+// fixture.upload / fixture.download / execution.* / human.request, dotted registry
+// names); the 13 browser.* atomic actions and the underscore wire form are retired.
+// v0.2.4-F T15: the scenario consumes the natural-language task pack and carries
+// sut_id as factual attribution; the "fixture" mode exercises the P18 reuse chain.
 //
 // Endpoints:
 //   GET  /health               -> {"status":"ok","service":"fake-llm",...}
@@ -18,8 +25,10 @@
 //   POST /v1/chat/completions  -> non-stream JSON or stream=true SSE
 //   GET/POST /__p4-mode        -> legacy P4 scenario mode (ok|error|partial|impact-ai)
 //   GET/POST /__p5-mode        -> legacy P5 scenario mode (normal|invalid|degraded)
-//   GET/POST /__p6-mode        -> legacy P6 scenario mode (normal|fail|blocked|takeover|budget)
+//   GET/POST /__p6-mode        -> P6 execution scenario mode (normal|fail|blocked|takeover|fixture|budget)
 //   GET/POST /__p7-mode        -> legacy P7 scenario mode (normal|noop|degraded|invalid)
+//   GET/POST /__judge-mode     -> design_judge scenario mode (pass|fail|minor|error)
+//   GET/POST /__author-mode    -> design_author coverage mode (full|partial)
 //
 // Determinism rules (same request body => byte-identical response):
 //   * completion id  = "chatcmpl-fake-" + sha256(raw body)[0:12]
@@ -35,16 +44,32 @@
 //       - context_scout -> attachment summary derived from the latest role:
 //         "tool" result
 //       - design_host -> design chat text; when the user asks to add/modify a
-//         case, reads design.graph_read then submits case.graph_propose
+//         case, reads design.graph_read, then requirement.read (for the AC-id
+//         set), then submits case.graph_propose
 //       - design_planner -> scope-only text, no tools
-//       - case_author -> design.graph_read, then case.graph_propose with one
-//         scenario and two draft cases, then final text
+//       - case_author -> design.graph_read, then requirement.read (ac_ids), then
+//         case.graph_propose with one scenario and two draft cases, then final
+//         text. Cases carry the v0.2.4-B natural-language contract: sut_description,
+//         preconditions, covered_acs (from requirement.read.ac_ids) and prose step
+//         targets; the deleted version_sut/page/api id fields are never emitted.
 //       - design_critic -> design.review_submit with one minor finding, then
 //         final text
+//       - design_author (v0.2.4-E T19) -> same read/propose flow as case_author
+//         under the CURRENT profile marker; /__author-mode partial covers only
+//         the first AC (coverage-gap seed), full covers the whole AC set. A
+//         design.rework task revises the scoped case (existing id, added step +
+//         assertion) so the content hash changes and the judge re-reviews.
+//       - design_judge (v0.2.4-E T19) -> design.graph_read once, then ONE
+//         design.judgment_submit covering every judge_case scope entry with a
+//         per-case verdict per /__judge-mode: pass (clean pass + AC matrix),
+//         minor (pass + minor finding), fail (fail + blocker finding); error
+//         answers HTTP 500 server_error (LLM unavailable). round is NEVER
+//         emitted (server-derived, T13 contract).
 //       - data_planner -> design.graph_read, then design.data_plan_submit for
 //         the first draft case, then final text
 //       - no profile ever calls case.confirm (user/server-only)
-//   * legacy P3-P7 scenarios: see scripts/fake-llm-legacy.cjs. P4 file/impact
+//   * execution scenario (P6 dispatcher, current T13 contract) + legacy P3-P7
+//         scenarios: see scripts/fake-llm-legacy.cjs. P4 file/impact
 //         requests are recorded compactly in .tmp/fake-llm-requests.jsonl
 //         (mode/path/commit only, never prompt content).
 //   * context overflow  = system marker "[fake:context_overflow]" or request
@@ -62,8 +87,9 @@
 
 const crypto = require("node:crypto");
 const http = require("node:http");
-// Legacy P3-P7 scenario dispatchers kept for the regression suites committed in
-// the 0.2.0 tree (scripts/fake-llm.p4/p5/p6/p7.test.cjs). See the module banner.
+// Scenario dispatchers: the current case_executor execution scenario (P6) plus
+// the legacy P3-P7 suites committed in the 0.2.0 tree
+// (scripts/fake-llm.p4/p5/p6/p7.test.cjs). See the module banner.
 const legacyFake = require("./fake-llm-legacy.cjs");
 
 const HOST = "127.0.0.1";
@@ -72,16 +98,21 @@ const FIXED_CREATED = 1767225600;
 const REPLY_PREFIX = "EzTest fake LLM: ";
 const MAX_REPLY_CHARS = 240;
 const STREAM_CHUNK_CHARS = 16;
+// Tool-call arguments stream in 3-code-point fragments, mirroring the legacy
+// streamToolTurn wire shape (fake-llm-legacy.cjs) so the current dispatcher and
+// the legacy scenario suites emit identical incremental tool_calls deltas.
+const TOOL_STREAM_CHUNK_CHARS = 3;
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout|design_host|design_planner|case_author|design_critic|data_planner)\]/;
+const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout|design_host|design_planner|case_author|design_author|design_critic|design_judge|data_planner)\]/;
 const DESIGN_MODIFY_HINT = /(新增|补充|修改)/;
 const DESIGN_CASE_HINT = "用例";
 // Runtime-generated opening prompt; it mentions "新增或修改用例" but is not a
 // user write request, so the Host must not propose on the opening turn.
 const DESIGN_OPENING_MARKER = "设计会话的开场";
-// The agent runner injects the task scope into the system section
-// (requirement_id=<decimal>), which lets the fake author pick the requirement
-// the work item is actually scoped to instead of the first graph row.
+// The agent runner injects the task scope into the per-work-item task block
+// (requirement_id=<decimal>; user turn since Task 80), which lets the fake
+// author/judge pick the requirement the work item is actually scoped to instead
+// of the first graph row.
 const SCOPE_REQUIREMENT_PATTERN = /requirement_id=([1-9][0-9]*)/;
 const OVERFLOW_MARKER = "[fake:context_overflow]";
 const OVERFLOW_HEADER = "x-fake-context-overflow";
@@ -224,6 +255,18 @@ function allSystemText(body) {
     .join("\n");
 }
 
+// allPromptText joins the system AND user messages: since Task 80 the runner
+// renders the per-work-item task scope (requirement_id=, judge_case=, case_id=)
+// into the USER turn, while older fixtures put it in the system section. The
+// scope readers must find it in either place.
+function allPromptText(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  return messages
+    .filter((message) => message && (message.role === "system" || message.role === "user"))
+    .map((message) => messageText(message.content))
+    .join("\n");
+}
+
 // profileOf returns the P1 profile marker in the system prompt, if any.
 function profileOf(body) {
   const match = PROFILE_PATTERN.exec(allSystemText(body));
@@ -351,10 +394,73 @@ function firstGraphRequirement(graph) {
   return graph.requirements.find((requirement) => requirement && requirement.requirement_id) || null;
 }
 
-function requirementSUTIDs(requirement) {
-  const raw = Array.isArray(requirement.target_version_sut_ids) ? requirement.target_version_sut_ids : [];
-  const ids = raw.filter((value) => typeof value === "string" && /^[1-9][0-9]*$/.test(value));
-  return ids.length > 0 ? ids : ["9001"];
+// toolResults returns every parsed JSON tool-message result, newest first, so a
+// profile can look back past the latest result (the design flow accumulates a
+// graph_read result AND a requirement.read result before proposing).
+function toolResults(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const out = [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (!message || message.role !== "tool") continue;
+    const text = messageText(message.content).trim();
+    if (text === "") continue;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) out.push(parsed);
+    } catch {
+      // Not a JSON tool result; keep looking at older tool messages.
+    }
+  }
+  return out;
+}
+
+// findGraphResult returns the newest design.graph_read result (a requirements
+// array, no error), regardless of whether a later requirement.read result exists.
+function findGraphResult(body) {
+  for (const result of toolResults(body)) {
+    if (!result.error && Array.isArray(result.requirements)) return result;
+  }
+  return null;
+}
+
+// findRequirementRead returns the newest requirement.read result, identified by
+// its ac_ids array (the flat AC-id set the design author must draw covered_acs
+// from; design v1.3.1 §5.2). graph_read does NOT carry the requirement AC set.
+// The REAL tool wraps the detail as {"requirement": {...}} (tools/requirements.go
+// requirementReadResult); older fixtures carry the flat shape, so both are
+// accepted and the inner requirement object is returned.
+function findRequirementRead(body) {
+  for (const result of toolResults(body)) {
+    if (result.error) continue;
+    if (Array.isArray(result.ac_ids)) return result;
+    const nested = result.requirement;
+    if (nested && typeof nested === "object" && !Array.isArray(nested) && Array.isArray(nested.ac_ids)) {
+      return nested;
+    }
+  }
+  return null;
+}
+
+// requirementACIDs derives a case's covered_acs from the requirement.read ac_ids
+// set (server-assigned AC-<n> ids). The contract requires covered_acs to be a
+// non-empty subset of the requirement's current AC set, so the fake covers the
+// whole set. The ["AC-1"] fallback only fires for a degenerate empty source; a
+// confirmed requirement always has at least one AC.
+function requirementACIDs(reqRead) {
+  const raw = reqRead && Array.isArray(reqRead.ac_ids) ? reqRead.ac_ids : [];
+  const ids = raw.filter((value) => typeof value === "string" && /^AC-[1-9][0-9]*$/.test(value));
+  return ids.length > 0 ? ids : ["AC-1"];
+}
+
+// caseSutDescription derives the case's prose system-under-test description from
+// the requirement's own sut_description (requirement.read). The contract allows a
+// case to be as specific as or more specific than the requirement; the fake reuses
+// it verbatim, with a deterministic prose fallback when the source is empty.
+function caseSutDescription(reqRead) {
+  const desc =
+    reqRead && typeof reqRead.sut_description === "string" ? reqRead.sut_description.trim() : "";
+  return desc !== "" ? desc : "被测系统的核心页面与接口（自然语言描述，执行团队据此解析目标）。";
 }
 
 function firstGraphCase(requirement) {
@@ -389,9 +495,11 @@ function firstDraftGraphCase(requirement) {
 }
 
 // scopedRequirementID reads the runtime-injected requirement scope from the
-// task block, so design.requirement/gap runs target the work item's requirement.
+// task block, so design.requirement/gap/rework/judge runs target the work item's
+// requirement. The block lives in the user turn (Task 80); older fixtures carry
+// it in the system section, so both are scanned.
 function scopedRequirementID(body) {
-  const match = SCOPE_REQUIREMENT_PATTERN.exec(allSystemText(body));
+  const match = SCOPE_REQUIREMENT_PATTERN.exec(allPromptText(body));
   return match ? match[1] : null;
 }
 
@@ -410,7 +518,6 @@ function selectGraphRequirement(graph, body) {
 }
 
 function scenarioProposal(requirement) {
-  const suts = requirementSUTIDs(requirement);
   const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
   const currentVersion = String(requirement.requirement_version_id || "");
   // Only reuse a scenario bound to the current requirement version; scenarios
@@ -418,37 +525,38 @@ function scenarioProposal(requirement) {
   const existing = scenarios.find(
     (scenario) => scenario && scenario.id && String(scenario.requirement_version_id) === currentVersion,
   );
+  // v0.2.4-B natural-language contract: a scenario carries only ref/name/
+  // description/sort_order (+id when updating). version_sut_ids/page_ids/api_ids
+  // are deleted and hard-rejected by the decoder (DisallowUnknownFields).
   const node = {
     ref: "s1",
     name: existing && typeof existing.name === "string" && existing.name !== "" ? existing.name : "AI 设计场景",
     description: "由 fake LLM 生成的确定性设计场景。",
-    version_sut_ids: suts,
-    page_ids: [],
-    api_ids: [],
     sort_order: 0,
   };
   if (existing) node.id = String(existing.id);
   return node;
 }
 
-function caseProposal(requirement, existing, title, ordinal) {
-  const suts = requirementSUTIDs(requirement);
+function caseProposal(requirement, existing, title, ordinal, coveredACs, sutDescription) {
   const requirementVersionID = String(requirement.requirement_version_id || "");
+  // v0.2.4-B natural-language case contract: sut_description (prose SUT),
+  // preconditions, covered_acs (AC ids from requirement.read) and prose step
+  // targets replace the deleted default_version_sut_id/version_sut_ids/page_ids/
+  // api_ids resource ids, which the decoder hard-rejects.
   const node = {
     ref: "c" + (ordinal > 0 ? ordinal : 1),
     scenario_ref: "s1",
     title,
     description: "由 fake LLM 生成的确定性用例草案，等待用户确认。",
+    sut_description: sutDescription,
     preconditions: "已准备测试账号与运行环境。",
+    covered_acs: coveredACs,
     test_data: { fake: true },
     priority: "P2",
-    default_version_sut_id: suts[0],
-    version_sut_ids: suts,
-    page_ids: [],
-    api_ids: [],
     steps: [
-      { seq: 1, action: "打开被测页面", expected: "页面加载完成", data: {} },
-      { seq: 2, action: "执行核心操作", expected: "操作成功", data: {} },
+      { seq: 1, action: "打开被测页面", expected: "页面加载完成并显示主要内容", target_description: "被测系统的入口页面", data: {} },
+      { seq: 2, action: "执行核心操作", expected: "页面显示操作成功的结果提示", target_description: "页面的核心操作控件", data: {} },
     ],
     assertions: [
       { step_seq: 1, kind: "ui", target: "页面标题", expected: "标题可见" },
@@ -466,11 +574,19 @@ function graphProposal(requirement, options) {
   const settings = options || {};
   const titles = Array.isArray(settings.titles) && settings.titles.length > 0 ? settings.titles : ["AI 新增用例"];
   const existing = settings.updateFirstCase ? firstGraphCase(requirement) : null;
+  const coveredACs =
+    Array.isArray(settings.coveredACs) && settings.coveredACs.length > 0 ? settings.coveredACs : ["AC-1"];
+  const sutDescription =
+    typeof settings.sutDescription === "string" && settings.sutDescription !== ""
+      ? settings.sutDescription
+      : "被测系统的核心页面与接口。";
   return {
     requirement_id: String(requirement.requirement_id),
     requirement_version_id: String(requirement.requirement_version_id),
     scenarios: [scenarioProposal(requirement)],
-    cases: titles.map((title, index) => caseProposal(requirement, index === 0 ? existing : null, title, index + 1)),
+    cases: titles.map((title, index) =>
+      caseProposal(requirement, index === 0 ? existing : null, title, index + 1, coveredACs, sutDescription),
+    ),
   };
 }
 
@@ -496,8 +612,9 @@ function designHostOutcome(body, rawBody) {
       "我是设计 Host。我会读取用例脑图，并可以按你的要求新增或修改场景/用例 draft；请说明要调整的内容。",
     );
   }
-  const graph = graphResult(body);
-  if (graph) {
+  const graph = findGraphResult(body);
+  const reqRead = findRequirementRead(body);
+  if (graph && reqRead) {
     const requirement = selectGraphRequirement(graph, body);
     if (!requirement) {
       return textOutcome("当前版本还没有可设计的已澄清需求。");
@@ -505,8 +622,22 @@ function designHostOutcome(body, rawBody) {
     return toolCallOutcome(
       rawBody,
       "case.graph_propose",
-      graphProposal(requirement, { updateFirstCase: true, titles: ["AI 补充用例（设计对话）"] }),
+      graphProposal(requirement, {
+        updateFirstCase: true,
+        titles: ["AI 补充用例（设计对话）"],
+        coveredACs: requirementACIDs(reqRead),
+        sutDescription: caseSutDescription(reqRead),
+      }),
     );
+  }
+  if (graph) {
+    const requirement = selectGraphRequirement(graph, body);
+    if (!requirement) {
+      return textOutcome("当前版本还没有可设计的已澄清需求。");
+    }
+    // covered_acs must come from the requirement AC set, which graph_read does not
+    // carry: read it once via requirement.read before proposing.
+    return toolCallOutcome(rawBody, "requirement.read", { requirement_id: String(requirement.requirement_id) });
   }
   return toolCallOutcome(rawBody, "design.graph_read", {});
 }
@@ -522,8 +653,9 @@ function caseAuthorOutcome(body, rawBody) {
   if (result && isProposeResult(result)) {
     return textOutcome("已提交 1 个场景与 2 条用例 draft，等待用户在脑图中确认。");
   }
-  const graph = graphResult(body);
-  if (graph) {
+  const graph = findGraphResult(body);
+  const reqRead = findRequirementRead(body);
+  if (graph && reqRead) {
     const requirement = selectGraphRequirement(graph, body);
     if (!requirement) {
       return textOutcome("没有找到可设计的已澄清需求。");
@@ -531,8 +663,21 @@ function caseAuthorOutcome(body, rawBody) {
     return toolCallOutcome(
       rawBody,
       "case.graph_propose",
-      graphProposal(requirement, { titles: ["AI 用例 1：核心流程", "AI 用例 2：异常流程"] }),
+      graphProposal(requirement, {
+        titles: ["AI 用例 1：核心流程", "AI 用例 2：异常流程"],
+        coveredACs: requirementACIDs(reqRead),
+        sutDescription: caseSutDescription(reqRead),
+      }),
     );
+  }
+  if (graph) {
+    const requirement = selectGraphRequirement(graph, body);
+    if (!requirement) {
+      return textOutcome("没有找到可设计的已澄清需求。");
+    }
+    // The AC-id set covered_acs must be drawn from is not in graph_read; read it
+    // once via requirement.read (design v1.3.1 §5.2) before proposing.
+    return toolCallOutcome(rawBody, "requirement.read", { requirement_id: String(requirement.requirement_id) });
   }
   if (result && result.error) {
     return textOutcome("读取脑图失败，请稍后重试。");
@@ -551,6 +696,269 @@ function designCriticOutcome(body, rawBody) {
       { severity: "minor", message: "建议补充异常路径的断言与测试数据。" },
     ],
   });
+}
+
+// --- v0.2.4-E T19: design_author / design_judge dispatchers ------------------
+//
+// Mode controls follow the legacy /__p6-mode pattern (test-only runtime switch,
+// env-backed so the E2E can flip scenarios without restarting the fake):
+//   /__judge-mode  pass (default) | fail | minor | error
+//   /__author-mode full (default) | partial
+const JUDGE_MODES = new Set(["pass", "fail", "minor", "error"]);
+const AUTHOR_MODES = new Set(["full", "partial"]);
+
+function judgeMode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_JUDGE_MODE || "pass").trim().toLowerCase();
+  return JUDGE_MODES.has(value) ? value : "pass";
+}
+
+function authorMode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_AUTHOR_MODE || "full").trim().toLowerCase();
+  return AUTHOR_MODES.has(value) ? value : "full";
+}
+
+async function handleModeControl(req, res, modes, envKey, current) {
+  const raw = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  const mode = String(body.mode || "").trim().toLowerCase();
+  if (!modes.has(mode)) {
+    sendError(res, 400, "mode must be one of " + [...modes].join(", "));
+    return;
+  }
+  process.env[envKey] = mode;
+  sendJson(res, 200, { mode: current() });
+}
+
+// judgeCaseScope parses the review scope the runner renders into the task block
+// (runner.go taskContext): one "judge_case=case_id:<id>,case_version_id:<id>,
+// content_hash:<64hex>" line per pending draft. The scope entries are the
+// authoritative review targets (T14), not the full-draft-set generation anchor.
+const JUDGE_CASE_PATTERN = /judge_case=case_id:([1-9][0-9]*),case_version_id:([1-9][0-9]*),content_hash:([0-9a-f]{64})/g;
+const REWORK_CASE_PATTERN = /case_id=([1-9][0-9]*)/;
+const REWORK_TYPE_PATTERN = /类型:\s*design\.rework/;
+
+function judgeCaseScope(body) {
+  const text = allPromptText(body);
+  const cases = [];
+  for (const match of text.matchAll(JUDGE_CASE_PATTERN)) {
+    cases.push({ caseID: match[1], caseVersionID: match[2], contentHash: match[3] });
+  }
+  return cases;
+}
+
+// findGraphCaseByID locates one case of the requirement's CURRENT revision by
+// logical case id (rework targets the scoped case, not the first graph row).
+function findGraphCaseByID(requirement, caseID) {
+  const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  const currentVersion = String(requirement.requirement_version_id || "");
+  for (const scenario of scenarios) {
+    if (!scenario || String(scenario.requirement_version_id) !== currentVersion) continue;
+    const cases = Array.isArray(scenario.cases) ? scenario.cases : [];
+    for (const item of cases) {
+      if (item && String(item.case_id) === String(caseID)) return item;
+    }
+  }
+  return null;
+}
+
+// draftGraphCases lists the current-revision draft cases of one requirement
+// (the judge fallback when no judge_case scope lines are present).
+function draftGraphCases(requirement) {
+  const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  const currentVersion = String(requirement.requirement_version_id || "");
+  const out = [];
+  for (const scenario of scenarios) {
+    if (!scenario || String(scenario.requirement_version_id) !== currentVersion) continue;
+    const cases = Array.isArray(scenario.cases) ? scenario.cases : [];
+    for (const item of cases) {
+      if (item && item.case_id && item.status === "draft" && item.current_version_id) {
+        out.push({
+          caseID: String(item.case_id),
+          caseVersionID: String(item.current_version_id),
+          coveredACs: Array.isArray(item.covered_acs) ? item.covered_acs : [],
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// judgeCoverageMatrix builds the optional ac_coverage_matrix object (T13
+// contract: a free JSON object keyed by AC id) from the graph case's covered_acs.
+function judgeCoverageMatrix(graph, body, target) {
+  const requirement = selectGraphRequirement(graph, body);
+  if (!requirement) return null;
+  const item = findGraphCaseByID(requirement, target.caseID);
+  if (!item || String(item.current_version_id) !== String(target.caseVersionID)) return null;
+  const acs = Array.isArray(item.covered_acs) ? item.covered_acs.filter((ac) => /^AC-[1-9][0-9]*$/.test(ac)) : [];
+  if (acs.length === 0) return null;
+  const matrix = {};
+  for (const ac of acs) {
+    matrix[ac] = { covered: true, case_id: target.caseID, basis: "用例步骤与断言实现了该 AC 的 when/then。" };
+  }
+  return matrix;
+}
+
+// designJudgeOutcome is the independent judge flow: read the graph once, then
+// submit ONE design.judgment_submit batch covering every scoped pending draft.
+// The payload shape is the T13 tool contract (tools/judgment.go): no round, no
+// unknown fields; pass never carries blocker/important findings.
+function designJudgeOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result && Array.isArray(result.submitted)) {
+    return textOutcome("已完成独立审查：逐用例提交 verdict 与 findings，等待人工在 case_review 决断。");
+  }
+  const graph = findGraphResult(body);
+  if (!graph) {
+    if (result && result.error) {
+      return textOutcome("读取脑图失败，本轮未提交判定。");
+    }
+    return toolCallOutcome(rawBody, "design.graph_read", {});
+  }
+  const requirementID = scopedRequirementID(body);
+  let targets = judgeCaseScope(body);
+  if (targets.length === 0) {
+    const requirement = selectGraphRequirement(graph, body);
+    if (requirement) targets = draftGraphCases(requirement);
+  }
+  if (!requirementID || targets.length === 0) {
+    return textOutcome("当前需求没有待审的用例草案，本轮未提交判定。");
+  }
+  const mode = judgeMode();
+  const judgments = targets.map((target) => {
+    if (mode === "fail") {
+      return {
+        case_id: target.caseID,
+        case_version_id: target.caseVersionID,
+        verdict: "fail",
+        findings: [
+          {
+            dimension: "coverage",
+            severity: "blocker",
+            message: "用例未覆盖该需求验收标准的反向/边界场景，且断言不足以证明 AC 的 then 成立；请补齐覆盖与可观察断言。",
+            case_ref: target.caseID,
+          },
+        ],
+      };
+    }
+    if (mode === "minor") {
+      return {
+        case_id: target.caseID,
+        case_version_id: target.caseVersionID,
+        verdict: "pass",
+        findings: [
+          {
+            dimension: "executability",
+            severity: "minor",
+            message: "建议补充测试数据的具体取值，便于执行团队复现。",
+            case_ref: target.caseID,
+          },
+        ],
+      };
+    }
+    const item = { case_id: target.caseID, case_version_id: target.caseVersionID, verdict: "pass" };
+    const matrix = judgeCoverageMatrix(graph, body, target);
+    if (matrix) item.ac_coverage_matrix = matrix;
+    return item;
+  });
+  return toolCallOutcome(rawBody, "design.judgment_submit", {
+    requirement_id: requirementID,
+    judgments,
+  });
+}
+
+// reworkProposal revises ONE scoped case: it keeps the logical case id and
+// title (natural key) and changes the content (description + one added step and
+// assertion) so the server writes a new case version with a new content hash
+// and the judge re-reviews it (spec SC-E4 rework loop).
+function reworkProposal(requirement, target, coveredACs, sutDescription) {
+  const node = caseProposal(requirement, target, target.title, 1, coveredACs, sutDescription);
+  node.description = "按裁判打回意见修订：补齐反向/边界覆盖与可观察断言。";
+  node.steps.push({
+    seq: node.steps.length + 1,
+    action: "验证边界场景",
+    expected: "边界输入得到明确的错误提示或拦截",
+    target_description: "页面的边界输入控件",
+    data: {},
+  });
+  node.assertions.push({
+    step_seq: node.steps.length,
+    kind: "text",
+    target: "边界提示",
+    expected: "提示信息与验收标准一致",
+  });
+  return {
+    requirement_id: String(requirement.requirement_id),
+    requirement_version_id: String(requirement.requirement_version_id),
+    scenarios: [scenarioProposal(requirement)],
+    cases: [node],
+  };
+}
+
+// designAuthorOutcome is the CURRENT design_author background job flow. It
+// mirrors caseAuthorOutcome's read/propose contract under the current profile
+// marker, adds the /__author-mode coverage knob (partial = first AC only, the
+// SC-E4 coverage-gap seed) and the design.rework revision branch.
+function designAuthorOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result && isProposeResult(result)) {
+    return textOutcome("已提交用例草案（draft），等待独立裁判审查与人工确认。");
+  }
+  const graph = findGraphResult(body);
+  const reqRead = findRequirementRead(body);
+  if (graph && reqRead) {
+    const requirement = selectGraphRequirement(graph, body);
+    if (!requirement) {
+      return textOutcome("没有找到可设计的已澄清需求。");
+    }
+    const promptText = allPromptText(body);
+    if (REWORK_TYPE_PATTERN.test(promptText)) {
+      const caseMatch = REWORK_CASE_PATTERN.exec(promptText);
+      const target = caseMatch
+        ? findGraphCaseByID(requirement, caseMatch[1])
+        : firstGraphCase(requirement);
+      if (!target) {
+        return textOutcome("打回的用例不在当前需求版本内，本轮未提交修订。");
+      }
+      return toolCallOutcome(
+        rawBody,
+        "case.graph_propose",
+        reworkProposal(requirement, target, requirementACIDs(reqRead), caseSutDescription(reqRead)),
+      );
+    }
+    const allACs = requirementACIDs(reqRead);
+    const coveredACs = authorMode() === "partial" ? allACs.slice(0, 1) : allACs;
+    return toolCallOutcome(
+      rawBody,
+      "case.graph_propose",
+      graphProposal(requirement, {
+        titles: ["AI 用例 1：核心流程", "AI 用例 2：异常流程"],
+        coveredACs,
+        sutDescription: caseSutDescription(reqRead),
+      }),
+    );
+  }
+  if (graph) {
+    const requirement = selectGraphRequirement(graph, body);
+    if (!requirement) {
+      return textOutcome("没有找到可设计的已澄清需求。");
+    }
+    return toolCallOutcome(rawBody, "requirement.read", { requirement_id: String(requirement.requirement_id) });
+  }
+  if (result && result.error) {
+    return textOutcome("读取脑图失败，请稍后重试。");
+  }
+  return toolCallOutcome(rawBody, "design.graph_read", {});
 }
 
 function dataPlannerOutcome(body, rawBody) {
@@ -593,8 +1001,12 @@ function chatOutcome(body, rawBody) {
       return designPlannerOutcome();
     case "case_author":
       return caseAuthorOutcome(body, rawBody);
+    case "design_author":
+      return designAuthorOutcome(body, rawBody);
     case "design_critic":
       return designCriticOutcome(body, rawBody);
+    case "design_judge":
+      return designJudgeOutcome(body, rawBody);
     case "data_planner":
       return dataPlannerOutcome(body, rawBody);
     default:
@@ -701,7 +1113,11 @@ function writeSseEvent(res, data) {
   return res.write("data: " + JSON.stringify(data) + "\n\n");
 }
 
-function streamCompletion(res, body, rawBody, reply) {
+// openSse centralises the SSE response lifecycle both streaming writers share
+// (H-E9): the identical writeHead/flushHeaders block, the close/error guard that
+// stops writing to a dead socket, and the terminal `data: [DONE]` + res.end().
+// streamCompletion and streamToolCompletion keep only their own delta loops.
+function openSse(res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -710,20 +1126,32 @@ function streamCompletion(res, body, rawBody, reply) {
   });
   if (typeof res.flushHeaders === "function") res.flushHeaders();
 
-  const id = completionId(rawBody);
-  const model = modelFor(body);
-  const chars = Array.from(reply);
-  const usage = makeUsage(body, reply);
-
-  // Opening role delta.
-  writeSseEvent(res, streamChunk(id, model, { role: "assistant" }));
-
   let closed = false;
   const markClosed = () => {
     closed = true;
   };
   res.on("close", markClosed);
   res.on("error", markClosed);
+
+  return {
+    isClosed: () => closed,
+    event: (data) => writeSseEvent(res, data),
+    done: () => {
+      res.write("data: [DONE]\n\n");
+      res.end();
+    },
+  };
+}
+
+function streamCompletion(res, body, rawBody, reply) {
+  const sse = openSse(res);
+  const id = completionId(rawBody);
+  const model = modelFor(body);
+  const chars = Array.from(reply);
+  const usage = makeUsage(body, reply);
+
+  // Opening role delta.
+  sse.event(streamChunk(id, model, { role: "assistant" }));
 
   const chunks = [];
   for (let i = 0; i < chars.length; i += STREAM_CHUNK_CHARS) {
@@ -733,13 +1161,50 @@ function streamCompletion(res, body, rawBody, reply) {
   if (chunks.length === 0) chunks.push("");
 
   for (const content of chunks) {
-    if (closed) return;
-    writeSseEvent(res, streamChunk(id, model, { content }));
+    if (sse.isClosed()) return;
+    sse.event(streamChunk(id, model, { content }));
   }
-  if (closed) return;
-  writeSseEvent(res, streamChunk(id, model, {}, "stop", usage));
-  res.write("data: [DONE]\n\n");
-  res.end();
+  if (sse.isClosed()) return;
+  sse.event(streamChunk(id, model, {}, "stop", usage));
+  sse.done();
+}
+
+// streamToolCompletion streams a tool_calls outcome as OpenAI chat-completions
+// SSE, mirroring the legacy streamToolTurn: each call's first argument fragment
+// carries id/type/function.name, later fragments carry only function.arguments
+// at the same index; a terminal finish_reason:"tool_calls" chunk carries usage
+// (satisfying stream_options.include_usage), followed by [DONE]. Every call is
+// streamed at its own index so multiple calls never collapse (no silent drop).
+function streamToolCompletion(res, body, rawBody, outcome) {
+  const sse = openSse(res);
+  const id = completionId(rawBody);
+  const model = modelFor(body);
+  const usageText = outcome.calls.map((call) => call.arguments).join("");
+  const usage = makeUsage(body, usageText);
+
+  for (let callIndex = 0; callIndex < outcome.calls.length; callIndex += 1) {
+    const call = outcome.calls[callIndex];
+    const chars = Array.from(call.arguments);
+    const parts = [];
+    for (let i = 0; i < chars.length; i += TOOL_STREAM_CHUNK_CHARS) {
+      parts.push(chars.slice(i, i + TOOL_STREAM_CHUNK_CHARS).join(""));
+    }
+    // Empty arguments still emit one fragment carrying id/type/name.
+    if (parts.length === 0) parts.push("");
+    for (let index = 0; index < parts.length; index += 1) {
+      if (sse.isClosed()) return;
+      const fragment = { index: callIndex, function: { arguments: parts[index] } };
+      if (index === 0) {
+        fragment.id = call.id;
+        fragment.type = "function";
+        fragment.function.name = call.name;
+      }
+      sse.event(streamChunk(id, model, { tool_calls: [fragment] }));
+    }
+  }
+  if (sse.isClosed()) return;
+  sse.event(streamChunk(id, model, {}, "tool_calls", usage));
+  sse.done();
 }
 
 async function handleChatCompletions(req, res) {
@@ -767,6 +1232,15 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
+  // Judge-unavailable scenario (v0.2.4-E T19 loop ④): /__judge-mode error makes
+  // every design_judge request fail as an upstream server error, so the real
+  // runner classifies a model failure and the scheduler's bounded judge
+  // generations exhaust into judge_exhausted. Other profiles are unaffected.
+  if (profileOf(body) === "design_judge" && judgeMode() === "error") {
+    sendError(res, 500, "fake judge upstream unavailable (EZTEST_FAKE_LLM_JUDGE_MODE=error)", "server_error");
+    return;
+  }
+
   // The legacy P3-P7 scenario suites (and their P1/P3/P4 regression guards) are
   // dispatched first: each detector only matches its own system-prompt marker,
   // and the P1/P3 fallbacks are gated so an unmarked current P1/P2 request
@@ -785,8 +1259,12 @@ async function handleChatCompletions(req, res) {
   }
 
   const outcome = chatOutcome(body, rawBody);
-  if (body.stream === true && outcome.kind === "text") {
-    streamCompletion(res, body, rawBody, outcome.text);
+  if (body.stream === true && (outcome.kind === "text" || outcome.kind === "tool_calls")) {
+    if (outcome.kind === "tool_calls") {
+      streamToolCompletion(res, body, rawBody, outcome);
+    } else {
+      streamCompletion(res, body, rawBody, outcome.text);
+    }
     return;
   }
   sendJson(res, 200, completionBody(body, rawBody, outcome));
@@ -817,6 +1295,28 @@ async function handleRequest(req, res) {
   if (req.method === "POST" && pathname === "/v1/chat/completions") {
     await handleChatCompletions(req, res);
     return;
+  }
+  // Test-only scenario controls for the current design dispatchers (T19),
+  // same GET/POST shape as the legacy /__p4-mode ... /__p7-mode controls.
+  if (pathname === "/__judge-mode") {
+    if (req.method === "POST") {
+      await handleModeControl(req, res, JUDGE_MODES, "EZTEST_FAKE_LLM_JUDGE_MODE", judgeMode);
+      return;
+    }
+    if (req.method === "GET") {
+      sendJson(res, 200, { mode: judgeMode() });
+      return;
+    }
+  }
+  if (pathname === "/__author-mode") {
+    if (req.method === "POST") {
+      await handleModeControl(req, res, AUTHOR_MODES, "EZTEST_FAKE_LLM_AUTHOR_MODE", authorMode);
+      return;
+    }
+    if (req.method === "GET") {
+      sendJson(res, 200, { mode: authorMode() });
+      return;
+    }
   }
   // Test-only legacy scenario controls (/__p4-mode ... /__p7-mode).
   if (await legacyFake.handleLegacyControl(req, res, pathname)) return;

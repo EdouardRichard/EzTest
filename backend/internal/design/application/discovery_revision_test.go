@@ -18,11 +18,12 @@ import (
 
 // fakeDiscoveryStore is the in-memory discovery revision read port.
 type fakeDiscoveryStore struct {
-	byObservation map[int64]DiscoveryProvenance
-	byResource    map[string][]DiscoveryProvenance
-	resources     map[int64]DiscoveryApprovedResource
-	duplicates    map[int64]int64
-	readErr       error
+	byObservation  map[int64]DiscoveryProvenance
+	byResource     map[string][]DiscoveryProvenance
+	resources      map[int64]DiscoveryApprovedResource
+	duplicates     map[int64]int64
+	readErr        error
+	lastContentKey discoveryContentKey
 }
 
 func newFakeDiscoveryStore() *fakeDiscoveryStore {
@@ -71,9 +72,28 @@ func (f *fakeDiscoveryStore) ApprovedResource(_ context.Context, resourceID int6
 	return resource, true, nil
 }
 
-func (f *fakeDiscoveryStore) FindConfirmedCaseByContent(_ context.Context, versionID, requirementID int64, contentHash string, pageID, apiID int64) (int64, bool, error) {
+// FindConfirmedCaseByContent records the content key it was asked about so a test
+// can prove the duplicate lookup is keyed on content (ruling 7) and not on a
+// resource id.
+func (f *fakeDiscoveryStore) FindConfirmedCaseByContent(_ context.Context, versionID, requirementID int64, contentHash, sutDescription, targetDescription string) (int64, bool, error) {
+	f.lastContentKey = discoveryContentKey{
+		versionID:         versionID,
+		requirementID:     requirementID,
+		contentHash:       contentHash,
+		sutDescription:    sutDescription,
+		targetDescription: targetDescription,
+	}
 	id, ok := f.duplicates[requirementID]
 	return id, ok, nil
+}
+
+// discoveryContentKey is the Critic ④ lookup argument snapshot.
+type discoveryContentKey struct {
+	versionID         int64
+	requirementID     int64
+	contentHash       string
+	sutDescription    string
+	targetDescription string
 }
 
 // ---------- fake rollback persistence ----------
@@ -192,11 +212,6 @@ func (t *fakeRollbackTx) SetCurrentVersion(_ context.Context, caseID, caseVersio
 	return nil
 }
 
-func (t *fakeRollbackTx) InsertConfirmation(_ context.Context, confirmation design.Confirmation) error {
-	t.repo.confirmations = append(t.repo.confirmations, confirmation)
-	return nil
-}
-
 // ---------- harness ----------
 
 type discoveryRevisionHarness struct {
@@ -222,7 +237,8 @@ func newDiscoveryRevisionTest(t *testing.T) *discoveryRevisionHarness {
 	repo := newFakeRepo()
 	events := &fakePublisher{}
 	audit := &fakeAudit{}
-	svc := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, events, &fakeTeamRoom{})
+	svc := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, events, &fakeTeamRoom{}).
+		SetJudgmentGate(alwaysPassJudgmentGate{})
 	store := newFakeDiscoveryStore()
 	store.resources[6001] = DiscoveryApprovedResource{
 		ID: 6001, Kind: "page", Status: "approved", Label: "/orders/{id}", Template: "/orders/{id}",
@@ -243,7 +259,10 @@ func newDiscoveryRevisionTest(t *testing.T) *discoveryRevisionHarness {
 		ResourceID: harness.pageID, Kind: "page",
 		CaseRunID: harness.caseRunID, CaseVersionID: 5101,
 		RequirementID: harness.requirementID, RequirementVersionID: harness.requirementVersionID,
-		VersionSUTID: harness.versionSUTID, FactID: 6101, EvidenceRows: 2,
+		SUTID: harness.versionSUTID, FactID: 6101, EvidenceRows: 2,
+		// v0.2.4-B: the additive draft inherits the covered_acs of the case
+		// version whose execution produced the observation.
+		CoveredACs: []string{"AC-1"},
 	})
 	svc.SetDiscoveryRevisionStore(store)
 	return harness
@@ -271,15 +290,22 @@ func equalIDs(left, right []int64) bool {
 
 // ---------- tests ----------
 
-func TestAutoConfirmKeepsCurrentWaveAndRollback(t *testing.T) {
+// TestDiscoveryDraftKeepsCurrentWaveAndLegacyRollback pins the R-E2r contract end
+// to end: a resource approval whose five predicates pass yields a DRAFT
+// (judgment_pending) that never mutates the current wave and never auto-confirms;
+// and Rollback — now legacy-only — undoes a pre-E system auto-confirm by
+// superseding it and inserting a DRAFT replacement, without bypassing Confirm.
+func TestDiscoveryDraftKeepsCurrentWaveAndLegacyRollback(t *testing.T) {
 	d := newDiscoveryRevisionTest(t)
 	before := d.CurrentWaveCaseRunIDs(d.versionID)
 	rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
 	if err != nil {
 		t.Fatalf("OnResourceConfirmed: %v", err)
 	}
-	if rev.Status != design.CaseStatusConfirmed || rev.Trigger != design.CaseTriggerDiscoveryDelta {
-		t.Fatalf("rev = %+v, want confirmed discovery_delta", rev)
+	// R-E2r: every predicate passing yields a draft awaiting judge + human, never
+	// a confirmed revision.
+	if rev.Status != design.CaseStatusDraft || rev.Trigger != design.CaseTriggerDiscoveryDelta || rev.LowConfidenceReason != "judgment_pending" {
+		t.Fatalf("rev = %+v, want draft discovery_delta judgment_pending", rev)
 	}
 	if rev.CaseVersionID <= 0 || rev.CaseID <= 0 {
 		t.Fatalf("rev ids = %+v", rev)
@@ -287,86 +313,78 @@ func TestAutoConfirmKeepsCurrentWaveAndRollback(t *testing.T) {
 	if !equalIDs(before, d.CurrentWaveCaseRunIDs(d.versionID)) {
 		t.Fatal("current wave case_run ids changed")
 	}
-	if got := len(d.eventsOfType("case.revision.auto_confirmed")); got != 1 {
-		t.Fatalf("auto-confirm events = %d, want 1 (%v)", got, d.events.types())
+	if got := len(d.eventsOfType("case.revision.auto_confirmed")); got != 0 {
+		t.Fatalf("auto-confirm events = %d, want 0 (%v)", got, d.events.types())
 	}
 	stored := d.caseVersion(rev.CaseVersionID)
-	if stored.Status != design.CaseStatusConfirmed ||
+	if stored.Status != design.CaseStatusDraft ||
 		stored.Trigger != design.CaseTriggerDiscoveryDelta ||
-		stored.AutoConfirmedBy != design.AutoConfirmationActor ||
+		stored.AutoConfirmedBy != "" ||
 		stored.SourceObservationID == nil || *stored.SourceObservationID != d.observationID {
-		t.Fatalf("stored revision = %+v", stored)
+		t.Fatalf("stored revision = %+v, want draft discovery_delta with no system actor", stored)
 	}
-	if len(d.repo.confirmations) != 1 {
-		t.Fatalf("confirmations = %d, want 1", len(d.repo.confirmations))
+	if len(d.repo.confirmations) != 0 {
+		t.Fatalf("confirmations = %d, want 0 (discovery never confirms)", len(d.repo.confirmations))
 	}
-	confirmation := d.repo.confirmations[0]
-	if !confirmation.AutoConfirmed || confirmation.AutoConfirmedBy != design.AutoConfirmationActor ||
-		confirmation.Trigger != design.CaseTriggerDiscoveryDelta ||
-		confirmation.SourceObservationID == nil || *confirmation.SourceObservationID != d.observationID {
-		t.Fatalf("confirmation = %+v", confirmation)
-	}
-	confirmAudit := findAudit(d.audit.events, "case.confirmed")
-	if confirmAudit == nil ||
-		confirmAudit.Metadata["trigger"] != design.CaseTriggerDiscoveryDelta ||
-		confirmAudit.Metadata["auto_confirmed_by"] != design.AutoConfirmationActor ||
-		confirmAudit.Metadata["source_observation_id"] != platformid.Format(d.observationID) {
-		t.Fatalf("auto-confirm audit = %+v", d.audit.events)
+	if findAudit(d.audit.events, "case.confirmed") != nil {
+		t.Fatalf("discovery draft emitted a confirm audit: %+v", d.audit.events)
 	}
 
-	alt, err := d.svc.Rollback(context.Background(), d.versionID, rev.CaseVersionID, "revert", 9)
+	// Rollback is legacy-only after R-E2r: the discovery draft above is not
+	// rollbackable, so seed a pre-E system auto-confirm and roll THAT back.
+	legacy := d.seedLegacySystemConfirmedDiscoveryRevision(7001)
+	alt, err := d.svc.Rollback(context.Background(), d.versionID, legacy.ID, "revert", 9)
 	if err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
-	if alt.RollbackOf != rev.CaseVersionID || alt.Status != design.CaseStatusConfirmed || alt.Trigger != design.CaseTriggerRollback {
-		t.Fatalf("alt = %+v", alt)
+	if alt.RollbackOf != legacy.ID || alt.Status != design.CaseStatusDraft || alt.Trigger != design.CaseTriggerRollback {
+		t.Fatalf("alt = %+v, want draft rollback of %d", alt, legacy.ID)
 	}
-	if got := d.caseVersion(rev.CaseVersionID).Status; got != design.CaseStatusSuperseded {
+	if got := d.caseVersion(legacy.ID).Status; got != design.CaseStatusSuperseded {
 		t.Fatalf("original status = %q, want superseded", got)
 	}
-	if len(d.repo.confirmations) != 2 {
-		t.Fatalf("confirmations = %d, want auto-confirm + rollback = 2", len(d.repo.confirmations))
-	}
-	rollbackConfirmation := d.repo.confirmations[1]
-	if len(rollbackConfirmation.AffectedCaseVersionIDs) != 1 ||
-		rollbackConfirmation.AffectedCaseVersionIDs[0] != platformid.Format(alt.CaseVersionID) {
-		t.Fatalf("rollback affected ids = %v, want [%s]",
-			rollbackConfirmation.AffectedCaseVersionIDs, platformid.Format(alt.CaseVersionID))
+	// Confirm is the only terminal entry: the rollback writes no confirmation row
+	// for the draft replacement.
+	if len(d.repo.confirmations) != 0 {
+		t.Fatalf("confirmations = %d, want 0 (rollback no longer bypasses Confirm)", len(d.repo.confirmations))
 	}
 	if alt.ResourceID != d.pageID {
 		t.Fatalf("rollback resource_id = %d, want %d", alt.ResourceID, d.pageID)
 	}
-	again, err := d.svc.Rollback(context.Background(), d.versionID, rev.CaseVersionID, "revert", 9)
+	again, err := d.svc.Rollback(context.Background(), d.versionID, legacy.ID, "revert", 9)
 	if err != nil || again.CaseVersionID != alt.CaseVersionID {
 		t.Fatalf("rollback not idempotent: again=%+v err=%v", again, err)
 	}
 	if again.ResourceID != d.pageID {
 		t.Fatalf("idempotent rollback resource_id = %d, want %d", again.ResourceID, d.pageID)
 	}
-	if len(d.repo.confirmations) != 2 {
-		t.Fatalf("idempotent rollback wrote another confirmation: %d", len(d.repo.confirmations))
+	if len(d.repo.confirmations) != 0 {
+		t.Fatalf("idempotent rollback wrote a confirmation: %d", len(d.repo.confirmations))
 	}
-	if got := len(d.eventsOfType("case.revision.auto_confirmed")); got != 2 {
-		t.Fatalf("events = %d, want auto+rollback = 2", got)
+	// The rollback still notifies via the legacy EV-12 event (rollback_of) and the
+	// case.rolled_back audit. The discovery draft emitted no auto-confirm event, so
+	// exactly one such event exists — the rollback's. (The event name/confidence is
+	// a legacy contract retained pending T17; the replacement itself is a draft.)
+	rollbackEvents := d.eventsOfType("case.revision.auto_confirmed")
+	if len(rollbackEvents) != 1 {
+		t.Fatalf("rollback events = %d, want 1 (%v)", len(rollbackEvents), d.events.types())
 	}
-	rollbackEvents := 0
-	for _, event := range d.eventsOfType("case.revision.auto_confirmed") {
-		if event.Payload["trigger"] == design.CaseTriggerRollback {
-			rollbackEvents++
-			if event.Payload["rollback_of"] != platformid.Format(rev.CaseVersionID) {
-				t.Fatalf("rollback event payload = %+v", event.Payload)
-			}
-			if event.Payload["resource_id"] != platformid.Format(d.pageID) {
-				t.Fatalf("rollback event resource_id = %v, want %d", event.Payload["resource_id"], d.pageID)
-			}
-		}
+	if rollbackEvents[0].Payload["trigger"] != design.CaseTriggerRollback ||
+		rollbackEvents[0].Payload["rollback_of"] != platformid.Format(legacy.ID) ||
+		rollbackEvents[0].Payload["resource_id"] != platformid.Format(d.pageID) {
+		t.Fatalf("rollback event payload = %+v", rollbackEvents[0].Payload)
 	}
-	if rollbackEvents != 1 {
-		t.Fatalf("rollback events = %d, want 1", rollbackEvents)
+	// Additive hardening (whole-branch review minor): the legacy event NAME says
+	// "auto_confirmed" while the replacement is a DRAFT. The payload must carry the
+	// authoritative status so a consumer cannot misread a draft as confirmed even
+	// if it only reads the payload.
+	if rollbackEvents[0].Payload["status"] != design.CaseStatusDraft {
+		t.Fatalf("rollback event payload status = %v, want %q (draft, not confirmed)",
+			rollbackEvents[0].Payload["status"], design.CaseStatusDraft)
 	}
 	rollbackAudit := findAudit(d.audit.events, "case.rolled_back")
 	if rollbackAudit == nil ||
-		rollbackAudit.Metadata["rolled_back_from"] != platformid.Format(rev.CaseVersionID) ||
+		rollbackAudit.Metadata["rolled_back_from"] != platformid.Format(legacy.ID) ||
 		rollbackAudit.Metadata["trigger"] != design.CaseTriggerRollback {
 		t.Fatalf("rollback audit = %+v", d.audit.events)
 	}
@@ -430,10 +448,49 @@ func TestDuplicateTargetStaysDraft(t *testing.T) {
 	}
 }
 
-func TestOutOfScopeTargetAndUnapprovedResourceStayDraft(t *testing.T) {
-	t.Run("out_of_scope", func(t *testing.T) {
+// TestContractGapsAndUnapprovedResourceStayDraft pins the fail-closed gates that
+// replaced Critic ⑥ ("target inside the version scope", deleted by ruling 7).
+// With no resource scope left to check, what stops an approval from becoming a
+// case is the §5.2 contract: the draft must be able to state the system under
+// test and name at least one acceptance criterion it covers. When either source
+// is empty the pass stays a draft rather than fabricating coverage -- a fabricated
+// covered_acs would make E's union pre-check report a gap that does not exist.
+func TestContractGapsAndUnapprovedResourceStayDraft(t *testing.T) {
+	t.Run("missing_sut_description", func(t *testing.T) {
 		d := newDiscoveryRevisionTest(t)
-		d.repo.version.PageToSUT = map[int64]int64{}
+		d.repo.requirement.SutDescription = "   "
+		rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
+		if err != nil {
+			t.Fatalf("OnResourceConfirmed: %v", err)
+		}
+		if rev.Status != design.CaseStatusDraft || rev.LowConfidenceReason != "missing_sut_description" {
+			t.Fatalf("rev = %+v", rev)
+		}
+		if len(d.repo.cases) != 0 {
+			t.Fatalf("no case may be written when the SUT description cannot be derived: %d", len(d.repo.cases))
+		}
+	})
+	t.Run("missing_covered_acs", func(t *testing.T) {
+		d := newDiscoveryRevisionTest(t)
+		provenance := d.store.byObservation[d.observationID]
+		provenance.CoveredACs = nil
+		d.store.seedProvenance(provenance)
+		rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
+		if err != nil {
+			t.Fatalf("OnResourceConfirmed: %v", err)
+		}
+		if rev.Status != design.CaseStatusDraft || rev.LowConfidenceReason != "missing_covered_acs" {
+			t.Fatalf("rev = %+v", rev)
+		}
+		if len(d.repo.cases) != 0 {
+			t.Fatalf("no case may be written when no AC can be inherited: %d", len(d.repo.cases))
+		}
+	})
+	t.Run("unknown_observation_kind", func(t *testing.T) {
+		d := newDiscoveryRevisionTest(t)
+		provenance := d.store.byObservation[d.observationID]
+		provenance.Kind = "database"
+		d.store.seedProvenance(provenance)
 		rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
 		if err != nil {
 			t.Fatalf("OnResourceConfirmed: %v", err)
@@ -457,12 +514,81 @@ func TestOutOfScopeTargetAndUnapprovedResourceStayDraft(t *testing.T) {
 	})
 }
 
-func TestAutoConfirmIdempotentPerObservation(t *testing.T) {
+// TestDuplicateLookupIsKeyedOnContent pins ruling 7's main point: Critic ④ asks
+// the store for a content identity (content_hash + sut_description + the step's
+// target_description), never for a page/api id.
+func TestDuplicateLookupIsKeyedOnContent(t *testing.T) {
+	d := newDiscoveryRevisionTest(t)
+	if _, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID); err != nil {
+		t.Fatalf("OnResourceConfirmed: %v", err)
+	}
+	key := d.store.lastContentKey
+	if key.versionID != d.versionID || key.requirementID != d.requirementID {
+		t.Fatalf("content key scope = %+v", key)
+	}
+	if len(key.contentHash) != 64 {
+		t.Fatalf("content key hash = %q, want the created version's content hash", key.contentHash)
+	}
+	if key.sutDescription != d.repo.requirement.SutDescription {
+		t.Fatalf("content key sut_description = %q, want the requirement's %q",
+			key.sutDescription, d.repo.requirement.SutDescription)
+	}
+	// The discovered resource's label becomes the step's target_description.
+	if key.targetDescription != "/orders/{id}" {
+		t.Fatalf("content key target_description = %q, want the discovered label", key.targetDescription)
+	}
+}
+
+// TestDiscoveryDraftCarriesInheritedContract pins what the additive draft
+// actually stores: the requirement's sut_description, the inherited covered_acs
+// and an explicit "无" precondition, plus the discovered resource recovered as a
+// page provenance source (which is how caseVersionResourceID still answers).
+// R-E2r: the draft is judgment_pending, never auto-confirmed; the inherited
+// contract content is unchanged.
+func TestDiscoveryDraftCarriesInheritedContract(t *testing.T) {
+	d := newDiscoveryRevisionTest(t)
+	rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
+	if err != nil {
+		t.Fatalf("OnResourceConfirmed: %v", err)
+	}
+	if rev.Status != design.CaseStatusDraft || rev.LowConfidenceReason != "judgment_pending" {
+		t.Fatalf("rev = %+v, want draft judgment_pending", rev)
+	}
+	if rev.ResourceID != d.pageID {
+		t.Fatalf("resource id = %d, want %d (recovered from the page provenance source)", rev.ResourceID, d.pageID)
+	}
+	item := d.repo.cases[rev.CaseID]
+	if item == nil || item.current == nil {
+		t.Fatalf("case %d was not persisted", rev.CaseID)
+	}
+	version := item.current
+	if version.SutDescription != d.repo.requirement.SutDescription {
+		t.Fatalf("sut_description = %q", version.SutDescription)
+	}
+	if len(version.CoveredACs) != 1 || version.CoveredACs[0] != "AC-1" {
+		t.Fatalf("covered_acs = %v, want the inherited [AC-1]", version.CoveredACs)
+	}
+	if version.Preconditions != "无" {
+		t.Fatalf("preconditions = %q, want the explicit 无", version.Preconditions)
+	}
+	var pageSource bool
+	for _, source := range version.Sources {
+		if source.Kind == design.SourcePage && source.RefID == platformid.Format(d.pageID) {
+			pageSource = true
+		}
+	}
+	if !pageSource {
+		t.Fatalf("the discovered page must remain a provenance source: %+v", version.Sources)
+	}
+}
+
+func TestDiscoveryDraftIdempotentPerObservation(t *testing.T) {
 	d := newDiscoveryRevisionTest(t)
 	first, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
+	eventsAfterFirst := len(d.events.events)
 	second, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
 	if err != nil {
 		t.Fatalf("second: %v", err)
@@ -470,8 +596,18 @@ func TestAutoConfirmIdempotentPerObservation(t *testing.T) {
 	if first.CaseVersionID != second.CaseVersionID {
 		t.Fatalf("idempotency: first=%+v second=%+v", first, second)
 	}
-	if len(d.eventsOfType("case.revision.auto_confirmed")) != 1 {
-		t.Fatalf("events = %v, want one", d.events.types())
+	// The replay projects the stored draft (the low-confidence reason is a
+	// creation-time annotation, not re-derived on an idempotent hit).
+	if second.Status != design.CaseStatusDraft {
+		t.Fatalf("second = %+v, want the same draft", second)
+	}
+	if len(d.eventsOfType("case.revision.auto_confirmed")) != 0 {
+		t.Fatalf("discovery draft emitted an auto-confirm event: %v", d.events.types())
+	}
+	// The idempotent replay short-circuits on the observation key and emits nothing
+	// new (the draft-creation events fired once, on the first call).
+	if len(d.events.events) != eventsAfterFirst {
+		t.Fatalf("idempotent replay emitted new events: %d -> %d", eventsAfterFirst, len(d.events.events))
 	}
 }
 
@@ -486,8 +622,14 @@ func TestResourceConfirmedObserverMapsSystemEvent(t *testing.T) {
 	if err := observer(context.Background(), event); err != nil {
 		t.Fatalf("observer: %v", err)
 	}
-	if len(d.eventsOfType("case.revision.auto_confirmed")) != 1 {
-		t.Fatalf("observer did not auto-confirm (%v)", d.events.types())
+	// R-E2r: the observer creates a discovery DRAFT (judge + human confirm later),
+	// never an auto-confirm. Draft creation is observable via the normal
+	// case_version_created event, not case.revision.auto_confirmed.
+	if len(d.eventsOfType("design.case_version_created")) != 1 {
+		t.Fatalf("observer did not create a discovery draft (%v)", d.events.types())
+	}
+	if len(d.eventsOfType("case.revision.auto_confirmed")) != 0 {
+		t.Fatalf("observer auto-confirmed (%v)", d.events.types())
 	}
 
 	// A non-system channel and an unrelated system event are ignored.
@@ -499,8 +641,8 @@ func TestResourceConfirmedObserverMapsSystemEvent(t *testing.T) {
 	_ = ignoredObserver(context.Background(), eventing.Event{
 		Channel: "system", Type: "resource.page.updated", Payload: map[string]any{"id": "6001"},
 	})
-	if len(ignored.eventsOfType("case.revision.auto_confirmed")) != 0 {
-		t.Fatalf("observer reacted to an ignored event")
+	if len(ignored.eventsOfType("design.case_version_created")) != 0 {
+		t.Fatalf("observer reacted to an ignored event (%v)", ignored.events.types())
 	}
 
 	// A nil revision store is a safe no-op.
@@ -532,22 +674,21 @@ func TestRollbackRejectsManualRevision(t *testing.T) {
 
 func TestRollbackRejectsHumanConfirmedDiscoveryRevision(t *testing.T) {
 	d := newDiscoveryRevisionTest(t)
-	rev, err := d.svc.OnResourceConfirmed(context.Background(), d.versionID, d.pageID, d.observationID, d.requirementID)
-	if err != nil {
-		t.Fatalf("OnResourceConfirmed: %v", err)
-	}
-	// Model a human confirming a low-confidence discovery draft: the revision
-	// is confirmed and still a discovery_delta, but no system auto-confirmation
-	// actor is recorded.
+	// A human may confirm a discovery draft through the normal Confirm path: the
+	// revision is confirmed and still discovery_delta, but carries no system
+	// auto-confirm actor. After R-E2r OnResourceConfirmed only produces drafts, so
+	// seed that human-confirmed shape directly (confirmed + discovery_delta, empty
+	// auto_confirmed_by) rather than mutating an auto-confirm that no longer exists.
+	rev := d.seedLegacySystemConfirmedDiscoveryRevision(7001)
 	for _, item := range d.repo.cases {
 		for index := range item.versions {
-			if item.versions[index].ID == rev.CaseVersionID {
+			if item.versions[index].ID == rev.ID {
 				item.versions[index].AutoConfirmedBy = ""
 			}
 		}
 	}
 
-	_, err = d.svc.Rollback(context.Background(), d.versionID, rev.CaseVersionID, "why", 9)
+	_, err := d.svc.Rollback(context.Background(), d.versionID, rev.ID, "why", 9)
 	var platformErr *platform.Error
 	if !asPlatformError(err, &platformErr) || platformErr.Status != 409 {
 		t.Fatalf("err = %v, want 409", err)
@@ -579,12 +720,17 @@ func TestRollbackBasesReplacementOnPriorConfirmedRevision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rollback: %v", err)
 	}
-	if replacement.RollbackOf != autorev.ID || replacement.Status != design.CaseStatusConfirmed {
-		t.Fatalf("replacement = %+v", replacement)
+	// R-E2r: the replacement is a DRAFT copy of the prior confirmed revision, not
+	// a confirmed revision; it awaits judge review + human confirm.
+	if replacement.RollbackOf != autorev.ID || replacement.Status != design.CaseStatusDraft {
+		t.Fatalf("replacement = %+v, want draft rollback of %d", replacement, autorev.ID)
 	}
 	stored := d.caseVersion(replacement.CaseVersionID)
 	if stored.Title != base.Title {
 		t.Fatalf("replacement title = %q, want prior confirmed %q", stored.Title, base.Title)
+	}
+	if stored.AutoConfirmedBy != "" {
+		t.Fatalf("replacement auto_confirmed_by = %q, want empty (no system auto-confirm)", stored.AutoConfirmedBy)
 	}
 	if d.caseVersion(autorev.ID).Status != design.CaseStatusSuperseded {
 		t.Fatal("original auto-confirmed revision was not superseded")

@@ -9,8 +9,8 @@
     (runtime\node\node.exe web\server.js) and the PDF renderer
     (runtime\node\node.exe renderer\src\server.mjs). Each process gets a pid file
     under run\ and a log under logs\; startup waits for the documented health
-    checks (API /healthz + /api/health db=ok, executor /healthz with a
-    browserVersion, web /login, renderer /healthz with a browser version) before
+    checks (API /healthz + /api/health db=ok, executor /healthz with status=ok
+    (v2 workstation; browser optional), web /login, renderer /healthz with a browser version) before
     reporting success.
 
     EzTest 0.2 keeps its runtime configuration in the database settings center.
@@ -356,10 +356,12 @@ function Wait-ExecutorReady {
             $response = Invoke-RawHttp -Url "$BaseUrl/healthz" -TimeoutSec 5
             if ($response.Status -eq 200) {
                 $json = $response.Body | ConvertFrom-Json
-                if ($json.status -eq "ok" -and -not [string]::IsNullOrWhiteSpace("$($json.browserVersion)")) {
+                # v2 (v0.2.4-C): healthz reports the SESSION service, not the browser.
+                # Readiness is status=ok; browserVersion was removed (browser optional).
+                if ($json.status -eq "ok") {
                     return $json
                 }
-                $lastDetail = "status=$($json.status) browserVersion=$($json.browserVersion)"
+                $lastDetail = "status=$($json.status)"
             } else {
                 $body = $response.Body
                 if ($body.Length -gt 300) { $body = $body.Substring(0, 300) }
@@ -370,7 +372,7 @@ function Wait-ExecutorReady {
         }
         Start-Sleep -Milliseconds 500
     }
-    throw "The Playwright executor did not become ready within $Seconds seconds (last: $lastDetail).$([Environment]::NewLine)Bundled Chromium could not be launched; check logs\executor.err.log and the PACKAGE.md troubleshooting section.$([Environment]::NewLine)$(Get-LogHint executor)"
+    throw "The executor did not become ready within $Seconds seconds (last: $lastDetail).$([Environment]::NewLine)The executor is a general workstation (protocol v2); readiness is /healthz status=ok. Check logs\executor.err.log and the PACKAGE.md troubleshooting section.$([Environment]::NewLine)$(Get-LogHint executor)"
 }
 
 function Wait-RendererReady {
@@ -601,16 +603,14 @@ try {
     Write-Host "[2/4] Playwright executor ..." -NoNewline
     [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_TOKEN", $executorToken, "Process")
     [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_ADDR", "$(Get-EnvValue -Name 'EZTEST_EXECUTOR_ADDR' -Default "127.0.0.1:$execPort")", "Process")
-    $maxContexts = Get-EnvValue -Name "EZTEST_EXECUTOR_MAX_CONTEXTS" -Default "8"
-    [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_MAX_CONTEXTS", $maxContexts, "Process")
-    $allowedHosts = Get-EnvValue -Name "EZTEST_EXEC_ALLOWED_HOSTS" -Default "localhost,127.0.0.1"
-    [Environment]::SetEnvironmentVariable("EZTEST_EXEC_ALLOWED_HOSTS", $allowedHosts, "Process")
+    $maxSessions = Get-EnvValue -Name "EZTEST_EXECUTOR_MAX_SESSIONS" -Default "8"
+    [Environment]::SetEnvironmentVariable("EZTEST_EXECUTOR_MAX_SESSIONS", $maxSessions, "Process")
     $baselineBytes = Get-EnvValue -Name "EZTEST_VISUAL_BASELINE_MAX_BYTES" -Default "5242880"
     [Environment]::SetEnvironmentVariable("EZTEST_VISUAL_BASELINE_MAX_BYTES", $baselineBytes, "Process")
     $execArgs = '"' + $paths.ExecServer + '"'
     $execProcess = Start-EztestProcess -Name "executor" -Exe $paths.Node -Arguments $execArgs -WorkingDirectory $PackageRoot
     $execHealth = Wait-ExecutorReady -BaseUrl $execBaseUrl -Process $execProcess -Seconds 120
-    Write-Host " ready (browser $($execHealth.browserVersion))" -ForegroundColor Green
+    Write-Host " ready (cli $($execHealth.browserCli.cli_version))" -ForegroundColor Green
 
     # --- web ---------------------------------------------------------------
     Write-Host "[3/4] web ..." -NoNewline

@@ -2,7 +2,6 @@ package executionapp
 
 import (
 	"context"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,9 +18,11 @@ func TestBuildWaveScopeSnapshotFreezesAndNormalizesScope(t *testing.T) {
 	repoID := int64(77)
 	binding := VersionBinding{
 		VersionID: 5,
-		SUTs: []VersionSUTBinding{{
-			VersionSUTID:  12,
-			SUTID:         2,
+		SUTs: []SUTBinding{{
+			// v0.2.4-B: one SUT key. This literal used to carry both the
+			// binding-row id (12) and the SUT id (2); the dropped leg is why
+			// the frozen document's shape changed.
+			SUTID:         12,
 			EnvironmentID: 3,
 			PageIDs:       []int64{9, 7},
 			APIIDs:        []int64{6},
@@ -38,7 +39,8 @@ func TestBuildWaveScopeSnapshotFreezesAndNormalizesScope(t *testing.T) {
 	for _, needle := range []string{
 		`"version_id":5`,
 		`"frozen_at":"2026-11-05T01:02:03Z"`,
-		`"version_sut_id":12`,
+		`"suts":[`,
+		`"sut_id":12`,
 		`"page_ids":[7,9]`,
 		`"api_ids":[6]`,
 		`"database_ids":[8]`,
@@ -49,8 +51,17 @@ func TestBuildWaveScopeSnapshotFreezesAndNormalizesScope(t *testing.T) {
 			t.Fatalf("snapshot %s does not contain %s", first, needle)
 		}
 	}
+	// The v0.2.4-B rekey renamed the frozen document's keys: the array is
+	// `suts` and its entries carry only `sut_id`. run_wave.scope_snapshot is
+	// passed through verbatim by the scope-snapshot handler, so the old key
+	// names must not survive anywhere in the document.
+	for _, stale := range []string{"version_suts", "version_sut_id"} {
+		if strings.Contains(first, stale) {
+			t.Fatalf("snapshot %s still contains the stale key %s", first, stale)
+		}
+	}
 	reordered := binding
-	reordered.SUTs = []VersionSUTBinding{binding.SUTs[0]}
+	reordered.SUTs = []SUTBinding{binding.SUTs[0]}
 	reordered.SUTs[0].PageIDs = []int64{7, 9}
 	reordered.SUTs[0].AccountRoles = []string{"admin", "author"}
 	second, err := buildWaveScopeSnapshot(reordered, frozenAt)
@@ -71,9 +82,8 @@ func TestBuildWaveScopeSnapshotCarriesEveryEffectiveRepository(t *testing.T) {
 	repoID := int64(77)
 	binding := VersionBinding{
 		VersionID: 5,
-		SUTs: []VersionSUTBinding{{
-			VersionSUTID:  12,
-			SUTID:         2,
+		SUTs: []SUTBinding{{
+			SUTID:         12,
 			EnvironmentID: 3,
 			RepositoryIDs: []int64{9, 7, 9, 0},
 			CodeRepoID:    &repoID,
@@ -84,7 +94,7 @@ func TestBuildWaveScopeSnapshotCarriesEveryEffectiveRepository(t *testing.T) {
 		t.Fatalf("buildWaveScopeSnapshot: %v", err)
 	}
 	payload := decodeWaveScopeSnapshot(t, raw)
-	got := payload.VersionSUTs[0].RepositoryIDs
+	got := payload.SUTs[0].RepositoryIDs
 	t.Logf("multi-repo repository_ids = %v", got)
 	if len(got) != 2 || got[0] != 7 || got[1] != 9 {
 		t.Fatalf("repository_ids = %v, want the sorted unique multi-repo set [7 9]", got)
@@ -97,7 +107,7 @@ func TestBuildWaveScopeSnapshotCarriesEveryEffectiveRepository(t *testing.T) {
 		t.Fatalf("buildWaveScopeSnapshot fallback: %v", err)
 	}
 	payload = decodeWaveScopeSnapshot(t, raw)
-	got = payload.VersionSUTs[0].RepositoryIDs
+	got = payload.SUTs[0].RepositoryIDs
 	if len(got) != 1 || got[0] != 77 {
 		t.Fatalf("legacy repository_ids = %v, want the single CodeRepoID [77]", got)
 	}
@@ -128,10 +138,10 @@ func TestSnapshotFreezesAndNextWaveSeesNew(t *testing.T) {
 		t.Fatalf("active wave1 = %+v err=%v", wave1, err)
 	}
 	frozen1 := decodeWaveScopeSnapshot(t, wave1.ScopeSnapshot)
-	if got := frozen1.VersionSUTs[0].PageIDs; len(got) != 1 || got[0] != 10 {
+	if got := frozen1.SUTs[0].PageIDs; len(got) != 1 || got[0] != 10 {
 		t.Fatalf("wave1 page_ids = %v, want [10]", got)
 	}
-	if got := frozen1.VersionSUTs[0].RepositoryIDs; len(got) != 2 || got[0] != 7 || got[1] != 9 {
+	if got := frozen1.SUTs[0].RepositoryIDs; len(got) != 2 || got[0] != 7 || got[1] != 9 {
 		t.Fatalf("wave1 repository_ids = %v, want the two effective repos [7 9]", got)
 	}
 
@@ -166,10 +176,10 @@ func TestSnapshotFreezesAndNextWaveSeesNew(t *testing.T) {
 		t.Fatalf("wave2 reused wave1 id %d", wave1.ID)
 	}
 	next := decodeWaveScopeSnapshot(t, wave2.ScopeSnapshot)
-	if got := next.VersionSUTs[0].PageIDs; len(got) != 2 || got[0] != 10 || got[1] != 11 {
+	if got := next.SUTs[0].PageIDs; len(got) != 2 || got[0] != 10 || got[1] != 11 {
 		t.Fatalf("wave2 page_ids = %v, want the newly approved [10 11]", got)
 	}
-	if got := next.VersionSUTs[0].RepositoryIDs; len(got) != 1 || got[0] != 7 {
+	if got := next.SUTs[0].RepositoryIDs; len(got) != 1 || got[0] != 7 {
 		t.Fatalf("wave2 repository_ids = %v, want [7]", got)
 	}
 	// The frozen wave1 snapshot is still unchanged after wave2 was planned.
@@ -213,11 +223,12 @@ func TestSnapshotFreezesAndNextWaveSeesNew(t *testing.T) {
 	}
 }
 
-// decodeWaveScopeSnapshot decodes the frozen scope document.
-func decodeWaveScopeSnapshot(t *testing.T, raw string) waveScopeSnapshotPayload {
+// decodeWaveScopeSnapshot decodes the frozen scope document through the domain's
+// single authoritative shape.
+func decodeWaveScopeSnapshot(t *testing.T, raw string) execution.WaveScopeSnapshot {
 	t.Helper()
-	var payload waveScopeSnapshotPayload
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+	payload, err := execution.ParseWaveScopeSnapshot(raw)
+	if err != nil {
 		t.Fatalf("decode scope snapshot %q: %v", raw, err)
 	}
 	return payload

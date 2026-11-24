@@ -66,6 +66,11 @@ export function fetchSettings(): Promise<Setting[]> {
   return apiGet<Setting[]>("/api/admin/settings")
 }
 
+/** Reads one catalog setting by key (`GET /api/admin/settings/{key}`, admin). */
+export function getSetting(key: string): Promise<Setting> {
+  return apiGet<Setting>(`/api/admin/settings/${encodeURIComponent(key)}`)
+}
+
 export function updateSetting(key: string, value: unknown): Promise<Setting> {
   return apiPatch<Setting>(`/api/admin/settings/${encodeURIComponent(key)}`, { value })
 }

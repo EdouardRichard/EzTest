@@ -99,7 +99,8 @@ func NewAnalysisService(deps AnalysisDeps) *AnalysisService {
 	}
 }
 
-// ChangeSet is the GET /changes preview model (base = version_sut baseline).
+// ChangeSet is the GET /changes preview model (base = the repository's pinned
+// (SUT, repository) baseline).
 type ChangeSet struct {
 	RepoID        int64
 	BaseCommitSHA string
@@ -111,7 +112,7 @@ type ChangeSet struct {
 // Start creates or reuses a version×repo analysis. A missing baseline maps to
 // baseline_commit_missing; a non-descendant head maps to invalid_head.
 func (s *AnalysisService) Start(ctx context.Context, versionID, repoID int64, headCommit string, force bool) (codeintel.Analysis, bool, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return codeintel.Analysis{}, false, err
 	}
@@ -851,7 +852,7 @@ func (s *AnalysisService) Search(ctx context.Context, repoID int64, commit, quer
 
 // Changes previews the version baseline..head change set without persisting it.
 func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, headCommit string) (ChangeSet, error) {
-	bindings, err := s.versions.VersionSUTBindings(ctx, versionID)
+	bindings, err := s.versions.SUTRepoBindings(ctx, versionID)
 	if err != nil {
 		return ChangeSet{}, err
 	}
@@ -900,13 +901,13 @@ func (s *AnalysisService) Changes(ctx context.Context, versionID, repoID int64, 
 	return ChangeSet{RepoID: repoID, BaseCommitSHA: base, HeadCommitSHA: head, Files: result.Files, Truncated: result.Truncated}, nil
 }
 
-// repoBaseline resolves the analysis base commit of one repository. A
-// version_sut stores a single baseline commit shared by every effective
-// repository; when that commit does not resolve in this repository (multi-repo
-// binding), the repository's own newest done index commit of this version is the
-// baseline. The version scope and the done filter keep another version's run and
-// a newer failed/queued run from hiding a usable baseline.
-func (s *AnalysisService) repoBaseline(ctx context.Context, versionID int64, bindings []VersionSUTBinding, repoID int64, repository RepoRef) (string, error) {
+// repoBaseline resolves the analysis base commit of one repository. The
+// baseline is pinned per (SUT, repository) pair of the environment code pool;
+// when that commit does not resolve in the local clone, the repository's own
+// newest done index commit of this version is the baseline. The version scope
+// and the done filter keep another version's run and a newer failed/queued run
+// from hiding a usable baseline.
+func (s *AnalysisService) repoBaseline(ctx context.Context, versionID int64, bindings []SUTRepoBinding, repoID int64, repository RepoRef) (string, error) {
 	base, err := baselineForRepo(bindings, repoID)
 	if err != nil {
 		return "", err

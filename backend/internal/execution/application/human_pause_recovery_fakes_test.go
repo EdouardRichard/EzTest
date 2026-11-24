@@ -392,27 +392,27 @@ type fakeExecutorControl struct {
 	mu      sync.Mutex
 	deleted []string
 	cancels []string
-	live    []ExecutorContext
+	live    []ExecutorSession
 }
 
-func (c *fakeExecutorControl) CancelContext(_ context.Context, _ int64, contextID string) error {
+func (c *fakeExecutorControl) CancelSession(_ context.Context, _ int64, contextID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cancels = append(c.cancels, contextID)
 	return nil
 }
 
-func (c *fakeExecutorControl) DeleteContext(_ context.Context, _ int64, contextID string) error {
+func (c *fakeExecutorControl) DeleteSession(_ context.Context, _ int64, contextID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleted = append(c.deleted, contextID)
 	return nil
 }
 
-func (c *fakeExecutorControl) ListContexts(context.Context) ([]ExecutorContext, error) {
+func (c *fakeExecutorControl) ListSessions(context.Context) ([]ExecutorSession, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]ExecutorContext(nil), c.live...), nil
+	return append([]ExecutorSession(nil), c.live...), nil
 }
 
 func (c *fakeExecutorControl) deletedContext(contextID string) bool {
@@ -431,6 +431,7 @@ type task9Fixture struct {
 	intents   *fakeIntentStore
 	waves     *fakeWaveStore
 	runs      *fakeCaseRunStore
+	evidence  *fakeEvidenceStore
 	humans    *fakeHumanStore
 	executors *fakeExecutorStore
 	contexts  *fakeSUTContextStore
@@ -452,6 +453,7 @@ func newTask9Fixture() *task9Fixture {
 		intents:   newFakeIntentStore(),
 		waves:     newFakeWaveStore(),
 		runs:      newFakeCaseRunStore(),
+		evidence:  newFakeEvidenceStore(),
 		humans:    newFakeHumanStore(),
 		executors: newFakeExecutorStore(),
 		contexts:  newFakeSUTContextStore(),
@@ -477,6 +479,7 @@ func newTask9Fixture() *task9Fixture {
 	f.human = NewHumanService(HumanServiceDeps{
 		Humans:    f.humans,
 		CaseRuns:  f.runs,
+		Evidence:  f.evidence,
 		Waves:     f.waves,
 		Canceller: f.canceller,
 		WorkQueue: f.queue,
@@ -489,6 +492,7 @@ func newTask9Fixture() *task9Fixture {
 		Intents:     f.intents,
 		Waves:       f.waves,
 		CaseRuns:    f.runs,
+		Evidence:    f.evidence,
 		Humans:      f.human,
 		Executors:   f.executors,
 		Contexts:    f.contexts,
@@ -529,7 +533,7 @@ func (f *task9Fixture) seedRun(id int64, intentID int64, status execution.CaseRu
 func (f *task9Fixture) seedIntent(id, caseVersionID int64) execution.ExecutionIntent {
 	intent := execution.ExecutionIntent{
 		ID: id, VersionID: 100, CaseVersionID: caseVersionID,
-		VersionSUTIDs:          []int64{5001},
+		SUTIDs:                 []int64{5001},
 		EnvironmentFingerprint: testFingerprintForTask9,
 		Purpose:                execution.PurposeInitial,
 		Status:                 execution.IntentRunning,

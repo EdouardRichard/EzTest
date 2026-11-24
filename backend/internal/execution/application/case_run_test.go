@@ -32,7 +32,8 @@ type caseRunnerFixture struct {
 	humans     *fakeHumanRepo
 	cases      *fakeExecutionCaseReader
 	bindings   *fakeBindingResolver
-	browser    *fakeBrowserExecutor
+	versions   *fakeReplayVersionReader
+	execution  *fakeExecutionExecutor
 	creds      *fakeCredentialReader
 	content    *fakeContentStore
 	http       *fakeHTTPDoer
@@ -40,7 +41,6 @@ type caseRunnerFixture struct {
 	gaps       *fakeGapEnsurer
 	coverage   *fakeCoverageReader
 	room       *fakeTeamRoom
-	visual     *fakeVisualPort
 	settings   *fakeCaseRunnerSettings
 	clock      *caseRunnerClock
 	ids        *caseRunnerIDs
@@ -63,15 +63,18 @@ func intptr(value int) *int       { return &value }
 func caseRunSnapshot() execution.CaseSnapshot {
 	return execution.CaseSnapshot{
 		CaseID: 51, CaseVersionID: 41, RequirementID: 501, RequirementVersionID: 601,
-		DefaultVersionSUTID: 7, Title: "登录流程", Description: "用户使用账号密码登录",
+		DefaultSUTID: 7, Title: "登录流程", Description: "用户使用账号密码登录",
 		Preconditions: "已创建测试账号", Priority: "P0",
-		VersionSUTIDs: []int64{7},
+		SUTIDs: []int64{7},
+		// v0.2.4-B (T9 design contract): a step names its target in prose and
+		// carries no SUT/page/API id; DefaultSUTID/SUTIDs above are what
+		// executionSUTBindings resolves from the version binding during Prepare.
 		Steps: []execution.CaseStep{{
 			Seq: 1, Action: "打开登录页", Expected: "出现登录表单",
-			TargetVersionSUTID: 7, AccountRole: "admin", TargetPageID: int64ptr(71),
+			TargetDescription: "登录页", AccountRole: "admin",
 		}},
 		Assertions: []execution.CaseAssertion{{
-			StepSeq: 1, AssertionSeq: 1, Kind: "ui", Expected: "Login 按钮可见", TargetVersionSUTID: 7,
+			StepSeq: 1, AssertionSeq: 1, Kind: "ui", Expected: "Login 按钮可见", SUTID: 7,
 		}},
 	}
 }
@@ -102,14 +105,19 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 		humans:     newFakeHumanRepo(),
 		cases:      &fakeExecutionCaseReader{snapshot: caseRunSnapshot()},
 		bindings: &fakeBindingResolver{bindings: []execution.SUTBinding{{
-			VersionSUTID: 7, SUTName: "orders", EnvironmentName: "test",
+			SUTID: 7, SUTName: "orders", EnvironmentName: "test",
 			BaseURL:      "http://127.0.0.1:13335",
 			PageURLs:     []string{"http://127.0.0.1:13335/login"},
 			AccountRoles: []string{"admin"},
 		}}},
-		browser: &fakeBrowserExecutor{result: executionapp.BrowserActionResult{
-			OK: true, Result: json.RawMessage(`{"status":200}`),
+		versions: &fakeReplayVersionReader{binding: executionapp.VersionBinding{
+			VersionID: 10, Status: "running", Stage: "executing",
+			SUTs: []executionapp.SUTBinding{{
+				SUTID: 7, EnvironmentID: 3, BaseURL: "http://127.0.0.1:13335",
+				AccountRoles: []string{"admin"},
+			}},
 		}},
+		execution: &fakeExecutionExecutor{},
 		creds: &fakeCredentialReader{account: executionapp.AccountCredential{
 			AccountID: 81, Username: "alice", Password: "pw",
 		}},
@@ -119,7 +127,6 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 		gaps:     &fakeGapEnsurer{},
 		coverage: &fakeCoverageReader{requirements: []executionapp.RequirementRef{{RequirementID: 501, Status: "clarified"}}},
 		room:     &fakeTeamRoom{},
-		visual:   &fakeVisualPort{},
 		settings: &fakeCaseRunnerSettings{ints: map[string]int64{
 			"execution.case_timeout_seconds":          900,
 			"execution.evidence_max_bytes":            5 << 20,
@@ -138,7 +145,7 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 	t.Cleanup(fixture.runCancel)
 	fixture.intents.rows[1001] = execution.ExecutionIntent{
 		ID: 1001, VersionID: 10, CaseVersionID: 41, Status: execution.IntentClaimed,
-		VersionSUTIDs: []int64{7}, Purpose: execution.PurposeInitial, AttemptNo: 1,
+		SUTIDs: []int64{7}, Purpose: execution.PurposeInitial, AttemptNo: 1,
 	}
 	fixture.caseRuns.rows[3001] = execution.CaseRun{
 		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
@@ -154,7 +161,8 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 		Humans:               fixture.humans,
 		Cases:                fixture.cases,
 		Bindings:             fixture.bindings,
-		Browser:              fixture.browser,
+		Versions:             fixture.versions,
+		Execution:            fixture.execution,
 		Credentials:          fixture.creds,
 		Content:              fixture.content,
 		HTTPClient:           fixture.http,
@@ -162,7 +170,6 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 		Gaps:                 fixture.gaps,
 		Coverage:             fixture.coverage,
 		TeamRoom:             fixture.room,
-		Visual:               fixture.visual,
 		Settings:             fixture.settings,
 		Clock:                fixture.clock,
 		IDs:                  fixture.ids,
@@ -176,11 +183,11 @@ func newCaseRunnerFixtureWithDiscoveryWriter(t *testing.T, discovery executionap
 	return fixture
 }
 
-func p3WorkItem() agent.WorkItem {
-	return p3WorkItemFor(3, "dispatch-token")
+func executionWorkItem() agent.WorkItem {
+	return executionWorkItemFor(3, "dispatch-token")
 }
 
-func p3WorkItemFor(dispatchEpoch int64, dispatchToken string) agent.WorkItem {
+func executionWorkItemFor(dispatchEpoch int64, dispatchToken string) agent.WorkItem {
 	payload, _ := json.Marshal(map[string]any{
 		"intent_id":       "1001",
 		"wave_id":         "2001",
@@ -192,7 +199,7 @@ func p3WorkItemFor(dispatchEpoch int64, dispatchToken string) agent.WorkItem {
 	return agent.WorkItem{ID: 9001, VersionID: 10, Type: "execute.case", Payload: payload}
 }
 
-func p3Scope() tools.Scope {
+func executionScope() tools.Scope {
 	return tools.Scope{
 		VersionID: 10, WaveID: 2001, CaseRunID: 3001, IntentID: 1001,
 		CaseVersionID: 41, DispatchEpoch: 3, DispatchToken: "dispatch-token", AgentRunID: 7001,
@@ -217,7 +224,7 @@ func (h *fakeCaseSuccessHook) OnCaseRunPassed(_ context.Context, fact executiona
 
 func prepareCaseRun(t *testing.T, fixture *caseRunnerFixture) execution.TaskSnapshot {
 	t.Helper()
-	snapshot, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItem())
+	snapshot, err := fixture.runner.Prepare(fixture.runCtx, executionWorkItem())
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -253,8 +260,8 @@ func TestPrepareSetsRunningLeaseAndSnapshot(t *testing.T) {
 	if _, ok := fixture.sutContext.row(7, "admin"); !ok {
 		t.Fatalf("case_run_sut_context row for (7, admin) was not created")
 	}
-	if fixture.browser.contexts != 0 {
-		t.Fatalf("Prepare must not create browser contexts lazily, created %d", fixture.browser.contexts)
+	if fixture.execution.sessions != 0 {
+		t.Fatalf("Prepare must not create browser contexts lazily, created %d", fixture.execution.sessions)
 	}
 	if snapshot.Case.Title != "登录流程" || snapshot.CaseRun.ID != 3001 ||
 		len(snapshot.SUTs) != 1 || snapshot.SUTs[0].BaseURL != "http://127.0.0.1:13335" {
@@ -319,7 +326,7 @@ func TestPrepareMarksDispatchClaimed(t *testing.T) {
 func TestPrepareRejectsNonCurrentCase(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	fixture.cases.err = execution.ErrNotFound
-	_, err := fixture.runner.Prepare(context.Background(), p3WorkItem())
+	_, err := fixture.runner.Prepare(context.Background(), executionWorkItem())
 	if got := platformError(t, err); got.Status != 409 || got.Code != "state_conflict" {
 		t.Fatalf("error = %+v", got)
 	}
@@ -331,7 +338,7 @@ func TestPrepareRejectsStaleDispatch(t *testing.T) {
 		ID: 3001, WaveID: 2001, IntentID: 1001, CaseVersionID: 41,
 		Status: execution.CaseRunPending, DispatchEpoch: 4, DispatchToken: "new-token",
 	}
-	_, err := fixture.runner.Prepare(context.Background(), p3WorkItem())
+	_, err := fixture.runner.Prepare(context.Background(), executionWorkItem())
 	if got := platformError(t, err); got.Code != "lease_lost" {
 		t.Fatalf("error = %+v", got)
 	}
@@ -341,7 +348,7 @@ func TestRecordStepRejectsStaleEpoch(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 
-	stale := p3Scope()
+	stale := executionScope()
 	stale.DispatchToken = "old-token"
 	_, err := fixture.runner.StepRecord(context.Background(), stale, tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "ok",
@@ -353,7 +360,7 @@ func TestRecordStepRejectsStaleEpoch(t *testing.T) {
 		t.Fatalf("stale write changed rows: %+v", steps)
 	}
 
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "登录表单可见",
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
@@ -371,7 +378,7 @@ func TestRecordAssertionExpectedOverridden(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "failed",
 		Expected: "模型伪造的期望", Actual: "Login 按钮不存在", Reason: "not found",
 	}); err != nil {
@@ -389,7 +396,7 @@ func TestRecordAssertionExpectedOverridden(t *testing.T) {
 		t.Fatalf("assertion = %+v", got)
 	}
 
-	_, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	_, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 9, Verdict: "passed",
 	})
 	if got := platformError(t, err); got.Code != "invalid_argument" {
@@ -400,17 +407,22 @@ func TestRecordAssertionExpectedOverridden(t *testing.T) {
 func TestFinishAggregatesDeterministicVerdict(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "ok",
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "Login 按钮不存在",
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+	if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+		Kind: "text", Text: "failure evidence",
+	}); err != nil {
+		t.Fatalf("EvidenceText: %v", err)
+	}
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 		Verdict: execution.CaseRunPassed,
 	})
 	if err != nil {
@@ -430,15 +442,15 @@ func TestFinishAggregatesDeterministicVerdict(t *testing.T) {
 func TestFinishAllPassed(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
@@ -453,7 +465,7 @@ func TestFinishAllPassed(t *testing.T) {
 func TestFinishMissingResultsIsInconclusive(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
@@ -469,15 +481,15 @@ func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
 	finishPassed := func(t *testing.T, fixture *caseRunnerFixture) (execution.CaseRun, error) {
 		t.Helper()
 		prepareCaseRun(t, fixture)
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
 		}
-		return fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+		return fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 	}
 
 	t.Run("notifies once with the run fact", func(t *testing.T) {
@@ -502,21 +514,25 @@ func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
 		if len(fact.AccountRoles) != 1 || fact.AccountRoles[0] != "admin" {
 			t.Fatalf("fact account roles = %v", fact.AccountRoles)
 		}
-		if len(fact.PageIDs) != 1 || fact.PageIDs[0] != 71 {
-			t.Fatalf("fact page ids = %v", fact.PageIDs)
+		// v0.2.4-B (T9 design contract): a case step carries a prose target and
+		// no target_page_id/target_api_id, so the knowledge fact keeps only the
+		// account-role dimension. The page/API back-references are gone until
+		// C/F gives them a new source (flagged in the T11 report).
+		if len(fact.PageIDs) != 0 {
+			t.Fatalf("fact page ids = %v, want none (a step no longer carries target_page_id)", fact.PageIDs)
 		}
 		if len(fact.APIIDs) != 0 {
-			t.Fatalf("fact api ids = %v", fact.APIIDs)
+			t.Fatalf("fact api ids = %v, want none (a step no longer carries target_api_id)", fact.APIIDs)
 		}
 	})
 
 	t.Run("another owner's terminal write does not notify", func(t *testing.T) {
 		fixture := newCaseRunnerFixture(t)
 		prepareCaseRun(t, fixture)
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
@@ -529,7 +545,7 @@ func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
 			row.Status = execution.CaseRunPassed
 			fixture.caseRuns.rows[3001] = row
 		}
-		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+		finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 		if err != nil {
 			t.Fatalf("Finish: %v", err)
 		}
@@ -568,15 +584,20 @@ func TestFinishPassedNotifiesKnowledgeHookBestEffort(t *testing.T) {
 	t.Run("non passed runs do not notify", func(t *testing.T) {
 		fixture := newCaseRunnerFixture(t)
 		prepareCaseRun(t, fixture)
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "Login 按钮不存在",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
 		}
-		finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
+		if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+			Kind: "text", Text: "failure evidence",
+		}); err != nil {
+			t.Fatalf("EvidenceText: %v", err)
+		}
+		finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunPassed})
 		if err != nil {
 			t.Fatalf("Finish: %v", err)
 		}
@@ -593,7 +614,7 @@ func TestWaitBoundedAndInterruptible(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 
-	if _, err := fixture.runner.Wait(context.Background(), p3Scope(), tools.WaitInput{Seconds: 301}); err == nil {
+	if _, err := fixture.runner.Wait(context.Background(), executionScope(), tools.WaitInput{Seconds: 301}); err == nil {
 		t.Fatalf("Wait accepted 301 seconds")
 	} else if got := platformError(t, err); got.Status != 400 {
 		t.Fatalf("error = %+v", got)
@@ -602,7 +623,7 @@ func TestWaitBoundedAndInterruptible(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := fixture.runner.Wait(ctx, p3Scope(), tools.WaitInput{Seconds: 30})
+		_, err := fixture.runner.Wait(ctx, executionScope(), tools.WaitInput{Seconds: 30})
 		done <- err
 	}()
 	cancel()
@@ -625,7 +646,7 @@ func TestWaitInterruptedByRunCancellation(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		fixture.runner.CancelRun(3001)
 	}()
-	if _, err := fixture.runner.Wait(cancelCtx, p3Scope(), tools.WaitInput{Seconds: 30}); err == nil {
+	if _, err := fixture.runner.Wait(cancelCtx, executionScope(), tools.WaitInput{Seconds: 30}); err == nil {
 		t.Fatalf("paused wait returned no error")
 	}
 	fixture.runner.ClearRun(3001)
@@ -636,7 +657,7 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 	prepareCaseRun(t, fixture)
 
 	oversized := make([]byte, (5<<20)+1)
-	_, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
+	_, err := fixture.runner.AddEvidence(context.Background(), executionScope(), executionapp.EvidenceInput{
 		Kind: execution.EvidenceText, Data: oversized,
 	})
 	got := platformError(t, err)
@@ -644,7 +665,7 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 		t.Fatalf("oversize error = %+v", got)
 	}
 
-	first, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
+	first, err := fixture.runner.AddEvidence(context.Background(), executionScope(), executionapp.EvidenceInput{
 		Kind: execution.EvidenceText, Data: []byte("hello"), Filename: "note.txt",
 	})
 	if err != nil {
@@ -653,10 +674,10 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 	if first.CaseRunID != 3001 || first.Kind != execution.EvidenceText || first.SizeBytes != 5 {
 		t.Fatalf("evidence = %+v", first)
 	}
-	if first.VersionSUTID == nil || *first.VersionSUTID != 7 {
-		t.Fatalf("single-SUT evidence version_sut_id = %v, want 7", first.VersionSUTID)
+	if first.SUTID == nil || *first.SUTID != 7 {
+		t.Fatalf("single-SUT evidence sut_id = %v, want 7", first.SUTID)
 	}
-	second, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
+	second, err := fixture.runner.AddEvidence(context.Background(), executionScope(), executionapp.EvidenceInput{
 		Kind: execution.EvidenceText, Data: []byte("hello again"),
 	})
 	if err != nil {
@@ -673,26 +694,36 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 		t.Fatalf("evidence refs = %d", len(fixture.evidence.refs))
 	}
 
-	// The per-case_run cap drops further evidence without failing.
-	for i := 0; i < execution.EvidenceMaxPerCaseRun; i++ {
-		if _, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
+	// The per-case_run cap is the execution.evidence_max_per_case_run setting
+	// (v0.2.4-C): a configured cap drops further evidence without failing the
+	// run, and every drop emits an explicit evidence.skipped event.
+	fixture.settings.ints["execution.evidence_max_per_case_run"] = 100
+	for i := 0; i < 98; i++ {
+		if _, err := fixture.runner.AddEvidence(context.Background(), executionScope(), executionapp.EvidenceInput{
 			Kind: execution.EvidenceText, Data: []byte("filler"),
 		}); err != nil {
 			t.Fatalf("filler AddEvidence: %v", err)
 		}
 	}
-	if _, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
+	overflow, err := fixture.runner.AddEvidence(context.Background(), executionScope(), executionapp.EvidenceInput{
 		Kind: execution.EvidenceText, Data: []byte("overflow"),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("overflow AddEvidence must not fail the case: %v", err)
 	}
+	if overflow.ID != 0 {
+		t.Fatalf("overflow evidence = %+v, want the zero dropped signal at the configured cap", overflow)
+	}
 	rows, _ = fixture.evidence.ListByCaseRun(context.Background(), 3001, 0)
-	if len(rows) != execution.EvidenceMaxPerCaseRun {
-		t.Fatalf("evidence rows = %d, want cap %d", len(rows), execution.EvidenceMaxPerCaseRun)
+	if len(rows) != 100 {
+		t.Fatalf("evidence rows = %d, want the configured cap 100", len(rows))
+	}
+	if got := countEvents(fixture.events, "evidence.skipped"); got != 1 {
+		t.Fatalf("evidence.skipped events = %d, want 1 for the dropped overflow", got)
 	}
 }
 
-func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
+func TestExecCreatesSessionLazilyWithDispatchMetadata(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	owner := int64(7)
@@ -702,68 +733,59 @@ func TestBrowserToolCreatesContextLazilyAndStoresEvidence(t *testing.T) {
 	fixture.caseRuns.rows[3001] = caseRow
 	fixture.caseRuns.mu.Unlock()
 
-	// goto: creates one context for (7, admin) and runs the action.
-	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "goto",
-		json.RawMessage(`{"version_sut_id":"7","account_role":"admin","url":"http://127.0.0.1:13335/login"}`)); err != nil {
-		t.Fatalf("Browser goto: %v", err)
+	// exec: creates one session for (7, admin) and runs the command. The browser
+	// bridge retired in T16; the general-execution path owns lazy session creation.
+	if _, err := fixture.runner.Exec(context.Background(), executionScope(), executionapp.ExecCommandInput{
+		SUTID:       int64ptr(7),
+		AccountRole: "admin",
+		Command:     executionapp.ExecCommand{Argv: []string{"echo", "hi"}},
+	}); err != nil {
+		t.Fatalf("Exec: %v", err)
 	}
-	if fixture.browser.contexts != 1 {
-		t.Fatalf("contexts = %d", fixture.browser.contexts)
+	if fixture.execution.sessions != 1 {
+		t.Fatalf("sessions = %d", fixture.execution.sessions)
 	}
-	if fixture.browser.lastSpec.BaseURL != "http://127.0.0.1:13335" {
-		t.Fatalf("context spec = %+v", fixture.browser.lastSpec)
+	if fixture.execution.lastSpec.BaseURL != "http://127.0.0.1:13335" {
+		t.Fatalf("session spec = %+v", fixture.execution.lastSpec)
 	}
-	if fixture.browser.lastSpec.ExecutorID != 7 {
-		t.Fatalf("context spec executor = %d, want 7", fixture.browser.lastSpec.ExecutorID)
+	if fixture.execution.lastSpec.ExecutorID != 7 {
+		t.Fatalf("session spec executor = %d, want 7", fixture.execution.lastSpec.ExecutorID)
 	}
 	// X-01 review: the create metadata is the only producer that correlates a
-	// browser context with its dispatch attempt, so it must stamp both ids.
-	if got, _ := fixture.browser.lastSpec.Metadata["case_run_id"].(string); got != platformid.Format(caseRow.ID) {
-		t.Fatalf("context metadata case_run_id = %v, want %s", fixture.browser.lastSpec.Metadata["case_run_id"], platformid.Format(caseRow.ID))
+	// session with its dispatch attempt, so it must stamp both ids.
+	if got, _ := fixture.execution.lastSpec.Metadata["case_run_id"].(string); got != platformid.Format(caseRow.ID) {
+		t.Fatalf("session metadata case_run_id = %v, want %s", fixture.execution.lastSpec.Metadata["case_run_id"], platformid.Format(caseRow.ID))
 	}
-	if got, ok := fixture.browser.lastSpec.Metadata["attempt"].(int); !ok || got != caseRow.Attempts {
-		t.Fatalf("context metadata attempt = %v, want %d", fixture.browser.lastSpec.Metadata["attempt"], caseRow.Attempts)
+	if got, ok := fixture.execution.lastSpec.Metadata["attempt"].(int); !ok || got != caseRow.Attempts {
+		t.Fatalf("session metadata attempt = %v, want %d", fixture.execution.lastSpec.Metadata["attempt"], caseRow.Attempts)
 	}
 	row, ok := fixture.sutContext.row(7, "admin")
-	if !ok || row.Status != execution.SUTContextActive || row.BrowserContextID != "ctx_1" {
+	if !ok || row.Status != execution.SUTContextActive || row.SessionID != "sess_1" {
 		t.Fatalf("sut context = %+v", row)
 	}
 	if row.ExecutorID == nil || *row.ExecutorID != 7 {
 		t.Fatalf("sut context executor = %v, want 7", row.ExecutorID)
 	}
-	if fixture.browser.actions[0] != "goto" || fixture.browser.lastExecutorID != 7 {
-		t.Fatalf("actions = %v executor = %d", fixture.browser.actions, fixture.browser.lastExecutorID)
+	if fixture.execution.lastExecutorID != 7 {
+		t.Fatalf("executor = %d, want 7", fixture.execution.lastExecutorID)
 	}
 
-	// A second action reuses the same context.
-	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "snapshot", json.RawMessage(`{"account_role":"admin"}`)); err != nil {
-		t.Fatalf("Browser snapshot: %v", err)
+	// A second command reuses the same session.
+	if _, err := fixture.runner.Exec(context.Background(), executionScope(), executionapp.ExecCommandInput{
+		AccountRole: "admin",
+		Command:     executionapp.ExecCommand{Argv: []string{"echo", "again"}},
+	}); err != nil {
+		t.Fatalf("Exec reuse: %v", err)
 	}
-	if fixture.browser.contexts != 1 {
-		t.Fatalf("contexts after reuse = %d", fixture.browser.contexts)
-	}
-
-	// A screenshot artifact is stored as immutable evidence.
-	fixture.browser.result = executionapp.BrowserActionResult{
-		OK:     true,
-		Result: json.RawMessage(`{"bytes":3}`),
-		Artifacts: []executionapp.BrowserArtifact{{
-			Kind: "screenshot", MIME: "image/png", Base64: "AAAA", SHA256: "abc", Bytes: 3,
-		}},
-	}
-	if _, err := fixture.runner.Browser(context.Background(), p3Scope(), "screenshot", json.RawMessage(`{"account_role":"admin"}`)); err != nil {
-		t.Fatalf("Browser screenshot: %v", err)
-	}
-	rows, _ := fixture.evidence.ListByCaseRun(context.Background(), 3001, 0)
-	if len(rows) != 1 || rows[0].Kind != execution.EvidenceScreenshot {
-		t.Fatalf("evidence = %+v", rows)
+	if fixture.execution.sessions != 1 {
+		t.Fatalf("sessions after reuse = %d", fixture.execution.sessions)
 	}
 }
 
 func TestAccountCredentialsDelegatesWithRole(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	result, err := fixture.runner.AccountCredentials(context.Background(), p3Scope(), tools.AccountCredentialsInput{
+	result, err := fixture.runner.AccountCredentials(context.Background(), executionScope(), tools.AccountCredentialsInput{
 		VersionSUTID: int64ptr(7), Role: "admin",
 	})
 	if err != nil {
@@ -781,11 +803,22 @@ func TestAccountCredentialsDelegatesWithRole(t *testing.T) {
 	}
 }
 
-func TestHTTPRequestEvidenceRedactsCredentials(t *testing.T) {
+// GD-01 / Q05=B (R-C3): http request/response headers enter evidence and the
+// tool result plaintext. The legacy header-redaction scrub is removed;
+// credentials may appear in evidence by design.
+func TestHTTPRequestEvidenceKeepsHeadersPlaintext(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	result, err := fixture.runner.HTTP(context.Background(), p3Scope(), json.RawMessage(`{
-		"version_sut_id":"7","path":"/api/orders","method":"GET",
+	fixture.http.response = executionapp.HTTPResponseData{
+		Status: 200,
+		Body:   []byte(`{"ok":true}`),
+		Headers: map[string][]string{
+			"Set-Cookie": {"session=plain-cookie-value"},
+			"X-Trace":    {"resp-1"},
+		},
+	}
+	result, err := fixture.runner.HTTP(context.Background(), executionScope(), json.RawMessage(`{
+		"sut_id":"7","path":"/api/orders","method":"GET",
 		"headers":{"Authorization":"Bearer super-secret","X-Trace":"1"}
 	}`))
 	if err != nil {
@@ -798,14 +831,36 @@ func TestHTTPRequestEvidenceRedactsCredentials(t *testing.T) {
 	if fixture.http.lastReq.URL != "http://127.0.0.1:13335/api/orders" {
 		t.Fatalf("request URL = %q", fixture.http.lastReq.URL)
 	}
+	// The tool result carries the response headers verbatim (no [redacted]).
+	outHeaders, ok := payload["headers"].(map[string][]string)
+	if !ok {
+		t.Fatalf("headers type = %T, want map[string][]string", payload["headers"])
+	}
+	if got := outHeaders["Set-Cookie"]; len(got) != 1 || got[0] != "session=plain-cookie-value" {
+		t.Fatalf("Set-Cookie = %#v, want plaintext session=plain-cookie-value", got)
+	}
 	rows, _ := fixture.evidence.ListByCaseRun(context.Background(), 3001, 0)
 	if len(rows) != 1 || rows[0].Kind != execution.EvidenceHTTP {
 		t.Fatalf("evidence = %+v", rows)
 	}
+	var sawRequestSecret, sawResponseCookie bool
 	for _, put := range fixture.content.puts {
-		if string(put) != "" && containsSecret(string(put), "super-secret") {
-			t.Fatalf("http evidence leaked credentials: %s", put)
+		text := string(put)
+		if strings.Contains(text, "[redacted]") {
+			t.Fatalf("http evidence must not redact headers: %s", text)
 		}
+		if containsSecret(text, "Bearer super-secret") {
+			sawRequestSecret = true
+		}
+		if containsSecret(text, "session=plain-cookie-value") {
+			sawResponseCookie = true
+		}
+	}
+	if !sawRequestSecret {
+		t.Fatalf("http evidence must carry the request Authorization header plaintext")
+	}
+	if !sawResponseCookie {
+		t.Fatalf("http evidence must carry the response Set-Cookie header plaintext")
 	}
 }
 
@@ -814,8 +869,8 @@ func TestHTTPLargeBodySpillsHeadAndContentRef(t *testing.T) {
 	prepareCaseRun(t, fixture)
 	body := append([]byte("P8-LARGE-BEGIN"), bytes.Repeat([]byte("x"), 20_000)...)
 	fixture.http.response = executionapp.HTTPResponseData{Status: 200, Body: body}
-	result, err := fixture.runner.HTTP(context.Background(), p3Scope(), json.RawMessage(`{
-		"version_sut_id":"7","path":"/p8/large?bytes=20000","method":"GET"
+	result, err := fixture.runner.HTTP(context.Background(), executionScope(), json.RawMessage(`{
+		"sut_id":"7","path":"/p8/large?bytes=20000","method":"GET"
 	}`))
 	if err != nil {
 		t.Fatalf("HTTP large: %v", err)
@@ -848,7 +903,10 @@ func containsSecret(haystack, secret string) bool {
 	})()
 }
 
-func TestDBQueryRejectsNonReadOnlySQL(t *testing.T) {
+// TestDBQueryAcceptsGeneralSQL (v0.2.4-C T12/P8): the read-only gate is lifted —
+// write statements and multi-statement SQL are accepted, and a plain SELECT still
+// works and stores db evidence. Expectations come from the P8 contract.
+func TestDBQueryAcceptsGeneralSQL(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
 	for _, sqlText := range []string{
@@ -856,16 +914,15 @@ func TestDBQueryRejectsNonReadOnlySQL(t *testing.T) {
 		"SELECT 1; DROP TABLE users",
 		"UPDATE users SET admin = true",
 	} {
-		_, err := fixture.runner.DBQuery(context.Background(), p3Scope(), json.RawMessage(`{"version_sut_id":"7","sql":`+jsonString(sqlText)+`}`))
-		if err == nil {
-			t.Fatalf("db.query accepted %q", sqlText)
+		if _, err := fixture.runner.DBQuery(context.Background(), executionScope(), json.RawMessage(`{"sut_id":"7","sql":`+jsonString(sqlText)+`}`)); err != nil {
+			t.Fatalf("db.query rejected general SQL %q: %v", sqlText, err)
 		}
-		if got := platformError(t, err); got.Status != 400 {
-			t.Fatalf("error for %q = %+v", sqlText, got)
+		if fixture.db.lastSQL != sqlText {
+			t.Fatalf("querier SQL = %q, want %q", fixture.db.lastSQL, sqlText)
 		}
 	}
-	if _, err := fixture.runner.DBQuery(context.Background(), p3Scope(), json.RawMessage(`{
-		"version_sut_id":"7","sql":"SELECT count(*) FROM orders","max_rows":10
+	if _, err := fixture.runner.DBQuery(context.Background(), executionScope(), json.RawMessage(`{
+		"sut_id":"7","sql":"SELECT count(*) FROM orders","max_rows":10
 	}`)); err != nil {
 		t.Fatalf("valid SELECT rejected: %v", err)
 	}
@@ -873,7 +930,7 @@ func TestDBQueryRejectsNonReadOnlySQL(t *testing.T) {
 		t.Fatalf("querier SQL = %q", fixture.db.lastSQL)
 	}
 	rows, _ := fixture.evidence.ListByCaseRun(context.Background(), 3001, 0)
-	if len(rows) != 1 || rows[0].Kind != execution.EvidenceDB {
+	if len(rows) == 0 || rows[0].Kind != execution.EvidenceDB {
 		t.Fatalf("db evidence = %+v", rows)
 	}
 }
@@ -886,18 +943,23 @@ func jsonString(value string) string {
 func TestFailureSubmitDedupeHintMatchesSpec(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+	if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 		StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "mismatch",
 	}); err != nil {
 		t.Fatalf("AssertionRecord: %v", err)
 	}
-	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed}); err != nil {
+	if _, err := fixture.runner.EvidenceText(context.Background(), executionScope(), tools.EvidenceTextInput{
+		Kind: "text", Text: "failure evidence",
+	}); err != nil {
+		t.Fatalf("EvidenceText: %v", err)
+	}
+	if _, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: execution.CaseRunFailed}); err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
-	if _, err := fixture.runner.FailureSubmit(context.Background(), p3Scope(), tools.FailureSubmitInput{
+	if _, err := fixture.runner.FailureSubmit(context.Background(), executionScope(), tools.FailureSubmitInput{
 		CaseRunID: 3001, FailureClass: "application", Category: "ui", Severity: "major", Summary: "按钮文案不符",
 	}); err != nil {
 		t.Fatalf("FailureSubmit: %v", err)
@@ -956,7 +1018,7 @@ func newHeartbeatFixture(t *testing.T, clock executionapp.Clock, interval time.D
 		Humans:            fixture.humans,
 		Cases:             fixture.cases,
 		Bindings:          fixture.bindings,
-		Browser:           fixture.browser,
+		Execution:         fixture.execution,
 		Credentials:       fixture.creds,
 		Content:           fixture.content,
 		HTTPClient:        fixture.http,
@@ -964,7 +1026,6 @@ func newHeartbeatFixture(t *testing.T, clock executionapp.Clock, interval time.D
 		Gaps:              fixture.gaps,
 		Coverage:          fixture.coverage,
 		TeamRoom:          fixture.room,
-		Visual:            fixture.visual,
 		Settings:          fixture.settings,
 		Clock:             clock,
 		IDs:               fixture.ids,
@@ -1077,11 +1138,15 @@ func TestRecoveryExhaustedAttemptsKeepsExecutorLost(t *testing.T) {
 	row.LeaseUntil = &expired
 	fixture.caseRuns.rows[3001] = row
 	fixture.caseRuns.mu.Unlock()
+	// The exhausted run recorded failure evidence before its lease expired;
+	// seed it so the evidence gate keeps the failed(executor_lost) settlement.
+	_ = fixture.evidence.Insert(context.Background(), execution.Evidence{CaseRunID: 3001, Kind: execution.EvidenceText})
 
 	recovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     fixture.intents,
 		Waves:       &fakeSchedulerWaveRepo{wave: &execution.RunWave{ID: 2001, VersionID: 10, Status: execution.WaveRunning}},
 		CaseRuns:    fixture.caseRuns,
+		Evidence:    fixture.evidence,
 		Clock:       clock,
 		Events:      fixture.events,
 		MaxAttempts: 3,
@@ -1164,6 +1229,15 @@ type fakeDispatchRegistry struct {
 
 func (r *fakeDispatchRegistry) Select(context.Context) (*execution.ExecutorInstance, error) {
 	return r.executor, nil
+}
+
+// MaxDispatchableCapacity implements executionapp.ExecutorRegistry: a single
+// configured executor, so the fleet maximum is just its capacity.
+func (r *fakeDispatchRegistry) MaxDispatchableCapacity(context.Context) (int, error) {
+	if r.executor == nil {
+		return 0, nil
+	}
+	return r.executor.Capacity, nil
 }
 
 type fakeDispatchQueue struct {
@@ -1340,12 +1414,12 @@ func TestTerminalSummaryPreservesDispatchSnapshot(t *testing.T) {
 	run.Summary.Dispatch = snapshot
 	fixture.caseRuns.rows[3001] = run
 	prepareCaseRun(t, fixture)
-	if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{
+	if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{
 		Seq: 1, Status: "passed", Observed: "ok",
 	}); err != nil {
 		t.Fatalf("StepRecord: %v", err)
 	}
-	if _, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{
+	if _, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{
 		Verdict: execution.CaseRunPassed,
 	}); err != nil {
 		t.Fatalf("Finish: %v", err)
@@ -1500,7 +1574,7 @@ func TestStaleFinalizeDoesNotStopSupersedingHeartbeat(t *testing.T) {
 	row.LeaseUntil = nil
 	fixture.caseRuns.rows[3001] = row
 	fixture.caseRuns.mu.Unlock()
-	if _, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItemFor(4, "dispatch-token-4")); err != nil {
+	if _, err := fixture.runner.Prepare(fixture.runCtx, executionWorkItemFor(4, "dispatch-token-4")); err != nil {
 		t.Fatalf("Prepare superseding dispatch: %v", err)
 	}
 
@@ -1514,4 +1588,80 @@ func TestStaleFinalizeDoesNotStopSupersedingHeartbeat(t *testing.T) {
 
 	clock.Advance(70 * time.Second)
 	waitForLeaseRenewal(t, fixture, clock, 75*time.Second)
+}
+
+// TestToolArgExplicitVersionSUTIDSelectsTheNamedBinding covers review I2: an
+// explicit `sut_id` tool argument must actually decode and select the
+// SUT it names.
+//
+// This coverage had silently disappeared. Five tool-argument literals in this
+// file were rekeyed to `{"sut_id":"7"}` while the structs that decode them
+// (browserToolArgs, httpToolArgs, dbQueryToolArgs, schemaReadToolArgs) are tagged
+// `json:"sut_id,omitempty"` -- the frozen wire contract documented on
+// browserToolArgs in tools.go. Decoding is lenient json.Unmarshal, so the
+// unknown key was dropped, SUTID decoded to "", inference fell back to the
+// fixture's only binding, and every test still passed *because that binding is
+// also id 7*. Someone "fixing" production to match those tests would have broken
+// the contract and seen five greens.
+//
+// So this test uses a TWO-binding fixture: with more than one SUT the explicit
+// argument and the inference fallback give different answers, and a dropped key
+// can no longer hide.
+func TestToolArgExplicitVersionSUTIDSelectsTheNamedBinding(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	fixture.bindings.bindings = []execution.SUTBinding{
+		{SUTID: 7, SUTName: "orders", EnvironmentName: "test",
+			BaseURL: "http://127.0.0.1:13335", AccountRoles: []string{"admin"}},
+		{SUTID: 9, SUTName: "billing", EnvironmentName: "test",
+			BaseURL: "http://127.0.0.1:13337", AccountRoles: []string{"admin"}},
+	}
+	// Keep the intent consistent with the widened binding set. Since v0.2.4-B
+	// intent.sut_ids is the version's whole bound set (decision #1), and
+	// resolveSUTID infers from it when that set is unambiguous; a two-SUT intent
+	// is ambiguous, so omitting the argument below must be an error rather than
+	// silently resolving to 7 through the single-SUT inference path.
+	intent, err := fixture.intents.Get(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("read seeded intent: %v", err)
+	}
+	intent.SUTIDs = []int64{7, 9}
+	fixture.intents.rows[1001] = intent
+	prepareCaseRun(t, fixture)
+
+	// The wire name is sut_id. Had it been renamed one-sidedly, the key
+	// would decode to nothing and this call would fail with "sut_id is
+	// required when the version has multiple SUT bindings" instead of resolving
+	// SUT 9 -- which is exactly the production breakage the freeze prevents.
+	if _, err := fixture.runner.DBQuery(context.Background(), executionScope(),
+		json.RawMessage(`{"sut_id":"9","sql":"SELECT count(*) FROM invoices"}`)); err != nil {
+		t.Fatalf("db.query with an explicit sut_id on a two-binding version: %v", err)
+	}
+	if got := fixture.creds.sutIDs; len(got) != 1 || got[0] != 9 {
+		t.Fatalf("credential resolved for SUTs %v, want exactly [9]: the explicit tool "+
+			"argument must select the named binding, not fall back to the first one", got)
+	}
+
+	// An id that is not bound is rejected, and the error names the argument the
+	// model actually has in its schema. Naming "sut_id" here would be unfixable:
+	// agent/application/tools/registry.go decodes tool arguments with
+	// DisallowUnknownFields(), so the model's natural correction {"sut_id": ...}
+	// is hard-rejected with retryable:false.
+	_, err = fixture.runner.DBQuery(context.Background(), executionScope(),
+		json.RawMessage(`{"sut_id":"999","sql":"SELECT 1"}`))
+	apiErr := platformError(t, err)
+	if apiErr.Status != 400 {
+		t.Fatalf("unbound SUT status = %d, want 400", apiErr.Status)
+	}
+	if got, _ := apiErr.Details["field"].(string); got != "sut_id" {
+		t.Fatalf("unbound-SUT error field = %q, want sut_id (the model's own argument name)", got)
+	}
+
+	// Omitting the argument on a multi-binding version is ambiguous and must say
+	// so using the same frozen field name.
+	_, err = fixture.runner.DBQuery(context.Background(), executionScope(),
+		json.RawMessage(`{"sql":"SELECT 1"}`))
+	apiErr = platformError(t, err)
+	if got, _ := apiErr.Details["field"].(string); got != "sut_id" {
+		t.Fatalf("omitted-argument error field = %q, want sut_id", got)
+	}
 }

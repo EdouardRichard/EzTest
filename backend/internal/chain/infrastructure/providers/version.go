@@ -16,10 +16,10 @@ import (
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
-// nodeKindVersionSUT is the pseudo node kind of the version-SUT label rows. It
-// is never part of the chain graph (the domain has no version_sut node kind);
-// ChainService only consumes the RefID/Label pairs to resolve SUT labels.
-const nodeKindVersionSUT chain.NodeKind = "version_sut"
+// nodeKindSUT is the pseudo node kind of the SUT label rows. It is never part
+// of the chain graph (the domain has no sut node kind); ChainService only
+// consumes the RefID/Label pairs to resolve SUT labels.
+const nodeKindSUT chain.NodeKind = "sut"
 
 // RequirementLister is the version application requirement read surface. The
 // version requirement service satisfies it.
@@ -27,14 +27,15 @@ type RequirementLister interface {
 	List(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]versionapp.RequirementView, bool, error)
 }
 
-// VersionReader is the version application detail surface used to resolve the
-// version-SUT bindings (and, transitively, the resource labels). The version
-// service satisfies it.
+// VersionReader is the version application detail surface used to read the
+// version's bound environment and its SUT label rows. The version service
+// satisfies it.
 type VersionReader interface {
 	Get(ctx context.Context, id int64) (versionapp.VersionView, error)
 }
 
-// VersionProvider supplies requirement nodes and the version-SUT label rows.
+// VersionProvider supplies requirement nodes and the bound environment's SUT
+// label rows.
 type VersionProvider struct {
 	requirements RequirementLister
 	versions     VersionReader
@@ -48,8 +49,9 @@ func NewVersionProvider(requirements RequirementLister, versions VersionReader) 
 var _ chainapp.VersionChainProvider = (*VersionProvider)(nil)
 
 // Requirements lists up to limit version requirement roots. The node keeps the
-// requirement status (draft/clarified/closed) and its target version SUTs,
-// which make the SUT filter match requirement roots.
+// requirement status (draft/clarified/closed). v0.2.4-B requirements name their
+// subject in prose rather than carrying target SUT ids, so the chain's SUT rows
+// come from the version's bound environment (SUTs below), not the requirement.
 //
 // The version application clamps every list page to
 // platform/pagination.MaxLimit, so one List call cannot satisfy a chain root
@@ -94,9 +96,11 @@ func (p *VersionProvider) Requirements(ctx context.Context, versionID int64, lim
 				UpdatedAt:     view.UpdatedAt,
 				Meta:          map[string]any{"revision": view.Revision},
 			}
-			if targets := parseDecimalIDs(view.TargetVersionSUTs); len(targets) > 0 {
-				node.VersionSUTIDs = targets
-			}
+			// v0.2.4-B (T8): a requirement no longer carries target SUT ids --
+			// it names its subject in prose (requirement_version.sut_description,
+			// design v1.3.1 §5.1) -- so a requirement node has no SUTIDs to
+			// project. The chain's SUT rows come from the version's bound
+			// environment (SUTs below), not from the requirement.
 			nodes = append(nodes, node)
 		}
 		if !hasMore || len(nodes) >= limit {
@@ -112,50 +116,36 @@ func (p *VersionProvider) Requirements(ctx context.Context, versionID int64, lim
 	return nodes, nil
 }
 
-// VersionSUTs maps the version bindings onto label rows keyed by version-SUT
-// id. The chain domain has no version_sut node, so these rows are only consumed
+// SUTs maps the SUTs of the version's bound environment onto label rows keyed
+// by SUT id. The chain domain has no sut node, so these rows are only consumed
 // by ChainService.mergeSUTNames.
-func (p *VersionProvider) VersionSUTs(ctx context.Context, versionID int64) ([]chain.Node, error) {
+func (p *VersionProvider) SUTs(ctx context.Context, versionID int64) ([]chain.Node, error) {
 	view, err := p.versions.Get(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
-	nodes := make([]chain.Node, 0, len(view.Bindings))
-	for _, binding := range view.Bindings {
-		if binding.ID <= 0 {
+	suts := view.Binding.Environment.SUTs
+	nodes := make([]chain.Node, 0, len(suts))
+	for _, sut := range suts {
+		id, parseErr := strconv.ParseInt(sut.ID, 10, 64)
+		if parseErr != nil || id <= 0 {
 			continue
 		}
-		id := binding.ID
 		nodes = append(nodes, chain.Node{
-			ID:           chain.NodeID(nodeKindVersionSUT, id),
-			Kind:         nodeKindVersionSUT,
-			RefID:        strconv.FormatInt(id, 10),
-			Label:        binding.SUT.Name,
-			Status:       "active",
-			VersionSUTID: int64Ptr(id),
+			ID:     chain.NodeID(nodeKindSUT, id),
+			Kind:   nodeKindSUT,
+			RefID:  strconv.FormatInt(id, 10),
+			Label:  sut.Name,
+			Status: "active",
+			SUTID:  int64Ptr(id),
 			Meta: map[string]any{
-				"sut_id":           binding.SUT.ID,
-				"environment_id":   binding.Environment.ID,
-				"environment_name": binding.Environment.Name,
+				"sut_id":           sut.ID,
+				"environment_id":   view.Binding.Environment.ID,
+				"environment_name": view.Binding.Environment.Name,
 			},
 		})
 	}
 	return nodes, nil
-}
-
-// parseDecimalIDs parses the decimal-string ID arrays of the application views
-// (requirement targets are strings on the version boundary), dropping
-// malformed/non-positive values and returning sorted unique IDs.
-func parseDecimalIDs(values []string) []int64 {
-	ids := make([]int64, 0, len(values))
-	for _, raw := range values {
-		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-		if err != nil || id <= 0 {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	return sortUniqueIDs(ids)
 }
 
 // sortUniqueIDs returns the sorted unique positive IDs.

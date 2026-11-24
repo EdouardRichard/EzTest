@@ -166,9 +166,12 @@ type QualityView struct {
 	RunStats RunStats
 }
 
-// AgentCenterReader is the agent context's P6 read-only source for the Agent
-// center. It never writes and never exposes prompts/transcripts. Implementations
-// batch catalog rows and run stats so the service never issues N+1 reads.
+// AgentCenterReader is the agent context's read-only source for the Agent
+// center. It never writes. The catalog/run/stat projections carry no prompts or
+// transcripts; RunTranscript is the separate ADMIN-ONLY transcript read
+// (v0.2.4-D T8, SC-D3) — its caller is gated at the HTTP edge and it is never
+// part of the ordinary run metadata view. Implementations batch catalog rows and
+// run stats so the service never issues N+1 reads.
 type AgentCenterReader interface {
 	ListCatalogProfiles(ctx context.Context) ([]CatalogProfileRow, error)
 	// ProfileRunStats returns one aggregate keyed by profile_key.
@@ -176,6 +179,15 @@ type AgentCenterReader interface {
 	// ListRuns returns at most query.Limit+1 rows so the application can
 	// report has_more without a COUNT query.
 	ListRuns(ctx context.Context, query RunQuery) ([]RunRow, bool, error)
+	// RunTranscript returns the run's whole transcript in ID order, including
+	// rows still streaming. It is deliberately unpaginated: a hidden default
+	// page would silently truncate the administrator's view (constitution 七.6).
+	RunTranscript(ctx context.Context, runID int64) ([]agent.AgentMessage, error)
+	// RunActivity returns the run's whole agent_activity fact ledger in seq
+	// order (v0.2.4-D T10, SC-D5). It is the production read side of the coarse
+	// tool/compaction facts — a SEPARATE path from the transcript (R-D6) — and
+	// is admin-gated at the HTTP edge like RunTranscript.
+	RunActivity(ctx context.Context, runID int64) ([]agent.Activity, error)
 }
 
 // VersionTitleReader resolves version titles in one batch. It is the
@@ -339,6 +351,37 @@ func (s *AgentCenterService) Runs(ctx context.Context, filter RunFilter) ([]RunV
 	return views, hasMore, nil
 }
 
+// RunTranscript returns one run's live transcript snapshot (v0.2.4-D T8,
+// SC-D3): every persisted agent_message row in ID order, including rows still
+// streaming. It is the read side of the admin-only Agent Center transcript; the
+// HTTP edge enforces the admin role on this path and on both generic event
+// endpoints that carry the run:{id} channel. Ordinary run metadata is unchanged.
+func (s *AgentCenterService) RunTranscript(ctx context.Context, runID int64) ([]agent.AgentMessage, error) {
+	if runID <= 0 {
+		return nil, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if err := s.requireReader(); err != nil {
+		return nil, err
+	}
+	return s.reader.RunTranscript(ctx, runID)
+}
+
+// RunActivity returns one run's agent_activity fact ledger (v0.2.4-D T10,
+// SC-D5/Q04): the coarse tool-call and compaction-boundary facts in seq order.
+// It is the PRODUCTION reader that keeps the fact table wired (V-0019 D-share)
+// and is independent of the transcript read (R-D6): activity never routes
+// through agent_message. The HTTP edge enforces the admin role, exactly as for
+// the transcript; ordinary run metadata is unchanged.
+func (s *AgentCenterService) RunActivity(ctx context.Context, runID int64) ([]agent.Activity, error) {
+	if runID <= 0 {
+		return nil, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if err := s.requireReader(); err != nil {
+		return nil, err
+	}
+	return s.reader.RunActivity(ctx, runID)
+}
+
 // Quality returns the latest eval summary plus the global run aggregate. With
 // no evaluation yet the latest block is null (never a fabricated summary).
 func (s *AgentCenterService) Quality(ctx context.Context) (QualityView, error) {
@@ -422,19 +465,23 @@ type agentCenterTeamDefinition struct {
 
 // agentCenterTeams is the converged v0.22 team map (R-B1-1..R-B1-4). The
 // conversation team holds the two Hosts (the only conversation writers) and the
-// two design background jobs (job cards only, no conversation entry); the
-// execution team holds the execution/analysis profiles. There is no code team
-// because deterministic workers have no agent profile.
+// THREE design background jobs — design_author / design_critic / design_judge
+// (job cards only, no conversation entry); the execution team holds the
+// execution/analysis profiles. There is no code team because deterministic
+// workers have no agent profile. The key list below is the authority; this
+// comment must name the same set (H-F10b #26: it said "two" after the judge
+// joined).
 var agentCenterTeams = []agentCenterTeamDefinition{
 	{
 		team:  "conversation",
 		label: "对话 Host 与后台作业",
-		note:  "2 个 Host 是对话唯一写者；design_author/design_critic 是后台作业，只出作业卡，无对话入口。",
+		note:  "2 个 Host 是对话唯一写者；design_author/design_critic/design_judge 是后台作业，只出作业卡，无对话入口。",
 		keys: []string{
 			ProfileKeyClarificationHost,
 			ProfileKeyDesignHost,
 			ProfileKeyDesignAuthor,
 			ProfileKeyDesignCritic,
+			ProfileKeyDesignJudge,
 		},
 	},
 	{
@@ -447,7 +494,6 @@ var agentCenterTeams = []agentCenterTeamDefinition{
 			ProfileKeyCoverageAnalyst,
 			ProfileKeyIssueTriager,
 			ProfileKeyReportWriter,
-			ProfileKeyVersionSteward,
 			ProfileKeyKnowledgeCurator,
 		},
 	},

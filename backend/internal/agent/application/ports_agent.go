@@ -80,6 +80,29 @@ type ConversationPort interface {
 	UpdateSummary(ctx context.Context, versionID, conversationID int64, summary string, pinnedFacts []string) (ConversationSummary, error)
 }
 
+// conversationStreamPort is the v0.2.4-D incremental Host reply surface of the
+// conversation context (SC-D2). It rides the same single-writer lease as
+// conversationWriterPort: the runner type-asserts both, and only a Host turn
+// that owns the lease writes incrementally. An adapter without this surface
+// keeps the batch Host reply (the pre-T6 contract) and the fallback is logged.
+//
+// Seq is 1-based and contiguous; every update carries the FULL snapshot of that
+// part (the version service derives the SSE increment from the stored previous
+// snapshot). Finish seals complete, Interrupt seals interrupted — both keep the
+// accumulated parts the caller passes. InterruptOrphanStreams is the crash
+// recovery sweep: the lease holder seals the heads a dead turn left streaming.
+//
+// All five calls for one message must stay on ONE goroutine: the version
+// service publishes the delta outside the row lock, so concurrent updates of
+// different snapshots to one seq could publish out of commit order.
+type conversationStreamPort interface {
+	BeginAssistantStream(ctx context.Context, conversationID int64, agent string, turnID, runID int64) (int64, error)
+	UpdateStreamPart(ctx context.Context, conversationID, messageID int64, seq int, part ConversationPart) error
+	FinishAssistantStream(ctx context.Context, conversationID, messageID int64, parts []ConversationPart) error
+	InterruptAssistantStream(ctx context.Context, conversationID, messageID int64, parts []ConversationPart) error
+	InterruptOrphanStreams(ctx context.Context, conversationID int64, agent string, turnID int64, errorPart ConversationPart) (int, error)
+}
+
 // VersionReader builds the version/task package rendered into the context.
 type VersionReader interface {
 	VersionPack(ctx context.Context, versionID int64) (VersionPack, error)
@@ -171,13 +194,18 @@ type ContentWriter interface {
 // design.round, design.data_plan and explore.* mappings together with their
 // profiles: those capabilities moved to the deterministic server pipeline or
 // Host tools, so an item of one of those legacy types fails closed here instead
-// of resolving a deleted profile.
+// of resolving a deleted profile. v0.2.4-G GD-17 likewise removed the
+// requirement.close/version.close mappings and the version_steward profile:
+// closure is a deterministic reconciler action, so a legacy close item fails
+// closed here (its in-flight rows are terminalized by startup disposal).
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
 		return ProfileKeyClarificationHost, true
-	case WorkTypeDesignRequirement, WorkTypeDesignGap, agent.WorkItemKindDesignCases:
+	case WorkTypeDesignRequirement, WorkTypeDesignGap, WorkTypeDesignRework, agent.WorkItemKindDesignCases:
 		return ProfileKeyDesignAuthor, true
+	case WorkTypeDesignJudge:
+		return ProfileKeyDesignJudge, true
 	case WorkTypeDesignCritic, agent.WorkItemKindReviewCases:
 		return ProfileKeyDesignCritic, true
 	case WorkTypeExecuteCase, agent.WorkItemKindExecuteBatch:
@@ -190,8 +218,6 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyIssueTriager, true
 	case WorkTypeReportWave, WorkTypeReportVersion:
 		return ProfileKeyReportWriter, true
-	case WorkTypeRequirementClose, WorkTypeVersionClose:
-		return ProfileKeyVersionSteward, true
 	case agent.WorkItemKindKnowledgePropose:
 		return ProfileKeyKnowledgeCurator, true
 	default:
@@ -245,11 +271,15 @@ const (
 
 // P2 design work item types (contracts/task-types.md P2 increment).
 const (
-	WorkTypeDesignRound       = "design.round"
 	WorkTypeDesignRequirement = "design.requirement"
 	WorkTypeDesignGap         = "design.gap"
 	WorkTypeDesignCritic      = "design.critic"
-	WorkTypeDesignDataPlan    = "design.data_plan"
+	// v0.2.4-E quality gate (spec SC-E3/SC-E4): the independent judge run and the
+	// author rework a judge fail triggers within budget. They mirror
+	// designapp.TaskTypeDesignJudge/TaskTypeDesignRework (0.2.1 type path); the
+	// judge maps to design_judge, the rework reuses the design_author profile.
+	WorkTypeDesignJudge  = "design.judge"
+	WorkTypeDesignRework = "design.rework"
 )
 
 // P3 execution work item types (contracts/task-types.md P3 increment).
@@ -259,13 +289,13 @@ const (
 	WorkTypeAnalyzeCoverage = "analyze.coverage"
 )
 
-// P4 delivery/closure work item types (contracts/task-types.md P4 increment).
+// P4 delivery work item types (contracts/task-types.md P4 increment). GD-17
+// (v0.2.4-G) removed requirement.close/version.close: closure is a deterministic
+// reconciler action, not an agent work item.
 const (
-	WorkTypeIssueTriage      = "issue.triage"
-	WorkTypeReportWave       = "report.wave"
-	WorkTypeReportVersion    = "report.version"
-	WorkTypeRequirementClose = "requirement.close"
-	WorkTypeVersionClose     = "version.close"
+	WorkTypeIssueTriage   = "issue.triage"
+	WorkTypeReportWave    = "report.wave"
+	WorkTypeReportVersion = "report.version"
 )
 
 // P5 codeintel work item types (contracts/task-types.md P5 increment). They are
@@ -301,15 +331,13 @@ type WorkItemPayload struct {
 	CaseRunID     int64
 	DispatchEpoch int64
 	DispatchToken string
-	// P4 delivery/steward payload (contracts/task-types.md §6). IDs are
-	// decimal strings in JSON, parsed by ParseWorkItemPayload;
-	// RequirementID/RequirementVersionID above are reused by requirement.close.
-	IssueID              int64
-	ReportID             int64
-	ReportRevision       int32
-	CloseRound           int32
-	ReportRevisionID     int64
-	PredicateFingerprint string
+	// P4 delivery payload (contracts/task-types.md §6). IDs are decimal strings
+	// in JSON, parsed by ParseWorkItemPayload. GD-17 removed the close-task
+	// payload fields (close_round/report_revision_id/predicate_fingerprint) with
+	// the requirement.close/version.close work types.
+	IssueID        int64
+	ReportID       int64
+	ReportRevision int32
 	// P5 codeintel payload (contracts/task-types.md §7). IDs follow the same
 	// decimal-string/number convention; commit SHAs are 40 hex strings.
 	RepoID        int64
@@ -317,6 +345,36 @@ type WorkItemPayload struct {
 	AnalysisID    int64
 	BaseCommitSHA string
 	HeadCommitSHA string
+	// v0.2.4-E quality gate (spec SC-E3/SC-E4): the design.judge scheduling
+	// payload (T8 ensureJudgeTasks). JudgeCases is the pending draft set this
+	// run must review (one verdict per case via design.judgment_submit);
+	// DraftCaseVersionIDs is the full-current-draft-set generation anchor
+	// (designapp.JudgeDraftSetKey format: comma-joined, sorted, deduped) — the
+	// scheduler's budget/dedupe key, not itself a review target. Both are
+	// absent (zero/nil) for every non-judge work type.
+	JudgeCases          []JudgeCaseRef
+	DraftCaseVersionIDs string
+	// ReworkRound/ReworkFindings carry the design.rework scheduling payload
+	// (design Planner.handleJudgeFail, SC-E4): the next judgment round and the
+	// judge findings summary ("<dimension>: <message>" joined by "; "). The
+	// rework task context renders both so the author sees WHY the case failed
+	// (T19 fix round 1); both are zero/empty for every other work type.
+	ReworkRound    int32
+	ReworkFindings string
+}
+
+// JudgeCaseRef is one pending draft case the design.judge work item scopes for
+// review (v0.2.4-E quality gate, T8 scheduling payload). It mirrors
+// designapp.JudgeCaseRef's wire shape (case_id/case_version_id/content_hash)
+// without importing the design context: the runner renders it into the judge's
+// task scope so the model knows which case versions to review. The judgment
+// tool/service independently validates the model's submitted case_version_id/
+// content_hash against the CURRENT case version (design context authority);
+// this scope rendering is informational, not itself a validation gate.
+type JudgeCaseRef struct {
+	CaseID        int64
+	CaseVersionID int64
+	ContentHash   string
 }
 
 // ToolDeps is the adapter wiring for the P1 tools. The runner adds the

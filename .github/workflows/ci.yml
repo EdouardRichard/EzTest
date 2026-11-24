@@ -4,7 +4,7 @@
 # so the workflow installs the browser explicitly (cached between runs) instead
 # of relying on the runner image or on `pnpm install` post-install scripts.
 #
-# The 0.2 static acceptance gate (`scripts/p8-static-check.ps1`) validates the
+# The 0.2 static acceptance gate (`scripts/static-gate.ps1`) validates the
 # development docs/contracts tree, which is intentionally not part of the public
 # source tree, so it runs locally in the development workflow only and is not a
 # hosted CI job here.
@@ -28,7 +28,8 @@ jobs:
   test:
     name: Go, frontend, executor and renderer tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The real-database integration suite adds ~20 minutes (H-D4).
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17
@@ -85,6 +86,16 @@ jobs:
         working-directory: backend
         run: go test -count=1 ./...
 
+      # Real-database integration suite (H-D4). Serial (-p 1) because the
+      # packages reset the shared test database; the job-level
+      # EZTEST_TEST_DATABASE_URL points at the postgres service above, whose
+      # health check makes the runner wait for readiness before any step. No
+      # -short / tag skipping: environment-absent t.Skip is acceptable, but a
+      # DB-related skip is not. This adds roughly 20 minutes to the job.
+      - name: Go integration tests (real postgres)
+        working-directory: backend
+        run: go test -tags=integration -p 1 -count=1 ./...
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
@@ -105,23 +116,40 @@ jobs:
 
       - name: Install executor dependencies
         working-directory: executor
-        run: pnpm install --frozen-lockfile
+        # P10/Q3=B floating model: the executor install resolves the manifest
+        # anew rather than freezing it. The browser domain runs the global CLI;
+        # the transitional playwright library bridge was removed in T16.
+        run: pnpm install --no-frozen-lockfile
 
       - name: Install renderer dependencies
         working-directory: renderer
         run: pnpm install --frozen-lockfile
 
+      # The browser capability domain runs the OFFICIAL @playwright/cli at @latest
+      # (ARTEX model). Its version pins a specific Playwright engine, so it keys
+      # the browser cache: a CLI upgrade resolves a fresh browser build.
+      - name: Install official playwright CLI (floating)
+        id: cli
+        run: |
+          npm install -g @playwright/cli@latest
+          echo "version=$(playwright-cli --version)" >> "$GITHUB_OUTPUT"
+
       - name: Cache Playwright browsers
         uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('executor/pnpm-lock.yaml', 'renderer/pnpm-lock.yaml') }}
+          key: ${{ runner.os }}-playwright-${{ hashFiles('executor/pnpm-lock.yaml', 'renderer/pnpm-lock.yaml') }}-cli-${{ steps.cli.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-${{ hashFiles('executor/pnpm-lock.yaml', 'renderer/pnpm-lock.yaml') }}-
 
       # `--with-deps` still installs the OS libraries on a cache hit; only the
-      # ~100 MB browser download is skipped.
-      - name: Install Playwright Chromium
+      # browser download is skipped. Chromium is installed for the CLI's own
+      # pinned engine (install-browser). The stable playwright library bridge was
+      # removed in T16, so only the CLI engine build is needed.
+      - name: Install Playwright Chromium (CLI engine)
         working-directory: executor
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          playwright-cli install-browser chromium --with-deps
 
       - name: Executor unit tests
         working-directory: executor
@@ -130,3 +158,41 @@ jobs:
       - name: Renderer unit tests
         working-directory: renderer
         run: pnpm test
+
+  # v0.2.4-B OpenAPI contract guards (T19). Unlike the local-only static acceptance
+  # gate above (which validates a docs/contracts tree absent from the public source
+  # tree), these guards need only TRACKED files — docs/openapi/api.yaml, the Go sources,
+  # and the frontend `yaml` devDependency — so they genuinely run in hosted CI. Node-only:
+  # no pwsh and no check-docs.ps1, so the 35 pre-existing local-gate failures cannot mask
+  # a guard regression. Each guard exits non-zero on drift and fails this job.
+  openapi-contract:
+    name: OpenAPI contract guards (v0.2.4-B, node-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (yaml parser)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: OpenAPI contract guards
+        run: |
+          node scripts/v024-openapi-contract-check.cjs
+          node scripts/v024-openapi-deep-check.cjs
+          node scripts/v024-openapi-validate.cjs
+          node scripts/v024-openapi-oneof-test.cjs
+          node scripts/v024-openapi-mutants.cjs

@@ -22,6 +22,7 @@ vi.mock("./api", async (importOriginal) => {
     ...actual,
     listSuts: vi.fn(),
     getSut: vi.fn(),
+    listEnvironments: vi.fn(),
     listRepositories: vi.fn(),
     createSutWithDefaultEnvironment: vi.fn(),
     createEnvironment: vi.fn(),
@@ -59,16 +60,6 @@ import {
   sutListItemFixture,
 } from "./test-fixtures"
 
-function jsonFixtureDetail() {
-  return {
-    ...sutFixture,
-    environments: [
-      { ...secondEnvironmentFixture, id: "1110", is_default: false },
-      { ...environmentFixture, id: "1111", is_default: true },
-    ],
-  }
-}
-
 describe("parseResourceTab", () => {
   it("normalizes unknown and array query values", () => {
     expect(parseResourceTab("pages")).toBe("pages")
@@ -82,9 +73,14 @@ describe("ResourcesPage", () => {
   beforeEach(() => {
     vi.mocked(api.listSuts).mockReset()
     vi.mocked(api.getSut).mockReset()
+    vi.mocked(api.listEnvironments).mockReset()
     vi.mocked(api.listRepositories).mockReset()
     vi.mocked(api.listSuts).mockResolvedValue([sutListItemFixture, secondSutFixture])
     vi.mocked(api.getSut).mockResolvedValue(sutFixture)
+    vi.mocked(api.listEnvironments).mockResolvedValue([
+      environmentFixture,
+      secondEnvironmentFixture,
+    ])
     vi.mocked(api.listRepositories).mockResolvedValue([])
     navigation.replace.mockReset()
   })
@@ -105,19 +101,12 @@ describe("ResourcesPage", () => {
     expect(await screen.findByRole("button", { name: "新建代码仓" })).toBeInTheDocument()
   })
 
-  it("defaults to the first SUT and its default environment", async () => {
+  it("defaults to the first SUT and its environment", async () => {
     render(<ResourcesPage initialTab="data" />)
 
     expect(await screen.findByLabelText("SUT")).toHaveValue("1001")
     expect(await screen.findByLabelText("环境")).toHaveValue("1101")
     expect(screen.getByRole("table", { name: "目标库列表" })).toBeInTheDocument()
-  })
-
-  it("prefers the environment flagged is_default when none is selected yet", async () => {
-    vi.mocked(api.getSut).mockResolvedValue(jsonFixtureDetail())
-    render(<ResourcesPage initialTab="pages" />)
-
-    expect(await screen.findByLabelText("环境")).toHaveValue("1111")
   })
 
   it("loads another SUT aggregate when the scope selector changes", async () => {

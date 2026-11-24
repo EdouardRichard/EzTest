@@ -15,12 +15,10 @@
 | `corpus/code.json` | 固定仓库、变更文件、代码锚点与期望影响需求 |
 | `corpus/execution.json` | 固定波次、用例运行状态、注入失败真值 |
 | `corpus/issues.json` | 期望 AI 问题与真阳性场景 |
-| `corpus/visual.json` | 视觉断言与期望分类 |
 | `ground-truth/impact.json` | 影响召回/精确率的真值需求集合 |
 | `ground-truth/classification.json` | 注入失败及期望 failure class |
 | `ground-truth/issues.json` | AI 问题真阳性标题 |
 | `ground-truth/supplement.json` | 期望 AI 补充用例 |
-| `ground-truth/visual.json` | 视觉分类真值 |
 | `observation.example.json` | 真实 run 的 observation **契约模板**（不是证据，本身不可用于提交评测） |
 
 所有文件共享同一个 `corpus_version`（当前 `v02-2026-11-01.1`）。修改任一语料必须同时 bump 全部文件的 `corpus_version`，否则 `scripts/eval.ps1 -DryRun` 会失败。
@@ -40,7 +38,6 @@ observation 契约（`schema: p6-eval-observation/v1`）见 `observation.example
 - `execution.case_runs[]`：真实执行结果（`case_title/status/failure_class`）。
 - `issues.ai_issues[]`：真实 AI 问题（`title`）。
 - `supplement.ai_case_titles[]`：真实 AI 补充用例标题。
-- `visual`（可选，有视觉断言时提供）：`injected` 与 `cases[{case_title,classification}]`。
 
 脚本只信任 open-truth 匹配后的 **计数**；不会把 observation 里的 `sample` 字段当真（契约里没有该字段）。样本物理约束在脚本与服务端各校验一次。
 
@@ -67,7 +64,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -Mode r
 | `-BearerToken` | `EZTEST_ADMIN_TOKEN`；否则用 `.env` / 环境中的 `EZTEST_ADMIN_USERNAME`/`EZTEST_ADMIN_PASSWORD` 登录（无内置默认口令，缺失即失败） | admin 凭据/口令永不打印 |
 | `-RequestTimeoutSeconds` | 60 | 单次 HTTP 超时 |
 
-DryRun 校验：14 个语料/真值文件存在且 JSON 可解析、`corpus_version` 一致、baseline 7 指标与阈值精确匹配 spec §5.3、语料与真值互相引用一致、OpenAPI 冻结标记/P6 quality 路径与 schema、quality 路由文件、迁移 `order.txt` 33 条（含 `quality_0001_eval.sql`）、`.env` 数据库 URL 本地可连接、LLM 配置三项非空、工具链（PowerShell/psql）。不要求服务已启动。
+DryRun 校验：14 个语料/真值文件存在且 JSON 可解析、`corpus_version` 一致、baseline 7 指标与阈值精确匹配 spec §5.3、语料与真值互相引用一致、OpenAPI 冻结标记/P6 quality 路径与 schema、quality 路由文件、迁移 `order.txt` **按实际条数派生**（当前 92 条，逐条须有对应迁移文件；含 `quality_0001_eval.sql`）、`.env` 数据库 URL 本地可连接、LLM 配置三项非空、工具链（PowerShell/psql）。不要求服务已启动。
 
 ## 输出/退出码
 
@@ -80,4 +77,4 @@ DryRun 校验：14 个语料/真值文件存在且 JSON 可解析、`corpus_vers
 
 1. 第一次真实 LLM run 完成后，用 `result.json.metrics` 更新 `baseline.json.metrics`；只允许不变差（下界指标不下降，`issue_false_positive_rate` 不上升）。
 2. 语料/真值改动必须 bump `corpus_version` 并重新跑真实验收；不得为了让指标好看而下调阈值或伪造 observation。
-3. 阈值是报告信号，不是阶段门禁；不改 `docs/version-V0.2/` 设计文档。
+3. 阈值是报告信号，不是阶段门禁；不改 `docs/design/` 与 `docs/v0.2.4/` 现行设计文档（旧 `docs/version-V0.2/` 已退役，R-H3r）。

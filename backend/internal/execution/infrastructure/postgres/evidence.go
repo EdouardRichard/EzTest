@@ -9,17 +9,17 @@ import (
 // EvidenceRepository implements the matching executionapp repository port.
 type EvidenceRepository struct{ base }
 
-const evidenceColumns = `id, case_run_id, version_sut_id, step_seq, assertion_seq, kind,
+const evidenceColumns = `id, case_run_id, sut_id, step_seq, assertion_seq, kind,
 	content_ref_id, sha256, size_bytes, mime, filename, created_by_run_id, created_at`
 
 // Insert writes one immutable evidence row.
 func (r *EvidenceRepository) Insert(ctx context.Context, evidence execution.Evidence) error {
 	ctx = contextOrBackground(ctx)
 	_, err := r.pool.Exec(ctx, `
-		INSERT INTO evidence (id, case_run_id, version_sut_id, step_seq, assertion_seq, kind,
+		INSERT INTO evidence (id, case_run_id, sut_id, step_seq, assertion_seq, kind,
 			content_ref_id, sha256, size_bytes, mime, filename, created_by_run_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`, r.insertID(evidence.ID), evidence.CaseRunID, evidence.VersionSUTID, evidence.StepSeq,
+	`, r.insertID(evidence.ID), evidence.CaseRunID, evidence.SUTID, evidence.StepSeq,
 		evidence.AssertionSeq, string(evidence.Kind), evidence.ContentRefID, evidence.SHA256,
 		evidence.SizeBytes, evidence.MIME, evidence.Filename, evidence.CreatedByRunID)
 	return wrapDB("insert evidence", err)
@@ -35,6 +35,21 @@ func (r *EvidenceRepository) Get(ctx context.Context, id int64) (execution.Evide
 	return item, nil
 }
 
+// EvidenceByCaseRunSHA loads one case_run's evidence by its content sha256 (the
+// P17 evidence-gate lookup, v0.2.4-F SC-F3). A missing sha maps to
+// execution.ErrNotFound. The newest matching row wins (id DESC) — evidence is
+// content-addressed, so repeated identical bytes share a sha within the run.
+func (r *EvidenceRepository) EvidenceByCaseRunSHA(ctx context.Context, caseRunID int64, sha256 string) (execution.Evidence, error) {
+	ctx = contextOrBackground(ctx)
+	item, err := scanEvidence(r.pool.QueryRow(ctx,
+		`SELECT `+evidenceColumns+` FROM evidence WHERE case_run_id = $1 AND sha256 = $2 ORDER BY id DESC LIMIT 1`,
+		caseRunID, sha256))
+	if err != nil {
+		return execution.Evidence{}, wrapDB("get evidence by case run sha", err)
+	}
+	return item, nil
+}
+
 // ListByCaseRun lists the evidence of one case_run newest first.
 func (r *EvidenceRepository) ListByCaseRun(ctx context.Context, caseRunID int64, limit int) ([]execution.Evidence, error) {
 	ctx = contextOrBackground(ctx)
@@ -44,6 +59,61 @@ func (r *EvidenceRepository) ListByCaseRun(ctx context.Context, caseRunID int64,
 	`, caseRunID, effectiveLimit(limit))
 	if err != nil {
 		return nil, wrapDB("list case run evidence", err)
+	}
+	defer rows.Close()
+	items, err := collectEvidence(rows)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// SHA256sByCaseRun returns the sha256 of EVERY evidence row of one case_run
+// (newest first), with no page cap (v0.2.4-G T8 fix round, SC-G7). It is the
+// causally-complete fingerprint digest carrier (art.4.6): a NARROW read of the
+// sha column only — never full metadata rows — so an unlimited write cap does
+// not pull every column of every row into memory just to hash the set. A run
+// without evidence returns an empty non-nil slice.
+func (r *EvidenceRepository) SHA256sByCaseRun(ctx context.Context, caseRunID int64) ([]string, error) {
+	ctx = contextOrBackground(ctx)
+	rows, err := r.pool.Query(ctx, `
+		SELECT sha256 FROM evidence
+		WHERE case_run_id = $1 ORDER BY id DESC
+	`, caseRunID)
+	if err != nil {
+		return nil, wrapDB("list case run evidence sha256s", err)
+	}
+	defer rows.Close()
+	shas := make([]string, 0)
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, wrapDB("scan case run evidence sha256", err)
+		}
+		shas = append(shas, sha)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapDB("scan case run evidence sha256s", err)
+	}
+	return shas, nil
+}
+
+// ListNewestByCaseRun returns up to limit newest evidence rows (full metadata)
+// of one case_run for the bounded report DISPLAY projection (v0.2.4-G T8 fix
+// round, SC-G7). limit <= 0 means unlimited (NULLIF maps 0 to a NULL LIMIT).
+// Unlike ListByCaseRun it does NOT clamp to the 100-row page bound: the display
+// cap is the report's own setting, which may exceed 100 or be unlimited.
+func (r *EvidenceRepository) ListNewestByCaseRun(ctx context.Context, caseRunID int64, limit int) ([]execution.Evidence, error) {
+	ctx = contextOrBackground(ctx)
+	if limit < 0 {
+		limit = 0
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+evidenceColumns+` FROM evidence
+		WHERE case_run_id = $1 ORDER BY id DESC LIMIT NULLIF($2, 0)
+	`, caseRunID, limit)
+	if err != nil {
+		return nil, wrapDB("list newest case run evidence", err)
 	}
 	defer rows.Close()
 	items, err := collectEvidence(rows)
@@ -68,12 +138,12 @@ func (r *EvidenceRepository) ListByVersion(ctx context.Context, versionID int64,
 		JOIN run_wave wave ON wave.id = run.wave_id
 		WHERE wave.version_id = $1
 		  AND ($2::BIGINT IS NULL OR evidence.case_run_id = $2)
-		  AND ($3::BIGINT IS NULL OR evidence.version_sut_id = $3)
+		  AND ($3::BIGINT IS NULL OR evidence.sut_id = $3)
 		  AND ($4 = '' OR evidence.kind = $4)
 		  AND ($5::BIGINT IS NULL OR evidence.id < $5)
 		ORDER BY evidence.id DESC
 		LIMIT $6
-	`, versionID, filter.CaseRunID, filter.VersionSUTID, kind, filter.BeforeID, limit+1)
+	`, versionID, filter.CaseRunID, filter.SUTID, kind, filter.BeforeID, limit+1)
 	if err != nil {
 		return nil, false, wrapDB("list version evidence", err)
 	}
@@ -89,7 +159,9 @@ func (r *EvidenceRepository) ListByVersion(ctx context.Context, versionID int64,
 	return items, hasMore, nil
 }
 
-// InsertRef links one evidence row to an owner row.
+// InsertRef links one evidence row to an owner row. The reverse-lookup read side
+// is ListByOwner (evidence_read.go, v0.2.4-G V-0019): owner_kind/owner_id -> the
+// bound evidence joined with its immutable metadata.
 func (r *EvidenceRepository) InsertRef(ctx context.Context, ref execution.EvidenceRef) error {
 	ctx = contextOrBackground(ctx)
 	_, err := r.pool.Exec(ctx, `
@@ -111,13 +183,22 @@ func (r *EvidenceRepository) CountByCaseRun(ctx context.Context, caseRunID int64
 	return count, nil
 }
 
+// evidenceScanDests is the SINGLE scan authority for the evidenceColumns field
+// order: both the single-table read (scanEvidence) and the joined evidence_ref
+// read (scanEvidenceRef) build their destinations from it, so the two readers
+// cannot hand-mirror divergent field orders (H-G4 T4, constitution 五.1).
+func evidenceScanDests(ev *execution.Evidence, kind *string) []any {
+	return []any{
+		&ev.ID, &ev.CaseRunID, &ev.SUTID, &ev.StepSeq, &ev.AssertionSeq,
+		kind, &ev.ContentRefID, &ev.SHA256, &ev.SizeBytes, &ev.MIME, &ev.Filename,
+		&ev.CreatedByRunID, &ev.CreatedAt,
+	}
+}
+
 func scanEvidence(row rowScanner) (execution.Evidence, error) {
 	var item execution.Evidence
 	var kind string
-	err := row.Scan(&item.ID, &item.CaseRunID, &item.VersionSUTID, &item.StepSeq, &item.AssertionSeq,
-		&kind, &item.ContentRefID, &item.SHA256, &item.SizeBytes, &item.MIME, &item.Filename,
-		&item.CreatedByRunID, &item.CreatedAt)
-	if err != nil {
+	if err := row.Scan(evidenceScanDests(&item, &kind)...); err != nil {
 		return execution.Evidence{}, err
 	}
 	item.Kind = execution.EvidenceKind(kind)

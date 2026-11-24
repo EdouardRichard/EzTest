@@ -19,7 +19,9 @@ var (
 	ErrStageConflict = errors.New("version stage changed concurrently")
 )
 
-// Summary is the list read model for one version.
+// Summary is the list read model for one version. SUTCount is the number of
+// SUTs in the environment the version binds (v0.2.4-B); it is derived, never
+// stored.
 type Summary struct {
 	ID        int64
 	Title     string
@@ -49,35 +51,25 @@ type ReferencingVersion struct {
 	SuspendedFrom *Stage
 }
 
-// Repository persists versions, their SUT bindings and the selected database/
-// account rows. Create must write the whole aggregate in one transaction.
+// Repository persists versions and the account subset each version executes
+// with. The environment binding is a column on the version row (v0.2.4-B), so
+// Create must write the version and its version_account rows in one transaction.
 type Repository interface {
-	Create(ctx context.Context, version Version, bindings []Binding) error
-	Get(ctx context.Context, id int64) (Version, []Binding, error)
+	Create(ctx context.Context, version Version, accounts []AccountBinding) error
+	Get(ctx context.Context, id int64) (Version, []AccountBinding, error)
 	List(ctx context.Context, limit int, beforeID *int64) ([]Summary, error)
 	Update(ctx context.Context, version Version) (Version, error)
 	// UpdateBinding rewrites the editable binding projection of one existing
-	// version: the environment and scope_exclude of version_sut, the
-	// version_repository_override rows and the version_account rows. It is one
+	// version: version.environment_id and the version_account rows. It is one
 	// transaction, first locks the version row and then applies the write only
 	// while the persisted version.updated_at still equals expectedUpdatedAt
 	// (optimistic check, so concurrent binding/stage writers settle as
-	// ErrBindingConflict). It yields ErrNotFound when the version or its binding
-	// is missing.
-	UpdateBinding(ctx context.Context, version Version, binding Binding, expectedUpdatedAt time.Time) error
-
-	// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut
-	// binding (P5 §5.5). The first successful code index uses it to backfill a
-	// binding that was created before its repository could be resolved. An empty
-	// commit clears the column to NULL.
-	SetCodeBaselineCommit(ctx context.Context, versionSUTID int64, commitSHA string) error
+	// ErrBindingConflict). It yields ErrNotFound when the version is missing.
+	UpdateBinding(ctx context.Context, version Version, accounts []AccountBinding, expectedUpdatedAt time.Time) error
 
 	// MarkRunning projects the version from initial to running. It reports
 	// whether this call changed the status; the WHERE guard makes it idempotent.
 	MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
-	// Reopen projects a completed version back to running and clears the close
-	// fields (P3 §5.9). It reports whether this call changed the row.
-	Reopen(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
 	// Stats returns the P1 detail aggregates for one version.
 	Stats(ctx context.Context, id int64) (VersionStats, error)
 	// ListInitialVersionsWithContent returns initial versions that already have a
@@ -106,12 +98,24 @@ type Repository interface {
 // StageState is the persisted deterministic stage-machine projection of one
 // version (spec §5.3). SuspendedFrom is the workflow stage the version was in
 // when it entered blocked/paused; it is nil unless the version is suspended.
+//
+// Reason and Actor are transition-scoped, not persisted on the version row:
+// GetStage leaves them empty and only ApplyStage consumes them to write the
+// durable stage_transition fact (V-0020). Keeping them on StageState rather than
+// widening the ApplyStage signature preserves every StageRepository implementer
+// (including the delivery/execution test doubles) unchanged.
 type StageState struct {
 	VersionID      int64
 	Stage          Stage
 	StageEnteredAt time.Time
 	Blocker        string
 	SuspendedFrom  *Stage
+	// Reason is the transition reason recorded on the stage_transition fact
+	// (from/to/reason/actor). It is the same value the stage event carries.
+	Reason string
+	// Actor is the authenticated caller projected into the fact payload (role,
+	// decimal id, or "system" for a background callback).
+	Actor string
 }
 
 // StageRepository persists the deterministic stage machine state. Only the
@@ -136,14 +140,18 @@ type StageRepository interface {
 // evaluation. ReopenIfCompleted flips completed -> running and clears the close
 // fields; a version in any other status is a no-op.
 type VersionCloseRepository interface {
-	// Get loads one version. It is the read used by Evaluate and by the
-	// reconcile loop.
-	Get(ctx context.Context, id int64) (Version, []Binding, error)
+	// Get loads one version with its account subset. It is the read used by
+	// Evaluate and by the reconcile loop.
+	Get(ctx context.Context, id int64) (Version, []AccountBinding, error)
 	// Close completes one running version. The callback runs after the row
 	// lock is acquired and before the conditional UPDATE; a callback error
-	// rolls the transaction back unchanged. A missing version yields
-	// ErrNotFound; a version that is not running yields ErrStateConflict.
-	Close(ctx context.Context, id int64, close VersionCloseFields, recheck func(context.Context, Version) error) (Version, error)
+	// rolls the transaction back unchanged. The close projection is passed by
+	// pointer so the under-lock recheck can adjust it from the authoritative
+	// locked evaluation (a normal close whose requirements include an admin-waived
+	// requirement sets Unverified — final fix wave #1); the fields are consumed
+	// AFTER the callback returns. A missing version yields ErrNotFound; a version
+	// that is not running yields ErrStateConflict.
+	Close(ctx context.Context, id int64, close *VersionCloseFields, recheck func(context.Context, Version) error) (Version, error)
 	// ReopenIfCompleted returns the version after a completed -> running
 	// transition and whether this call changed the row. A version already
 	// running (or still initial) is returned unchanged with changed=false.

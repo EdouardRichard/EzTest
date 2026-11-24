@@ -169,8 +169,8 @@ func analysisTriageInput(issue delivery.Issue, refs []delivery.IssueRef) (json.R
 		if ref.Role != "" {
 			entry["role"] = ref.Role
 		}
-		if ref.VersionSUTID != nil && *ref.VersionSUTID > 0 {
-			entry["version_sut_id"] = formatIssueID(*ref.VersionSUTID)
+		if ref.SUTID != nil && *ref.SUTID > 0 {
+			entry["sut_id"] = formatIssueID(*ref.SUTID)
 		}
 		refPayload = append(refPayload, entry)
 	}

@@ -30,6 +30,18 @@ const IssueRefRoleRecurrence = "recurrence"
 // IssueRefRoleSource, so a retest never hides the original failure linkage.
 const IssueRefRoleRetest = "retest"
 
+// IssueHistoryReasonRecurrence is the delivery_issue_status_history.reason of a
+// recurrence redirect (spec §4.6): from_status == to_status, the row records the
+// redirect itself. It is a DIFFERENT column and a different concept from
+// IssueRefRoleRecurrence (delivery_issue_ref.role) even though both spell
+// "recurrence"; the redirect writes both, so each reads its own constant.
+//
+// Before T11e-6 the postgres adapter and the application each declared their own
+// unexported issueReasonRecurrence = "recurrence" (the application's copy had no
+// reader at all): a hand-written second truth across two layers (constitution
+// 五.3). Both now source this authority.
+const IssueHistoryReasonRecurrence = "recurrence"
+
 // Stable merge conflict reasons (spec §5.2 details.reason subcodes).
 const (
 	// MergeReasonTargetInvalid marks a self, cross-version, unknown or already

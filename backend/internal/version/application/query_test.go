@@ -10,10 +10,10 @@ import (
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
-// fakeP6QueryReader is the version-context P6 read source used by the query
+// fakeQueryReader is the version-context P6 read source used by the query
 // port tests. Every call is recorded so the tests can assert trimming, limit
 // normalization and batching.
-type fakeP6QueryReader struct {
+type fakeQueryReader struct {
 	closureNum   int
 	closureDenom int
 	closureErr   error
@@ -44,44 +44,44 @@ type fakeP6QueryReader struct {
 	draftCalls   int
 }
 
-func (f *fakeP6QueryReader) CountRequirementClosure(_ context.Context, versionID *int64) (int, int, error) {
+func (f *fakeQueryReader) CountRequirementClosure(_ context.Context, versionID *int64) (int, int, error) {
 	f.closureCalls++
 	f.closureScope = versionID
 	return f.closureNum, f.closureDenom, f.closureErr
 }
 
-func (f *fakeP6QueryReader) SearchVersions(_ context.Context, q string, limit int) ([]versionapp.VersionSearchRow, error) {
+func (f *fakeQueryReader) SearchVersions(_ context.Context, q string, limit int) ([]versionapp.VersionSearchRow, error) {
 	f.versionCalls++
 	f.versionQ, f.versionLimit = q, limit
 	return f.versionRows, f.versionErr
 }
 
-func (f *fakeP6QueryReader) SearchRequirements(_ context.Context, q string, limit int) ([]versionapp.RequirementSearchRow, error) {
+func (f *fakeQueryReader) SearchRequirements(_ context.Context, q string, limit int) ([]versionapp.RequirementSearchRow, error) {
 	f.requirementCalls++
 	f.requirementQ, f.requirementLimit = q, limit
 	return f.requirementRows, f.requirementErr
 }
 
-func (f *fakeP6QueryReader) VersionTitles(_ context.Context, ids []int64) (map[int64]string, error) {
+func (f *fakeQueryReader) VersionTitles(_ context.Context, ids []int64) (map[int64]string, error) {
 	f.titleCalls++
 	f.titleIDs = append([]int64(nil), ids...)
 	return f.titleResult, f.titleErr
 }
 
-func (f *fakeP6QueryReader) ListPendingDesignVersions(context.Context) ([]versionapp.PendingDesignVersionRow, error) {
+func (f *fakeQueryReader) ListPendingDesignVersions(context.Context) ([]versionapp.PendingDesignVersionRow, error) {
 	f.pendingCalls++
 	return f.pendingRows, f.pendingErr
 }
 
-func (f *fakeP6QueryReader) ListDraftRequirements(_ context.Context, limit int) ([]versionapp.DraftRequirementRow, error) {
+func (f *fakeQueryReader) ListDraftRequirements(_ context.Context, limit int) ([]versionapp.DraftRequirementRow, error) {
 	f.draftCalls++
 	f.draftLimit = limit
 	return f.draftRows, f.draftErr
 }
 
-func TestP6CountRequirementClosure(t *testing.T) {
+func TestCountRequirementClosure(t *testing.T) {
 	t.Run("empty store returns zero counts", func(t *testing.T) {
-		reader := &fakeP6QueryReader{}
+		reader := &fakeQueryReader{}
 		service := versionapp.NewQueryService(reader)
 
 		num, denom, err := service.CountRequirementClosure(context.Background(), nil)
@@ -97,7 +97,7 @@ func TestP6CountRequirementClosure(t *testing.T) {
 	})
 
 	t.Run("version filter is forwarded", func(t *testing.T) {
-		reader := &fakeP6QueryReader{closureNum: 3, closureDenom: 5}
+		reader := &fakeQueryReader{closureNum: 3, closureDenom: 5}
 		service := versionapp.NewQueryService(reader)
 		versionID := int64(7)
 
@@ -114,7 +114,7 @@ func TestP6CountRequirementClosure(t *testing.T) {
 	})
 
 	t.Run("zero denominator is reported without error", func(t *testing.T) {
-		service := versionapp.NewQueryService(&fakeP6QueryReader{closureNum: 0, closureDenom: 0})
+		service := versionapp.NewQueryService(&fakeQueryReader{closureNum: 0, closureDenom: 0})
 
 		num, denom, err := service.CountRequirementClosure(context.Background(), nil)
 		if err != nil {
@@ -126,7 +126,7 @@ func TestP6CountRequirementClosure(t *testing.T) {
 	})
 
 	t.Run("non-positive version is rejected", func(t *testing.T) {
-		reader := &fakeP6QueryReader{}
+		reader := &fakeQueryReader{}
 		service := versionapp.NewQueryService(reader)
 		versionID := int64(0)
 
@@ -140,7 +140,7 @@ func TestP6CountRequirementClosure(t *testing.T) {
 
 	t.Run("reader error is propagated", func(t *testing.T) {
 		want := errors.New("boom")
-		service := versionapp.NewQueryService(&fakeP6QueryReader{closureErr: want})
+		service := versionapp.NewQueryService(&fakeQueryReader{closureErr: want})
 
 		if _, _, err := service.CountRequirementClosure(context.Background(), nil); !errors.Is(err, want) {
 			t.Fatalf("err = %v, want %v", err, want)
@@ -148,8 +148,8 @@ func TestP6CountRequirementClosure(t *testing.T) {
 	})
 }
 
-func TestP6SearchVersions(t *testing.T) {
-	reader := &fakeP6QueryReader{versionRows: []versionapp.VersionSearchRow{
+func TestSearchVersions(t *testing.T) {
+	reader := &fakeQueryReader{versionRows: []versionapp.VersionSearchRow{
 		{ID: 7, Title: "Login SUT", Status: "running"},
 		{ID: 3, Title: "Checkout SUT", Status: "completed"},
 	}}
@@ -188,8 +188,8 @@ func TestP6SearchVersions(t *testing.T) {
 	}
 }
 
-func TestP6SearchRequirements(t *testing.T) {
-	reader := &fakeP6QueryReader{requirementRows: []versionapp.RequirementSearchRow{
+func TestSearchRequirements(t *testing.T) {
+	reader := &fakeQueryReader{requirementRows: []versionapp.RequirementSearchRow{
 		{ID: 9, VersionID: 7, VersionTitle: "Login SUT", Title: "Login with email", Status: "clarified"},
 	}}
 	service := versionapp.NewQueryService(reader)
@@ -217,8 +217,8 @@ func TestP6SearchRequirements(t *testing.T) {
 	}
 }
 
-func TestP6VersionTitlesBatchesAndDeduplicates(t *testing.T) {
-	reader := &fakeP6QueryReader{titleResult: map[int64]string{3: "三", 4: "四"}}
+func TestVersionTitlesBatchesAndDeduplicates(t *testing.T) {
+	reader := &fakeQueryReader{titleResult: map[int64]string{3: "三", 4: "四"}}
 	service := versionapp.NewQueryService(reader)
 
 	titles, err := service.VersionTitles(context.Background(), []int64{3, 3, 0, -1, 4})
@@ -248,8 +248,8 @@ func TestP6VersionTitlesBatchesAndDeduplicates(t *testing.T) {
 	}
 }
 
-func TestP6ListPendingDesignVersionsBuildsTodos(t *testing.T) {
-	reader := &fakeP6QueryReader{pendingRows: []versionapp.PendingDesignVersionRow{
+func TestListPendingDesignVersionsBuildsTodos(t *testing.T) {
+	reader := &fakeQueryReader{pendingRows: []versionapp.PendingDesignVersionRow{
 		{VersionID: 7, VersionTitle: "Login SUT", PendingCount: 2},
 	}}
 	service := versionapp.NewQueryService(reader)
@@ -288,9 +288,9 @@ func TestP6ListPendingDesignVersionsBuildsTodos(t *testing.T) {
 	}
 }
 
-func TestP6ListDraftRequirementsBuildsTodos(t *testing.T) {
+func TestListDraftRequirementsBuildsTodos(t *testing.T) {
 	created := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
-	reader := &fakeP6QueryReader{draftRows: []versionapp.DraftRequirementRow{
+	reader := &fakeQueryReader{draftRows: []versionapp.DraftRequirementRow{
 		{ID: 9, VersionID: 7, VersionTitle: "Login SUT", Title: "Login with email", CreatedAt: created},
 	}}
 	service := versionapp.NewQueryService(reader)
@@ -333,7 +333,7 @@ func TestP6ListDraftRequirementsBuildsTodos(t *testing.T) {
 	}
 }
 
-func TestP6QueryServiceRequiresReader(t *testing.T) {
+func TestQueryServiceRequiresReader(t *testing.T) {
 	service := versionapp.NewQueryService(nil)
 	_, _, err := service.CountRequirementClosure(context.Background(), nil)
 	if err == nil {

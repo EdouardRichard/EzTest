@@ -66,7 +66,7 @@ func TakeReportNarrative(reportID int64, revision int32) (ReportNarrativeDraft, 
 // contracts/agent-profiles-tools.md §7.3). The tools only ever receive the
 // runtime-injected tools.Scope: their JSON schemas never expose the report or
 // version IDs. The composition root (Task 23) registers this group through
-// tools.RegisterP4ToolGroup with a captured ReportService.
+// tools.RegisterToolGroup with a captured ReportService.
 func ReportTools(svc *ReportService) []agenttools.Tool {
 	return []agenttools.Tool{
 		&reportDataReadTool{svc: svc},
@@ -110,7 +110,7 @@ func (t *reportDataReadTool) Execute(ctx context.Context, scope agenttools.Scope
 		return nil, errors.New("report.data_read has no report service")
 	}
 	var params struct{}
-	if err := agenttools.DecodeP4Params(raw, &params); err != nil {
+	if err := agenttools.DecodeDeliveryParams(raw, &params); err != nil {
 		return nil, err
 	}
 	report, revision, err := t.svc.reportToolTarget(ctx, scope)
@@ -225,22 +225,22 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"case_versions_flaky_coverage":  row.CaseVersionsFlakyCoverage,
 		})
 	}
-	versionSUTIDs := make([]string, 0, len(snapshot.VersionSUTs))
-	for _, sut := range snapshot.VersionSUTs {
+	sutIDs := make([]string, 0, len(snapshot.SUTs))
+	for _, sut := range snapshot.SUTs {
 		if sut.ID > 0 {
-			versionSUTIDs = append(versionSUTIDs, platformid.Format(sut.ID))
+			sutIDs = append(sutIDs, platformid.Format(sut.ID))
 		}
 	}
-	byVersionSUT := make([]map[string]any, 0)
+	bySUT := make([]map[string]any, 0)
 	for _, wave := range snapshot.Waves {
-		for _, counts := range wave.ByVersionSUT {
-			byVersionSUT = append(byVersionSUT, map[string]any{
-				"version_sut_id": platformid.Format(counts.VersionSUTID),
-				"total":          counts.Total,
-				"passed":         counts.Passed,
-				"failed":         counts.Failed,
-				"blocked":        counts.Blocked,
-				"inconclusive":   counts.Inconclusive,
+		for _, counts := range wave.BySUT {
+			bySUT = append(bySUT, map[string]any{
+				"sut_id":       platformid.Format(counts.SUTID),
+				"total":        counts.Total,
+				"passed":       counts.Passed,
+				"failed":       counts.Failed,
+				"blocked":      counts.Blocked,
+				"inconclusive": counts.Inconclusive,
 			})
 		}
 	}
@@ -258,9 +258,9 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"by_status": requirementStatus,
 		},
 		"waves": map[string]any{
-			"total":          len(snapshot.Waves),
-			"by_status":      waveStatus,
-			"by_version_sut": byVersionSUT,
+			"total":     len(snapshot.Waves),
+			"by_status": waveStatus,
+			"by_sut":    bySUT,
 		},
 		"case_runs": map[string]any{
 			"total":                len(snapshot.CaseRuns),
@@ -288,7 +288,7 @@ func reportSnapshotSummary(report delivery.Report, revision int32, snapshot deli
 			"gaps_by_reason":        gapsByReason,
 			"by_requirement":        byRequirement,
 		},
-		"version_sut_ids":    versionSUTIDs,
+		"sut_ids":            sutIDs,
 		"evidence":           map[string]any{"count": evidenceCount},
 		"truncated_sections": truncated,
 	}
@@ -335,7 +335,7 @@ func (t *reportNarrativeProposeTool) Execute(ctx context.Context, scope agenttoo
 		SummaryMarkdown string   `json:"summary_markdown"`
 		Highlights      []string `json:"highlights"`
 	}
-	if err := agenttools.DecodeP4Params(raw, &params); err != nil {
+	if err := agenttools.DecodeDeliveryParams(raw, &params); err != nil {
 		return nil, err
 	}
 	report, revision, err := t.svc.reportToolTarget(ctx, scope)

@@ -8,12 +8,11 @@
 // system-prompt detection, per-run step counting, mode switch and the tool-call
 // payloads the backend agent runtime consumes.
 //
-// The system prompts are read from the current product role prompts instead of
-// being duplicated here: the detector must keep matching the real Chinese role
-// markers. The 0.2.1 tree removed backend/internal/mindmap/domain/prompts.go;
-// the current equivalents are the design profile prompts in
-// backend/internal/agent/application/profiles.go and the explorer role prompt in
-// backend/internal/agent/application/roles.go.
+// The system prompts, role markers and expected tool wire names are derived from
+// the backend sources by scripts/generate-fake-llm-p5-mirror.cjs and read from
+// scripts/testdata/fake-llm-p5-mirror.json, so this suite cannot drift out of
+// step with the product prompts again (H-D14). The staleness gate in loadMirror
+// re-derives the fixture and fails on any mismatch.
 //
 // Run:
 //   node scripts/fake-llm.p5.test.cjs
@@ -24,11 +23,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { after, before, test } = require("node:test");
+const { parseSse, parseSseChunks, foldSse } = require("./fake-llm-sse-test-helper.cjs");
 
 const repoRoot = path.resolve(__dirname, "..");
 const fakeLlmScript = path.join(__dirname, "fake-llm.cjs");
-const promptsPath = path.join(repoRoot, "backend", "internal", "agent", "application", "profiles.go");
-const rolesPath = path.join(repoRoot, "backend", "internal", "agent", "application", "roles.go");
 const serverLogRoot = fs.mkdtempSync(path.join(os.tmpdir(), "eztest-fake-llm-p5-"));
 
 const MODEL = "deepseek-flash";
@@ -44,30 +42,49 @@ const NODE_CASE_ONE = "1838293000128";
 const NODE_CASE_TWO = "1838293000129";
 const FIXTURE_BASE = "http://127.0.0.1:13335";
 
-// The current product equivalents of the removed P5 mindmap role prompts.
-// Every constant below is a backtick Go constant in profiles.go/roles.go.
-const PROMPT_CONSTS = {
-  design: "caseAuthorPrompt",
-  review: "designCriticPrompt",
-  data_plan: "dataPlannerPrompt",
-  explore: "explorerRolePrompt",
-};
+// Go-authoritative mirror (H-D14, Ruling T21-R1). The prompt constant names,
+// [profile:<key>] markers, prompt bodies and tool wire names are DERIVED from the
+// backend sources by scripts/generate-fake-llm-p5-mirror.cjs and committed as
+// scripts/testdata/fake-llm-p5-mirror.json. This test no longer hand-maintains
+// those strings; the staleness gate below fails the moment the fixture drifts
+// from Go, and a missing/malformed fixture or Go source fails loudly too.
+const mirror = require("./generate-fake-llm-p5-mirror.cjs");
 
-// The current role markers the P5 detector matches. They are the
-// [profile:<key>] / [role:<key>] markers carried by the current prompts above.
-const ROLE_MARKERS = {
-  design: ["[profile:case_author]"],
-  review: ["[profile:design_critic]"],
-  data_plan: ["[profile:data_planner]"],
-  explore: ["[role:explorer]"],
-};
+function loadMirror() {
+  assert.ok(
+    fs.existsSync(mirror.fixturePath),
+    "missing P5 mirror fixture " + mirror.fixturePath +
+      " (run node scripts/generate-fake-llm-p5-mirror.cjs --write)",
+  );
+  const committed = JSON.parse(fs.readFileSync(mirror.fixturePath, "utf8"));
+  // Staleness gate: a fresh derivation from Go must equal the committed fixture.
+  const derived = JSON.parse(mirror.serialize(mirror.buildFixture()));
+  assert.deepEqual(
+    committed,
+    derived,
+    "P5 mirror fixture is stale vs the Go sources (run node scripts/generate-fake-llm-p5-mirror.cjs --write)",
+  );
+  return committed;
+}
 
-const TOOL_NAMES = {
-  design: ["case_graph_read", "case_graph_propose"],
-  review: ["case_graph_read", "case_review_submit"],
-  data_plan: ["case_graph_read", "case_data_plan_submit"],
-  explore: ["explore_http", "explore_http", "app_model_propose"],
-};
+const MIRROR = loadMirror();
+// Only scenarios with a live Go prompt are mirrored (design, review). explore was
+// a removed capability (Ruling T21-R2); data_plan lost its seeded profile prompt.
+const SCENARIOS = Object.keys(MIRROR.scenarios);
+
+function scenarioBody(name) {
+  return MIRROR.prompts[MIRROR.scenarios[name].promptConst];
+}
+
+function scenarioMarker(name) {
+  return MIRROR.scenarios[name].marker;
+}
+
+// The tool wire names the fake must emit for one scenario, derived from the Go
+// registry and sanitized exactly as backend/internal/llm does (dot -> underscore).
+function scenarioWireFlow(name) {
+  return MIRROR.scenarios[name].flow.map((dotted) => MIRROR.toolWire[dotted]);
+}
 
 let serverCounter = 0;
 
@@ -75,40 +92,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// --- prompts ---------------------------------------------------------------
-
-function readPromptsSource() {
-  assert.ok(
-    fs.existsSync(promptsPath),
-    "missing backend/internal/agent/application/profiles.go (current design prompts)",
-  );
-  assert.ok(
-    fs.existsSync(rolesPath),
-    "missing backend/internal/agent/application/roles.go (current explorer role prompt)",
-  );
-  return [fs.readFileSync(promptsPath, "utf8"), fs.readFileSync(rolesPath, "utf8")].join("\n");
-}
-
-/** Extracts one prompt constant body from prompts.go. */
-function promptBody(name, source) {
-  const pattern = new RegExp("const " + name + " = `([\\s\\S]*?)`");
-  const match = pattern.exec(source);
-  assert.ok(match, "the current role prompt source has no " + name + " constant");
-  return match[1];
-}
-
 // --- request bodies --------------------------------------------------------
 
-/** Minimal agent tool list; the fake validates tool names only by echoing them. */
+/** Minimal agent tool list (Go-derived wire names); the fake echoes them. */
 function agentTools() {
-  return [
-    "case_graph_read",
-    "case_graph_propose",
-    "case_review_submit",
-    "case_data_plan_submit",
-    "app_model_propose",
-    "explore_http",
-  ].map((name) => ({
+  const names = [...new Set(SCENARIOS.flatMap((name) => scenarioWireFlow(name)))];
+  return names.map((name) => ({
     type: "function",
     function: {
       name,
@@ -119,10 +108,12 @@ function agentTools() {
 }
 
 /**
- * Mirrors the landed T10 context builder
- * (`backend/internal/mindmap/application/run_service.go`): a `versionId=` line,
- * a `## 已确认需求` table of `- id=... title=...` rows, then a `## 需求关系`
- * section, then the mandatory submission footer.
+ * The P5 mindmap run instruction shape the legacy fake accepts: a `versionId=`
+ * line, a `## 已确认需求` table of `- id=... title=...` rows, a `## 需求关系`
+ * section and the submission footer. The original run provider
+ * (backend/internal/mindmap/…, since deleted) emitted this shape; the fake only
+ * parses the `versionId=`/labelled ids and the requirement tables, so the exact
+ * header prose is not load-bearing.
  */
 function designInstruction() {
   return [
@@ -161,34 +152,11 @@ function reviewInstruction() {
     "已确认需求（id | 标题）：",
     REQUIREMENT_ONE + " | 下单主流程",
     REQUIREMENT_TWO + " | 退款流程",
-    "必须调用 case_review_submit 提交 findings。",
+    "必须调用 design.review_submit 提交 findings。",
   ].join("\n");
 }
 
-function dataPlanInstruction() {
-  return [
-    "任务：为已有用例补齐前置条件与测试数据（kind=data_plan）。",
-    "versionId=" + VERSION_ID,
-    "runId=" + RUN_ID,
-    "节点清单（id | revision | 标题）：",
-    NODE_CASE_ONE + " | 3 | P5 正常用例",
-    "必须调用 case_data_plan_submit 提交 items。",
-  ].join("\n");
-}
-
-function exploreInstruction() {
-  return [
-    "任务：只读探索应用并提交应用模型（kind=explore）。",
-    "versionId=" + VERSION_ID,
-    "runId=" + RUN_ID,
-    "systemId=" + SYSTEM_ID,
-    "environmentId=" + ENVIRONMENT_ID,
-    "baseUrl=" + FIXTURE_BASE,
-    "只允许 GET/HEAD，必须调用 app_model_propose 提交 nodes。",
-  ].join("\n");
-}
-
-/** The graph summary a real case_graph_read tool returns (spec §8.2/§7.3). */
+/** The graph summary a real design.graph_read tool returns (spec §8.2/§7.3). */
 function graphReadResult() {
   return {
     data: {
@@ -346,7 +314,7 @@ async function chat(base, messages) {
   return res.json.choices[0];
 }
 
-/** Sends one streaming chat request and folds the SSE fragments together. */
+/** Sends one streaming chat request; returns the folded turn plus raw chunks. */
 async function streamChat(base, messages) {
   const response = await fetch(base + "/v1/chat/completions", {
     method: "POST",
@@ -357,44 +325,10 @@ async function streamChat(base, messages) {
   const text = await response.text();
   assert.match(text, /^data: /m, "the fake LLM must answer with SSE frames");
   assert.ok(text.includes("[DONE]"), "the SSE stream must end with [DONE]");
-  return parseSse(text);
-}
-
-/** Folds the OpenAI SSE chunks of one assistant turn into a single message. */
-function parseSse(text) {
-  const result = { content: "", reasoning: "", toolCalls: [], finishReason: null };
-  for (const line of text.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    const data = line.slice("data: ".length).trim();
-    if (data === "" || data === "[DONE]") continue;
-    let chunk;
-    try {
-      chunk = JSON.parse(data);
-    } catch {
-      continue;
-    }
-    const choice = chunk && Array.isArray(chunk.choices) ? chunk.choices[0] : null;
-    if (!choice) continue;
-    const delta = choice.delta || {};
-    if (typeof delta.content === "string") result.content += delta.content;
-    if (typeof delta.reasoning_content === "string") result.reasoning += delta.reasoning_content;
-    if (Array.isArray(delta.tool_calls)) {
-      for (const fragment of delta.tool_calls) {
-        const index = typeof fragment.index === "number" ? fragment.index : 0;
-        const slot = result.toolCalls[index] || (result.toolCalls[index] = { id: "", type: "", name: "", arguments: "" });
-        if (fragment.id) slot.id = fragment.id;
-        if (fragment.type) slot.type = fragment.type;
-        if (fragment.function) {
-          if (fragment.function.name) slot.name = fragment.function.name;
-          if (typeof fragment.function.arguments === "string") {
-            slot.arguments += fragment.function.arguments;
-          }
-        }
-      }
-    }
-    if (choice.finish_reason) result.finishReason = choice.finish_reason;
-  }
-  return result;
+  const chunks = parseSseChunks(text);
+  const folded = foldSse(chunks);
+  folded.chunks = chunks;
+  return folded;
 }
 
 /** Asserts a completion is one tool call with an underscore-only name. */
@@ -403,13 +337,13 @@ function assertToolCall(choice, expectedName) {
   assert.equal(calls.length, 1, "expected exactly one tool call, got " + calls.length);
   const call = calls[0];
   assert.equal(call.function.name, expectedName);
-  assertUnderscoreToolName(call.function.name);
+  assertWireToolName(call.function.name);
   assert.equal(choice.finish_reason, "tool_calls");
   return JSON.parse(call.function.arguments);
 }
 
-/** Spec §10.6: tool function names use the P1 dot->underscore mapping. */
-function assertUnderscoreToolName(name) {
+/** Tool function names use the current Go registry sanitized to wire form. */
+function assertWireToolName(name) {
   assert.equal(typeof name, "string");
   assert.ok(name.length > 0, "tool name must not be empty");
   assert.ok(!name.includes("."), "tool name " + JSON.stringify(name) + " must not contain a dot");
@@ -554,62 +488,11 @@ function assertReviewFindings(args) {
   );
 }
 
-function assertDataPlanItems(args) {
-  assert.equal(args.versionId, VERSION_ID);
-  assert.ok(Array.isArray(args.items), "items must be an array");
-  assert.ok(args.items.length >= 1, "the fake data plan must target the existing case");
-  const nodeIds = new Set([NODE_CASE_ONE, NODE_CASE_TWO]);
-  for (const item of args.items) {
-    assert.equal(typeof item.nodeId, "string");
-    assert.ok(nodeIds.has(item.nodeId), "unknown data plan nodeId " + item.nodeId);
-    assert.ok(Number.isInteger(item.nodeRevision), "nodeRevision must be an integer");
-    assert.ok(item.nodeRevision >= 1, "nodeRevision must be positive");
-  }
-  const first = args.items.find((item) => item.nodeId === NODE_CASE_ONE);
-  assert.ok(first, "the fake data plan must target the first case node");
-  assert.equal(first.nodeRevision, 3, "the nodeRevision must come from case_graph_read");
-  assert.equal(typeof first.preconditions, "string");
-  assert.ok(first.preconditions.length > 0);
-  assert.ok(first.testData !== undefined, "the fake data plan must provide testData");
-}
-
-function assertAppModelProposal(args) {
-  assert.equal(String(args.systemId), SYSTEM_ID);
-  assert.ok(Array.isArray(args.nodes), "nodes must be an array");
-  const kinds = new Set(args.nodes.map((node) => node.kind));
-  for (const kind of ["page", "route", "api"]) {
-    assert.ok(kinds.has(kind), "the app model proposal must include a " + kind + " node");
-  }
-  for (const node of args.nodes) {
-    assert.equal(typeof node.key, "string");
-    assert.equal(typeof node.name, "string");
-    assert.ok(node.name.length > 0);
-    if (node.kind === "page") assert.ok(node.key.startsWith("page:"), "page key " + node.key);
-    if (node.kind === "route") assert.ok(node.key.startsWith("route:"), "route key " + node.key);
-    if (node.kind === "api") {
-      assert.match(node.key, /^api:[A-Z]+ \S/, "api key " + node.key);
-      assert.equal(node.method, "GET");
-    }
-    if (node.path !== undefined) assert.ok(node.path.startsWith("/"), "node path " + node.path);
-  }
-}
-
-/** Asserts one explore_http call targets a fixture page with GET. */
-function assertExploreCall(args, expectedPath) {
-  assert.equal(typeof args.url, "string");
-  const url = new URL(args.url);
-  assert.equal(url.origin, FIXTURE_BASE);
-  assert.equal(url.pathname, expectedPath);
-  assert.equal(args.method === undefined || args.method === "GET", true);
-}
-
 // --- shared server ---------------------------------------------------------
 
 let sharedServer = null;
-let promptsSource = "";
 
 before(async () => {
-  promptsSource = readPromptsSource();
   sharedServer = await startFakeLlm({ EZTEST_FAKE_LLM_P5_MODE: "normal" });
 });
 
@@ -620,28 +503,55 @@ after(() => {
 
 // --- prompt drift ----------------------------------------------------------
 
-test("the current role prompts still contain the four markers the detector matches", () => {
-  for (const [kind, name] of Object.entries(PROMPT_CONSTS)) {
-    const body = promptBody(name, promptsSource);
-    const markers = ROLE_MARKERS[kind];
+test("each live P5 scenario's current Go prompt carries its derived marker", () => {
+  for (const scenario of SCENARIOS) {
+    const body = scenarioBody(scenario);
+    const marker = scenarioMarker(scenario);
+    assert.match(marker, /^\[profile:[a-z0-9_]+\]$/, "marker " + marker + " must be a [profile:<key>] marker");
     assert.ok(
-      markers.some((marker) => body.includes(marker)),
-      name + " no longer contains any P5 role marker of " + JSON.stringify(markers),
+      body.includes(marker),
+      scenario + " prompt no longer contains the derived marker " + marker,
     );
   }
 });
 
+// --- shared SSE parser (Ruling T21-R4) -------------------------------------
+
+test("shared parseSse accepts both data: forms and fails on malformed lines", () => {
+  // Both `data: {...}` and `data:{...}` are valid SSE; neither frame may be
+  // silently dropped (the no-space form used to fall outside the prefix match).
+  const spaced = parseSse(
+    'data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"a"}}]}\n\n',
+  );
+  assert.equal(spaced.content, "a", "the spaced data: frame must fold");
+  const compact = parseSse(
+    'data:{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"b"}}]}\n\n',
+  );
+  assert.equal(compact.content, "b", "the no-space data: frame must fold");
+  // A malformed line that still starts with `data:` must fail, never be skipped.
+  assert.throws(
+    () => parseSse("data: {not json}\n\n"),
+    /non-JSON data line/,
+    "parseSse must fail loudly on malformed spaced SSE",
+  );
+  assert.throws(
+    () => parseSse("data:{not json}\n\n"),
+    /non-JSON data line/,
+    "parseSse must fail loudly on malformed no-space SSE",
+  );
+});
+
 // --- design ----------------------------------------------------------------
 
-test("design role: case_graph_read -> case_graph_propose -> final text", async () => {
+test("design role: design_graph_read -> case_graph_propose -> final text", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const system = scenarioBody("design");
   const { calls, text } = await driveRun(
     sharedServer.base,
     system,
     designInstruction(),
     [graphReadResult(), { ok: true }],
-    TOOL_NAMES.design,
+    scenarioWireFlow("design"),
   );
 
   assert.deepEqual(calls[0].args, { versionId: VERSION_ID });
@@ -649,25 +559,50 @@ test("design role: case_graph_read -> case_graph_propose -> final text", async (
   assert.match(text, /P5/);
 });
 
-test("design role streaming path emits the same case_graph_read tool call", async () => {
+test("design role streaming path emits framed chunks and the design_graph_read call", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const system = scenarioBody("design");
   const turn = await streamChat(sharedServer.base, [
     { role: "system", content: system },
     { role: "user", content: designInstruction() },
   ]);
 
+  // Per-chunk framing pin (Ruling T21-R4): every chunk must carry the real
+  // OpenAI chat-completions.chunk envelope the legacy streamToolTurn emits.
+  assert.ok(turn.chunks.length > 0, "expected at least one SSE chunk");
+  for (let index = 0; index < turn.chunks.length; index += 1) {
+    const chunk = turn.chunks[index];
+    const label = "chunk[" + index + "]";
+    assert.equal(typeof chunk.id, "string", label + " id");
+    assert.ok(chunk.id.startsWith("chatcmpl-fake-"), label + " id prefix");
+    assert.equal(chunk.object, "chat.completion.chunk", label + " object");
+    assert.equal(typeof chunk.created, "number", label + " created");
+    assert.equal(chunk.model, MODEL, label + " model");
+    assert.ok(Array.isArray(chunk.choices) && chunk.choices.length === 1, label + " choices");
+    assert.equal(chunk.choices[0].index, 0, label + " choice index");
+    assert.ok(
+      chunk.choices[0].delta !== null && typeof chunk.choices[0].delta === "object",
+      label + " delta",
+    );
+  }
+  // The legacy tool turn opens with reasoning fragments, then the tool call.
+  assert.equal(typeof turn.chunks[0].choices[0].delta.reasoning_content, "string");
+  assert.ok(turn.reasoning.length > 0, "the tool turn must carry reasoning_content");
+
+  const terminal = turn.chunks[turn.chunks.length - 1];
+  assert.equal(terminal.choices[0].finish_reason, "tool_calls", "terminal finish_reason");
+  assert.ok(terminal.usage && typeof terminal.usage.total_tokens === "number", "terminal usage");
+
   assert.equal(turn.finishReason, "tool_calls");
   assert.equal(turn.toolCalls.length, 1);
-  assert.equal(turn.toolCalls[0].name, "case_graph_read");
-  assertUnderscoreToolName(turn.toolCalls[0].name);
-  assert.ok(turn.reasoning.length > 0, "the tool turn must carry reasoning_content");
+  assert.equal(turn.toolCalls[0].name, scenarioWireFlow("design")[0]);
+  assertWireToolName(turn.toolCalls[0].name);
   assert.deepEqual(JSON.parse(turn.toolCalls[0].arguments), { versionId: VERSION_ID });
 });
 
 test("design role stops the requirement table at the next heading", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const system = scenarioBody("design");
   // One requirement plus one relation: if the parser ran past the heading, the
   // relation id would become the second case's requirement source.
   const instruction = [
@@ -682,7 +617,7 @@ test("design role stops the requirement table at the next heading", async () => 
     system,
     instruction,
     [graphReadResult(), { ok: true }],
-    TOOL_NAMES.design,
+    scenarioWireFlow("design"),
   );
 
   assert.deepEqual(calls[1].args.cases[0].requirementIds, [REQUIREMENT_ONE]);
@@ -695,7 +630,7 @@ test("design role stops the requirement table at the next heading", async () => 
 
 test("design role emits empty requirementIds instead of fabricating ids", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const system = scenarioBody("design");
   // No labelled requirement list/table: runId and the graph coverage ids must
   // not be guessed as requirement sources (server validation must fail loudly).
   const instruction = [
@@ -709,7 +644,7 @@ test("design role emits empty requirementIds instead of fabricating ids", async 
     system,
     instruction,
     [graphReadResult(), { ok: true }],
-    TOOL_NAMES.design,
+    scenarioWireFlow("design"),
   );
 
   for (const item of calls[1].args.cases) {
@@ -723,7 +658,7 @@ test("design role emits empty requirementIds instead of fabricating ids", async 
 
 test("design role still tolerates the legacy pipe-separated requirement table", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const system = scenarioBody("design");
   const instruction = [
     "versionId=" + VERSION_ID,
     "已确认需求（id | 标题）：",
@@ -735,7 +670,7 @@ test("design role still tolerates the legacy pipe-separated requirement table", 
     system,
     instruction,
     [graphReadResult(), { ok: true }],
-    TOOL_NAMES.design,
+    scenarioWireFlow("design"),
   );
 
   assert.deepEqual(calls[1].args.cases[0].requirementIds, [REQUIREMENT_ONE]);
@@ -744,15 +679,15 @@ test("design role still tolerates the legacy pipe-separated requirement table", 
 
 // --- review ----------------------------------------------------------------
 
-test("review role: case_graph_read -> case_review_submit -> final text", async () => {
+test("review role: design_graph_read -> design_review_submit -> final text", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.review, promptsSource);
+  const system = scenarioBody("review");
   const { calls, text } = await driveRun(
     sharedServer.base,
     system,
     reviewInstruction(),
     [graphReadResult(), { ok: true }],
-    TOOL_NAMES.review,
+    scenarioWireFlow("review"),
   );
 
   assert.deepEqual(calls[0].args, { versionId: VERSION_ID });
@@ -760,60 +695,22 @@ test("review role: case_graph_read -> case_review_submit -> final text", async (
   assert.match(text, /P5/);
 });
 
-// --- data plan -------------------------------------------------------------
-
-test("data plan role: case_graph_read -> case_data_plan_submit -> final text", async () => {
-  assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.data_plan, promptsSource);
-  const { calls, text } = await driveRun(
-    sharedServer.base,
-    system,
-    dataPlanInstruction(),
-    [graphReadResult(), { ok: true }],
-    TOOL_NAMES.data_plan,
-  );
-
-  assert.deepEqual(calls[0].args, { versionId: VERSION_ID });
-  assertDataPlanItems(calls[1].args);
-  assert.match(text, /P5/);
-});
-
-// --- explore ---------------------------------------------------------------
-
-test("explore role: two explore_http probes -> app_model_propose -> final text", async () => {
-  assert.ok(sharedServer, "shared fake LLM server was not started");
-  const system = promptBody(PROMPT_CONSTS.explore, promptsSource);
-  const { calls, text } = await driveRun(
-    sharedServer.base,
-    system,
-    exploreInstruction(),
-    [{ status: 200, title: "P5 Home" }, { status: 200, title: "orders" }, { ok: true }],
-    TOOL_NAMES.explore,
-  );
-
-  assertExploreCall(calls[0].args, "/p5/home");
-  assertExploreCall(calls[1].args, "/api/orders");
-  assert.notEqual(calls[0].args.url, calls[1].args.url);
-  assertAppModelProposal(calls[2].args);
-  assert.match(text, /P5/);
-});
-
 // --- modes -----------------------------------------------------------------
 
 test("invalid mode returns a proposal the server must reject", async () => {
   await withFakeLlm("invalid", async (server) => {
-    const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+    const system = scenarioBody("design");
     const messages = [
       { role: "system", content: system },
       { role: "user", content: designInstruction() },
     ];
 
     const readChoice = await chat(server.base, messages);
-    assertToolCall(readChoice, "case_graph_read");
+    assertToolCall(readChoice, scenarioWireFlow("design")[0]);
     appendToolResult(messages, readChoice, graphReadResult());
 
     const proposeChoice = await chat(server.base, messages);
-    const args = assertToolCall(proposeChoice, "case_graph_propose");
+    const args = assertToolCall(proposeChoice, scenarioWireFlow("design")[1]);
     assert.equal(args.versionId, VERSION_ID);
 
     // Every independent §6.7 rule is broken at least once.
@@ -837,21 +734,15 @@ test("invalid mode returns a proposal the server must reject", async () => {
   });
 });
 
-test("degraded mode returns text only for every role", async () => {
+test("degraded mode returns text only for every live role", async () => {
   await withFakeLlm("degraded", async (server) => {
-    const scenarios = [
-      ["design", designInstruction()],
-      ["review", reviewInstruction()],
-      ["data_plan", dataPlanInstruction()],
-      ["explore", exploreInstruction()],
-    ];
-    for (const [kind, instruction] of scenarios) {
-      const system = promptBody(PROMPT_CONSTS[kind], promptsSource);
+    const instructions = { design: designInstruction, review: reviewInstruction };
+    for (const scenario of SCENARIOS) {
       const choice = await chat(server.base, [
-        { role: "system", content: system },
-        { role: "user", content: instruction },
+        { role: "system", content: scenarioBody(scenario) },
+        { role: "user", content: instructions[scenario]() },
       ]);
-      const text = assertTextTurn(choice, kind + " degraded");
+      const text = assertTextTurn(choice, scenario + " degraded");
       assert.match(text, /降级/);
     }
   });
@@ -881,14 +772,14 @@ test("the runtime P5 mode control switches, rejects unknown modes and resets", a
     assert.equal(await setMode("invalid"), "invalid");
     assert.equal(await getMode(), "invalid");
     const designMessages = [
-      { role: "system", content: promptBody(PROMPT_CONSTS.design, promptsSource) },
+      { role: "system", content: scenarioBody("design") },
       { role: "user", content: designInstruction() },
     ];
     const readChoice = await chat(sharedServer.base, designMessages);
-    assertToolCall(readChoice, "case_graph_read");
+    assertToolCall(readChoice, scenarioWireFlow("design")[0]);
     appendToolResult(designMessages, readChoice, graphReadResult());
     const proposeChoice = await chat(sharedServer.base, designMessages);
-    const invalidArgs = assertToolCall(proposeChoice, "case_graph_propose");
+    const invalidArgs = assertToolCall(proposeChoice, scenarioWireFlow("design")[1]);
     assert.ok(
       invalidArgs.cases.some((item) => !Array.isArray(item.requirementIds) || item.requirementIds.length === 0),
       "the runtime invalid mode must take effect without a restart",
@@ -897,7 +788,7 @@ test("the runtime P5 mode control switches, rejects unknown modes and resets", a
     assert.equal(await setMode("degraded"), "degraded");
     assert.equal(await getMode(), "degraded");
     const degraded = await chat(sharedServer.base, [
-      { role: "system", content: promptBody(PROMPT_CONSTS.design, promptsSource) },
+      { role: "system", content: scenarioBody("design") },
       { role: "user", content: designInstruction() },
     ]);
     assertTextTurn(degraded, "runtime degraded");
@@ -927,7 +818,7 @@ test("P1, P3 and P4 requests keep their pre-P5 behavior", async () => {
   });
   assert.equal(p1.status, 200, p1.text);
   const p1Call = p1.json.choices[0].message.tool_calls[0];
-  assert.equal(p1Call.function.name, "file_read");
+  assert.equal(p1Call.function.name, "file.read");
   assert.deepEqual(JSON.parse(p1Call.function.arguments), { path: "README.md" });
 
   const p3 = await postChat(sharedServer.base, {

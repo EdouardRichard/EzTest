@@ -195,7 +195,7 @@ func (s *ReportService) currentExportRevision(ctx context.Context, report delive
 		if revision.ID != *report.CurrentRevisionID {
 			continue
 		}
-		if revision.Status != delivery.ReportStatusPublished || revision.RenderStatus != reportRenderDone {
+		if revision.Status != delivery.ReportStatusPublished || revision.RenderStatus != ReportRenderDone {
 			return delivery.ReportRevision{}, reportArtifactNotReady()
 		}
 		return revision, nil

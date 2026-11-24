@@ -16,3 +16,18 @@ type DesignMetrics interface {
 	CountPendingDesign(ctx context.Context, versionID int64) (int, error)
 	CaseCounts(ctx context.Context, versionID int64) (CaseCounts, error)
 }
+
+// DesignReviewGate is the shared designing -> case_review review predicate (T9,
+// spec SC-E2/SC-E4/SC-E5): for every activated requirement, AC coverage complete
+// (confirmed union current drafts) AND every current draft review-complete
+// (pass / escalated_fail / judge_unavailable; only pending/reworking block).
+//
+// The design context's *designapp.ReviewGateService satisfies it. The version
+// application never imports the design domain/application: the composition root
+// (T13) adapts ONE gate instance into both this manual-advance port and the
+// design reconciler's converge path, so the two advance paths share a single
+// truth. A nil port fails closed (requireCaseDrafts): manual advance can never
+// bypass the review gate.
+type DesignReviewGate interface {
+	ReviewGate(ctx context.Context, versionID int64) error
+}

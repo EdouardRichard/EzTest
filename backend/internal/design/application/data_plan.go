@@ -3,6 +3,7 @@ package designapp
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -39,7 +40,12 @@ func (s *GraphService) SubmitDataPlan(ctx context.Context, versionID, caseVersio
 		return DataPlanResult{}, err
 	}
 	if in.Preconditions != nil {
-		if err := validation.String("preconditions", *in.Preconditions, 0, design.CaseDescriptionMax); err != nil {
+		// v0.2.4-B (§5.2, Lead ruling 5): preconditions is a REQUIRED case
+		// contract element, so a patch that supplies it must supply a value.
+		// Omitting the field still means "leave it alone"; supplying a blank
+		// would silently clear a required element, which the proposal gate would
+		// have rejected in the first place.
+		if err := validation.String("preconditions", strings.TrimSpace(*in.Preconditions), 1, design.CaseDescriptionMax); err != nil {
 			return DataPlanResult{}, err
 		}
 	}

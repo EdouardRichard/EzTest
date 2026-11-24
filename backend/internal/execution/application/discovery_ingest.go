@@ -6,22 +6,25 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
 // DiscoveryObservationStore is the application-side port of the DB-29 upsert
 // (implemented by the postgres adapter). It accepts already normalized rows and
-// is idempotent on the natural key (version_id, version_sut_id, kind, method,
+// is idempotent on the natural key (version_id, sut_id, kind, method,
 // resource_template).
 type DiscoveryObservationStore interface {
 	UpsertObservations(ctx context.Context, observations []DiscoveryObservation) error
 }
 
-// SUTHostResolver returns the hosts of one version_sut binding: the SUT
-// environment base URL plus the hosts of its registered pages. It lets the
-// ingest service filter third-party CDN/analytics traffic. A nil resolver means
-// no host filtering.
+// SUTHostResolver returns the hosts of one SUT binding: the SUT's own base URL
+// plus the hosts of its registered pages. (v0.2.4-B: base_url moved off the
+// dropped sut_environment and onto sut, and sut_page is owned by sut_id alone.)
+// It lets the ingest service filter third-party CDN/analytics traffic. A nil
+// resolver means no host filtering.
 type SUTHostResolver interface {
-	AllowedHosts(ctx context.Context, versionSUTID int64) (map[string]bool, error)
+	AllowedHosts(ctx context.Context, sutID int64) (map[string]bool, error)
 }
 
 // DiscoveryIngestDeps wires the discovery ingest service. Store is mandatory;
@@ -68,10 +71,10 @@ func (s *DiscoveryIngest) WriteObservations(ctx context.Context, observations []
 }
 
 type discoveryObservationKey struct {
-	versionSUTID int64
-	kind         string
-	method       string
-	template     string
+	sutID    int64
+	kind     string
+	method   string
+	template string
 }
 
 type discoveryHostCacheEntry struct {
@@ -96,11 +99,11 @@ func (s *DiscoveryIngest) normalize(ctx context.Context, observations []Discover
 		if isStaticDiscoveryMIME(observation.MIME) {
 			continue
 		}
-		if s.hosts != nil && !s.hostAllowed(ctx, observation.VersionSUTID, host, hostCache) {
+		if s.hosts != nil && !s.hostAllowed(ctx, observation.SUTID, host, hostCache) {
 			continue
 		}
 		pathTemplate := template
-		if kind == "page" {
+		if kind == execution.ObservationKindPage {
 			method = ""
 		} else {
 			if method == "" {
@@ -117,10 +120,10 @@ func (s *DiscoveryIngest) normalize(ctx context.Context, observations []Discover
 			row.Occurrences = 1
 		}
 		key := discoveryObservationKey{
-			versionSUTID: observation.VersionSUTID,
-			kind:         kind,
-			method:       method,
-			template:     pathTemplate,
+			sutID:    observation.SUTID,
+			kind:     kind,
+			method:   method,
+			template: pathTemplate,
 		}
 		if at, found := index[key]; found {
 			rows[at].Occurrences += row.Occurrences
@@ -141,24 +144,24 @@ func (s *DiscoveryIngest) normalize(ctx context.Context, observations []Discover
 	return rows
 }
 
-// hostAllowed caches the allowed-host set per version_sut. A resolver failure or
+// hostAllowed caches the allowed-host set per SUT. A resolver failure or
 // an empty set disables the filter for that binding (fail open: a missing
 // binding must not silently hide every observation). An exact host match always
 // wins; otherwise a host in the same registrable domain is first-party too, so
 // the SUT's own api./static. subdomains are not mistaken for third parties
 // (W1-11).
-func (s *DiscoveryIngest) hostAllowed(ctx context.Context, versionSUTID int64, host string, cache map[int64]discoveryHostCacheEntry) bool {
-	entry, cached := cache[versionSUTID]
+func (s *DiscoveryIngest) hostAllowed(ctx context.Context, sutID int64, host string, cache map[int64]discoveryHostCacheEntry) bool {
+	entry, cached := cache[sutID]
 	if !cached {
-		hosts, err := s.hosts.AllowedHosts(ctx, versionSUTID)
+		hosts, err := s.hosts.AllowedHosts(ctx, sutID)
 		if err != nil {
 			s.logger.Warn("execution discovery: resolve SUT hosts failed; host filter skipped",
-				"version_sut_id", versionSUTID, "error", err)
+				"sut_id", sutID, "error", err)
 			entry = discoveryHostCacheEntry{}
 		} else {
 			entry = discoveryHostCacheEntry{hosts: hosts, filter: len(hosts) > 0}
 		}
-		cache[versionSUTID] = entry
+		cache[sutID] = entry
 	}
 	if !entry.filter {
 		return true

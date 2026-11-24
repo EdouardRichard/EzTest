@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Optional real-LLM acceptance for P4 code intelligence (gated by
@@ -123,8 +123,6 @@ $requiredEnvKeys = @(
     "EZTEST_DATABASE_URL",
     "EZTEST_ADMIN_USERNAME",
     "EZTEST_ADMIN_PASSWORD",
-    "EZTEST_SECRET_KEYS",
-    "EZTEST_SECRET_KEY_ACTIVE",
     "llm_base_url",
     "llm_key",
     "llm_model_name"
@@ -1111,22 +1109,6 @@ try {
     $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
 
     $script:secretValues = @($adminPassword, $llmKey, $databaseUrl)
-    if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {
-        $rawSecretKeys = [string]$envValues["EZTEST_SECRET_KEYS"]
-        if (-not [string]::IsNullOrWhiteSpace($rawSecretKeys)) {
-            $script:secretValues += $rawSecretKeys
-            try {
-                $secretObject = $rawSecretKeys | ConvertFrom-Json
-                foreach ($property in $secretObject.PSObject.Properties) {
-                    if ($null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                        $script:secretValues += [string]$property.Value
-                    }
-                }
-            } catch {
-                # A malformed keyring is reported by the API at startup.
-            }
-        }
-    }
 
     # Validate the URL and rebuild the eztest_e2e API URL from its validated
     # components before any destructive psql statement. The query may keep
@@ -1204,7 +1186,7 @@ try {
         $env:EZTEST_OPENAPI_PATH = (Join-Path $repoRoot "docs\openapi\api.yaml")
         $env:EZTEST_ADMIN_USERNAME = $adminUsername
         $env:EZTEST_ADMIN_PASSWORD = $adminPassword
-        foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
+        foreach ($key in @("llm_base_url", "llm_key", "llm_model_name")) {
             if ($envValues.ContainsKey($key)) { Set-Item -Path ("Env:" + $key) -Value $envValues[$key] }
         }
         # Honour any P4 tuning the operator put in .env; the API validates the

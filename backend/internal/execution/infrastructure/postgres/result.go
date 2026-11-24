@@ -9,11 +9,11 @@ import (
 // ResultRepository implements the matching executionapp repository port.
 type ResultRepository struct{ base }
 
-const stepResultColumns = `id, case_run_id, seq, target_version_sut_id, status, observed,
+const stepResultColumns = `id, case_run_id, seq, target_sut_id, status, observed,
 	error, started_at, finished_at, created_at, updated_at`
 
 const assertionResultColumns = `id, case_run_id, step_seq, assertion_seq, kind, verdict,
-	reason, expected, actual, target_version_sut_id, created_at, updated_at`
+	reason, expected, actual, target_sut_id, created_at, updated_at`
 
 // UpsertStep inserts or updates one step result fenced by the dispatch
 // epoch/token. A stale fence returns false,nil and never overwrites the row.
@@ -36,18 +36,18 @@ func (r *ResultRepository) UpsertStep(ctx context.Context, result execution.Step
 		return false, err
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO step_result (id, case_run_id, seq, target_version_sut_id, status, observed,
+		INSERT INTO step_result (id, case_run_id, seq, target_sut_id, status, observed,
 			error, started_at, finished_at)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
 		ON CONFLICT (case_run_id, seq) DO UPDATE SET
-			target_version_sut_id = EXCLUDED.target_version_sut_id,
+			target_sut_id = EXCLUDED.target_sut_id,
 			status = EXCLUDED.status,
 			observed = EXCLUDED.observed,
 			error = EXCLUDED.error,
 			started_at = EXCLUDED.started_at,
 			finished_at = EXCLUDED.finished_at,
 			updated_at = now()
-	`, r.insertID(result.ID), result.CaseRunID, result.Seq, result.TargetVersionSUTID,
+	`, r.insertID(result.ID), result.CaseRunID, result.Seq, result.TargetSUTID,
 		string(result.Status), observed, result.Error, result.StartedAt, result.FinishedAt)
 	if err != nil {
 		return false, wrapDB("upsert step result", err)
@@ -76,7 +76,7 @@ func (r *ResultRepository) UpsertAssertion(ctx context.Context, result execution
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO assertion_result (id, case_run_id, step_seq, assertion_seq, kind, verdict,
-			reason, expected, actual, target_version_sut_id)
+			reason, expected, actual, target_sut_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (case_run_id, step_seq, assertion_seq) DO UPDATE SET
 			kind = EXCLUDED.kind,
@@ -84,11 +84,11 @@ func (r *ResultRepository) UpsertAssertion(ctx context.Context, result execution
 			reason = EXCLUDED.reason,
 			expected = EXCLUDED.expected,
 			actual = EXCLUDED.actual,
-			target_version_sut_id = EXCLUDED.target_version_sut_id,
+			target_sut_id = EXCLUDED.target_sut_id,
 			updated_at = now()
 	`, r.insertID(result.ID), result.CaseRunID, result.StepSeq, result.AssertionSeq,
 		result.Kind, string(result.Verdict), result.Reason, result.Expected, result.Actual,
-		result.TargetVersionSUTID)
+		result.TargetSUTID)
 	if err != nil {
 		return false, wrapDB("upsert assertion result", err)
 	}
@@ -114,7 +114,7 @@ func (r *ResultRepository) ListSteps(ctx context.Context, caseRunID int64) ([]ex
 		var item execution.StepResult
 		var status string
 		var observedRaw []byte
-		if err := rows.Scan(&item.ID, &item.CaseRunID, &item.Seq, &item.TargetVersionSUTID,
+		if err := rows.Scan(&item.ID, &item.CaseRunID, &item.Seq, &item.TargetSUTID,
 			&status, &observedRaw, &item.Error, &item.StartedAt, &item.FinishedAt,
 			&item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
@@ -149,7 +149,7 @@ func (r *ResultRepository) ListAssertions(ctx context.Context, caseRunID int64) 
 		var verdict string
 		if err := rows.Scan(&item.ID, &item.CaseRunID, &item.StepSeq, &item.AssertionSeq,
 			&item.Kind, &verdict, &item.Reason, &item.Expected, &item.Actual,
-			&item.TargetVersionSUTID, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&item.TargetSUTID, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		item.Verdict = execution.AssertionVerdict(verdict)

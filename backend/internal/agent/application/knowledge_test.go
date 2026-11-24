@@ -449,7 +449,7 @@ func TestRunnerRejectsKnowledgeProposeOutsideWhitelist(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if fixture.knowledgeWriter.calls != 0 {
-		t.Fatalf("knowledge writer calls = %d, want 0 for a non-P7 profile", fixture.knowledgeWriter.calls)
+		t.Fatalf("knowledge writer calls = %d, want 0 for a non-knowledge profile", fixture.knowledgeWriter.calls)
 	}
 	var toolContent string
 	for _, message := range fixture.repo.messages {

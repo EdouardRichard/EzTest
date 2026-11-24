@@ -140,3 +140,37 @@ func TestCaseAuthorFactsBounds(t *testing.T) {
 		t.Fatalf("facts = %d, want per-kind cap %d", len(facts), maxCaseAuthorFactsPerKind)
 	}
 }
+
+// TestCaseAuthorFactsNilDiscoveryWiring pins the nil-reader safety of the
+// case-author read face. Since v0.2.4-F T14 (SC-F10) the composition root DOES
+// wire a producer (SetDiscoveryFacts over the execution P17/P18 facts — R-E7
+// routes the producer to F, not E: it depends on execution-side exploration
+// facts E has no source for; 19 号 §4.1k). A nil reader remains the safe
+// partial-assembly state (and the pre-T14 historical state after GD-21 deleted
+// the deterministic explore pipeline, v0.2.4-C T3): the read face must serve an
+// empty, error-free projection rather than panic or fail the design graph.
+// Expectations come from the CaseAuthorFacts contract (nil reader -> empty
+// best-effort read), not from observed output.
+func TestCaseAuthorFactsNilDiscoveryWiring(t *testing.T) {
+	// A graph constructed without SetDiscoveryFacts (partial assembly).
+	service := NewGraphService(nil, nil, nil, nil, nil, nil)
+	facts, err := service.CaseAuthorFacts(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("CaseAuthorFacts with no discovery wiring: %v", err)
+	}
+	if len(facts) != 0 {
+		t.Fatalf("facts = %+v, want empty (no discovery reader wired)", facts)
+	}
+
+	// An explicit nil attachment is the same safe state, not a panic.
+	service.SetDiscoveryFacts(nil)
+	facts, err = service.CaseAuthorFacts(context.Background(), 1001)
+	if err != nil || len(facts) != 0 {
+		t.Fatalf("nil-attached reader facts = %+v err = %v, want empty/nil", facts, err)
+	}
+
+	// The version-id guard still applies with no discovery reader wired.
+	if _, err := service.CaseAuthorFacts(context.Background(), 0); err == nil {
+		t.Fatal("CaseAuthorFacts must reject a non-positive version id even with nil discovery")
+	}
+}

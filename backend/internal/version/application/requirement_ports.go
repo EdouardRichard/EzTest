@@ -2,8 +2,6 @@ package versionapp
 
 import (
 	"context"
-
-	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 )
 
 // VersionReader is the slice of the version service consumed by the
@@ -12,12 +10,6 @@ import (
 type VersionReader interface {
 	Get(ctx context.Context, id int64) (VersionView, error)
 	MarkRunning(ctx context.Context, id int64) error
-}
-
-// ResourceCatalog resolves page/API targets against the resource catalog.
-type ResourceCatalog interface {
-	GetPage(ctx context.Context, id int64) (resourceapp.PageView, error)
-	GetAPI(ctx context.Context, id int64) (resourceapp.APIView, error)
 }
 
 // CaseStaleHook is the P2 stale-marking port. P1 wires the no-op

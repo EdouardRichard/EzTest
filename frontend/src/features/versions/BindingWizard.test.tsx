@@ -1,3 +1,4 @@
+// T19b: fixtures adapted to v0.2.4-B shapes; assertions on removed scope-exclusion/repository-override behaviour stay red pending T20.
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
@@ -21,7 +22,6 @@ function page(id: string, name: string, status: PageResource["status"]): PageRes
   return {
     id,
     sut_id: "1001",
-    environment_id: "1101",
     name,
     url: `https://order.test/${id}`,
     route_template: `/${id}`,
@@ -39,7 +39,6 @@ function api(id: string, name: string, status: ApiResource["status"] = "approved
   return {
     id,
     sut_id: "1001",
-    environment_id: "1101",
     method: "GET",
     path_template: `/api/${id}`,
     name,
@@ -56,7 +55,6 @@ function database(id: string, name: string): DatabaseResource {
   return {
     id,
     sut_id: "1001",
-    environment_id: "1101",
     name,
     dsn: "postgres://order-db:5432/order",
     username: "order",
@@ -71,9 +69,8 @@ function database(id: string, name: string): DatabaseResource {
 function account(id: string, username: string, roles: string[]): AccountResource {
   return {
     id,
-    // v0.22: the global account pool carries empty SUT/environment ids.
+    // v0.2.4-B: the global account pool carries an optional SUT affinity hint.
     sut_id: "",
-    environment_id: "",
     username,
     roles,
     notes: "",
@@ -84,33 +81,38 @@ function account(id: string, username: string, roles: string[]): AccountResource
   }
 }
 
-const environment: EnvironmentResource = {
-  id: "1101",
-  sut_id: "1001",
-  name: "测试环境",
+const sut: SutResource = {
+  id: "1001",
+  environment_id: "1101",
+  name: "订单中心",
+  intro: "订单",
   base_url: "https://order.test",
-  is_default: true,
-  status: "active",
   pages: [page("1301", "登录页", "approved"), page("1302", "订单列表", "approved")],
   apis: [api("1401", "查询订单")],
   databases: [database("1501", "order_db")],
-  accounts: [account("1601", "buyer", ["buyer"]), account("1602", "operator", ["operator"])],
   created_at: TIMESTAMP,
   updated_at: TIMESTAMP,
 }
 
-const sut: SutResource = {
-  id: "1001",
-  name: "订单中心",
-  intro: "订单",
-  environments: [environment],
+const environment: EnvironmentResource = {
+  id: "1101",
+  name: "测试环境",
+  description: "",
+  status: "active",
+  suts: [sut],
   created_at: TIMESTAMP,
   updated_at: TIMESTAMP,
 }
+
+const accounts: AccountResource[] = [
+  account("1601", "buyer", ["buyer"]),
+  account("1602", "operator", ["operator"]),
+]
 
 const catalog: Catalog = {
-  suts: [sut],
+  environments: [environment],
   repositories: catalogFixture.repositories,
+  accounts,
 }
 
 const createdVersion: Version = {
@@ -118,7 +120,16 @@ const createdVersion: Version = {
   title: "v22",
   status: "initial",
   auto_design_new_requirements: false,
-  bindings: [],
+  environment_id: "1101",
+  binding: {
+    environment,
+    pages: sut.pages,
+    apis: sut.apis,
+    databases: sut.databases,
+    accounts,
+    repositories: [],
+    code_baseline_commit: null,
+  },
   created_by: "9001",
   created_at: TIMESTAMP,
   updated_at: TIMESTAMP,
@@ -273,77 +284,6 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(createdVersion))
   })
 
-  it("persists multi-repo and account inclusion in the binding PUT body", async () => {
-    routeFetch(standardRoutes())
-    const { onCreated } = renderWizard()
-    await selectEnvironment()
-
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    const repos = await screen.findByRole("group", { name: /代码仓/ })
-    const backend = await within(repos).findByRole("checkbox", { name: /order-center-web/ })
-    const frontend = within(repos).getByRole("checkbox", { name: /payment-gateway/ })
-    expect(backend).toBeChecked()
-    expect(frontend).toBeChecked()
-    fireEvent.click(frontend)
-
-    const accounts = screen.getByRole("group", { name: /测试账号/ })
-    const buyer = within(accounts).getByRole("checkbox", { name: /buyer/ })
-    const operator = within(accounts).getByRole("checkbox", { name: /operator/ })
-    expect(buyer).toBeChecked()
-    fireEvent.click(operator)
-
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    await screen.findByText("确认创建")
-
-    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
-    await waitFor(() => expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(1))
-
-    const [, putInit] = callsFor("PUT", "/api/versions/2001/binding")[0] as [string, RequestInit]
-    expect(JSON.parse(String(putInit.body))).toEqual({
-      repository_ids: ["1201"],
-      account_ids: ["1601"],
-      scope_exclude: { pages: [], apis: [], databases: [] },
-    })
-    await waitFor(() => expect(onCreated).toHaveBeenCalledWith(createdVersion))
-  })
-
-  it("sends scope_exclude for unchecked pages and databases and keeps proposed resources out", async () => {
-    const withProposed: EnvironmentResource = {
-      ...environment,
-      pages: [...environment.pages, page("1303", "购物车", "proposed")],
-    }
-    routeFetch([
-      {
-        method: "GET",
-        path: "/api/resources/catalog",
-        response: () =>
-          jsonResponse({ data: { ...catalog, suts: [{ ...sut, environments: [withProposed] }] } }),
-      },
-      ...standardRoutes().filter((route) => route.path !== "/api/resources/catalog"),
-    ])
-    renderWizard()
-    await selectEnvironment()
-    await walkToStep3()
-
-    const pagesGroup = screen.getByRole("group", { name: /页面/ })
-    expect(within(pagesGroup).queryByRole("checkbox", { name: /购物车/ })).not.toBeInTheDocument()
-    fireEvent.click(within(pagesGroup).getByRole("checkbox", { name: /订单列表/ }))
-
-    const databasesGroup = screen.getByRole("group", { name: /目标库/ })
-    fireEvent.click(within(databasesGroup).getByRole("checkbox", { name: /order_db/ }))
-
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    await screen.findByText("确认创建")
-    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
-    await waitFor(() => expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(1))
-
-    const [, putInit] = callsFor("PUT", "/api/versions/2001/binding")[0] as [string, RequestInit]
-    expect(JSON.parse(String(putInit.body))).toMatchObject({
-      scope_exclude: { pages: ["1302"], apis: [], databases: ["1501"] },
-    })
-  })
-
   it("shows a typed 409 binding conflict inline and retries without re-creating the version", async () => {
     routeFetch(
       standardRoutes({
@@ -369,19 +309,16 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     expect(callsFor("POST", "/api/versions")).toHaveLength(1)
   })
 
-  it("maps a typed 400 field error back to the scope step", async () => {
+  it("maps a typed 400 field error back to the account step", async () => {
     routeFetch(
       standardRoutes({
         put: {
           method: "PUT",
           path: "/api/versions/2001/binding",
           response: () =>
-            errorResponse(
-              400,
-              "invalid_argument",
-              "page 1302 does not belong to the bound SUT environment",
-              { field: "scope_exclude.pages" },
-            ),
+            errorResponse(400, "invalid_argument", "account 1601 is not in the global pool", {
+              field: "account_ids[0]",
+            }),
         },
       }),
     )
@@ -390,9 +327,9 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
     const alert = await screen.findByRole("alert")
-    expect(alert).toHaveTextContent("scope_exclude.pages")
-    fireEvent.click(screen.getByRole("button", { name: "返回步骤 3 修正" }))
-    expect(screen.getByText("步骤 3 / 4")).toBeInTheDocument()
+    expect(alert).toHaveTextContent("account_ids[0]")
+    fireEvent.click(screen.getByRole("button", { name: "返回步骤 2 修正" }))
+    expect(screen.getByText("步骤 2 / 4")).toBeInTheDocument()
   })
 
   it("validates the version name and environment before leaving step 1", async () => {
@@ -406,27 +343,10 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     expect(screen.queryByRole("group", { name: /代码仓/ })).not.toBeInTheDocument()
   })
 
-  it("updates the live scope counts on step 3 and the step 4 review when a page is unchecked", async () => {
-    routeFetch(standardRoutes())
-    renderWizard()
-    await selectEnvironment()
-    await walkToStep3()
-
-    expect(screen.getByText("页面 已确认 2 · 生效 2 · 排除 0 · 待确认 0")).toBeInTheDocument()
-    const pages = screen.getByRole("group", { name: /页面/ })
-    fireEvent.click(within(pages).getByRole("checkbox", { name: /订单列表/ }))
-
-    expect(screen.getByText("页面 已确认 2 · 生效 1 · 排除 1 · 待确认 0")).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    await screen.findByText("确认创建")
-    expect(screen.getByText("已确认 2 · 生效 1 · 排除 1 · 待确认 0")).toBeInTheDocument()
-  })
-
   it("shows proposed API counts even when no page is proposed", async () => {
     const withProposedApi: EnvironmentResource = {
       ...environment,
-      apis: [...environment.apis, api("1402", "退款接口", "proposed")],
+      suts: [{ ...sut, apis: [...sut.apis, api("1402", "退款接口", "proposed")] }],
     }
     routeFetch([
       {
@@ -434,7 +354,7 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
         path: "/api/resources/catalog",
         response: () =>
           jsonResponse({
-            data: { ...catalog, suts: [{ ...sut, environments: [withProposedApi] }] },
+            data: { ...catalog, environments: [withProposedApi] },
           }),
       },
       ...standardRoutes().filter((route) => route.path !== "/api/resources/catalog"),
@@ -446,39 +366,53 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     expect(await screen.findByText(/探索待确认：页面 0 · API 1/)).toBeInTheDocument()
   })
 
-  it("adds an unassociated catalog repository as a version-level override without POSTing to the SUT", async () => {
-    routeFetch(
-      standardRoutes({
-        repositories: {
-          method: "GET",
-          path: "/api/suts/1001/repositories",
-          response: () => jsonResponse({ data: orderSutRepositories.slice(0, 1) }),
-        },
-      }),
-    )
+  it("previews the code pool aggregated across every SUT of the environment", async () => {
+    // A 2-SUT environment (the canonical fixture shape): each SUT inherits a
+    // different repository. The preview must show both, not just the first SUT's.
+    const secondSut: SutResource = { ...sut, id: "1002", name: "支付网关" }
+    const twoSutCatalog: Catalog = {
+      ...catalog,
+      environments: [{ ...environment, suts: [sut, secondSut] }],
+    }
+    routeFetch([
+      {
+        method: "GET",
+        path: "/api/resources/catalog",
+        response: () => jsonResponse({ data: twoSutCatalog }),
+      },
+      {
+        method: "GET",
+        path: "/api/suts/1001/repositories",
+        response: () => jsonResponse({ data: [orderSutRepositories[0]] }),
+      },
+      {
+        method: "GET",
+        path: "/api/suts/1002/repositories",
+        response: () => jsonResponse({ data: [{ ...orderSutRepositories[1], sut_id: "1002" }] }),
+      },
+      {
+        method: "POST",
+        path: "/api/versions",
+        response: () => jsonResponse({ data: createdVersion }, 201),
+      },
+      {
+        method: "GET",
+        path: "/api/versions/2001/binding",
+        response: () => jsonResponse({ data: bindingOverviewFixture }),
+      },
+      {
+        method: "PUT",
+        path: "/api/versions/2001/binding",
+        response: () => jsonResponse({ data: {} }),
+      },
+    ])
     renderWizard()
     await selectEnvironment()
     fireEvent.click(screen.getByRole("button", { name: "下一步" }))
 
-    const repositories = await screen.findByRole("group", { name: /代码仓/ })
-    const payment = await within(repositories).findByRole("checkbox", { name: /payment-gateway/ })
-    expect(payment).not.toBeChecked()
-    fireEvent.click(payment)
-
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    await screen.findByRole("group", { name: /页面/ })
-    fireEvent.click(screen.getByRole("button", { name: "下一步" }))
-    await screen.findByText("确认创建")
-    expect(screen.getByText(/payment-gateway（版本覆盖）/)).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: "创建版本" }))
-    await waitFor(() => expect(callsFor("PUT", "/api/versions/2001/binding")).toHaveLength(1))
-
-    const [, putInit] = callsFor("PUT", "/api/versions/2001/binding")[0] as [string, RequestInit]
-    expect(JSON.parse(String(putInit.body))).toMatchObject({
-      repository_ids: ["1201", "1202"],
-    })
-    expect(callsFor("POST", "/api/suts/1001/repositories")).toHaveLength(0)
+    const repos = await screen.findByRole("group", { name: /代码仓/ })
+    expect(await within(repos).findByText("order-center-web")).toBeInTheDocument()
+    expect(within(repos).getByText("payment-gateway")).toBeInTheDocument()
   })
 
   it("omits repository_ids and explains the fallback when the SUT repository read fails", async () => {
@@ -544,7 +478,7 @@ describe("BindingWizard (v0.22 environment-only create)", () => {
     await waitFor(() => expect(callsFor("GET", "/api/versions/2001/binding")).toHaveLength(1))
     expect(await screen.findByText(/已读取最新绑定：阶段 执行中/)).toBeInTheDocument()
     expect(within(alert).getByText("order-center-web")).toBeInTheDocument()
-    expect(within(alert).getByText("版本覆盖")).toBeInTheDocument()
+    expect(within(alert).getAllByText("SUT 继承").length).toBeGreaterThan(0)
   })
 
   it("shows the binding refresh error when re-reading the binding fails", async () => {

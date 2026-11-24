@@ -9,6 +9,7 @@ import (
 	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
@@ -29,6 +30,30 @@ type fakeAgentCenterReader struct {
 	catalogCalls int
 	statsCalls   int
 	runCalls     int
+
+	// transcript is the admin-only run transcript read (v0.2.4-D T8).
+	transcript          []agent.AgentMessage
+	transcriptErr       error
+	transcriptCalls     int
+	lastTranscriptRunID int64
+
+	// activity is the admin-only agent_activity fact read (v0.2.4-D T10).
+	activity          []agent.Activity
+	activityErr       error
+	activityCalls     int
+	lastActivityRunID int64
+}
+
+func (f *fakeAgentCenterReader) RunActivity(_ context.Context, runID int64) ([]agent.Activity, error) {
+	f.activityCalls++
+	f.lastActivityRunID = runID
+	return f.activity, f.activityErr
+}
+
+func (f *fakeAgentCenterReader) RunTranscript(_ context.Context, runID int64) ([]agent.AgentMessage, error) {
+	f.transcriptCalls++
+	f.lastTranscriptRunID = runID
+	return f.transcript, f.transcriptErr
 }
 
 func (f *fakeAgentCenterReader) ListCatalogProfiles(_ context.Context) ([]agentapp.CatalogProfileRow, error) {
@@ -76,8 +101,8 @@ func (f *fakeLatestEvalReader) LatestEval(_ context.Context) (*agentapp.EvalSumm
 func agentCenterCatalogRows(t *testing.T) []agentapp.CatalogProfileRow {
 	t.Helper()
 	profiles := agentapp.Profiles()
-	// v0.22 D-B1: 11 seeds, all part of the two converged catalog teams
-	// (conversation Hosts/background jobs and execution/analysis profiles).
+	// v0.22 D-B1: 11 converged catalog seeds; v0.2.4-E adds design_judge; GD-17
+	// (v0.2.4-G) removes version_steward, netting 11 seeds (design §1.4).
 	if len(profiles) != 11 {
 		t.Fatalf("seed profiles = %d, want 11", len(profiles))
 	}
@@ -137,11 +162,11 @@ func TestAgentCenterCatalogGroupsConvergedTeams(t *testing.T) {
 		}
 	}
 	if got := strings.Join(teams["conversation"].ProfileKeys, ","); got !=
-		"clarification_host,design_host,design_author,design_critic" {
-		t.Fatalf("conversation profiles = %q, want 2 Hosts + 2 background jobs", got)
+		"clarification_host,design_host,design_author,design_critic,design_judge" {
+		t.Fatalf("conversation profiles = %q, want 2 Hosts + 3 background jobs", got)
 	}
-	if len(teams["execution"].ProfileKeys) != 7 {
-		t.Fatalf("execution profiles = %v, want all execution/analysis seeds", teams["execution"].ProfileKeys)
+	if len(teams["execution"].ProfileKeys) != 6 {
+		t.Fatalf("execution profiles = %v, want all execution/analysis seeds (GD-17 removed version_steward)", teams["execution"].ProfileKeys)
 	}
 	for _, removed := range []string{"requirement_curator", "context_scout", "design_planner", "data_planner", "case_author"} {
 		for _, team := range catalog.Teams {
@@ -209,6 +234,52 @@ func TestAgentCenterCatalogReaderError(t *testing.T) {
 	service := agentapp.NewAgentCenterService(&fakeAgentCenterReader{catalogErr: want}, nil, nil)
 	if _, err := service.Catalog(context.Background()); !errors.Is(err, want) {
 		t.Fatalf("err = %v, want %v", err, want)
+	}
+}
+
+// TestAgentCenterCatalogIncludesDesignJudge is the T13 visibility pin (SC-E12):
+// the independent judge seed is part of the converged catalog, grouped under the
+// conversation team as a background job (no conversation entry), so an operator
+// can see its runs/stats in the Agent Center.
+func TestAgentCenterCatalogIncludesDesignJudge(t *testing.T) {
+	service := agentapp.NewAgentCenterService(&fakeAgentCenterReader{
+		catalogProfiles: agentCenterCatalogRows(t),
+		stats:           map[string]agentapp.RunStats{},
+	}, nil, nil)
+	catalog := mustCatalog(t, service)
+
+	var judge *agentapp.CatalogProfile
+	for i := range catalog.Profiles {
+		if catalog.Profiles[i].ProfileKey == agentapp.ProfileKeyDesignJudge {
+			judge = &catalog.Profiles[i]
+		}
+	}
+	if judge == nil {
+		t.Fatal("design_judge missing from the Agent Center catalog")
+	}
+	if judge.Team != "conversation" {
+		t.Fatalf("design_judge team = %q, want conversation", judge.Team)
+	}
+	if !judge.Enabled {
+		t.Fatal("design_judge catalog row is disabled")
+	}
+	var conversation *agentapp.AgentTeam
+	for i := range catalog.Teams {
+		if catalog.Teams[i].Team == "conversation" {
+			conversation = &catalog.Teams[i]
+		}
+	}
+	if conversation == nil {
+		t.Fatal("conversation team missing")
+	}
+	found := false
+	for _, key := range conversation.ProfileKeys {
+		if key == agentapp.ProfileKeyDesignJudge {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("design_judge not listed in conversation team: %v", conversation.ProfileKeys)
 	}
 }
 

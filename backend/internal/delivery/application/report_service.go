@@ -57,11 +57,23 @@ func (e *VersionReportNotDueError) Unwrap() error { return ErrVersionReportNotDu
 // Report lifecycle constants. template_version falls back to "1" (the frozen
 // P4 built-in template) when the renderer does not report a version; renderers
 // implementing delivery.ReportTemplateVersioner supply the actual version.
+//
+// The render-status values are EXPORTED (H T11e-1, 五.1/五.4): they are the single
+// authority for delivery_report_revision.render_status, whose CHECK is
+// ('pending','running','done','failed') (delivery_0002_report_revision.sql:49-50).
+// The postgres adapter binds them as query parameters instead of re-writing the
+// literals inline; an unexported authority was unreachable from the adapter and
+// had left a hand-written second truth there.
 const (
 	reportTemplateVersion = "1"
-	reportRenderPending   = "pending"
-	reportRenderDone      = "done"
-	reportRenderFailed    = "failed"
+	// ReportRenderPending is a revision whose HTML has not been rendered yet.
+	ReportRenderPending = "pending"
+	// ReportRenderRunning is a revision whose HTML render is in flight.
+	ReportRenderRunning = "running"
+	// ReportRenderDone is a revision whose HTML is stored in the content ledger.
+	ReportRenderDone = "done"
+	// ReportRenderFailed is a revision whose HTML render failed terminally.
+	ReportRenderFailed = "failed"
 )
 
 // ReportService owns the report lifecycle: ensuring report rows and generation
@@ -286,13 +298,13 @@ func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) erro
 	if err != nil {
 		return err
 	}
-	// Mark every published report whose deterministic input changed as stale
-	// before the wave loop: a wave report published before an issue triage
-	// finished must be regenerated once the triage projection is part of the
-	// snapshot (Task 118), even when the version report is not due yet.
-	if _, err := s.MarkStaleIfChanged(ctx, versionID); err != nil {
-		return err
-	}
+	// Stale DETECTION is no longer done here (v0.2.4-G T11, SC-G8/R-G10): the old
+	// narrow polling only ran for running versions on the P4 tick. It is replaced
+	// by the event-driven causal watcher (all conclusion-input change events, every
+	// version) plus the periodic complete sweep (all published reports). Both call
+	// MarkStaleIfChanged and emit report.stale, which wakes the reconciler back into
+	// this ensure pass. EnsureReports keeps its job: regenerate reports already
+	// marked stale (the wave loop and the version switch below).
 	existing, err := s.repo.ListReports(ctx, versionID, ReportFilter{Limit: 100})
 	if err != nil {
 		return mapReportError(err)
@@ -384,7 +396,7 @@ func (s *ReportService) Regenerate(ctx context.Context, versionID, reportID int6
 	}
 	if len(revisions) > 0 {
 		latest := revisions[0]
-		if latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != reportRenderFailed {
+		if latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != ReportRenderFailed {
 			if err := s.ensureTask(ctx, reportID, latest.Revision); err != nil {
 				return 0, err
 			}
@@ -399,6 +411,168 @@ func (s *ReportService) Regenerate(ctx context.Context, versionID, reportID int6
 		return 0, err
 	}
 	return revision.Revision, nil
+}
+
+// RegenerateWaivedVersionReport is the synchronous post-waive-close report path
+// (v0.2.4-G R-G8, SC-G11). A waived close flips the version to completed, which
+// the reconciler's report ensure pass excludes — so the unverified report would
+// never regenerate on its own. This entry breaks that dead chain: it ensures the
+// version report exists, allocates the next revision and publishes it
+// immediately, returning the published revision.
+//
+// The waiver overrides ONLY the requirement-settled leg of the report due gate
+// (the report-side projection of RequirementsClosed, which the waiver overrides);
+// the execution-data legs (a terminal wave, at least one case_run) still hold, so
+// a version that never executed cannot produce a report here (fail-closed). The
+// rendered unverified CONTENT (waived scope/reason/operator) is the W3 read-model
+// + template work (T8/T9/T10); this entry guarantees the report EXISTS and is
+// published post-close.
+func (s *ReportService) RegenerateWaivedVersionReport(ctx context.Context, versionID int64) (delivery.ReportRevision, error) {
+	return s.syncRefreshVersionReport(ctx, versionID)
+}
+
+// RefreshVersionReportDisplay regenerates and synchronously publishes the
+// version's published report so display-only projections stay current
+// (v0.2.4-G T11, R-G10a). Judge verdict/review_state are shown by the report but
+// are NOT canonical fingerprint members, so MarkStaleIfChanged alone would never
+// refresh them; a judge state event therefore drives this deterministic refresh.
+// It reuses the waived sync-publish mechanics (no LLM narrative task, idempotent
+// Publish). It ONLY refreshes an already-published version report: a judge event
+// must not create the first report (that is EnsureVersionReport's gated job), and
+// a version with no execution data yet is a no-op — the display heals later
+// through the normal stale/regeneration path once execution settles.
+func (s *ReportService) RefreshVersionReportDisplay(ctx context.Context, versionID int64) error {
+	if versionID <= 0 {
+		return platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	kind := delivery.ReportKindVersion
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 1})
+	if err != nil {
+		return mapReportError(err)
+	}
+	if len(reports) == 0 || !reportHasPublishedRevision(reports[0]) {
+		return nil // no published display to refresh
+	}
+	_, err = s.syncRefreshVersionReport(ctx, versionID)
+	if errors.Is(err, ErrVersionReportNotDue) {
+		return nil
+	}
+	return err
+}
+
+// RefreshDisplayIfChanged is the display analogue of MarkStaleIfChanged for the
+// complete sweep (v0.2.4-G T11 fix round 1, R-G10a / art.7.6): it compares the
+// current source DISPLAY digest (judge review_state/verdict/findings — display-
+// only, NOT canonical members) against the published report's stored
+// DisplayFingerprint and refreshes the report on divergence. This heals a lost
+// judge event on a static version: the canonical fingerprint is unchanged (so no
+// stale marker), but the displayed judge state would otherwise stay outdated
+// forever. An empty stored digest (pre-T11 row) is divergent and republishes once.
+// It only acts on an already-published version report; no report / not-due is a
+// no-op. It reports whether a refresh was published.
+func (s *ReportService) RefreshDisplayIfChanged(ctx context.Context, versionID int64) (bool, error) {
+	return s.refreshDisplayIfChanged(ctx, versionID, nil)
+}
+
+// refreshDisplayIfChanged is RefreshDisplayIfChanged with an optional shared
+// version-snapshot loader (H-G4 #27, same memoization as markStaleIfChanged).
+func (s *ReportService) refreshDisplayIfChanged(ctx context.Context, versionID int64, loadVersion func() (*delivery.ReportSnapshot, error)) (bool, error) {
+	if versionID <= 0 {
+		return false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if s.data == nil {
+		return false, reportServiceNotConfigured("report data reader")
+	}
+	kind := delivery.ReportKindVersion
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 1})
+	if err != nil {
+		return false, mapReportError(err)
+	}
+	if len(reports) == 0 || !reportHasPublishedRevision(reports[0]) {
+		return false, nil
+	}
+	snapshot, err := s.snapshotForReport(ctx, reports[0], loadVersion)
+	if err != nil {
+		return false, err
+	}
+	if delivery.DisplayFingerprint(snapshot) == reports[0].DisplayFingerprint {
+		return false, nil
+	}
+	if _, err := s.syncRefreshVersionReport(ctx, versionID); err != nil {
+		if errors.Is(err, ErrVersionReportNotDue) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// syncRefreshVersionReport ensures the version report exists, allocates the next
+// draft revision (reusing an in-flight pending draft) and publishes it
+// immediately WITHOUT an LLM narrative work item. It is the shared mechanics of
+// the waived post-close refresh (R-G8) and the judge display refresh (R-G10a).
+//
+// The gate overrides ONLY the requirement-settled leg (the report-side projection
+// of RequirementsClosed, which a waiver overrides and which a display refresh of
+// an already-published report must not block on); the execution-data legs (a
+// terminal wave, at least one case_run) still hold, so a version that never
+// executed cannot produce a report here (fail-closed).
+func (s *ReportService) syncRefreshVersionReport(ctx context.Context, versionID int64) (delivery.ReportRevision, error) {
+	if versionID <= 0 {
+		return delivery.ReportRevision{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if s.data == nil {
+		return delivery.ReportRevision{}, reportServiceNotConfigured("report data reader")
+	}
+	snapshot, err := s.data.VersionSnapshot(ctx, versionID)
+	if err != nil {
+		return delivery.ReportRevision{}, err
+	}
+	if reason := versionReportGateReason(snapshot); reason != "" && reason != versionReportNotDueRequirementsOpen {
+		return delivery.ReportRevision{}, &VersionReportNotDueError{Reason: reason}
+	}
+
+	kind := delivery.ReportKindVersion
+	reports, err := s.repo.ListReports(ctx, versionID, ReportFilter{Kind: &kind, Limit: 100})
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	var report delivery.Report
+	if len(reports) > 0 {
+		report = reports[0]
+	} else {
+		report, err = s.repo.CreateReport(ctx, delivery.Report{
+			VersionID: versionID,
+			Kind:      delivery.ReportKindVersion,
+			Status:    delivery.ReportStatusDraft,
+		})
+		if err != nil {
+			return delivery.ReportRevision{}, mapReportError(err)
+		}
+	}
+
+	// Allocate the next draft revision WITHOUT ensuring a report.version work
+	// item: this path publishes synchronously, so an LLM narrative task would be
+	// redundant (its later Publish is idempotent and its narrative discarded) and
+	// would leave an open work item counting toward NoBlockingWorkItems after a
+	// reopen. A pending draft left by an earlier ensure pass is reused; any task
+	// already ensured for that draft self-heals (the worker claims it and its
+	// Publish is idempotent on the now-published revision).
+	revisions, err := s.repo.ListRevisions(ctx, report.ID)
+	if err != nil {
+		return delivery.ReportRevision{}, mapReportError(err)
+	}
+	var revision int32
+	if len(revisions) > 0 && revisions[0].Status == delivery.ReportStatusDraft && revisions[0].RenderStatus != ReportRenderFailed {
+		revision = revisions[0].Revision
+	} else {
+		draft, err := s.createNextDraft(ctx, report)
+		if err != nil {
+			return delivery.ReportRevision{}, err
+		}
+		revision = draft.Revision
+	}
+	return s.Publish(ctx, report.ID, revision, "")
 }
 
 // Publish renders one draft revision from the current deterministic snapshot,
@@ -483,7 +657,7 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 		s.failRevision(ctx, current.ID, err)
 		return delivery.ReportRevision{}, mapReportError(err)
 	}
-	if err := s.repo.FinalizePublished(ctx, reportID, revision, contentRefID, fingerprint); err != nil {
+	if err := s.repo.FinalizePublished(ctx, reportID, revision, contentRefID, fingerprint, delivery.DisplayFingerprint(snapshot)); err != nil {
 		s.failRevision(ctx, current.ID, err)
 		return delivery.ReportRevision{}, mapReportError(err)
 	}
@@ -542,6 +716,14 @@ func (s *ReportService) bookPDF(ctx context.Context, report delivery.Report, rev
 // Exactly one report.stale event is emitted per report while it stays stale
 // (spec §6.5). It reports whether any report changed.
 func (s *ReportService) MarkStaleIfChanged(ctx context.Context, versionID int64) (bool, error) {
+	return s.markStaleIfChanged(ctx, versionID, nil)
+}
+
+// markStaleIfChanged is MarkStaleIfChanged with an optional shared version-
+// snapshot loader. loadVersion, when non-nil, memoizes the version snapshot so
+// the sweep's canonical and display legs read it once (H-G4 #27); nil keeps the
+// independent per-report read.
+func (s *ReportService) markStaleIfChanged(ctx context.Context, versionID int64, loadVersion func() (*delivery.ReportSnapshot, error)) (bool, error) {
 	if versionID <= 0 {
 		return false, platform.Invalid("version_id", "must be a positive decimal ID")
 	}
@@ -557,7 +739,7 @@ func (s *ReportService) MarkStaleIfChanged(ctx context.Context, versionID int64)
 		if report.Status != delivery.ReportStatusPublished {
 			continue
 		}
-		snapshot, err := s.snapshotFor(ctx, report)
+		snapshot, err := s.snapshotForReport(ctx, report, loadVersion)
 		if err != nil {
 			return changedAny, err
 		}
@@ -659,7 +841,7 @@ func (s *ReportService) OpenHTML(ctx context.Context, versionID, reportID int64,
 	if err != nil {
 		return nil, delivery.ReportRevision{}, mapReportError(err)
 	}
-	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != reportRenderDone || stored.HTMLRef == nil {
+	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != ReportRenderDone || stored.HTMLRef == nil {
 		return nil, stored, platform.NotFound("report revision")
 	}
 	if s.content == nil {
@@ -702,7 +884,7 @@ func (s *ReportService) OpenPDF(ctx context.Context, versionID, reportID int64, 
 	if err != nil {
 		return nil, delivery.ReportRevision{}, mapReportError(err)
 	}
-	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != reportRenderDone {
+	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != ReportRenderDone {
 		return nil, stored, platform.NotFound("report revision")
 	}
 	switch stored.PDFStatus {
@@ -762,7 +944,7 @@ func (s *ReportService) ensureGeneration(ctx context.Context, report delivery.Re
 	switch {
 	case latest.Status == delivery.ReportStatusPublished:
 		return report, nil
-	case latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != reportRenderFailed:
+	case latest.Status == delivery.ReportStatusDraft && latest.RenderStatus != ReportRenderFailed:
 		if err := s.ensureTask(ctx, report.ID, latest.Revision); err != nil {
 			return delivery.Report{}, err
 		}
@@ -803,7 +985,7 @@ func (s *ReportService) createNextDraft(ctx context.Context, report delivery.Rep
 		InputFingerprint: fingerprint,
 		AsOf:             asOf,
 		TemplateVersion:  s.templateVersion(),
-		RenderStatus:     reportRenderPending,
+		RenderStatus:     ReportRenderPending,
 	})
 	if err != nil {
 		return delivery.ReportRevision{}, mapReportError(err)
@@ -827,6 +1009,15 @@ func (s *ReportService) templateVersion() string {
 // stamps the report's authoritative scope onto it (a mis-scoped reader can
 // never cross versions or waves).
 func (s *ReportService) snapshotFor(ctx context.Context, report delivery.Report) (delivery.ReportSnapshot, error) {
+	return s.snapshotForReport(ctx, report, nil)
+}
+
+// snapshotForReport is snapshotFor with an optional shared version-snapshot
+// loader. For a VERSION report, loadVersion (when non-nil) supplies the raw
+// snapshot instead of a fresh s.data.VersionSnapshot read, so the sweep's two
+// legs share one read (H-G4 #27); the cap + scope stamping stay on this single
+// path. Wave reports always read their own wave snapshot (never shared).
+func (s *ReportService) snapshotForReport(ctx context.Context, report delivery.Report, loadVersion func() (*delivery.ReportSnapshot, error)) (delivery.ReportSnapshot, error) {
 	if s.data == nil {
 		return delivery.ReportSnapshot{}, reportServiceNotConfigured("report data reader")
 	}
@@ -839,7 +1030,15 @@ func (s *ReportService) snapshotFor(ctx context.Context, report delivery.Report)
 		}
 		snapshot, err = s.data.WaveSnapshot(ctx, report.VersionID, *report.WaveID)
 	case delivery.ReportKindVersion:
-		snapshot, err = s.data.VersionSnapshot(ctx, report.VersionID)
+		if loadVersion != nil {
+			var raw *delivery.ReportSnapshot
+			raw, err = loadVersion()
+			if err == nil && raw != nil {
+				snapshot = *raw
+			}
+		} else {
+			snapshot, err = s.data.VersionSnapshot(ctx, report.VersionID)
+		}
 	default:
 		return delivery.ReportSnapshot{}, fmt.Errorf("%w: unknown report kind %q", delivery.ErrInvalidArgument, report.Kind)
 	}
@@ -857,13 +1056,50 @@ func (s *ReportService) snapshotFor(ctx context.Context, report delivery.Report)
 	return snapshot, nil
 }
 
+// SweepVersionOnce runs BOTH sweep legs for one version sharing a single version-
+// snapshot read (H-G4 #27): the canonical stale leg and the display-heal leg each
+// load the full version snapshot independently otherwise, doubling the sweep's
+// heaviest read. The shared loader memoizes the raw snapshot lazily (only when a
+// leg actually needs it) and both legs keep their own error attribution. It
+// reports (staled, refreshed); errors are joined with the same per-leg prefixes
+// the sweeper uses, so a failed leg never suppresses the other.
+func (s *ReportService) SweepVersionOnce(ctx context.Context, versionID int64) (bool, bool, error) {
+	if versionID <= 0 {
+		return false, false, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	if s.data == nil {
+		return false, false, reportServiceNotConfigured("report data reader")
+	}
+	var raw *delivery.ReportSnapshot
+	loadVersion := func() (*delivery.ReportSnapshot, error) {
+		if raw == nil {
+			snapshot, err := s.data.VersionSnapshot(ctx, versionID)
+			if err != nil {
+				return nil, err
+			}
+			raw = &snapshot
+		}
+		return raw, nil
+	}
+	staled, staleErr := s.markStaleIfChanged(ctx, versionID, loadVersion)
+	refreshed, displayErr := s.refreshDisplayIfChanged(ctx, versionID, loadVersion)
+	var errs []error
+	if staleErr != nil {
+		errs = append(errs, fmt.Errorf("stale sweep version %d: %w", versionID, staleErr))
+	}
+	if displayErr != nil {
+		errs = append(errs, fmt.Errorf("display sweep version %d: %w", versionID, displayErr))
+	}
+	return staled, refreshed, errors.Join(errs...)
+}
+
 // failRevision best-effort records a failed render. The revision stays a draft
 // for audit and the next retry allocates a new revision (spec §6.3).
 func (s *ReportService) failRevision(ctx context.Context, revisionID int64, cause error) {
 	if s.repo == nil {
 		return
 	}
-	_ = s.repo.MarkRenderMetadata(ctx, revisionID, reportRenderFailed, cause.Error())
+	_ = s.repo.MarkRenderMetadata(ctx, revisionID, ReportRenderFailed, cause.Error())
 }
 
 // ensureWaveLink backfills run_wave.report_id for a wave report.
@@ -957,7 +1193,7 @@ func (s *ReportService) publishStaleEvent(ctx context.Context, report delivery.R
 }
 
 // reportRefsForSnapshot derives the append-only logical refs of one revision:
-// requirements, waves, case versions, case runs, issues and version SUTs. The
+// requirements, waves, case versions, case runs, issues and SUTs. The
 // list is deduplicated and sorted by (kind, ref_id) for replay determinism.
 func reportRefsForSnapshot(report delivery.Report, snapshot delivery.ReportSnapshot) []delivery.ReportRef {
 	seen := make(map[string]bool)
@@ -988,18 +1224,18 @@ func reportRefsForSnapshot(report delivery.Report, snapshot delivery.ReportSnaps
 		if run.WaveID > 0 {
 			add("wave", run.WaveID)
 		}
-		if run.VersionSUTID != nil {
-			add("version_sut", *run.VersionSUTID)
+		if run.SUTID != nil {
+			add("sut", *run.SUTID)
 		}
-		for _, versionSUTID := range run.VersionSUTIDs {
-			add("version_sut", versionSUTID)
+		for _, sutID := range run.SUTIDs {
+			add("sut", sutID)
 		}
 	}
 	for _, issue := range snapshot.Issues {
 		add("issue", issue.ID)
 	}
-	for _, versionSUT := range snapshot.VersionSUTs {
-		add("version_sut", versionSUT.ID)
+	for _, sut := range snapshot.SUTs {
+		add("sut", sut.ID)
 	}
 	sort.Slice(refs, func(i, j int) bool {
 		if refs[i].Kind != refs[j].Kind {

@@ -88,7 +88,7 @@ func TestVersionCloseRepoCloseWritesFields(t *testing.T) {
 
 	recheckCalls := 0
 	lockedStatus := ""
-	closed, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+	closed, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 		ClosedAt:    closedAt,
 		CloseReason: "all requirements delivered",
 		CloseRunID:  &runID,
@@ -124,7 +124,7 @@ func TestVersionCloseRepoCloseWritesFields(t *testing.T) {
 	}
 
 	// A second close is a state conflict; the recheck never runs again.
-	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 		ClosedAt: closedAt, CloseReason: "again",
 	}, func(context.Context, version.Version) error {
 		recheckCalls++
@@ -142,7 +142,7 @@ func TestVersionCloseRepoCloseWritesFields(t *testing.T) {
 	if _, changed, err := fixture.versionRepo.ReopenIfCompleted(ctx, fixture.version.ID, reopenedAt); err != nil || !changed {
 		t.Fatalf("ReopenIfCompleted = %v/%v", changed, err)
 	}
-	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 		ClosedAt: reopenedAt.Add(time.Minute), CloseReason: "should roll back",
 	}, func(context.Context, version.Version) error {
 		return wantErr
@@ -153,7 +153,7 @@ func TestVersionCloseRepoCloseWritesFields(t *testing.T) {
 	if status != string(version.StatusRunning) || storedClosedAt != nil || storedReason != "" || storedRunID != nil {
 		t.Fatalf("failed close left projection = %q/%v/%q/%v", status, storedClosedAt, storedReason, storedRunID)
 	}
-	if _, err := fixture.versionRepo.Close(ctx, 999999, version.VersionCloseFields{ClosedAt: closedAt}, nil); !errors.Is(err, version.ErrNotFound) {
+	if _, err := fixture.versionRepo.Close(ctx, 999999, &version.VersionCloseFields{ClosedAt: closedAt}, nil); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing version Close error = %v, want ErrNotFound", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestVersionCloseRepoReopenIfCompleted(t *testing.T) {
 	ctx := context.Background()
 	closedAt := testTime.Add(time.Hour)
 	runID := int64(9001)
-	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+	if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 		ClosedAt: closedAt, CloseReason: "done", CloseRunID: &runID,
 	}, nil); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -208,7 +208,7 @@ func TestVersionCloseRepoConcurrentNewIntent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+			_, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 				ClosedAt: testTime.Add(time.Hour), CloseReason: "racing close",
 			}, func(ctx context.Context, _ version.Version) error {
 				close(locked)
@@ -254,7 +254,7 @@ func TestVersionCloseRepoConcurrentNewIntent(t *testing.T) {
 		fixture := newVersionCloseFixture(t)
 		ctx := context.Background()
 		closedAt := testTime.Add(time.Hour)
-		if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, version.VersionCloseFields{
+		if _, err := fixture.versionRepo.Close(ctx, fixture.version.ID, &version.VersionCloseFields{
 			ClosedAt: closedAt, CloseReason: "close won",
 		}, func(context.Context, version.Version) error {
 			if fixture.countActiveIntents(t) != 0 {

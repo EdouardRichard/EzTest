@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // Priority values frozen by P1-D6.
@@ -12,14 +14,22 @@ var requirementPriorities = []string{"P0", "P1", "P2", "P3"}
 
 var relationKinds = []string{"depends_on", "conflicts_with", "overlaps", "shares_scope"}
 
+// Requirement contract bounds. They are DERIVED from the version domain
+// authority (single source, constitution art.5): the tool boundary rejects the
+// same payloads the service would, with a tool-level error instead of a 400.
+// Do not hand-copy a value here — a domain change must flow through (U1g, T22).
 const (
-	maxRequirementTitle        = 200
-	maxRequirementDescription  = 20000
-	maxRequirementAcceptance   = 20000
-	maxRequirementTargets      = 100
-	maxRelationDescription     = 1000
-	maxReopenReason            = 2000
-	defaultRequirementPriority = "P2"
+	maxRequirementTitle          = version.RequirementTitleMax
+	maxRequirementUserStoryPart  = version.RequirementUserStoryPartMax
+	maxRequirementRules          = version.RequirementRulesMax
+	maxRequirementACPart         = version.AcceptanceCriterionPartMax
+	maxRequirementACs            = version.MaxAcceptanceCriteria
+	maxRequirementSutDescription = version.RequirementSutDescriptionMax
+	maxRequirementScopeOut       = version.RequirementScopeOutMax
+	maxRequirementAccountRole    = version.RequirementAccountRoleMax
+	maxRelationDescription       = version.RequirementRelationDescriptionMax
+	maxReopenReason              = version.RequirementReasonMax
+	defaultRequirementPriority   = version.DefaultPriority
 )
 
 type requirementReadParams struct {
@@ -80,14 +90,31 @@ func (t *requirementRead) Execute(ctx context.Context, scope Scope, raw json.Raw
 }
 
 type draftFields struct {
-	Title              string          `json:"title"`
-	Description        string          `json:"description"`
-	AcceptanceCriteria string          `json:"acceptance_criteria"`
-	Priority           string          `json:"priority"`
-	Constraints        json.RawMessage `json:"constraints"`
-	TargetVersionSUTs  []string        `json:"target_version_suts"`
-	TargetPages        []string        `json:"target_pages"`
-	TargetAPIs         []string        `json:"target_apis"`
+	Title              string                      `json:"title"`
+	UserStory          userStoryFields             `json:"user_story"`
+	Rules              string                      `json:"rules"`
+	AcceptanceCriteria []acceptanceCriterionFields `json:"acceptance_criteria"`
+	Priority           string                      `json:"priority"`
+	Constraints        json.RawMessage             `json:"constraints"`
+	SutDescription     string                      `json:"sut_description"`
+	ScopeOut           string                      `json:"scope_out"`
+	AccountRolesHint   []string                    `json:"account_roles_hint"`
+}
+
+// userStoryFields is the §5.1 three-part story as a model submits it.
+type userStoryFields struct {
+	AsA    string `json:"as_a"`
+	IWant  string `json:"i_want"`
+	SoThat string `json:"so_that"`
+}
+
+// acceptanceCriterionFields is one Gherkin criterion as a model submits it.
+// There is no id field: ids are server-assigned and inherited by content, so a
+// model cannot choose one.
+type acceptanceCriterionFields struct {
+	Given string `json:"given"`
+	When  string `json:"when"`
+	Then  string `json:"then"`
 }
 
 type requirementDraftCreateParams struct {
@@ -99,6 +126,11 @@ type requirementDraftUpdateParams struct {
 	draftFields
 }
 
+// draftRequiredFields are the §5.1 mandatory draft fields. requirement_id is
+// added by the update tool; both tools must agree on this list, so it is stated
+// once.
+var draftRequiredFields = []string{"title", "user_story", "acceptance_criteria", "sut_description"}
+
 func draftProperties() map[string]any {
 	return map[string]any{
 		"title": map[string]any{
@@ -107,17 +139,35 @@ func draftProperties() map[string]any {
 			"maxLength":   maxRequirementTitle,
 			"description": "需求标题。",
 		},
-		"description": map[string]any{
+		"user_story": map[string]any{
+			"type":        "object",
+			"description": "用户故事三段式，三项均必填且各 1..500 字。",
+			"properties": map[string]any{
+				"as_a":    map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementUserStoryPart, "description": "作为……（角色）"},
+				"i_want":  map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementUserStoryPart, "description": "我希望……（能力）"},
+				"so_that": map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementUserStoryPart, "description": "以便……（价值）"},
+			},
+			"required": []string{"as_a", "i_want", "so_that"},
+		},
+		"rules": map[string]any{
 			"type":        "string",
-			"minLength":   1,
-			"maxLength":   maxRequirementDescription,
-			"description": "需求描述。",
+			"maxLength":   maxRequirementRules,
+			"description": "可选：业务规则、例外、数据约束等不属于用户故事的自由文本。",
 		},
 		"acceptance_criteria": map[string]any{
-			"type":        "string",
-			"minLength":   1,
-			"maxLength":   maxRequirementAcceptance,
-			"description": "可验证的验收标准。",
+			"type":        "array",
+			"minItems":    1,
+			"maxItems":    maxRequirementACs,
+			"description": "Gherkin 验收条件，至少 1 条；id 由服务端分配（AC-1、AC-2……）并在修订间按内容继承，不要自己填。",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"given": map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementACPart, "description": "前置条件"},
+					"when":  map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementACPart, "description": "触发动作"},
+					"then":  map[string]any{"type": "string", "minLength": 1, "maxLength": maxRequirementACPart, "description": "可观察结果"},
+				},
+				"required": []string{"given", "when", "then"},
+			},
 		},
 		"priority": map[string]any{
 			"type":        "string",
@@ -128,23 +178,21 @@ func draftProperties() map[string]any {
 			"type":        "object",
 			"description": "约束对象（business_rules/preconditions/exceptions/data_constraints/dependencies）。",
 		},
-		"target_version_suts": map[string]any{
-			"type":        "array",
-			"maxItems":    maxRequirementTargets,
-			"description": "目标 version_sut ID（十进制字符串，取 sut.list 返回的 version_sut_id），必须属于当前版本。",
-			"items":       map[string]any{"type": "string"},
+		"sut_description": map[string]any{
+			"type":        "string",
+			"minLength":   1,
+			"maxLength":   maxRequirementSutDescription,
+			"description": "被测系统的自然语言描述（1..2000 字）。不要填 SUT/页面/接口的 ID——需求不再绑定资源 ID，被测系统由执行团队按此描述自行解析。",
 		},
-		"target_pages": map[string]any{
-			"type":        "array",
-			"maxItems":    maxRequirementTargets,
-			"description": "目标页面 ID（十进制字符串，取 sut.page_list 中 kind=page 条目的 id）；不能填 path、URL 或页面名称，且必须属于当前版本绑定。",
-			"items":       map[string]any{"type": "string"},
+		"scope_out": map[string]any{
+			"type":        "string",
+			"maxLength":   maxRequirementScopeOut,
+			"description": "可选：明确不在本需求范围内的内容。",
 		},
-		"target_apis": map[string]any{
+		"account_roles_hint": map[string]any{
 			"type":        "array",
-			"maxItems":    maxRequirementTargets,
-			"description": "目标 API ID（十进制字符串，取 sut.page_list 中 kind=api 条目的 id）；不能填方法+路径或接口名称，且必须属于当前版本绑定。",
-			"items":       map[string]any{"type": "string"},
+			"description": "可选：涉及的账号角色提示，每项 ≤64 字；空白项会被丢弃、重复项会被去重（与需求服务同一归一化器）。",
+			"items":       map[string]any{"type": "string", "maxLength": maxRequirementAccountRole},
 		},
 	}
 }
@@ -154,11 +202,11 @@ type requirementDraftCreate struct{ deps Deps }
 func (t *requirementDraftCreate) Name() string { return ToolRequirementDraftCreate }
 
 func (t *requirementDraftCreate) Description() string {
-	return "在当前版本创建一条 draft 需求（服务端生成不可变 revision 1）。同一版本同一来源编号（title 开头的 FR/NFR 等编号）已存在时返回已有 draft（仅在已有草稿缺 target 时补全），不会重复创建。不能确认、删除或修改已澄清需求。"
+	return "在当前版本创建一条 draft 需求（服务端生成不可变 revision 1）。同一版本同一来源编号（title 开头的 FR/NFR 等编号）已存在时返回已有 draft（仅在新提交内容更丰富时补全），不会重复创建。不能确认、删除或修改已澄清需求。"
 }
 
 func (t *requirementDraftCreate) Parameters() json.RawMessage {
-	return schemaObject(draftProperties(), "title", "description", "acceptance_criteria")
+	return schemaObject(draftProperties(), draftRequiredFields...)
 }
 
 func (t *requirementDraftCreate) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
@@ -194,7 +242,7 @@ func (t *requirementDraftUpdate) Parameters() json.RawMessage {
 		"type":        "string",
 		"description": "要更新的需求 ID（十进制字符串）。",
 	}
-	return schemaObject(properties, "requirement_id", "title", "description", "acceptance_criteria")
+	return schemaObject(properties, append([]string{"requirement_id"}, draftRequiredFields...)...)
 }
 
 func (t *requirementDraftUpdate) Execute(ctx context.Context, scope Scope, raw json.RawMessage) (any, error) {
@@ -377,8 +425,6 @@ func (t *requirementReopenPropose) Execute(ctx context.Context, scope Scope, raw
 
 func buildDraft(fields draftFields) (RequirementDraft, *Error) {
 	title := strings.TrimSpace(fields.Title)
-	description := strings.TrimSpace(fields.Description)
-	acceptance := strings.TrimSpace(fields.AcceptanceCriteria)
 	priority := strings.TrimSpace(fields.Priority)
 	if priority == "" {
 		priority = defaultRequirementPriority
@@ -387,23 +433,53 @@ func buildDraft(fields draftFields) (RequirementDraft, *Error) {
 	if err := validateText("title", title, 1, maxRequirementTitle); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateText("description", description, 1, maxRequirementDescription); err != nil {
+	story := RequirementUserStory{
+		AsA:    strings.TrimSpace(fields.UserStory.AsA),
+		IWant:  strings.TrimSpace(fields.UserStory.IWant),
+		SoThat: strings.TrimSpace(fields.UserStory.SoThat),
+	}
+	for _, part := range []struct{ name, value string }{
+		{"user_story.as_a", story.AsA},
+		{"user_story.i_want", story.IWant},
+		{"user_story.so_that", story.SoThat},
+	} {
+		if err := validateText(part.name, part.value, 1, maxRequirementUserStoryPart); err != nil {
+			return RequirementDraft{}, err
+		}
+	}
+	rules := strings.TrimSpace(fields.Rules)
+	if err := validateText("rules", rules, 0, maxRequirementRules); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateText("acceptance_criteria", acceptance, 1, maxRequirementAcceptance); err != nil {
-		return RequirementDraft{}, err
+	criteria, criterionErr := buildAcceptanceCriteria(fields.AcceptanceCriteria)
+	if criterionErr != nil {
+		return RequirementDraft{}, criterionErr
 	}
 	if !contains(requirementPriorities, priority) {
 		return RequirementDraft{}, Invalid("priority", "must be one of P0, P1, P2, P3")
 	}
-	if err := validateTargetIDList("target_version_suts", fields.TargetVersionSUTs, maxRequirementTargets); err != nil {
+	sutDescription := strings.TrimSpace(fields.SutDescription)
+	if err := validateText("sut_description", sutDescription, 1, maxRequirementSutDescription); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateTargetIDList("target_pages", fields.TargetPages, maxRequirementTargets); err != nil {
+	scopeOut := strings.TrimSpace(fields.ScopeOut)
+	if err := validateText("scope_out", scopeOut, 0, maxRequirementScopeOut); err != nil {
 		return RequirementDraft{}, err
 	}
-	if err := validateTargetIDList("target_apis", fields.TargetAPIs, maxRequirementTargets); err != nil {
+	// Role hints use the SAME normalizer as the version domain write side
+	// (U1f, T22): trim, drop empties, de-duplicate, preserve first-occurrence
+	// order. The tool used to reject a blank entry with 400 while the REST side
+	// silently dropped it — one input, two results. The structural length bound
+	// below still matches ValidateDraft (each role 1..RequirementAccountRoleMax).
+	roles := version.NormalizeAccountRolesHint(fields.AccountRolesHint)
+	if err := validateStringList("account_roles_hint", roles, 0); err != nil {
 		return RequirementDraft{}, err
+	}
+	for index, role := range roles {
+		field := "account_roles_hint[" + strconv.Itoa(index) + "]"
+		if err := validateText(field, role, 1, maxRequirementAccountRole); err != nil {
+			return RequirementDraft{}, err
+		}
 	}
 
 	constraints, toolErr := normalizeConstraints(fields.Constraints)
@@ -412,31 +488,48 @@ func buildDraft(fields draftFields) (RequirementDraft, *Error) {
 	}
 	return RequirementDraft{
 		Title:              title,
-		Description:        description,
-		AcceptanceCriteria: acceptance,
+		UserStory:          story,
+		Rules:              rules,
+		AcceptanceCriteria: criteria,
 		Priority:           priority,
 		Constraints:        constraints,
-		TargetVersionSUTs:  normalizedList(fields.TargetVersionSUTs),
-		TargetPages:        normalizedList(fields.TargetPages),
-		TargetAPIs:         normalizedList(fields.TargetAPIs),
+		SutDescription:     sutDescription,
+		ScopeOut:           scopeOut,
+		AccountRolesHint:   roles,
 	}, nil
 }
 
-// validateTargetIDList keeps the version context's numeric-ID contract at the
-// tool boundary: implementation targets are catalog IDs exposed by sut.list /
-// sut.page_list ("id"), never paths, URLs or names. Membership in the version
-// binding stays the version service's validation.
-func validateTargetIDList(field string, values []string, max int) *Error {
-	if err := validateStringList(field, values, max); err != nil {
-		return err
+// buildAcceptanceCriteria validates the Gherkin criteria a model submitted. The
+// ids are not part of the input and are not produced here: the version service
+// assigns them (version.AssignACIDs) so that they stay stable across revisions.
+func buildAcceptanceCriteria(raw []acceptanceCriterionFields) ([]RequirementAcceptanceCriterionInput, *Error) {
+	if len(raw) == 0 {
+		return nil, Invalid("acceptance_criteria", "must contain at least one item")
 	}
-	for _, value := range values {
-		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-		if err != nil || parsed <= 0 {
-			return Invalid(field, "must contain positive decimal IDs (use the id values returned by sut.list/sut.page_list)")
+	if len(raw) > maxRequirementACs {
+		return nil, Invalid("acceptance_criteria",
+			"must contain at most "+strconv.Itoa(maxRequirementACs)+" items")
+	}
+	criteria := make([]RequirementAcceptanceCriterionInput, 0, len(raw))
+	for index, item := range raw {
+		field := "acceptance_criteria[" + strconv.Itoa(index) + "]"
+		criterion := RequirementAcceptanceCriterionInput{
+			Given: strings.TrimSpace(item.Given),
+			When:  strings.TrimSpace(item.When),
+			Then:  strings.TrimSpace(item.Then),
 		}
+		for _, part := range []struct{ name, value string }{
+			{".given", criterion.Given},
+			{".when", criterion.When},
+			{".then", criterion.Then},
+		} {
+			if err := validateText(field+part.name, part.value, 1, maxRequirementACPart); err != nil {
+				return nil, err
+			}
+		}
+		criteria = append(criteria, criterion)
 	}
-	return nil
+	return criteria, nil
 }
 
 // normalizeConstraints accepts an absent/null value or a JSON object; arrays
@@ -466,14 +559,39 @@ func requirementSummaryResult(item RequirementSummary) map[string]any {
 
 func requirementDetailResult(detail RequirementDetail) map[string]any {
 	result := requirementSummaryResult(detail.RequirementSummary)
-	result["description"] = detail.Description
-	result["acceptance_criteria"] = detail.AcceptanceCriteria
-	targets := map[string]any{
-		"version_suts": normalizedList(detail.TargetVersionSUTs),
-		"pages":        normalizedList(detail.TargetPages),
-		"apis":         normalizedList(detail.TargetAPIs),
+	result["user_story"] = map[string]any{
+		"as_a":    detail.UserStory.AsA,
+		"i_want":  detail.UserStory.IWant,
+		"so_that": detail.UserStory.SoThat,
 	}
-	result["targets"] = targets
+	if rules := strings.TrimSpace(detail.Rules); rules != "" {
+		result["rules"] = rules
+	}
+	// Canonical id-sequence order (version.SortAcceptanceCriteria, design §3.6
+	// "按 id 排序"): the structured array and ac_ids are emitted in the SAME
+	// order the version/design contexts normalize to, not storage order (U1b, T22).
+	sorted := version.SortAcceptanceCriteria(domainAcceptanceCriteria(detail.AcceptanceCriteria))
+	criteria := make([]map[string]any, 0, len(sorted))
+	for _, criterion := range sorted {
+		criteria = append(criteria, map[string]any{
+			"id":    criterion.ID,
+			"given": criterion.Given,
+			"when":  criterion.When,
+			"then":  criterion.Then,
+		})
+	}
+	result["acceptance_criteria"] = criteria
+	// ac_ids is the flat set a design case's covered_acs must be drawn from
+	// (design v1.3.1 §5.2); it is repeated here so the design author can read it
+	// without walking the structured array. Derived from the domain authority.
+	result["ac_ids"] = version.ACIDs(sorted)
+	result["sut_description"] = detail.SutDescription
+	if scopeOut := strings.TrimSpace(detail.ScopeOut); scopeOut != "" {
+		result["scope_out"] = scopeOut
+	}
+	if roles := version.NormalizeAccountRolesHint(detail.AccountRolesHint); len(roles) > 0 {
+		result["account_roles_hint"] = roles
+	}
 	if len(detail.Constraints) > 0 && string(detail.Constraints) != "null" {
 		result["constraints"] = json.RawMessage(detail.Constraints)
 	}
@@ -490,15 +608,16 @@ func draftResult(versionID int64, summary RequirementSummary) map[string]any {
 	}
 }
 
-func normalizedList(values []string) []string {
-	if values == nil {
-		return nil
+// domainAcceptanceCriteria projects the port DTOs onto the version domain type
+// so the canonical ordering/ids derive from the domain authority (single source).
+func domainAcceptanceCriteria(criteria []RequirementAcceptanceCriterion) []version.AcceptanceCriterion {
+	out := make([]version.AcceptanceCriterion, 0, len(criteria))
+	for _, criterion := range criteria {
+		out = append(out, version.AcceptanceCriterion{
+			ID: criterion.ID, Given: criterion.Given, When: criterion.When, Then: criterion.Then,
+		})
 	}
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		result = append(result, strings.TrimSpace(value))
-	}
-	return result
+	return out
 }
 
 func contains(values []string, target string) bool {

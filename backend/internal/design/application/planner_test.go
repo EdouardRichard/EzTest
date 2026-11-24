@@ -16,7 +16,7 @@ import (
 // design.round_started event, never by a work item.
 func assertNoDesignRoundTasks(t *testing.T, enqueuer *fakeEnqueuer) {
 	t.Helper()
-	if tasks := enqueuer.byType(TaskTypeDesignRound); len(tasks) != 0 {
+	if tasks := enqueuer.byType("design.round"); len(tasks) != 0 {
 		t.Fatalf("planner enqueued %d design.round task(s) %v; the work type has no runner profile",
 			len(tasks), sortedTaskDedupeKeys(tasks))
 	}
@@ -355,7 +355,7 @@ func TestPendingCountExcludesActiveScope(t *testing.T) {
 	}
 }
 
-func TestScanCreatesCriticAndDataPlanOnlyForDrafts(t *testing.T) {
+func TestScanCreatesCriticOnlyForDrafts(t *testing.T) {
 	planner, repo, enqueuer, _, _, _, _ := newPlannerFixture()
 	repo.hasConversation = true
 	repo.latestConversation = 9001
@@ -376,9 +376,12 @@ func TestScanCreatesCriticAndDataPlanOnlyForDrafts(t *testing.T) {
 	if len(criticTasks) != 2 {
 		t.Fatalf("critic tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
 	}
-	dataPlanTasks := enqueuer.byType("design.data_plan")
-	if len(dataPlanTasks) != 1 || dataPlanTasks[0].DedupeKey != "dataplan:3001:3002" {
-		t.Fatalf("data plan tasks = %v", sortedTaskDedupeKeys(enqueuer.tasks))
+	// V-0004: the design.data_plan background work item was removed with its
+	// v0.22 runner profile (it could only fail closed). Data planning is now the
+	// live design.data_plan_submit Host tool, never a planner enqueue.
+	if dataPlanTasks := enqueuer.byType("design.data_plan"); len(dataPlanTasks) != 0 {
+		t.Fatalf("planner enqueued %d design.data_plan task(s) %v; the work type has no runner profile",
+			len(dataPlanTasks), sortedTaskDedupeKeys(enqueuer.tasks))
 	}
 	requirementTasks := enqueuer.byType("design.requirement")
 	if len(requirementTasks) != 1 || requirementTasks[0].DedupeKey != "design:3007:3008" {
@@ -471,6 +474,10 @@ func TestDesignConvergesAfterCoverage(t *testing.T) {
 	})
 	converger := &fakeDesignConverger{}
 	planner.SetDesignConverger(converger)
+	// T9: convergence now also requires the shared review gate; this test pins the
+	// legacy coverage trigger, so inject a pass gate (the predicate itself is
+	// pinned in review_gate_test.go).
+	planner.SetReviewGate(fakeReviewGate{})
 	ctx := context.Background()
 
 	if err := planner.Reconcile(ctx); err != nil {
@@ -570,6 +577,10 @@ func TestDesigningToCaseReviewTransitionByDesignReconciler(t *testing.T) {
 	}
 	converger := &fakeDesignConverger{}
 	planner.SetDesignConverger(converger)
+	// T9: convergence now also requires the shared review gate; this test pins the
+	// legacy coverage trigger, so inject a pass gate (the predicate itself is
+	// pinned in review_gate_test.go).
+	planner.SetReviewGate(fakeReviewGate{})
 	ctx := context.Background()
 
 	if err := planner.Reconcile(ctx); err != nil {

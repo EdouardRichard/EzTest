@@ -35,7 +35,6 @@ type ClosureServiceDeps struct {
 	Issues       ClosureIssueRefReader
 	WorkItems    ClosureWorkItemReader
 	Versions     VersionReopener
-	Tasks        ClosureTaskEnsurer
 	Audit        auditapp.Recorder
 	Events       eventingapp.Publisher
 	IDs          platformid.Generator
@@ -53,7 +52,6 @@ type ClosureService struct {
 	issues       ClosureIssueRefReader
 	work         ClosureWorkItemReader
 	versions     VersionReopener
-	tasks        ClosureTaskEnsurer
 	audit        auditapp.Recorder
 	events       eventingapp.Publisher
 	ids          platformid.Generator
@@ -76,7 +74,6 @@ func NewClosureService(deps ClosureServiceDeps) *ClosureService {
 		issues:       deps.Issues,
 		work:         deps.WorkItems,
 		versions:     deps.Versions,
-		tasks:        deps.Tasks,
 		audit:        deps.Audit,
 		events:       deps.Events,
 		ids:          deps.IDs,
@@ -135,7 +132,7 @@ func (s *ClosureService) Close(ctx context.Context, requirementID int64, runID *
 		ID:                   s.ids.Next(),
 		RequirementID:        requirement.ID,
 		RequirementVersionID: currentVersionID,
-		CheckResult:          version.ClosureCheckResult{ClosureChecks: checks},
+		CheckResult:          version.ClosureCheckResult{ClosureChecks: checks, Waived: requirement.Waived},
 		EvidenceRefs:         evidence,
 		ClosedByRunID:        closedBy,
 		ClosedAt:             now,
@@ -215,6 +212,10 @@ func (s *ClosureService) Reopen(ctx context.Context, requirementID int64, reason
 	requirement.Status = version.RequirementDraft
 	requirement.ClosedAt = nil
 	requirement.ClosedByRunID = nil
+	// R-G8 lifecycle: a reopened requirement loses its waiver so the reconciler
+	// can never re-close it through a stale waiver (the repository Reopen clears
+	// the persisted column in the same transaction).
+	requirement.Waived = false
 	requirement.UpdatedAt = now
 	closure, err := s.closures.Reopen(ctx, requirement, now)
 	if err != nil {
@@ -246,19 +247,21 @@ func (s *ClosureService) Reopen(ctx context.Context, requirementID int64, reason
 	return nil
 }
 
-// EnsureClosures is the reconciler hook: it scans the clarified requirements
-// of one version, recomputes the predicate and idempotently ensures the
-// requirement.close task for every requirement whose checks already pass. The
-// task targets the requirement's current version and next close round, so its
-// dedupe key is revision- and round-aware (req-close:{requirement_id}:
-// {requirement_version_id}:{close_round}). The closure task itself is excluded
-// from the open-work count.
+// EnsureClosures is the reconciler hook (GD-17 / R-G4, SC-G10): it scans the
+// clarified requirements of one version and DIRECTLY closes every requirement
+// whose nine deterministic checks pass, through the same terminal Close entry the
+// manual path uses. There is no Steward LLM run and no requirement.close work item
+// — closure is a deterministic boolean aggregate, so the reconciler calls Close
+// itself. Close re-evaluates the predicate under the requirement row lock and is
+// idempotent on an already-closed requirement; a predicate rejection (a concurrent
+// intent/run committed after the scan) is a benign no-op, not a failure. Port
+// failures propagate to the reconciler error aggregate.
 func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) error {
 	if versionID <= 0 {
 		return platform.Invalid("id", "must be a positive decimal ID")
 	}
-	if s.requirements == nil || s.closures == nil || s.tasks == nil {
-		return errors.New("closure service is missing its requirement repository, closure repository or task ensurer")
+	if s.requirements == nil || s.closures == nil {
+		return errors.New("closure service is missing its requirement repository or closure repository")
 	}
 	var beforeID *int64
 	var failures []error
@@ -268,21 +271,13 @@ func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) er
 			return mapRequirementRepositoryError(err)
 		}
 		for _, item := range items {
-			checks, _, _, err := s.evaluate(ctx, item.Requirement)
-			if err != nil {
-				failures = append(failures, fmt.Errorf("evaluate requirement %d: %w", item.Requirement.ID, err))
-				continue
-			}
-			if !checks.Passed() {
-				continue
-			}
-			closeRound, err := s.nextCloseRound(ctx, item.Requirement.ID)
-			if err != nil {
-				failures = append(failures, fmt.Errorf("load close round for %d: %w", item.Requirement.ID, err))
-				continue
-			}
-			if err := s.tasks.EnsureRequirementClose(ctx, item.Requirement.ID, item.Current.ID, closeRound); err != nil {
-				failures = append(failures, fmt.Errorf("ensure requirement.close for %d: %w", item.Requirement.ID, err))
+			if _, err := s.Close(ctx, item.Requirement.ID, nil); err != nil {
+				var predicateFailed *version.ErrClosePredicateFailed
+				if errors.As(err, &predicateFailed) {
+					// The predicate is not satisfied (yet); a later tick retries.
+					continue
+				}
+				failures = append(failures, fmt.Errorf("close requirement %d: %w", item.Requirement.ID, err))
 			}
 		}
 		if len(items) < ReconcilerLimitMax {
@@ -294,22 +289,9 @@ func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) er
 	return errors.Join(failures...)
 }
 
-// nextCloseRound returns the round the next closure of one requirement will be
-// assigned: the newest recorded round plus one, or 1 when it was never closed.
-func (s *ClosureService) nextCloseRound(ctx context.Context, requirementID int64) (int32, error) {
-	latest, found, err := s.closures.Latest(ctx, requirementID)
-	if err != nil {
-		return 0, err
-	}
-	if !found {
-		return 1, nil
-	}
-	return int32(latest.CloseRound + 1), nil
-}
-
 // evaluate loads the ports and recomputes the checks plus the persisted
-// evidence refs. The requirement.close task is subtracted from the open work
-// count here (self-task exclusion).
+// evidence refs. GD-17 removed the requirement.close work type, so there is no
+// self-task to subtract: the open-work count is the raw blocking total.
 func (s *ClosureService) evaluate(ctx context.Context, requirement version.Requirement) (version.ClosureChecks, version.ClosureInput, []version.ClosureEvidenceRef, error) {
 	if err := s.requireEvaluationDeps(); err != nil {
 		return version.ClosureChecks{}, version.ClosureInput{}, nil, err
@@ -347,10 +329,7 @@ func (s *ClosureService) evaluate(ctx context.Context, requirement version.Requi
 	for runID := range issueRefsByRun {
 		issueRefs[runID] = true
 	}
-	openWorkItems := workCounts.Total - workCounts.RequirementClose
-	if openWorkItems < 0 {
-		openWorkItems = 0
-	}
+	openWorkItems := workCounts.Total
 	input := version.ClosureInput{
 		Requirement:      requirement,
 		CaseVersions:     caseVersions,

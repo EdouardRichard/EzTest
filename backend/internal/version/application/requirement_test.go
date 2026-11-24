@@ -314,14 +314,14 @@ func (f *fakeStaleHook) MarkRequirementChanged(_ context.Context, versionID, req
 // ---------- requirement test environment ----------
 
 type requirementEnv struct {
-	svc          *versionapp.RequirementService
-	repo         *fakeRequirementRepo
-	versionEnv   *testEnv
-	versionID    int64
-	versionSUTID string
-	hook         *fakeStaleHook
-	audit        *fakeAudit
-	events       *fakePublisher
+	svc        *versionapp.RequirementService
+	repo       *fakeRequirementRepo
+	versionEnv *testEnv
+	versionID  int64
+	hook       *fakeStaleHook
+	audit      *fakeAudit
+	events     *fakePublisher
+	settings   *fakeConfirmationSettings
 }
 
 func newRequirementEnv(t *testing.T) *requirementEnv {
@@ -332,27 +332,59 @@ func newRequirementEnv(t *testing.T) *requirementEnv {
 	hook := &fakeStaleHook{}
 	audit := &fakeAudit{}
 	events := &fakePublisher{}
+	settings := newFakeConfirmationSettings()
 	svc := versionapp.NewRequirementService(
-		repo, base.svc, base.catalog, hook, audit, events, &seqIDs{}, fixedClock{at: testTime},
+		repo, base.svc, hook, audit, events, &seqIDs{}, fixedClock{at: testTime},
 	)
+	// The confirmation gate fails closed without a settings reader (T11), so
+	// the shared env wires the catalog-default fake just like production wires
+	// the settings center.
+	svc.SetConfirmationSettings(settings)
 	return &requirementEnv{
 		svc: svc, repo: repo, versionEnv: base, versionID: created.ID,
-		versionSUTID: idString(created.Bindings[0].ID),
-		hook:         hook, audit: audit, events: events,
+		hook: hook, audit: audit, events: events, settings: settings,
 	}
 }
 
 func validRequirementDraft(env *requirementEnv) versionapp.RequirementDraft {
 	return versionapp.RequirementDraft{
-		Title:              "Checkout supports coupons",
-		Description:        "Users can apply a coupon code at checkout.",
-		AcceptanceCriteria: "A valid coupon reduces the order total.",
-		Priority:           "P1",
-		Constraints:        json.RawMessage(`{"business_rules":["one coupon per order"]}`),
-		TargetVersionSUTs:  []string{env.versionSUTID},
-		TargetPages:        []string{"1301"},
-		TargetAPIs:         []string{"1401"},
+		Title: "Checkout supports coupons",
+		UserStory: versionapp.RequirementUserStoryView{
+			AsA:    "a signed-in shopper",
+			IWant:  "to apply a coupon code at checkout",
+			SoThat: "I pay less for my order",
+		},
+		Rules: "One coupon per order.",
+		AcceptanceCriteria: []versionapp.RequirementAcceptanceCriterionInput{
+			{Given: "a valid coupon", When: "it is applied at checkout", Then: "the order total drops"},
+			{Given: "an expired coupon", When: "it is applied", Then: "the checkout rejects it"},
+		},
+		Priority:       "P1",
+		Constraints:    json.RawMessage(`{"business_rules":["one coupon per order"]}`),
+		SutDescription: "The web storefront checkout and the pricing API behind it.",
 	}
+}
+
+// requirementACIDs is the AC set of one revision, for the id-stability
+// assertions.
+func requirementACIDs(revision versionapp.RequirementVersionView) []string {
+	got := make([]string, 0, len(revision.AcceptanceCriteria))
+	for _, criterion := range revision.AcceptanceCriteria {
+		got = append(got, criterion.ID)
+	}
+	return got
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // atomicIDs is a concurrency-safe generator for the draft-creation races.
@@ -380,7 +412,7 @@ func concurrentRequirementService(t *testing.T, env *requirementEnv) *versionapp
 		t.Fatalf("version Get: %v", err)
 	}
 	return versionapp.NewRequirementService(
-		env.repo, &staticVersionReader{view: view}, nil, nil, nil, nil,
+		env.repo, &staticVersionReader{view: view}, nil, nil, nil,
 		&atomicIDs{}, fixedClock{at: testTime},
 	)
 }
@@ -442,8 +474,18 @@ func TestRequirementCreatePersistsImmutableRevisionAndProjectsRunning(t *testing
 	if detail.ConfirmedAt != nil {
 		t.Fatalf("confirmed_at = %v", detail.ConfirmedAt)
 	}
-	if len(detail.TargetVersionSUTs) != 1 || detail.TargetVersionSUTs[0] != env.versionSUTID {
-		t.Fatalf("targets = %#v", detail.TargetVersionSUTs)
+	// The §5.1 contract round-trips: the story, the system description and the
+	// server-assigned AC ids come back exactly as they were normalized.
+	if detail.CurrentVersion.UserStory.AsA != "a signed-in shopper" ||
+		detail.CurrentVersion.UserStory.IWant != "to apply a coupon code at checkout" ||
+		detail.CurrentVersion.UserStory.SoThat != "I pay less for my order" {
+		t.Fatalf("user_story = %#v", detail.CurrentVersion.UserStory)
+	}
+	if detail.CurrentVersion.SutDescription != "The web storefront checkout and the pricing API behind it." {
+		t.Fatalf("sut_description = %q", detail.CurrentVersion.SutDescription)
+	}
+	if !equalStrings(requirementACIDs(detail.CurrentVersion), []string{"AC-1", "AC-2"}) {
+		t.Fatalf("ac ids = %v, want [AC-1 AC-2]", requirementACIDs(detail.CurrentVersion))
 	}
 
 	// The version is projected to running (best effort, idempotent).
@@ -507,7 +549,7 @@ func containsAll(values []string, wanted ...string) bool {
 	return true
 }
 
-func TestRequirementCreateValidatesContentAndTargets(t *testing.T) {
+func TestRequirementCreateValidatesContent(t *testing.T) {
 	cases := []struct {
 		name      string
 		mutate    func(*versionapp.RequirementDraft)
@@ -517,10 +559,25 @@ func TestRequirementCreateValidatesContentAndTargets(t *testing.T) {
 		{"blank title", func(d *versionapp.RequirementDraft) { d.Title = "  " }, "title", 400},
 		{"bad priority", func(d *versionapp.RequirementDraft) { d.Priority = "P9" }, "priority", 400},
 		{"bad constraints", func(d *versionapp.RequirementDraft) { d.Constraints = json.RawMessage(`[1]`) }, "constraints", 400},
-		{"unknown version sut", func(d *versionapp.RequirementDraft) { d.TargetVersionSUTs = []string{"9999"} }, "targets.version_suts", 400},
-		{"page outside version scope", func(d *versionapp.RequirementDraft) { d.TargetPages = []string{"1303"} }, "targets.pages", 400},
-		{"unknown api", func(d *versionapp.RequirementDraft) { d.TargetAPIs = []string{"9999"} }, "targets.apis", 400},
-		{"non decimal target", func(d *versionapp.RequirementDraft) { d.TargetPages = []string{"page-a"} }, "targets.pages", 400},
+		{"blank story part", func(d *versionapp.RequirementDraft) { d.UserStory.IWant = " " }, "user_story.i_want", 400},
+		{"no acceptance criteria", func(d *versionapp.RequirementDraft) {
+			d.AcceptanceCriteria = nil
+		}, "acceptance_criteria", 400},
+		{"blank acceptance part", func(d *versionapp.RequirementDraft) {
+			d.AcceptanceCriteria[0].Then = "  "
+		}, "acceptance_criteria[0].then", 400},
+		{"blank sut_description", func(d *versionapp.RequirementDraft) { d.SutDescription = "" }, "sut_description", 400},
+		{"long sut_description", func(d *versionapp.RequirementDraft) {
+			d.SutDescription = string(make([]rune, version.RequirementSutDescriptionMax+1))
+		}, "sut_description", 400},
+		{"long scope_out", func(d *versionapp.RequirementDraft) {
+			d.ScopeOut = string(make([]rune, version.RequirementScopeOutMax+1))
+		}, "scope_out", 400},
+		// A blank role hint is normalized away rather than rejected; an
+		// over-long one survives normalization and must be caught.
+		{"long account role", func(d *versionapp.RequirementDraft) {
+			d.AccountRolesHint = []string{string(make([]rune, version.RequirementAccountRoleMax+1))}
+		}, "account_roles_hint[0]", 400},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -550,6 +607,229 @@ func TestRequirementCreateValidatesContentAndTargets(t *testing.T) {
 	} else if apiError(t, err).Status != http.StatusNotFound {
 		t.Fatalf("status = %d", apiError(t, err).Status)
 	}
+}
+
+// TestRequirementUpdateKeepsACIDsStable proves the §3.6 id rules end to end
+// through the service, not just inside AssignACIDs: an unchanged criterion keeps
+// its id, a deleted one leaves a hole that is never reused, a new one appends,
+// and reordering the criteria leaves the ContentHash -- and so the stale-design
+// signal -- untouched.
+func TestRequirementUpdateKeepsACIDsStable(t *testing.T) {
+	env := newRequirementEnv(t)
+	created := createRequirement(t, env, "Checkout supports coupons")
+	if got := requirementACIDs(created.CurrentVersion); !equalStrings(got, []string{"AC-1", "AC-2"}) {
+		t.Fatalf("revision 1 ids = %v, want [AC-1 AC-2]", got)
+	}
+	firstHash := created.CurrentVersion.ContentHash
+
+	// Revision 2: keep the first criterion, drop the second, add a new one.
+	draft := validRequirementDraft(env)
+	draft.AcceptanceCriteria = []versionapp.RequirementAcceptanceCriterionInput{
+		{Given: "a valid coupon", When: "it is applied at checkout", Then: "the order total drops"},
+		{Given: "a stacked coupon", When: "it is applied", Then: "the checkout rejects the second one"},
+	}
+	second, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "drop expired, add stacking", 42)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := requirementACIDs(second.CurrentVersion); !equalStrings(got, []string{"AC-1", "AC-3"}) {
+		t.Fatalf("revision 2 ids = %v, want [AC-1 AC-3] with AC-2 retired into a hole", got)
+	}
+
+	// Revision 3: restore the deleted criterion's exact content. It must get a
+	// NEW id -- AC-2 is a permanent hole, never reused.
+	draft.AcceptanceCriteria = []versionapp.RequirementAcceptanceCriterionInput{
+		{Given: "a valid coupon", When: "it is applied at checkout", Then: "the order total drops"},
+		{Given: "an expired coupon", When: "it is applied", Then: "the checkout rejects it"},
+		{Given: "a stacked coupon", When: "it is applied", Then: "the checkout rejects the second one"},
+	}
+	third, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "restore the expired case", 42)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := requirementACIDs(third.CurrentVersion); !equalStrings(got, []string{"AC-1", "AC-4", "AC-3"}) {
+		t.Fatalf("revision 3 ids = %v, want [AC-1 AC-4 AC-3] -- the restored criterion must not reclaim AC-2", got)
+	}
+	for _, criterion := range third.CurrentVersion.AcceptanceCriteria {
+		if criterion.ID == "AC-2" {
+			t.Fatal("the deleted id AC-2 was reused")
+		}
+	}
+
+	// Revision 4: same criteria, submitted in a different order. The ids follow
+	// the content, so the ContentHash is identical to revision 3's and nothing
+	// downstream is marked stale.
+	draft.AcceptanceCriteria = []versionapp.RequirementAcceptanceCriterionInput{
+		{Given: "a stacked coupon", When: "it is applied", Then: "the checkout rejects the second one"},
+		{Given: "an expired coupon", When: "it is applied", Then: "the checkout rejects it"},
+		{Given: "a valid coupon", When: "it is applied at checkout", Then: "the order total drops"},
+	}
+	fourth, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "reorder only", 42)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got := requirementACIDs(fourth.CurrentVersion); !equalStrings(got, []string{"AC-3", "AC-4", "AC-1"}) {
+		t.Fatalf("revision 4 ids = %v, want each criterion to keep its own id in the submitted order", got)
+	}
+	if fourth.CurrentVersion.ContentHash != third.CurrentVersion.ContentHash {
+		t.Fatalf("reordering changed the hash: %q -> %q",
+			third.CurrentVersion.ContentHash, fourth.CurrentVersion.ContentHash)
+	}
+	if fourth.CurrentVersion.ContentHash == firstHash {
+		t.Fatalf("the hash did not change across a real content edit: %q", firstHash)
+	}
+}
+
+// TestRequirementUpdateDedupesIdenticalCriteriaWithoutChurn is the
+// review-round-1 regression at the service boundary. A draft that repeats the
+// same criterion twice must collapse to one criterion on the write path, and
+// re-submitting that unchanged draft over several revisions must keep both the
+// ids and the ContentHash identical every time.
+//
+// Before the fix the duplicate survived into storage with two ids, and each
+// further revision retired one id and minted another: a no-op Update moved the
+// ContentHash, and any design case whose covered_acs pointed at the second id
+// was left dangling. T9 consumes that id set, so the stability is contractual.
+func TestRequirementUpdateDedupesIdenticalCriteriaWithoutChurn(t *testing.T) {
+	env := newRequirementEnv(t)
+	duplicate := []versionapp.RequirementAcceptanceCriterionInput{
+		{Given: "a valid coupon", When: "it is applied at checkout", Then: "the order total drops"},
+		{Given: " a valid coupon ", When: "it is applied at checkout", Then: "the order total  drops"},
+		{Given: "an expired coupon", When: "it is applied", Then: "the checkout rejects it"},
+	}
+	draft := validRequirementDraft(env)
+	draft.AcceptanceCriteria = duplicate
+	created, err := env.svc.Create(requestContext(), env.versionID, draft, 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The two whitespace-variant copies of the first criterion collapse into one,
+	// so the revision holds two criteria, not three.
+	if got := len(created.CurrentVersion.AcceptanceCriteria); got != 2 {
+		t.Fatalf("criteria = %d, want the duplicate collapsed to 2: %#v", got, created.CurrentVersion.AcceptanceCriteria)
+	}
+	if got := requirementACIDs(created.CurrentVersion); !equalStrings(got, []string{"AC-1", "AC-2"}) {
+		t.Fatalf("revision 1 ids = %v, want [AC-1 AC-2]", got)
+	}
+	stableIDs := requirementACIDs(created.CurrentVersion)
+	stableHash := created.CurrentVersion.ContentHash
+
+	// Re-submit the identical draft three more times. Revision numbers advance
+	// (Update always writes a revision) but the content identity must not move.
+	for revision := 2; revision <= 4; revision++ {
+		updated, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "no-op re-submit", 42)
+		if err != nil {
+			t.Fatalf("Update revision %d: %v", revision, err)
+		}
+		if updated.Revision != revision {
+			t.Fatalf("revision = %d, want %d", updated.Revision, revision)
+		}
+		if got := requirementACIDs(updated.CurrentVersion); !equalStrings(got, stableIDs) {
+			t.Fatalf("revision %d ids = %v, want the unchanged %v (id churn)", revision, got, stableIDs)
+		}
+		if updated.CurrentVersion.ContentHash != stableHash {
+			t.Fatalf("revision %d moved the ContentHash for unchanged content: %q -> %q",
+				revision, stableHash, updated.CurrentVersion.ContentHash)
+		}
+	}
+}
+
+// TestConfirmRejectsExtractionStyleThenOnlyCriteria pins the user-visible
+// behaviour disclosed in the release note (§6) and in report C7: a requirement
+// whose acceptance criteria were produced by the extraction pipeline -- flat
+// statements mapped onto `then`, with `given`/`when` empty -- can be stored and
+// read, but CANNOT be confirmed until clarification fills the Gherkin parts in.
+//
+// Extraction writes through its own INSERT and so bypasses normalizeDraft; the
+// gate that stops it is ValidateConfirmed -> ValidateDraft ->
+// ValidateAcceptanceCriteria. This test seeds that state directly and asserts
+// the 400, so that nobody later "fixes" the blocked extract-then-confirm flow by
+// weakening the g/w/t requirement: §5.1 makes all three mandatory and I-B1 puts
+// the strong gate exactly here.
+func TestConfirmRejectsExtractionStyleThenOnlyCriteria(t *testing.T) {
+	env := newRequirementEnv(t)
+	requirementID := int64(9101)
+	revisionID := int64(9102)
+	env.repo.seedRequirement(version.Requirement{
+		ID: requirementID, VersionID: env.versionID, CurrentVersionID: &revisionID,
+		Status: version.RequirementDraft, CreatedAt: testTime, UpdatedAt: testTime,
+	}, version.RequirementVersion{
+		ID: revisionID, RequirementID: requirementID, Revision: 1,
+		Title:       "手机号登录",
+		UserStory:   version.UserStory{AsA: "用户", IWant: "用手机号登录", SoThat: "不必记密码"},
+		Rules:       "抽取正文",
+		Priority:    "P2",
+		Constraints: json.RawMessage(`{}`),
+		// Then-only: exactly what the extraction pipeline persists.
+		AcceptanceCriteria: []version.AcceptanceCriterion{
+			{ID: "AC-1", Given: "", When: "", Then: "验证码 60 秒内有效"},
+		},
+		SutDescription: "",
+		ContentHash:    strings.Repeat("e", 64),
+		CreatedAt:      testTime,
+	})
+
+	_, err := env.svc.Confirm(requestContext(), env.versionID, requirementID, 42)
+	if err == nil {
+		t.Fatal("an extraction-style Then-only requirement was confirmable; clarification must fill given/when first")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", apiErr.Status)
+	}
+	// given is reported before when and before the empty sut_description, so the
+	// model/user is pointed at the first thing clarification has to supply.
+	if field, _ := apiErr.Details["field"].(string); field != "acceptance_criteria[0].given" {
+		t.Fatalf("field = %q, want acceptance_criteria[0].given", field)
+	}
+	if status := statusOfRequirement(t, env, requirementID); status != version.RequirementDraft {
+		t.Fatalf("status = %q, want the requirement left in draft", status)
+	}
+
+	// Once clarification completes the criterion, the same requirement confirms.
+	completed := versionapp.RequirementDraft{
+		Title:     "手机号登录",
+		UserStory: versionapp.RequirementUserStoryView{AsA: "用户", IWant: "用手机号登录", SoThat: "不必记密码"},
+		Rules:     "抽取正文",
+		AcceptanceCriteria: []versionapp.RequirementAcceptanceCriterionInput{
+			{Given: "已注册手机号", When: "提交验证码", Then: "验证码 60 秒内有效"},
+		},
+		Priority: "P2",
+		// The clarification must also satisfy the confirmation floor
+		// (validation.min_description_chars, default 20): this test pins the
+		// g/w/t gate, so the description is long enough not to trip the floor.
+		SutDescription: "登录页与验证码校验接口，含手机号输入与验证码提交表单。",
+	}
+	if _, err := env.svc.Update(requestContext(), env.versionID, requirementID, completed, "clarified", 42); err != nil {
+		t.Fatalf("Update after clarification: %v", err)
+	}
+	confirmed, err := env.svc.Confirm(requestContext(), env.versionID, requirementID, 42)
+	if err != nil {
+		t.Fatalf("Confirm after clarification: %v", err)
+	}
+	if !confirmed.Confirmed {
+		t.Fatalf("confirm result = %#v, want confirmed", confirmed)
+	}
+	// Note the id: filling in given/when CHANGES the normalized content, so by
+	// the §3.6 rule this is an edit -- AC-1 retires into a hole and the completed
+	// criterion is appended as AC-2. That is safe rather than a problem, because
+	// design only proposes against a CLARIFIED requirement (GraphService.Propose
+	// rejects any other status), so no covered_acs link can exist yet to dangle.
+	// It does mean an extraction-produced AC id never survives clarification, so
+	// nothing downstream may treat those ids as durable.
+	if got := requirementACIDs(confirmed.Requirement.CurrentVersion); !equalStrings(got, []string{"AC-2"}) {
+		t.Fatalf("ids after clarification = %v, want [AC-2]: completing given/when is an edit, so AC-1 retired", got)
+	}
+}
+
+func statusOfRequirement(t *testing.T, env *requirementEnv, requirementID int64) version.RequirementStatus {
+	t.Helper()
+	stored, ok := env.repo.requirements[requirementID]
+	if !ok {
+		t.Fatalf("requirement %d is not in the repository", requirementID)
+	}
+	return stored.Status
 }
 
 func TestRequirementUpdateCreatesRevisionAndReopensClarified(t *testing.T) {
@@ -758,10 +1038,9 @@ func TestRequirementBatchConfirmRejectsInvalidDraftAtomically(t *testing.T) {
 	env.repo.seedRequirement(version.Requirement{
 		ID: badID, VersionID: env.versionID, CurrentVersionID: &badVersionID,
 		Status: version.RequirementDraft, CreatedAt: testTime, UpdatedAt: testTime,
-		TargetVersionSUTIDs: []string{},
 	}, version.RequirementVersion{
 		ID: badVersionID, RequirementID: badID, Revision: 1,
-		Title: "", Description: "", AcceptanceCriteria: "", Priority: "P2",
+		Title: "", Priority: "P2",
 		Constraints: json.RawMessage(`{}`), ContentHash: strings.Repeat("0", 64),
 		CreatedAt: testTime,
 	})
@@ -1112,12 +1391,24 @@ func TestRequirementGetDetailIncludesHistoryRelationsAndAttachments(t *testing.T
 }
 
 // requirementDraftWithContent builds one distinct draft; Dedupe groups by
-// normalized title or by identical description+acceptance text.
-func requirementDraftWithContent(env *requirementEnv, title, description, acceptance string) versionapp.RequirementDraft {
+// normalized title or by identical content. Under the §5.1 contract the free
+// text is `rules` and the acceptance text is the single criterion's `then`.
+// The user story and the system description are held CONSTANT across calls so
+// that the content key differs only by the two arguments this helper varies --
+// two drafts that differ only by title must still collide on content.
+func requirementDraftWithContent(env *requirementEnv, title, rules, acceptance string) versionapp.RequirementDraft {
 	draft := validRequirementDraft(env)
 	draft.Title = title
-	draft.Description = description
-	draft.AcceptanceCriteria = acceptance
+	draft.Rules = rules
+	draft.UserStory = versionapp.RequirementUserStoryView{
+		AsA:    "a shopper",
+		IWant:  "the documented behaviour",
+		SoThat: "the contract is unambiguous",
+	}
+	draft.AcceptanceCriteria = []versionapp.RequirementAcceptanceCriterionInput{
+		{Given: "the system is running", When: "the behaviour is exercised", Then: acceptance},
+	}
+	draft.SutDescription = "The system under test."
 	return draft
 }
 
@@ -1234,11 +1525,20 @@ func TestRequirementDedup(t *testing.T) {
 			t.Fatalf("merge result = %#v", merged)
 		}
 		if merged.Requirement.Revision != 2 {
-			t.Fatalf("target revision = %d, want 2 with the merged acceptance text", merged.Requirement.Revision)
+			t.Fatalf("target revision = %d, want 2 with the merged criteria", merged.Requirement.Revision)
 		}
-		if !strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "publicly visible") ||
-			!strings.Contains(merged.Requirement.CurrentVersion.AcceptanceCriteria, "public list shows it") {
-			t.Fatalf("merged acceptance = %q", merged.Requirement.CurrentVersion.AcceptanceCriteria)
+		// The merge folds the source's criterion into the target's set instead of
+		// concatenating text, and the target's own ids are inherited so the
+		// surviving criterion keeps the id design cases may already link to.
+		mergedCriteria := merged.Requirement.CurrentVersion.AcceptanceCriteria
+		if len(mergedCriteria) != 2 {
+			t.Fatalf("merged criteria = %#v, want the target's plus the source's", mergedCriteria)
+		}
+		if mergedCriteria[0].Then != "The article is publicly visible." || mergedCriteria[0].ID != "AC-1" {
+			t.Fatalf("merged[0] = %#v, want the target's criterion keeping AC-1", mergedCriteria[0])
+		}
+		if mergedCriteria[1].Then != "The public list shows it." || mergedCriteria[1].ID != "AC-2" {
+			t.Fatalf("merged[1] = %#v, want the source's criterion appended as AC-2", mergedCriteria[1])
 		}
 		if stored := env.repo.requirements[source.ID]; stored.Status != version.RequirementObsolete {
 			t.Fatalf("source status = %q, want obsolete", stored.Status)
@@ -1278,7 +1578,7 @@ func TestRequirementDedupeScansOneCappedPage(t *testing.T) {
 	env := newRequirementEnv(t)
 	repo := &countingRequirementRepo{fakeRequirementRepo: env.repo}
 	service := versionapp.NewRequirementService(
-		repo, env.versionEnv.svc, env.versionEnv.catalog, env.hook,
+		repo, env.versionEnv.svc, env.hook,
 		env.audit, env.events, &seqIDs{}, fixedClock{at: testTime},
 	)
 
@@ -1383,12 +1683,26 @@ func TestConcurrentDraftCreationIsIdempotent(t *testing.T) {
 	}
 }
 
+// sparseRequirementDraft is the "says less" side of the duplicate-create
+// enrichment rule: the mandatory §5.1 fields and nothing else -- one criterion,
+// no rules, no scope_out, no role hints. validRequirementDraft carries two
+// criteria plus rules, so it strictly outranks this one.
+func sparseRequirementDraft(env *requirementEnv, title string) versionapp.RequirementDraft {
+	draft := validRequirementDraft(env)
+	draft.Title = title
+	draft.Rules = ""
+	draft.ScopeOut = ""
+	draft.AccountRolesHint = nil
+	draft.AcceptanceCriteria = draft.AcceptanceCriteria[:1]
+	return draft
+}
+
 // TestCuratorDoesNotDuplicateHostDrafts pins the source-key idempotency:
 // whichever actor created the FR draft first, a second create for the same FR
-// must resolve to that draft; an empty-target create must not replace populated
-// targets, while a populated create may enrich an empty draft.
+// must resolve to that draft; a create that says no more than the draft already
+// there must not replace it, while a richer create may enrich it.
 func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
-	t.Run("empty curator create keeps the populated host draft", func(t *testing.T) {
+	t.Run("sparse curator create keeps the richer host draft", func(t *testing.T) {
 		env := newRequirementEnv(t)
 		title := "FR-011 账号密码登录"
 
@@ -1399,12 +1713,7 @@ func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
 			t.Fatalf("host Create: %v", err)
 		}
 
-		curatorDraft := validRequirementDraft(env)
-		curatorDraft.Title = title
-		curatorDraft.TargetVersionSUTs = nil
-		curatorDraft.TargetPages = nil
-		curatorDraft.TargetAPIs = nil
-		curator, err := env.svc.Create(requestContext(), env.versionID, curatorDraft, 0)
+		curator, err := env.svc.Create(requestContext(), env.versionID, sparseRequirementDraft(env, title), 0)
 		if err != nil {
 			t.Fatalf("curator Create: %v", err)
 		}
@@ -1419,23 +1728,18 @@ func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
 			t.Fatalf("requirements = %d, want exactly 1 for %q", len(items), title)
 		}
 		if curator.Revision != 1 {
-			t.Fatalf("empty duplicate create revision = %d, want the untouched revision 1", curator.Revision)
+			t.Fatalf("sparse duplicate create revision = %d, want the untouched revision 1", curator.Revision)
 		}
-		if got := targetCount(curator.CurrentVersion.TargetVersionSUTs, curator.CurrentVersion.TargetPages, curator.CurrentVersion.TargetAPIs); got == 0 {
-			t.Fatalf("empty duplicate create erased the populated targets: %#v", curator.CurrentVersion)
+		if len(curator.CurrentVersion.AcceptanceCriteria) != 2 {
+			t.Fatalf("sparse duplicate create erased the host criteria: %#v", curator.CurrentVersion.AcceptanceCriteria)
 		}
 	})
 
-	t.Run("populated curator create enriches the empty host draft", func(t *testing.T) {
+	t.Run("richer curator create enriches the sparse host draft", func(t *testing.T) {
 		env := newRequirementEnv(t)
 		title := "FR-014 页面访问控制与权限跳转"
 
-		hostDraft := validRequirementDraft(env)
-		hostDraft.Title = title
-		hostDraft.TargetVersionSUTs = nil
-		hostDraft.TargetPages = nil
-		hostDraft.TargetAPIs = nil
-		host, err := env.svc.Create(requestContext(), env.versionID, hostDraft, 0)
+		host, err := env.svc.Create(requestContext(), env.versionID, sparseRequirementDraft(env, title), 0)
 		if err != nil {
 			t.Fatalf("host Create: %v", err)
 		}
@@ -1452,8 +1756,13 @@ func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
 		if enriched.Revision != 2 {
 			t.Fatalf("enriched revision = %d, want 2", enriched.Revision)
 		}
-		if got := targetCount(enriched.CurrentVersion.TargetVersionSUTs, enriched.CurrentVersion.TargetPages, enriched.CurrentVersion.TargetAPIs); got == 0 {
-			t.Fatalf("populated duplicate create did not bind the targets: %#v", enriched.CurrentVersion)
+		if len(enriched.CurrentVersion.AcceptanceCriteria) != 2 {
+			t.Fatalf("richer duplicate create did not add the second criterion: %#v", enriched.CurrentVersion.AcceptanceCriteria)
+		}
+		// The criterion the sparse draft already had keeps its id, so the
+		// enrichment cannot invalidate a design case that linked to it.
+		if !equalStrings(requirementACIDs(enriched.CurrentVersion), []string{"AC-1", "AC-2"}) {
+			t.Fatalf("ac ids = %v, want [AC-1 AC-2] with AC-1 inherited", requirementACIDs(enriched.CurrentVersion))
 		}
 		items, err := env.repo.List(requestContext(), env.versionID, "", 100, nil)
 		if err != nil {
@@ -1466,9 +1775,10 @@ func TestCuratorDoesNotDuplicateHostDrafts(t *testing.T) {
 }
 
 // TestImportBatchCreatesExactlyThreeRequirements reproduces the retry-5 S2
-// shape: the primary curator (populated targets) and the extraction-batch
-// curator (empty targets) both create FR-011/FR-014/FR-025. The version must end
-// with exactly the expected 3 requirements, all carrying targets.
+// shape: the primary curator (the full §5.1 contract) and the extraction-batch
+// curator (a sparse draft) both create FR-011/FR-014/FR-025. The version must
+// end with exactly the expected 3 requirements, none of them flattened by the
+// sparse batch create.
 func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
 	env := newRequirementEnv(t)
 	svc := concurrentRequirementService(t, env)
@@ -1478,15 +1788,15 @@ func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
 		"FR-025 保存草稿与发布",
 	}
 	type createCall struct {
-		title       string
-		withTargets bool
+		title string
+		rich  bool
 	}
 	calls := make([]createCall, 0, len(titles)*2)
 	for _, title := range titles {
-		calls = append(calls, createCall{title: title, withTargets: true})
+		calls = append(calls, createCall{title: title, rich: true})
 	}
 	for _, title := range titles {
-		calls = append(calls, createCall{title: title, withTargets: false})
+		calls = append(calls, createCall{title: title, rich: false})
 	}
 
 	results := make([]versionapp.RequirementDetail, len(calls))
@@ -1500,10 +1810,11 @@ func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
 			<-start
 			draft := validRequirementDraft(env)
 			draft.Title = call.title
-			if !call.withTargets {
-				draft.TargetVersionSUTs = nil
-				draft.TargetPages = nil
-				draft.TargetAPIs = nil
+			if !call.rich {
+				draft.Rules = ""
+				draft.ScopeOut = ""
+				draft.AccountRolesHint = nil
+				draft.AcceptanceCriteria = draft.AcceptanceCriteria[:1]
 			}
 			results[index], errs[index] = svc.Create(requestContext(), env.versionID, draft, 0)
 		}(i, call)
@@ -1530,8 +1841,9 @@ func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
 			t.Fatalf("duplicate FR requirement persisted: %q", frID)
 		}
 		seen[frID] = struct{}{}
-		if got := targetCount(item.Current.TargetVersionSUTs, item.Current.TargetPages, item.Current.TargetAPIs); got == 0 {
-			t.Fatalf("%s has no targets; the empty batch create replaced the populated draft: %#v", frID, item.Current)
+		if len(item.Current.AcceptanceCriteria) != 2 {
+			t.Fatalf("%s has %d criteria; the sparse batch create replaced the richer draft: %#v",
+				frID, len(item.Current.AcceptanceCriteria), item.Current)
 		}
 	}
 	for _, title := range titles {
@@ -1545,10 +1857,6 @@ func TestImportBatchCreatesExactlyThreeRequirements(t *testing.T) {
 			t.Fatalf("batch Create %d returned no requirement id", i)
 		}
 	}
-}
-
-func targetCount(versionSUTs, pages, apis []string) int {
-	return len(versionSUTs) + len(pages) + len(apis)
 }
 
 // containsID reports whether ids holds target.

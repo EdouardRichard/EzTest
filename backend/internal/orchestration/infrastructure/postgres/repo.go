@@ -27,6 +27,20 @@ const (
 	constraintInstancePK  = "pk_api_instance"
 )
 
+// liveInstanceStatuses is the single live-instance status set shared by the
+// node-id census, the heartbeat guard and the stale-heartbeat scan. Every call
+// site binds it as a query parameter so the SQL can never drift from the domain
+// authority (constitution 五.1; R-H10/T11e-3).
+func liveInstanceStatuses() []string {
+	return []string{string(domain.StatusActive), string(domain.StatusDraining)}
+}
+
+// reclaimableInstanceStatuses is the single confirmed-gone status set of the
+// Insert reclaim path (offline/stopped), bound as a query parameter.
+func reclaimableInstanceStatuses() []string {
+	return []string{string(domain.StatusOffline), string(domain.StatusStopped)}
+}
+
 // Repository persists api_instance rows.
 type Repository struct {
 	pool *pgxpool.Pool
@@ -46,9 +60,9 @@ func (r *Repository) UsedNodeIDs(ctx context.Context) ([]int, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT node_id
 		FROM api_instance
-		WHERE status IN ('active', 'draining')
+		WHERE status = ANY($1)
 		ORDER BY node_id
-	`)
+	`, liveInstanceStatuses())
 	if err != nil {
 		return nil, fmt.Errorf("list used node ids: %w", err)
 	}
@@ -114,8 +128,8 @@ func (r *Repository) reclaim(ctx context.Context, instance domain.Instance) (boo
 	tag, err := r.pool.Exec(ctx, `
 		DELETE FROM api_instance
 		WHERE (node_id = $1 OR instance_key = $2)
-		  AND status IN ('offline', 'stopped')
-	`, instance.NodeID, instance.InstanceKey)
+		  AND status = ANY($3)
+	`, instance.NodeID, instance.InstanceKey, reclaimableInstanceStatuses())
 	if err != nil {
 		return false, fmt.Errorf("reclaim stale api_instance: %w", err)
 	}
@@ -193,9 +207,9 @@ func (r *Repository) Heartbeat(ctx context.Context, id int64, at time.Time, acti
 	err := r.pool.QueryRow(ctx, `
 		UPDATE api_instance
 		SET heartbeat_at = $2, updated_at = $2, active_requests = $3, active_work = $4
-		WHERE id = $1 AND status IN ('active', 'draining')
+		WHERE id = $1 AND status = ANY($5)
 		RETURNING status
-	`, id, at, activeRequests, activeWork).Scan(&status)
+	`, id, at, activeRequests, activeWork, liveInstanceStatuses()).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
@@ -219,11 +233,11 @@ func (r *Repository) SetStatus(
 	instance, err := scanInstance(r.pool.QueryRow(ctx, `
 		UPDATE api_instance
 		SET status = $3,
-		    draining_at = CASE WHEN $3 = 'draining' THEN $4 ELSE draining_at END,
+		    draining_at = CASE WHEN $3 = $5 THEN $4 ELSE draining_at END,
 		    updated_at = $4
 		WHERE id = $1 AND status = $2
 		RETURNING `+instanceColumns,
-		id, string(from), string(to), at))
+		id, string(from), string(to), at, string(domain.StatusDraining)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Instance{}, false, nil
 	}
@@ -240,9 +254,9 @@ func (r *Repository) MarkStopped(ctx context.Context, id int64, at time.Time) (b
 	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE api_instance
-		SET status = 'stopped', stopped_at = $2, heartbeat_at = $2, updated_at = $2
-		WHERE id = $1 AND status <> 'stopped'
-	`, id, at)
+		SET status = $3, stopped_at = $2, heartbeat_at = $2, updated_at = $2
+		WHERE id = $1 AND status <> $3
+	`, id, at, string(domain.StatusStopped))
 	if err != nil {
 		return false, fmt.Errorf("mark api_instance stopped: %w", err)
 	}
@@ -263,10 +277,10 @@ func (r *Repository) MarkOfflineStale(ctx context.Context, cutoff time.Time) ([]
 	}
 	rows, err := r.pool.Query(ctx, `
 		UPDATE api_instance
-		SET status = 'offline', updated_at = now()
-		WHERE status IN ('active', 'draining') AND heartbeat_at < $1
+		SET status = $2, updated_at = now()
+		WHERE status = ANY($3) AND heartbeat_at < $1
 		RETURNING `+instanceColumns,
-		cutoff)
+		cutoff, string(domain.StatusOffline), liveInstanceStatuses())
 	if err != nil {
 		return nil, fmt.Errorf("mark stale api_instances offline: %w", err)
 	}

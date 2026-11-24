@@ -30,7 +30,6 @@ const (
 	HumanBlockedRecovery       HumanKind = "blocked_recovery"
 	HumanLoginTakeover         HumanKind = "login_takeover"
 	HumanConflict              HumanKind = "conflict"
-	HumanOther                 HumanKind = "other"
 )
 
 // MaxHumanRequestsPerCase bounds takeover attempts of one case_run (§6.8).
@@ -64,6 +63,16 @@ func (s HumanRequestStatus) Valid() bool {
 // Terminal reports whether the request is closed.
 func (s HumanRequestStatus) Terminal() bool { return s.Valid() && s != HumanPending }
 
+// StoresResolver reports whether a request in this status records WHO resolved
+// it and WHEN (answered/cancelled). It is the single authority for the resolver
+// bookkeeping rule: the repository's Go branch and its SQL CASE both derive from
+// it, so a status that starts storing a resolver cannot be added to one side only
+// (constitution 五.1/五.4). An expired request is closed by the sweep, not by an
+// actor, so it stores no resolver; reopening to pending clears the fields.
+func (s HumanRequestStatus) StoresResolver() bool {
+	return s == HumanAnswered || s == HumanCancelled
+}
+
 // CanTransitionTo implements the human request state machine. Only a pending
 // request can be answered/cancelled/expired; a closed request can be reopened to
 // pending for a correction.
@@ -78,11 +87,13 @@ func (s HumanRequestStatus) CanTransitionTo(next HumanRequestStatus) bool {
 	}
 }
 
-// Valid reports whether kind is a persisted human request kind.
+// Valid reports whether kind is a persisted human request kind. Q06 (H-A11)
+// removed the never-created "other" member; the DB CHECK and the published
+// OpenAPI/frontend enums drop it in the same change set.
 func (k HumanKind) Valid() bool {
 	switch k {
 	case HumanClarificationQuestion, HumanApproval, HumanBlockedRecovery,
-		HumanLoginTakeover, HumanConflict, HumanOther:
+		HumanLoginTakeover, HumanConflict:
 		return true
 	default:
 		return false
@@ -318,7 +329,7 @@ func (r HumanRequest) BlocksStage() bool { return false }
 // ownership metadata.
 const (
 	HumanPayloadReason        = "reason"
-	HumanPayloadVersionSUTID  = "version_sut_id"
+	HumanPayloadSUTID         = "sut_id"
 	HumanPayloadAccountRole   = "account_role"
 	HumanPayloadPageURL       = "page_url"
 	HumanPayloadChallengeKind = "challenge_kind"

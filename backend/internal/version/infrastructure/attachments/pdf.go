@@ -7,7 +7,7 @@ import (
 	"encoding/ascii85"
 	"errors"
 	"fmt"
-	"image"
+	imagepkg "image"
 	"image/png"
 	"io"
 	"regexp"
@@ -402,12 +402,12 @@ func decodePDFImageObject(object pdfImageObject) (versionapp.ExtractionImage, er
 }
 
 func pdfPixelsToPNG(payload []byte, width, height, components int) ([]byte, error) {
-	var picture image.Image
+	var picture imagepkg.Image
 	switch components {
 	case 1:
-		picture = &image.Gray{Pix: append([]byte(nil), payload...), Stride: width, Rect: image.Rect(0, 0, width, height)}
+		picture = &imagepkg.Gray{Pix: append([]byte(nil), payload...), Stride: width, Rect: imagepkg.Rect(0, 0, width, height)}
 	case 3:
-		rgba := image.NewRGBA(image.Rect(0, 0, width, height))
+		rgba := imagepkg.NewRGBA(imagepkg.Rect(0, 0, width, height))
 		for index := 0; index < width*height; index++ {
 			rgba.Pix[index*4] = payload[index*3]
 			rgba.Pix[index*4+1] = payload[index*3+1]
@@ -416,7 +416,7 @@ func pdfPixelsToPNG(payload []byte, width, height, components int) ([]byte, erro
 		}
 		picture = rgba
 	case 4:
-		rgba := image.NewRGBA(image.Rect(0, 0, width, height))
+		rgba := imagepkg.NewRGBA(imagepkg.Rect(0, 0, width, height))
 		for index := 0; index < width*height; index++ {
 			cyan := uint32(payload[index*4])
 			magenta := uint32(payload[index*4+1])

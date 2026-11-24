@@ -11,10 +11,12 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
 
-// RegisterAgentCenterRoutes mounts the three P6 Agent center read-only
-// operations. The assembly root owns the middleware and mounting call (Task
-// 22), so this package stays independent from server. Every route requires a
-// logged-in user (spec §4.3.4/§8.5); prompts and transcripts are not exposed.
+// RegisterAgentCenterRoutes mounts the Agent center read operations. The
+// assembly root owns the middleware and mounting call (Task 22), so this package
+// stays independent from server. The catalog/runs/quality routes require a
+// logged-in user and expose no prompts or transcripts; the run transcript route
+// (v0.2.4-D T8) and the run activity fact route (T10) are ADMIN ONLY and are
+// gated inside the handler, exactly like the context packet read API.
 func RegisterAgentCenterRoutes(mux *http.ServeMux, auth func(http.Handler) http.Handler, h *AgentCenterHandler) {
 	if mux == nil || auth == nil || h == nil {
 		return
@@ -22,6 +24,8 @@ func RegisterAgentCenterRoutes(mux *http.ServeMux, auth func(http.Handler) http.
 	mux.Handle("GET /api/agent-center/catalog", auth(http.HandlerFunc(h.Catalog)))
 	mux.Handle("GET /api/agent-center/runs", auth(http.HandlerFunc(h.Runs)))
 	mux.Handle("GET /api/agent-center/quality", auth(http.HandlerFunc(h.Quality)))
+	mux.Handle("GET /api/agent-center/runs/{id}/transcript", auth(http.HandlerFunc(h.RunTranscript)))
+	mux.Handle("GET /api/agent-center/runs/{id}/activity", auth(http.HandlerFunc(h.RunActivity)))
 }
 
 // ContextPacketReader is the narrow read port behind

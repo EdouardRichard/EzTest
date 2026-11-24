@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	skillapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application/skill"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -26,6 +28,10 @@ type contextAssembly struct {
 	// Decision is the policy-aware compaction decision actually applied at a
 	// boundary (pressure/overflow/stage_boundary). Nil for a normal round.
 	Decision *agentcontext.CompactionDecision
+	// Duration is the measured wall clock of the boundary work (rebuild +
+	// fold). It is the activity fact's real duration; a normal round leaves it
+	// zero because no boundary ran.
+	Duration time.Duration
 }
 
 // assembleContext renders the cache-first prompt of one run round.
@@ -119,12 +125,28 @@ func (r *Runner) assembleContextWithDecision(
 	// never trigger the proactive boundary. The packet bookkeeping stays
 	// packet-only; this is the same conservative estimate used for the budget.
 	userTokens := EstimateTokens(state.userContent)
+	// H-E3: the stage_boundary trigger. Stage is a stable-prefix input, so when
+	// the version's stage differs from the stage its last persisted packet was
+	// assembled with, this round crosses an assembly boundary: the prefix is
+	// rebuilt and the transcript is folded once, independently of the pressure
+	// threshold (CompactionPolicy.StageBoundaryDecision is forced by contract).
+	// Only the run's FIRST assembly can declare it — a mid-run compaction already
+	// carries its own explicit decision (pressure/overflow) and its own previous
+	// packet, and must not have that decision relabelled.
+	if invalidation == agentcontext.InvalidationNone && decision == nil && previous == nil {
+		if prior := r.priorVersionStage(ctx, state); prior != "" && prior != stage {
+			invalidation = agentcontext.InvalidationStageBoundary
+		}
+	}
 	if invalidation == agentcontext.InvalidationNone && decision == nil &&
 		float64(result.BeforeTokens+userTokens) > threshold*float64(budget) {
 		// The window is nearly full: this round is a declared boundary.
 		invalidation = agentcontext.InvalidationWindowFull
 	}
 	if invalidation != agentcontext.InvalidationNone || decision != nil {
+		// The boundary work is timed here so the activity fact records the real
+		// compaction duration instead of a permanent zero (T10 review #1).
+		boundaryStarted := r.now()
 		// Rebuild at the boundary, carrying the persisted rolling summary so the
 		// conversation memory accumulates instead of being replaced by the
 		// summary of this round only.
@@ -161,6 +183,7 @@ func (r *Runner) assembleContextWithDecision(
 		result.Packet = compacted
 		result.AfterTokens = contextPacketTokens(compacted)
 		result.Decision = &resolved
+		result.Duration = r.elapsedSince(boundaryStarted)
 	}
 	result.Messages = contextPacketMessages(result.Packet)
 	return result, nil
@@ -187,6 +210,48 @@ func (r *Runner) boundaryCompactionDecision(state *runState, invalidation agentc
 		Policy:  policy,
 		Retain:  policy.Retain,
 	}
+}
+
+// versionContextPacketSource is the version-scoped latest-packet read the
+// stage-boundary trigger needs (H-E3). The PostgreSQL runtime repository
+// implements it structurally; the domain RuntimeRepository interface does not
+// declare it because the runtime's own packet reads are by id, so the runner
+// type-asserts this narrow seam exactly as it does the incremental conversation
+// surface. An assembly without it (unit fakes, half-wired process) simply has no
+// prior stage and declares no boundary.
+type versionContextPacketSource interface {
+	LatestVersionContextPacket(ctx context.Context, versionID int64) (agent.ContextPacket, error)
+}
+
+// priorVersionStage returns the stage the version's last persisted context packet
+// was assembled with, or "" when it is unknown. It is read once per run (only the
+// first assembly asks). "Unknown" covers a version with no packet yet and a legacy
+// packet row without the recorded stage: neither is a transition, so neither may
+// fabricate a boundary. A read/decode failure is supplemental — the round stays
+// append-only and the failure is logged, never swallowed (constitution 七.6).
+func (r *Runner) priorVersionStage(ctx context.Context, state *runState) string {
+	if r == nil || r.repo == nil || state == nil || state.item.VersionID <= 0 {
+		return ""
+	}
+	source, ok := r.repo.(versionContextPacketSource)
+	if !ok {
+		return ""
+	}
+	stored, err := source.LatestVersionContextPacket(ctx, state.item.VersionID)
+	if err != nil {
+		if !errors.Is(err, agent.ErrNotFound) {
+			r.logContextWarning(ctx, "previous context packet read failed; continuing without the stage boundary", err)
+		}
+		return ""
+	}
+	packet, err := DecodeContextPacket(stored)
+	if err != nil {
+		if !errors.Is(err, agentcontext.ErrContextPacketNotFound) {
+			r.logContextWarning(ctx, "previous context packet could not be decoded; continuing without the stage boundary", err)
+		}
+		return ""
+	}
+	return strings.TrimSpace(packet.Stage)
 }
 
 // withConversationSummary seeds the boundary rebuild with the persisted rolling
@@ -234,6 +299,15 @@ func (r *Runner) versionBriefing(ctx context.Context, state *runState) (string, 
 	if briefingStage := strings.TrimSpace(briefing.Stage); briefingStage != "" {
 		stage = briefingStage
 	}
+	if isDesignJudgeWorkType(WorkTypeForItem(state.item)) {
+		// v0.2.4-E quality gate (I-B4): neither the handoff group nor the agent's
+		// own completion narrative may reach the judge. The handoff is the
+		// clarification Host's / design author's collaboration artifact; the
+		// findings group renders every current version_fact, including the
+		// kind=progress fact whose summary IS the author's conclusion. Objective
+		// version facts stay (see Briefing.WithoutHandoff / WithoutAgentNarrative).
+		briefing = briefing.WithoutHandoff().WithoutAgentNarrative()
+	}
 	return briefing.Render(), stage
 }
 
@@ -267,6 +341,9 @@ func contextFactBlocks(in ContextInput) []string {
 	}
 	if knowledge := knowledgeContent(in.VersionPack.Knowledge); strings.TrimSpace(knowledge) != "" {
 		blocks = append(blocks, strings.Replace(knowledge, "# 知识", "知识:", 1))
+	}
+	if skills := skillapp.RenderMetadata(in.Skills); strings.TrimSpace(skills) != "" {
+		blocks = append(blocks, strings.Replace(skills, "# 技能", "技能:", 1))
 	}
 	if room := teamRoomContent(in.TeamRoom); strings.TrimSpace(room) != "" {
 		blocks = append(blocks, room)
@@ -559,19 +636,83 @@ func (r *Runner) recordContextCompaction(ctx context.Context, state *runState, a
 		SummaryVersion:   summaryVersion,
 		CoveredMessageID: covered,
 		CachedTokens:     state.providerCacheTokens,
+		Duration:         assembly.Duration,
 	}
-	r.publishCompactionEvent(state, event)
+	r.publishCompactionEvent(ctx, state, event)
 }
 
-// publishCompactionEvent publishes the version-channel context.compacted event
-// with the runner's run/conversation scope.
-func (r *Runner) publishCompactionEvent(state *runState, event agentcontext.CompactionEvent) {
+// publishCompactionEvent records the compaction boundary as an agent_activity
+// FACT and only then publishes the version-channel context.compacted event with
+// the runner's run/conversation scope (v0.2.4-D T10, SC-D5). It is the single
+// compaction emission funnel of the runner, so every trigger of the authority
+// (pressure / overflow / stage_boundary) is recorded without a per-trigger
+// branch. A failed fact write skips the derived event and is logged by the fact
+// funnel — the projection never claims a boundary the ledger does not hold
+// (constitution 五.7/七.6).
+func (r *Runner) publishCompactionEvent(ctx context.Context, state *runState, event agentcontext.CompactionEvent) {
+	if !r.recordCompactionFact(ctx, state, event) {
+		return
+	}
 	payload := event.Payload()
 	payload["run_id"] = idText(state.run.ID)
 	if state.payload.ConversationID > 0 {
 		payload["conversation_id"] = idText(state.payload.ConversationID)
 	}
 	r.publish(state, agentcontext.EventContextCompacted, payload)
+}
+
+// recordCompactionFact writes one compaction boundary fact. The payload is the
+// SAME renderer the context.compacted event uses (CompactionEvent.Payload), so
+// the fact and its projection can never carry different numbers (constitution
+// 五.1/五.3). The boundary's start is derived from its measured duration.
+func (r *Runner) recordCompactionFact(ctx context.Context, state *runState, event agentcontext.CompactionEvent) bool {
+	return r.recordActivityFact(ctx, state, r.compactionActivity(state, event, true))
+}
+
+// recordCompactionAttemptFact records a compaction attempt that produced NO
+// context.compacted event: a recoverable stop (busy/thrashing/failure) or a
+// no-op rebuild that folded nothing. The trigger still happened, so SC-D5's
+// "one row per trigger" must hold for it too — otherwise the audit ledger
+// silently omits exactly the attempts an operator needs to explain a run
+// (constitution 五.7, 七.6). No event is derived: the existing no-op/stopped
+// contract deliberately keeps the event stream and the summary ledger untouched.
+//
+// tokensMeasured=false is the stopped attempt: it never produced a compacted
+// packet, so before/after token counts were never measured and publishing zeros
+// would fabricate a boundary that did not happen.
+func (r *Runner) recordCompactionAttemptFact(ctx context.Context, state *runState, event agentcontext.CompactionEvent, tokensMeasured bool) {
+	r.recordActivityFact(ctx, state, r.compactionActivity(state, event, tokensMeasured))
+}
+
+// compactionActivity is the ONE renderer of a compaction fact row, shared by the
+// folded boundary and the two event-less attempts.
+func (r *Runner) compactionActivity(state *runState, event agentcontext.CompactionEvent, tokensMeasured bool) agent.Activity {
+	ended := r.now()
+	payload := event.Payload()
+	if !tokensMeasured {
+		delete(payload, "before_tokens")
+		delete(payload, "after_tokens")
+	}
+	return agent.Activity{
+		RunID:     state.run.ID,
+		Seq:       state.nextActivitySeq(),
+		Type:      agent.ActivityTypeCompaction,
+		Title:     "context compaction (" + string(event.Trigger) + ")",
+		StartedAt: ended.Add(-event.Duration),
+		EndedAt:   &ended,
+		Payload:   payload,
+		Error:     event.Err,
+	}
+}
+
+// elapsedSince returns the non-negative wall clock since start on the runner's
+// clock (a frozen test clock yields zero, never a negative duration).
+func (r *Runner) elapsedSince(start time.Time) time.Duration {
+	elapsed := r.now().Sub(start)
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
 }
 
 // compactContext runs one policy-aware compaction transaction (R-A5-10) for the
@@ -585,6 +726,9 @@ func (r *Runner) publishCompactionEvent(state *runState, event agentcontext.Comp
 // summary revision nor emit a before==after context.compacted event (fix round
 // 2).
 func (r *Runner) compactContext(ctx context.Context, state *runState, decision agentcontext.CompactionDecision, keepRecent int) error {
+	// The whole transaction is timed (start -> summary -> end) so every outcome
+	// below records its real duration in the activity ledger.
+	transactionStarted := r.now()
 	previous := state.contextPacket
 	var assembly contextAssembly
 	operation := func(operationCtx context.Context, transaction agentcontext.CompactionTransaction) (agentcontext.CompactionOutcome, error) {
@@ -641,6 +785,16 @@ func (r *Runner) compactContext(ctx context.Context, state *runState, decision a
 	if err != nil {
 		if agentcontext.IsRecoverableCompactionError(err) {
 			r.logContextWarning(ctx, "context compaction stopped; keeping the original context", err)
+			// The trigger fired and the attempt stopped: that is a fact of record
+			// even though the run keeps its original context and no event is
+			// emitted (T10 review #1). No before/after tokens were measured.
+			r.recordCompactionAttemptFact(ctx, state, agentcontext.CompactionEvent{
+				Trigger:      decision.Trigger,
+				RetainTokens: decision.Retain,
+				CachedTokens: state.providerCacheTokens,
+				Duration:     r.elapsedSince(transactionStarted),
+				Err:          err.Error(),
+			}, false)
 			return nil
 		}
 		return compactionRunError(err)
@@ -650,6 +804,18 @@ func (r *Runner) compactContext(ctx context.Context, state *runState, decision a
 		// persisted packet chain and the summary ledger stay exactly as they
 		// were. Applying the rebuilt packet here would drop the run's in-flight
 		// assistant/tool messages and publish a before==after event.
+		//
+		// The attempt itself is still recorded: a trigger that ran and folded
+		// nothing must not be a silent gap in the ledger. Its before/after were
+		// measured and are equal, which is exactly what happened.
+		r.recordCompactionAttemptFact(ctx, state, agentcontext.CompactionEvent{
+			Trigger:      decision.Trigger,
+			BeforeTokens: assembly.BeforeTokens,
+			AfterTokens:  assembly.AfterTokens,
+			RetainTokens: decision.Retain,
+			CachedTokens: state.providerCacheTokens,
+			Duration:     r.elapsedSince(transactionStarted),
+		}, true)
 		return nil
 	}
 	// The manager publishes its own event when a publisher is wired; the runner
@@ -664,8 +830,9 @@ func (r *Runner) compactContext(ctx context.Context, state *runState, decision a
 		SummaryVersion:   outcome.SummaryVersion,
 		CoveredMessageID: outcome.CoveredMessageID,
 		CachedTokens:     state.providerCacheTokens,
+		Duration:         r.elapsedSince(transactionStarted),
 	}
-	r.publishCompactionEvent(state, event)
+	r.publishCompactionEvent(ctx, state, event)
 	if err := r.applyCompactedAssembly(ctx, state, assembly); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}

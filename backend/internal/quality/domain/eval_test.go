@@ -8,8 +8,6 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
-func ptrInt(value int) *int { return &value }
-
 // validSample is comfortably above every real-LLM threshold in spec §5.3 and
 // inside every physical constraint of §4.3.3.
 func validSample() Sample {
@@ -25,8 +23,6 @@ func validSample() Sample {
 		TruePositiveIssues:     9,
 		SupplementCases:        4,
 		SupplementHits:         3,
-		VisualInjected:         ptrInt(5),
-		VisualCorrect:          ptrInt(5),
 	}
 }
 
@@ -58,14 +54,6 @@ func TestValidateSampleAcceptsValidSample(t *testing.T) {
 	if err := ValidateSample(validSample()); err != nil {
 		t.Fatalf("ValidateSample(valid) = %v", err)
 	}
-
-	// Visual counters are optional as a pair.
-	sample := validSample()
-	sample.VisualInjected = nil
-	sample.VisualCorrect = nil
-	if err := ValidateSample(sample); err != nil {
-		t.Fatalf("ValidateSample(no visual) = %v", err)
-	}
 }
 
 func TestValidateSampleRejectsNegativeCounts(t *testing.T) {
@@ -85,8 +73,6 @@ func TestValidateSampleRejectsNegativeCounts(t *testing.T) {
 		{"true positives", "true_positive_issues", func(s *Sample) { s.TruePositiveIssues = -1 }},
 		{"supplement cases", "supplement_cases", func(s *Sample) { s.SupplementCases = -1 }},
 		{"supplement hits", "supplement_hits", func(s *Sample) { s.SupplementHits = -1 }},
-		{"visual injected", "visual_injected", func(s *Sample) { s.VisualInjected = ptrInt(-1) }},
-		{"visual correct", "visual_correct", func(s *Sample) { s.VisualCorrect = ptrInt(-1) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,11 +121,6 @@ func TestValidateSampleRejectsPhysicalImpossibilities(t *testing.T) {
 			"supplement_hits",
 			func(s *Sample) { s.SupplementHits = s.SupplementCases + 1 },
 		},
-		{
-			"visual correct above injected",
-			"visual_correct",
-			func(s *Sample) { s.VisualCorrect = ptrInt(*s.VisualInjected + 1) },
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,37 +133,22 @@ func TestValidateSampleRejectsPhysicalImpossibilities(t *testing.T) {
 	}
 }
 
-func TestValidateSampleRequiresBothVisualCounters(t *testing.T) {
-	missingCorrect := validSample()
-	missingCorrect.VisualCorrect = nil
-	if field := fieldOfError(t, ValidateSample(missingCorrect)); field != "visual_correct" {
-		t.Fatalf("missing correct field = %q", field)
-	}
-
-	missingInjected := validSample()
-	missingInjected.VisualInjected = nil
-	if field := fieldOfError(t, ValidateSample(missingInjected)); field != "visual_injected" {
-		t.Fatalf("missing injected field = %q", field)
-	}
-}
-
 func TestEvaluateDerivesRealLLMMetrics(t *testing.T) {
 	baseline := map[string]float64{
-		MetricDesignCoverage:              0.9,
-		MetricImpactRecall:                0.8,
-		MetricImpactPrecision:             0.6,
-		MetricClassificationAccuracy:      1.0,
-		MetricIssueFalsePositiveRate:      0.1,
-		MetricSupplementHitRate:           0.5,
-		MetricVisualClassificationAccuracy: 1.0,
+		MetricDesignCoverage:         0.9,
+		MetricImpactRecall:           0.8,
+		MetricImpactPrecision:        0.6,
+		MetricClassificationAccuracy: 1.0,
+		MetricIssueFalsePositiveRate: 0.1,
+		MetricSupplementHitRate:      0.5,
 	}
 	status, metrics := Evaluate(validSample(), baseline, 0.05)
 
 	if status != StatusPassed {
 		t.Fatalf("status = %q, want %q", status, StatusPassed)
 	}
-	if len(metrics) != 7 {
-		t.Fatalf("metrics = %d, want 7", len(metrics))
+	if len(metrics) != 6 {
+		t.Fatalf("metrics = %d, want 6", len(metrics))
 	}
 
 	wantNames := []string{
@@ -192,7 +158,6 @@ func TestEvaluateDerivesRealLLMMetrics(t *testing.T) {
 		MetricClassificationAccuracy,
 		MetricIssueFalsePositiveRate,
 		MetricSupplementHitRate,
-		MetricVisualClassificationAccuracy,
 	}
 	for index, name := range wantNames {
 		if metrics[index].Name != name {
@@ -213,7 +178,6 @@ func TestEvaluateDerivesRealLLMMetrics(t *testing.T) {
 		{MetricClassificationAccuracy, 1.0, 0.80, 5, 5},
 		{MetricIssueFalsePositiveRate, 0.1, 0.15, 1, 10},
 		{MetricSupplementHitRate, 0.75, 0.50, 3, 4},
-		{MetricVisualClassificationAccuracy, 1.0, 0.80, 5, 5},
 	}
 	for _, tc := range cases {
 		metric := metricByName(t, metrics, tc.name)
@@ -362,7 +326,7 @@ func TestEvaluateZeroDenominatorIsNotAFakePass(t *testing.T) {
 		t.Fatalf("status = %q, want failed", status)
 	}
 	if len(metrics) != 6 {
-		t.Fatalf("metrics = %d, want 6 without visual counters", len(metrics))
+		t.Fatalf("metrics = %d, want 6", len(metrics))
 	}
 	for _, metric := range metrics {
 		if metric.Value != 0 {
@@ -377,32 +341,6 @@ func TestEvaluateZeroDenominatorIsNotAFakePass(t *testing.T) {
 		if metric.Detail.Numerator != 0 || metric.Detail.Denominator != 0 {
 			t.Fatalf("%s detail = %+v", metric.Name, metric.Detail)
 		}
-	}
-}
-
-func TestEvaluateOmitsVisualMetricWhenCountersAreAbsent(t *testing.T) {
-	sample := validSample()
-	sample.VisualInjected = nil
-	sample.VisualCorrect = nil
-	_, metrics := Evaluate(sample, nil, 0.05)
-	for _, metric := range metrics {
-		if metric.Name == MetricVisualClassificationAccuracy {
-			t.Fatalf("visual metric returned without counters")
-		}
-	}
-}
-
-func TestEvaluateVisualMetricUsesThreshold(t *testing.T) {
-	sample := validSample()
-	sample.VisualInjected = ptrInt(10)
-	sample.VisualCorrect = ptrInt(5)
-	status, metrics := Evaluate(sample, nil, 0.05)
-	if status != StatusFailed {
-		t.Fatalf("status = %q, want failed", status)
-	}
-	metric := metricByName(t, metrics, MetricVisualClassificationAccuracy)
-	if metric.Value != 0.5 || metric.Passed || metric.Detail.Reason != ReasonBelowThreshold {
-		t.Fatalf("visual metric = %+v", metric)
 	}
 }
 
@@ -434,13 +372,12 @@ func TestEvaluateBaselineOnlyAffectsKnownMetric(t *testing.T) {
 func TestEvaluateUsesRealLLMThresholds(t *testing.T) {
 	_, metrics := Evaluate(validSample(), nil, 0.05)
 	want := map[string]float64{
-		MetricDesignCoverage:               0.80,
-		MetricImpactRecall:                 0.70,
-		MetricImpactPrecision:              0.60,
-		MetricClassificationAccuracy:       0.80,
-		MetricIssueFalsePositiveRate:       0.15,
-		MetricSupplementHitRate:            0.50,
-		MetricVisualClassificationAccuracy: 0.80,
+		MetricDesignCoverage:         0.80,
+		MetricImpactRecall:           0.70,
+		MetricImpactPrecision:        0.60,
+		MetricClassificationAccuracy: 0.80,
+		MetricIssueFalsePositiveRate: 0.15,
+		MetricSupplementHitRate:      0.50,
 	}
 	for name, threshold := range want {
 		if got := metricByName(t, metrics, name).Threshold; got != threshold {

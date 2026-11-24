@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Builds the Docker-free EzTest release packages (Windows x64 + Linux x64).
@@ -11,8 +11,8 @@
          web-build guard (fails when port 6868 or a next dev/build process is
          running - coordinate with frontend-ui / stop the dev stack first).
       1. API cross-builds for windows/amd64 and linux/amd64 with -trimpath and
-         -X main.version=<Version> (0.2 keeps the version in package main;
-         the v0.1 internal/server.Version symbol no longer exists).
+         -X <module>/cmd/eztest.version=<Version> (the version lives in package
+         main; the v0.1 internal/server.Version/Commit symbols do not exist).
       2. Next.js standalone build once (unless -SkipWebBuild), copy
          .next/standalone + .next/static (and public/ if present), flatten the
          pnpm store into a symlink-free node_modules, prune sharp / @img and
@@ -43,8 +43,9 @@
     guard first; do not run it while the demo/dev web stack is live.
 
 .PARAMETER Version
-    Release version stamped into the API binary, VERSION and manifest.json
-    (default 0.2.0-preview.1).
+    Release version stamped into the API binary, VERSION and manifest.json.
+    Defaults to the repository-root VERSION file; pass this to override it for a
+    one-off build.
 
 .PARAMETER RepoRoot
     Repository root. Defaults to the parent directory of scripts/.
@@ -81,7 +82,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.2.1",
+    [string]$Version = "",
     [string]$RepoRoot = "",
     [string]$OutDir = ".tmp/release",
     [string]$ApiBaseUrl = "http://localhost:13333",
@@ -94,6 +95,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+# The repository-root VERSION file is the single authority for the release
+# version. -Version still overrides it for a one-off build.
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $versionRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) { Split-Path -Parent $PSScriptRoot } else { $RepoRoot }
+    $versionFile = Join-Path $versionRoot "VERSION"
+    if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+        throw "No -Version was passed and the repository VERSION file was not found at $versionFile."
+    }
+    $Version = (Get-Content -LiteralPath $versionFile -TotalCount 1).Trim()
+}
 
 # ---------------------------------------------------------------------------
 # Pinned component versions (packaging-plan.md §5/§6).
@@ -659,11 +671,14 @@ function Test-BuildPreconditions {
 function Build-ApiBinaries {
     Write-Step "Go API cross-builds (windows/amd64 + linux/amd64, version $Version)"
     $stage = Join-Path $script:WorkRoot "payload\api"
-    # EzTest 0.2 keeps the release version in package main
-    # (backend/cmd/eztest/main.go: `var version = "..."`). The v0.1
-    # internal/server.Version/.Commit symbols no longer exist, and -X on a
-    # missing symbol fails the link, so stamp main.version only.
-    $ldflags = "-s -w -X main.version=$Version"
+    # The release version lives in package main
+    # (backend/cmd/eztest/main.go: `var version = "dev"`); the release pipeline
+    # stamps it via -X. Go's -X needs the main package's full import path, so
+    # derive it from backend/go.mod to keep the module path single-sourced. The
+    # v0.1 internal/server.Version/.Commit symbols no longer exist, and -X on a
+    # missing symbol is silently ignored, so only the real symbol is stamped.
+    $versionSymbol = "$($script:GoModulePath)/cmd/eztest.version"
+    $ldflags = "-s -w -X $versionSymbol=$Version"
     Write-Info "ldflags: $ldflags"
 
     $targets = @(
@@ -1634,8 +1649,7 @@ function Test-PackageTree {
             "EZTEST_EXECUTOR_TOKEN=eztest-dev-executor-token",
             "EZTEST_RENDER_TOKEN=eztest-dev-render-token",
             "EZTEST_EXECUTOR_ADDR=127.0.0.1:13336",
-            "EZTEST_EXECUTOR_MAX_CONTEXTS=",
-            "EZTEST_EXEC_ALLOWED_HOSTS=",
+            "EZTEST_EXECUTOR_MAX_SESSIONS=",
             "EZTEST_VISUAL_BASELINE_MAX_BYTES=",
             "EZTEST_ADMIN_USERNAME=admin",
             "EZTEST_INITIAL_ADMIN_PASSWORD=",
@@ -1650,7 +1664,7 @@ function Test-PackageTree {
                 [void]$problems.Add(".env.example is missing the 0.2 key '$needle'")
             }
         }
-        $obsoleteExample = @("EZTEST_HTTP_ADDR", "EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "EZTEST_WEB_ORIGIN", "EZTEST_OPENAPI_PATH", "EZTEST_STORAGE_DIR", "EZTEST_VERSION_ATTACHMENT_DIR", "EZTEST_EVIDENCE_DIR", "EZTEST_REPORT_DIR", "EZTEST_EXPORT_DIR", "EZTEST_GC_ENABLED", "EZTEST_LOG_LEVEL")
+        $obsoleteExample = @("EZTEST_HTTP_ADDR", "EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "EZTEST_WEB_ORIGIN", "EZTEST_OPENAPI_PATH", "EZTEST_STORAGE_DIR", "EZTEST_VERSION_ATTACHMENT_DIR", "EZTEST_EVIDENCE_DIR", "EZTEST_REPORT_DIR", "EZTEST_EXPORT_DIR", "EZTEST_GC_ENABLED", "EZTEST_LOG_LEVEL", "EZTEST_EXECUTOR_MAX_CONTEXTS", "EZTEST_EXEC_ALLOWED_HOSTS", "EZTEST_EXECUTOR_ALLOW_DATA_PAGES")
         foreach ($obsolete in $obsoleteExample) {
             if ($exampleText.Contains($obsolete)) {
                 [void]$problems.Add(".env.example still contains the obsolete 0.1 key '$obsolete'")
@@ -2001,7 +2015,7 @@ function Invoke-WindowsSmoke {
         $initCode = Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $packageRoot "init-config.ps1") -Arguments @("-DatabaseUrl", $databaseUrl) -LogPath (Join-Path $script:WorkRoot "logs\smoke-windows-init.log")
         if ($initCode -ne 0) { Write-Fail "The packaged init-config.ps1 failed (exit $initCode)." }
         $envPath = Join-Path $packageRoot ".env"
-        Set-DotEnvValue -Path $envPath -Name "EZTEST_EXECUTOR_MAX_CONTEXTS" -Value "1"
+        Set-DotEnvValue -Path $envPath -Name "EZTEST_EXECUTOR_MAX_SESSIONS" -Value "1"
 
         Write-Info "Running the packaged start-eztest.ps1"
         $startCode = Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $packageRoot "start-eztest.ps1") -Arguments @() -LogPath (Join-Path $script:WorkRoot "logs\smoke-windows-start.log")
@@ -2140,7 +2154,7 @@ echo "PostgreSQL ready (zonky minimal build: using the built-in 'postgres' datab
 
 echo "== package init-config =="
 bash "$PACKAGE/init-config.sh" --database-url "postgres://eztest@127.0.0.1:$PG_PORT/postgres?sslmode=disable" || { echo "INIT_CONFIG_FAILED"; exit 1; }
-sed -i 's/^EZTEST_EXECUTOR_MAX_CONTEXTS=.*/EZTEST_EXECUTOR_MAX_CONTEXTS=1/' "$PACKAGE/.env"
+sed -i 's/^EZTEST_EXECUTOR_MAX_SESSIONS=.*/EZTEST_EXECUTOR_MAX_SESSIONS=1/' "$PACKAGE/.env"
 
 echo "== package start-eztest.sh =="
 if ! bash "$PACKAGE/start-eztest.sh"; then

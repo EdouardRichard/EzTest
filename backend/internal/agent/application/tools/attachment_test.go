@@ -115,7 +115,7 @@ func fakeImages(count int, caption func(index int) string) []AttachmentImageDeta
 
 func readTextPage(t *testing.T, port *fakePagedAttachment, params string) map[string]any {
 	t.Helper()
-	registry := NewP1Registry(Deps{Attachment: port})
+	registry := NewBaseRegistry(Deps{Attachment: port})
 	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentReadText, params)
 	if err != nil {
 		t.Fatalf("attachment.read_text %s: %v", params, err)
@@ -388,7 +388,7 @@ func TestAttachmentImageRefAcceptsImageID(t *testing.T) {
 			}},
 		},
 	}
-	registry := NewP1Registry(Deps{Attachment: port})
+	registry := NewBaseRegistry(Deps{Attachment: port})
 	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{"image_id":"901"}`)
 	if err != nil {
 		t.Fatalf("attachment.image_ref by image_id: %v", err)
@@ -469,7 +469,7 @@ func TestAttachmentImageRefAcceptsImageID(t *testing.T) {
 // ambiguous, so the tool rejects the call instead of silently choosing one.
 func TestAttachmentImageRefRejectsBothIDs(t *testing.T) {
 	port := &fakePagedAttachment{}
-	registry := NewP1Registry(Deps{Attachment: port})
+	registry := NewBaseRegistry(Deps{Attachment: port})
 	_, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef,
 		`{"attachment_id":"9002","image_id":"901"}`)
 	toolErr := asToolError(t, err)
@@ -503,7 +503,7 @@ func TestAttachmentImageRefRejectsBothIDs(t *testing.T) {
 // contract: an empty call names both accepted parameters and is retryable.
 func TestAttachmentImageRefRejectsNeitherID(t *testing.T) {
 	port := &fakePagedAttachment{}
-	registry := NewP1Registry(Deps{Attachment: port})
+	registry := NewBaseRegistry(Deps{Attachment: port})
 	_, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{}`)
 	toolErr := asToolError(t, err)
 	if toolErr.Code != CodeInvalidArgument {
@@ -541,7 +541,7 @@ func TestAttachmentImageRefLocalizesUnknownAttachment(t *testing.T) {
 		imageRefErr:     platform.NotFound("attachment"),
 		imageByImageErr: platform.NotFound("attachment image"),
 	}
-	registry := NewP1Registry(Deps{Attachment: port})
+	registry := NewBaseRegistry(Deps{Attachment: port})
 
 	_, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolAttachmentImageRef, `{"attachment_id":"9002"}`)
 	toolErr := asToolError(t, err)
@@ -608,7 +608,7 @@ func TestAttachmentImageRefLocalizesUnknownAttachment(t *testing.T) {
 // the model reads: the tool description must document image paging (with its
 // continuation call) and where attachment completeness is authoritative.
 func TestReadTextDescriptionDocumentsCompletenessAndImagePaging(t *testing.T) {
-	tool, ok := NewP1Registry(Deps{}).Get(ToolAttachmentReadText)
+	tool, ok := NewBaseRegistry(Deps{}).Get(ToolAttachmentReadText)
 	if !ok {
 		t.Fatal("attachment.read_text is not registered")
 	}

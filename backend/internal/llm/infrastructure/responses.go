@@ -1,7 +1,6 @@
 package llminfra
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -29,7 +28,8 @@ var _ llmapp.Adapter = (*responsesAdapter)(nil)
 
 // ProtocolError is a non-retryable upstream protocol/capability rejection: the
 // request shape, model capability or credentials are wrong, so a retry cannot
-// help. It carries the upstream HTTP status and the redacted provider message.
+// help. It carries the upstream HTTP status and the bounded provider message
+// (GD-01: the message is plaintext, never redacted).
 // It implements llmapp.ClassifiedError and classifies as llmapp.ErrProtocol so
 // the application can map it without importing infrastructure (R25).
 type ProtocolError struct {
@@ -37,8 +37,9 @@ type ProtocolError struct {
 	Message    string
 }
 
-// Error renders the typed protocol failure without ever including the
-// configured API key or header values.
+// Error renders the typed protocol failure with the bounded upstream provider
+// message verbatim (GD-01: plaintext, never redacted — the message may echo
+// request content; credentials are plaintext by design, Q05=B).
 func (e *ProtocolError) Error() string {
 	if e == nil {
 		return "llm provider protocol error"
@@ -60,7 +61,7 @@ func (e *ProtocolError) HTTPStatusCode() int {
 	return e.StatusCode
 }
 
-// UpstreamMessage returns the already redacted provider message.
+// UpstreamMessage returns the bounded provider message (GD-01: plaintext).
 func (e *ProtocolError) UpstreamMessage() string {
 	if e == nil {
 		return ""
@@ -106,7 +107,7 @@ func (e *TransientError) HTTPStatusCode() int {
 	return e.StatusCode
 }
 
-// UpstreamMessage returns the redacted transport/provider message.
+// UpstreamMessage returns the bounded transport/provider message (GD-01: plaintext).
 func (e *TransientError) UpstreamMessage() string { return e.Error() }
 
 // Is maps the typed error onto the application sentinel.
@@ -171,14 +172,14 @@ func (a *responsesAdapter) doChat(ctx context.Context, payload responsesRequestP
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes))
-		return llmapp.ChatResponse{}, responsesHTTPError(a.cfg, response.StatusCode, raw)
+		return llmapp.ChatResponse{}, responsesHTTPError(response.StatusCode, raw)
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
 		return llmapp.ChatResponse{}, &TransientError{Err: errors.New("read llm responses response failed")}
 	}
-	parsed, err := parseResponsesResponse(raw, a.cfg, names)
+	parsed, err := parseResponsesResponse(raw, names)
 	if err != nil {
 		return llmapp.ChatResponse{}, err
 	}
@@ -216,9 +217,9 @@ func (a *responsesAdapter) Stream(ctx context.Context, req llmapp.ChatRequest, o
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBytes))
-		return responsesHTTPError(a.cfg, response.StatusCode, raw)
+		return responsesHTTPError(response.StatusCode, raw)
 	}
-	return consumeResponsesStream(a.cfg, response.Body, names, onDelta)
+	return consumeResponsesStream(response.Body, names, onDelta, payload.MaxOutputTokens)
 }
 
 // requestTimeout resolves the per-config request bound, falling back to the
@@ -231,11 +232,12 @@ func (a *responsesAdapter) requestTimeout() time.Duration {
 	return timeout
 }
 
-// responsesHTTPError maps a non-2xx upstream reply to a safe typed error. 429
+// responsesHTTPError maps a non-2xx upstream reply to a typed error. 429
 // and 5xx are transient; other 4xx are non-retryable protocol/capability
 // errors; context overflows stay recognizable as ErrContextOverflow. The
-// upstream body is parsed for a message and redacted like the chat adapter.
-func responsesHTTPError(cfg llm.Config, status int, raw []byte) error {
+// upstream body is parsed for a message and bounded like the chat adapter
+// (GD-01: the message is plaintext, never redacted).
+func responsesHTTPError(status int, raw []byte) error {
 	var payload responsesErrorEnvelope
 	message := ""
 	code := ""
@@ -246,7 +248,7 @@ func responsesHTTPError(cfg llm.Config, status int, raw []byte) error {
 	if strings.TrimSpace(message) == "" {
 		message = string(raw)
 	}
-	message = sanitizeResponsesMessage(cfg, message)
+	message = boundUpstreamMessage(message, 300)
 	if isChatContextOverflow(status, code, message) {
 		return fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)
 	}
@@ -254,17 +256,6 @@ func responsesHTTPError(cfg llm.Config, status int, raw []byte) error {
 		return &TransientError{StatusCode: status, Err: fmt.Errorf("llm provider returned HTTP %d: %s", status, message)}
 	}
 	return &ProtocolError{StatusCode: status, Message: message}
-}
-
-// sanitizeResponsesMessage redacts configured secrets and bounds an upstream
-// message before it can reach an error or an event.
-func sanitizeResponsesMessage(cfg llm.Config, message string) string {
-	for _, value := range cfg.Headers {
-		if strings.TrimSpace(value) != "" {
-			message = strings.ReplaceAll(message, value, "[redacted]")
-		}
-	}
-	return sanitizeUpstreamMessage(message, cfg.APIKey, 300)
 }
 
 // buildResponsesPayload maps the application request onto the Responses wire
@@ -357,7 +348,7 @@ func buildResponsesPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) 
 // parseResponsesResponse decodes a successful non-streaming reply into the
 // normalized application response. An empty turn is transient (retried); a
 // malformed body is a non-retryable protocol failure.
-func parseResponsesResponse(raw []byte, cfg llm.Config, names *toolNameMapping) (llmapp.ChatResponse, error) {
+func parseResponsesResponse(raw []byte, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	var payload responsesResponsePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		// A malformed success body is a protocol failure, not a transient one.
@@ -367,7 +358,7 @@ func parseResponsesResponse(raw []byte, cfg llm.Config, names *toolNameMapping) 
 	if payload.Status == "failed" {
 		message := "llm provider response failed"
 		if payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "" {
-			message += ": " + sanitizeResponsesMessage(cfg, payload.Error.Message)
+			message += ": " + boundUpstreamMessage(payload.Error.Message, 300)
 		}
 		return llmapp.ChatResponse{}, &TransientError{Err: errors.New(message)}
 	}
@@ -398,7 +389,6 @@ func normalizeResponsesResponse(payload responsesResponsePayload, names *toolNam
 				}
 				response.ReasoningContent += text
 			}
-			response.ReasoningItems = append(response.ReasoningItems, append(json.RawMessage(nil), rawItem...))
 		case "message":
 			for _, part := range item.Content {
 				if part.Type == "output_text" && part.Text != "" {
@@ -419,11 +409,32 @@ func normalizeResponsesResponse(payload responsesResponsePayload, names *toolNam
 			empty = false
 		}
 	}
+	response.ReasoningItems = responsesReasoningItems(payload.Output)
 	if payload.Usage != nil {
 		response.Usage = responsesUsageMap(payload.Usage)
 	}
 	response.FinishReason = responsesFinishReason(payload, len(response.ToolCalls) > 0)
 	return response, empty
+}
+
+// responsesReasoningItems copies the provider-issued reasoning output items
+// verbatim (id/summary/encrypted content) so buildResponsesPayload can replay
+// them on the next turn (spec §7.2). It is the single extraction shared by the
+// non-streaming normalizer and the streaming terminal capture, so both paths
+// preserve exactly the same items in output order.
+func responsesReasoningItems(output []json.RawMessage) []json.RawMessage {
+	var items []json.RawMessage
+	for _, rawItem := range output {
+		var item responsesOutputItem
+		if err := json.Unmarshal(rawItem, &item); err != nil {
+			continue
+		}
+		if item.Type != "reasoning" {
+			continue
+		}
+		items = append(items, append(json.RawMessage(nil), rawItem...))
+	}
+	return items
 }
 
 // responsesReasoningText extracts the readable reasoning text of one Responses
@@ -513,81 +524,21 @@ func responsesUsageMap(usage *responsesUsage) map[string]int {
 // responsesStreamState tracks function-call metadata announced by
 // response.output_item.added so argument fragments can carry the call id/name.
 type responsesStreamState struct {
-	cfg   llm.Config
 	names *toolNameMapping
-	calls map[int]responsesCallRef
-}
-
-// responsesCallRef is the stable identity of one streamed function call.
-type responsesCallRef struct {
-	id   string
-	name string
+	calls map[int]streamCallRef
 }
 
 // consumeResponsesStream reads SSE events, emits normalized deltas and
 // classifies empty/truncated/malformed streams as transient failures instead of
-// silently returning success.
-func consumeResponsesStream(cfg llm.Config, body io.Reader, names *toolNameMapping, onDelta func(llmapp.Delta)) error {
-	reader := bufio.NewReader(io.LimitReader(body, maxResponseBytes))
-	state := responsesStreamState{cfg: cfg, names: names, calls: make(map[int]responsesCallRef)}
-	var data strings.Builder
-	sawData := false
-	terminal := false
-
-	dispatch := func() error {
-		if data.Len() == 0 {
-			return nil
-		}
-		sawData = true
-		done, err := state.handleEvent(data.String(), onDelta)
-		data.Reset()
-		if err != nil {
-			return err
-		}
-		if done {
-			terminal = true
-		}
-		return nil
-	}
-
-	for !terminal {
-		line, readErr := reader.ReadString('\n')
-		if len(line) > 0 {
-			line = strings.TrimRight(line, "\r\n")
-			switch {
-			case line == "":
-				if err := dispatch(); err != nil {
-					return err
-				}
-			case strings.HasPrefix(line, "data:"):
-				value := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
-				if data.Len() > 0 {
-					data.WriteByte('\n')
-				}
-				data.WriteString(value)
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return &TransientError{Err: errors.New("read llm responses stream failed")}
-		}
-	}
-	if !terminal {
-		// Tolerate a final event that is not followed by a blank line.
-		if err := dispatch(); err != nil {
-			return err
-		}
-	}
-	switch {
-	case terminal:
-		return nil
-	case !sawData:
-		return &TransientError{Err: errors.New("llm provider returned an empty stream")}
-	default:
-		return &TransientError{Err: errors.New("llm provider stream ended before completion")}
-	}
+// silently returning success. The SSE framing is the shared consumeSSE scanner;
+// only the event semantics live here. maxOutputTokens is the request's forwarded
+// output limit, used to scale the streaming byte budget (H-E12) so a configured
+// long turn is not starved.
+func consumeResponsesStream(body io.Reader, names *toolNameMapping, onDelta func(llmapp.Delta), maxOutputTokens int) error {
+	state := responsesStreamState{names: names, calls: make(map[int]streamCallRef)}
+	return consumeSSE(body, func(data string) (bool, error) {
+		return state.handleEvent(data, onDelta)
+	}, "read llm responses stream failed", maxOutputTokens)
 }
 
 // handleEvent maps one SSE data payload to zero or more normalized deltas and
@@ -604,7 +555,7 @@ func (s *responsesStreamState) handleEvent(data string, onDelta func(llmapp.Delt
 		if strings.TrimSpace(message) == "" {
 			message = "llm provider stream failed"
 		}
-		return false, &TransientError{Err: errors.New(sanitizeResponsesMessage(s.cfg, message))}
+		return false, &TransientError{Err: errors.New(boundUpstreamMessage(message, 300))}
 	case "response.output_text.delta":
 		if event.Delta != "" {
 			onDelta(llmapp.Delta{Content: event.Delta})
@@ -617,7 +568,7 @@ func (s *responsesStreamState) handleEvent(data string, onDelta func(llmapp.Delt
 		if event.Item == nil || event.Item.Type != "function_call" {
 			return false, nil
 		}
-		ref := responsesCallRef{id: event.Item.CallID, name: s.names.originalName(event.Item.Name)}
+		ref := streamCallRef{id: event.Item.CallID, name: s.names.originalName(event.Item.Name)}
 		if ref.id == "" {
 			ref.id = event.Item.ID
 		}
@@ -648,6 +599,10 @@ func (s *responsesStreamState) handleEvent(data string, onDelta func(llmapp.Delt
 		if payload.Usage != nil {
 			delta.Usage = responsesUsageMap(payload.Usage)
 		}
+		// The completed response carries the full output array, so the
+		// provider-issued reasoning items are captured here exactly as the
+		// non-streaming normalizer captures them (spec §7.2 replay parity).
+		delta.ReasoningItems = responsesReasoningItems(payload.Output)
 		onDelta(delta)
 		return true, nil
 	}

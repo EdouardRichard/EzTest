@@ -9,7 +9,7 @@ import {
   requirementDetailFixture,
   requirementVersionFixture,
 } from "./test-fixtures"
-import type { RequirementDetail, TargetOptions } from "./types"
+import type { RequirementDetail } from "./types"
 
 const api = vi.hoisted(() => ({
   updateRequirement: vi.fn(),
@@ -22,17 +22,10 @@ vi.mock("./api", () => api)
 
 import { RequirementEditor } from "./RequirementEditor"
 
-const TARGET_OPTIONS: TargetOptions = {
-  suts: [
-    { id: "1001", label: "订单中心" },
-    { id: "1002", label: "支付网关" },
-  ],
-  pages: [
-    { id: "1301", label: "订单列表" },
-    { id: "2301", label: "退款详情" },
-  ],
-  apis: [{ id: "2401", label: "POST /api/payments" }],
-}
+// v0.2.4-B (T21): the editor is the V1 natural-language form. The deleted
+// SUT/page/API target selection is gone; the assertions below cover the V1
+// fields (user_story / rules / structured AC / sut_description / scope_out /
+// account_roles_hint) and the write DTO that omits server-assigned AC ids.
 
 const updatedDetail: RequirementDetail = {
   ...requirementDetailFixture,
@@ -51,7 +44,6 @@ function renderEditor(overrides: Partial<Parameters<typeof RequirementEditor>[0]
   const props = {
     versionId: "2001",
     requirement: requirementDetailFixture,
-    targetOptions: TARGET_OPTIONS,
     onUpdated: vi.fn(),
     ...overrides,
   }
@@ -73,31 +65,38 @@ describe("RequirementEditor", () => {
 
   afterEach(cleanup)
 
-  it("prefills the current requirement version and its targets", () => {
+  it("prefills the current V1 requirement version", () => {
     renderEditor()
 
     expect(screen.getByTestId("requirement-editor")).toHaveTextContent("退款到账时效")
     expect(screen.getByTestId("editor-title")).toHaveValue("退款到账时效")
-    expect(screen.getByTestId("editor-description")).toHaveValue(
-      "退款审核通过后 T+1 个工作日原路退回；节假日顺延。",
+    expect(screen.getByTestId("editor-story-as-a")).toHaveValue("买家")
+    expect(screen.getByTestId("editor-story-i-want")).toHaveValue(
+      "退款审核通过后 T+1 个工作日原路退回",
     )
-    expect(screen.getByTestId("editor-acceptance")).toHaveValue(
-      "审核通过后 T+1 个工作日到账；金额与订单实付一致。",
-    )
+    expect(screen.getByTestId("editor-story-so-that")).toHaveValue("我能及时收到退款")
+    expect(screen.getByTestId("editor-rules")).toHaveValue("节假日顺延。")
+    // The server-assigned AC id is shown read-only, never as an editable input.
+    expect(screen.getByTestId("editor-ac-0-id")).toHaveTextContent("AC-1")
+    expect(screen.getByTestId("editor-ac-0-given")).toHaveValue("退款审核通过")
+    expect(screen.getByTestId("editor-ac-0-when")).toHaveValue("T+1 个工作日")
+    expect(screen.getByTestId("editor-ac-0-then")).toHaveValue("金额与订单实付一致原路到账")
+    expect(screen.getByTestId("editor-sut-description")).toHaveValue("支付网关退款链路")
+    expect(screen.getByTestId("editor-scope-out")).toHaveValue("")
+    expect(screen.getByTestId("editor-account-roles")).toHaveValue("buyer")
     expect(screen.getByTestId("editor-priority")).toHaveValue("P1")
-    expect(screen.getByTestId("editor-target-sut-1002")).toBeChecked()
-    expect(screen.getByTestId("editor-target-page-2301")).toBeChecked()
-    expect(screen.getByTestId("editor-target-page-1301")).not.toBeChecked()
   })
 
-  it("saves through PATCH and reports the new draft revision", async () => {
+  it("saves the V1 form through PATCH, omitting server-assigned AC ids", async () => {
     const onUpdated = vi.fn()
     renderEditor({ onUpdated })
 
     fireEvent.change(screen.getByTestId("editor-title"), {
       target: { value: "退款到账时效（补充）" },
     })
-    fireEvent.click(screen.getByTestId("editor-target-page-1301"))
+    fireEvent.change(screen.getByTestId("editor-ac-0-then"), {
+      target: { value: "金额与订单实付一致原路到账（更新）" },
+    })
     fireEvent.click(screen.getByTestId("editor-save"))
 
     await waitFor(() => expect(api.updateRequirement).toHaveBeenCalledTimes(1))
@@ -106,17 +105,71 @@ describe("RequirementEditor", () => {
     expect(requirementId).toBe("6001")
     expect(payload).toMatchObject({
       title: "退款到账时效（补充）",
-      description: "退款审核通过后 T+1 个工作日原路退回；节假日顺延。",
-      acceptance_criteria: "审核通过后 T+1 个工作日到账；金额与订单实付一致。",
+      user_story: {
+        as_a: "买家",
+        i_want: "退款审核通过后 T+1 个工作日原路退回",
+        so_that: "我能及时收到退款",
+      },
+      rules: "节假日顺延。",
       priority: "P1",
+      sut_description: "支付网关退款链路",
+      scope_out: "",
+      account_roles_hint: ["buyer"],
     })
-    expect(payload.targets).toEqual({
-      version_suts: ["1002"],
-      pages: ["2301", "1301"],
-      apis: [],
-    })
+    // The write DTO is {given,when,then} only — toEqual is exact, so a leaked
+    // server-assigned id (or local key) would fail this assertion.
+    expect(payload.acceptance_criteria).toEqual([
+      { given: "退款审核通过", when: "T+1 个工作日", then: "金额与订单实付一致原路到账（更新）" },
+    ])
     expect(onUpdated).toHaveBeenCalledWith(updatedDetail)
     expect(await screen.findByRole("status")).toHaveTextContent("已保存为草案 v2")
+  })
+
+  it("adds and removes acceptance criteria, keeping ids read-only and out of the save body", async () => {
+    renderEditor()
+
+    expect(screen.getByTestId("editor-ac-0-id")).toHaveTextContent("AC-1")
+    // A newly added row has no id until the server assigns one on save.
+    fireEvent.click(screen.getByTestId("editor-ac-add"))
+    expect(screen.getByTestId("editor-ac-1-id")).toHaveTextContent("新条目")
+    fireEvent.change(screen.getByTestId("editor-ac-1-given"), { target: { value: "订单已支付" } })
+    fireEvent.change(screen.getByTestId("editor-ac-1-when"), { target: { value: "申请退款" } })
+    fireEvent.change(screen.getByTestId("editor-ac-1-then"), { target: { value: "退款单创建" } })
+
+    // Removing the first row re-indexes the new one to position 0.
+    fireEvent.click(screen.getByTestId("editor-ac-remove-0"))
+    expect(screen.queryByTestId("editor-ac-1-given")).not.toBeInTheDocument()
+    expect(screen.getByTestId("editor-ac-0-given")).toHaveValue("订单已支付")
+
+    fireEvent.click(screen.getByTestId("editor-save"))
+    await waitFor(() => expect(api.updateRequirement).toHaveBeenCalledTimes(1))
+    const payload = api.updateRequirement.mock.calls[0][2]
+    expect(payload.acceptance_criteria).toEqual([
+      { given: "订单已支付", when: "申请退款", then: "退款单创建" },
+    ])
+  })
+
+  it("trims prose fields in the save body to match the trimmed validation", async () => {
+    renderEditor()
+
+    fireEvent.change(screen.getByTestId("editor-title"), { target: { value: "  退款到账时效  " } })
+    fireEvent.change(screen.getByTestId("editor-rules"), { target: { value: "  节假日顺延。  " } })
+    fireEvent.change(screen.getByTestId("editor-scope-out"), {
+      target: { value: "  不含跨境退款  " },
+    })
+    fireEvent.change(screen.getByTestId("editor-ac-0-given"), {
+      target: { value: "  退款审核通过  " },
+    })
+    fireEvent.click(screen.getByTestId("editor-save"))
+
+    await waitFor(() => expect(api.updateRequirement).toHaveBeenCalledTimes(1))
+    const payload = api.updateRequirement.mock.calls[0][2]
+    expect(payload.title).toBe("退款到账时效")
+    expect(payload.rules).toBe("节假日顺延。")
+    expect(payload.scope_out).toBe("不含跨境退款")
+    expect(payload.acceptance_criteria).toEqual([
+      { given: "退款审核通过", when: "T+1 个工作日", then: "金额与订单实付一致原路到账" },
+    ])
   })
 
   it("validates required fields before calling the API", async () => {
@@ -126,6 +179,18 @@ describe("RequirementEditor", () => {
     fireEvent.click(screen.getByTestId("editor-save"))
 
     expect(await screen.findByText("标题不能为空")).toBeInTheDocument()
+    expect(api.updateRequirement).not.toHaveBeenCalled()
+  })
+
+  it("requires a complete acceptance criterion before saving", async () => {
+    renderEditor()
+
+    fireEvent.click(screen.getByTestId("editor-ac-add"))
+    fireEvent.click(screen.getByTestId("editor-save"))
+
+    expect(
+      await screen.findByText("每条验收标准的 Given / When / Then 都不能为空"),
+    ).toBeInTheDocument()
     expect(api.updateRequirement).not.toHaveBeenCalled()
   })
 
@@ -153,12 +218,21 @@ describe("RequirementEditor", () => {
       "该需求已澄清；编辑前需先回退为草案（会生成新 revision 并重新确认）。",
     )
     // C-06: a clarified requirement can only change through the audited
-    // rollback path, so every field is disabled and there is no save action.
+    // rollback path, so every V1 field is disabled and there is no save action.
     expect(screen.getByTestId("editor-title")).toBeDisabled()
-    expect(screen.getByTestId("editor-description")).toBeDisabled()
-    expect(screen.getByTestId("editor-acceptance")).toBeDisabled()
+    expect(screen.getByTestId("editor-story-as-a")).toBeDisabled()
+    expect(screen.getByTestId("editor-story-i-want")).toBeDisabled()
+    expect(screen.getByTestId("editor-story-so-that")).toBeDisabled()
+    expect(screen.getByTestId("editor-rules")).toBeDisabled()
+    expect(screen.getByTestId("editor-ac-0-given")).toBeDisabled()
+    expect(screen.getByTestId("editor-ac-0-when")).toBeDisabled()
+    expect(screen.getByTestId("editor-ac-0-then")).toBeDisabled()
+    expect(screen.getByTestId("editor-sut-description")).toBeDisabled()
+    expect(screen.getByTestId("editor-scope-out")).toBeDisabled()
+    expect(screen.getByTestId("editor-account-roles")).toBeDisabled()
     expect(screen.getByTestId("editor-priority")).toBeDisabled()
-    expect(screen.getByTestId("editor-target-sut-1002")).toBeDisabled()
+    expect(screen.getByTestId("editor-ac-add")).toBeDisabled()
+    expect(screen.getByTestId("editor-ac-remove-0")).toBeDisabled()
     expect(screen.queryByTestId("editor-save")).not.toBeInTheDocument()
     expect(screen.queryByTestId("editor-confirm")).not.toBeInTheDocument()
     expect(screen.getByTestId("editor-rollback")).toBeInTheDocument()
@@ -272,14 +346,14 @@ describe("RequirementEditor", () => {
       new ApiError({
         status: 400,
         code: "invalid_argument",
-        message: "目标页面不属于该版本",
-        details: { field: "targets.pages" },
+        message: "被测系统描述不能为空",
+        details: { field: "sut_description" },
       }),
     )
     renderEditor()
 
     fireEvent.click(screen.getByTestId("editor-save"))
 
-    expect(await screen.findByText("目标页面不属于该版本")).toBeInTheDocument()
+    expect(await screen.findByText("被测系统描述不能为空")).toBeInTheDocument()
   })
 })

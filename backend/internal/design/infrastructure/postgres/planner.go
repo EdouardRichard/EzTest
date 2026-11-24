@@ -8,6 +8,7 @@ import (
 	"time"
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -47,7 +48,10 @@ func (r *Repository) WithVersionLock(ctx context.Context, versionID int64, fn fu
 }
 
 // ListCandidateVersionIDs returns initial/running versions that hold any design
-// input, newest first (spec §9.1 rule 1).
+// input, newest first (spec §9.1 rule 1). The version/requirement status values
+// are passed as query parameters from the version domain constants (V-0014
+// E share): a SQL-inline status literal is a second truth that would survive a
+// constant rename silently.
 func (r *Repository) ListCandidateVersionIDs(ctx context.Context, limit int) ([]int64, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -55,16 +59,16 @@ func (r *Repository) ListCandidateVersionIDs(ctx context.Context, limit int) ([]
 	rows, err := r.pool.Query(ctx, `
 		SELECT v.id
 		FROM version v
-		WHERE v.status IN ('initial', 'running')
+		WHERE v.status = ANY($2)
 		  AND (
-		      EXISTS (SELECT 1 FROM requirement r WHERE r.version_id = v.id AND r.status = 'clarified')
-		      OR EXISTS (SELECT 1 FROM conversation c WHERE c.version_id = v.id AND c.kind = 'design')
+		      EXISTS (SELECT 1 FROM requirement r WHERE r.version_id = v.id AND r.status = $3)
+		      OR EXISTS (SELECT 1 FROM conversation c WHERE c.version_id = v.id AND c.kind = $4)
 		      OR EXISTS (SELECT 1 FROM design_scope ds WHERE ds.version_id = v.id)
 		      OR EXISTS (SELECT 1 FROM case_scenario s WHERE s.version_id = v.id)
 		  )
 		ORDER BY v.id
 		LIMIT $1
-	`, limit)
+	`, limit, []string{version.StatusInitial, version.StatusRunning}, string(version.RequirementClarified), version.ConversationDesign)
 	if err != nil {
 		return nil, fmt.Errorf("list design candidate versions: %w", err)
 	}
@@ -87,12 +91,12 @@ func (r *Repository) ListCandidateVersionIDs(ctx context.Context, limit int) ([]
 func (r *Repository) ListClarifiedRequirements(ctx context.Context, versionID int64) ([]design.RequirementRef, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       rv.priority, COALESCE(rv.target_version_suts, '[]'::jsonb)
+		       rv.priority
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
-		WHERE r.version_id = $1 AND r.status = 'clarified'
+		WHERE r.version_id = $1 AND r.status = $2
 		ORDER BY r.id
-	`, versionID)
+	`, versionID, string(version.RequirementClarified))
 	if err != nil {
 		return nil, fmt.Errorf("list clarified requirements: %w", err)
 	}
@@ -100,13 +104,9 @@ func (r *Repository) ListClarifiedRequirements(ctx context.Context, versionID in
 	refs := make([]design.RequirementRef, 0)
 	for rows.Next() {
 		var ref design.RequirementRef
-		var targetSUTs []byte
 		if err := rows.Scan(&ref.ID, &ref.VersionID, &ref.CurrentVersionID, &ref.Revision,
-			&ref.Title, &ref.Status, &ref.Priority, &targetSUTs); err != nil {
+			&ref.Title, &ref.Status, &ref.Priority); err != nil {
 			return nil, fmt.Errorf("scan clarified requirement: %w", err)
-		}
-		if ref.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
-			return nil, err
 		}
 		refs = append(refs, ref)
 	}
@@ -122,9 +122,9 @@ func (r *Repository) ListActiveScopes(ctx context.Context, versionID int64) ([]d
 		SELECT id, version_id, requirement_id, activated_by_round_id, activated_at,
 		       status, created_at, updated_at
 		FROM design_scope
-		WHERE version_id = $1 AND status = 'active'
+		WHERE version_id = $1 AND status = $2
 		ORDER BY id
-	`, versionID)
+	`, versionID, design.ScopeStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list design scopes: %w", err)
 	}
@@ -150,7 +150,7 @@ func (r *Repository) ListActiveScopes(ctx context.Context, versionID int64) ([]d
 func (r *Repository) ListRequirementCoverage(ctx context.Context, versionID int64) ([]design.RequirementCoverage, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
-		       rv.priority, COALESCE(rv.target_version_suts, '[]'::jsonb),
+		       rv.priority,
 		       (SELECT count(*) FROM case_scenario s
 		        WHERE s.version_id = r.version_id AND s.requirement_id = r.id
 		          AND s.requirement_version_id = r.current_version_id),
@@ -159,27 +159,28 @@ func (r *Repository) ListRequirementCoverage(ctx context.Context, versionID int6
 		        JOIN case_scenario s ON s.id = ce.scenario_id
 		        WHERE s.version_id = r.version_id AND s.requirement_id = r.id
 		          AND s.requirement_version_id = r.current_version_id
-		          AND cv.status = 'draft'),
+		          AND cv.status = $2),
 		       (SELECT count(*) FROM case_entity ce
 		        JOIN case_version cv ON cv.id = ce.current_version_id
 		        JOIN case_scenario s ON s.id = ce.scenario_id
 		        WHERE s.version_id = r.version_id AND s.requirement_id = r.id
 		          AND s.requirement_version_id = r.current_version_id
-		          AND cv.status = 'confirmed'),
+		          AND cv.status = $3),
 		       (SELECT count(*) FROM case_entity ce
 		        JOIN case_version cv ON cv.id = ce.current_version_id
 		        JOIN case_scenario s ON s.id = ce.scenario_id
 		        WHERE s.version_id = r.version_id AND s.requirement_id = r.id
 		          AND s.requirement_version_id = r.current_version_id
-		          AND cv.status = 'stale')
+		          AND cv.status = $4)
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1
 		  AND EXISTS (SELECT 1 FROM design_scope ds
 		              WHERE ds.version_id = r.version_id AND ds.requirement_id = r.id
-		                AND ds.status = 'active')
+		                AND ds.status = $5)
 		ORDER BY r.id
-	`, versionID)
+	`, versionID, design.CaseStatusDraft, design.CaseStatusConfirmed,
+		design.CaseStatusStale, design.ScopeStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list requirement coverage: %w", err)
 	}
@@ -187,17 +188,13 @@ func (r *Repository) ListRequirementCoverage(ctx context.Context, versionID int6
 	coverages := make([]design.RequirementCoverage, 0)
 	for rows.Next() {
 		var coverage design.RequirementCoverage
-		var targetSUTs []byte
 		if err := rows.Scan(&coverage.Requirement.ID, &coverage.Requirement.VersionID,
 			&coverage.Requirement.CurrentVersionID, &coverage.Requirement.Revision,
 			&coverage.Requirement.Title, &coverage.Requirement.Status,
-			&coverage.Requirement.Priority, &targetSUTs,
+			&coverage.Requirement.Priority,
 			&coverage.ScenarioCount, &coverage.DraftCount, &coverage.ConfirmedCount,
 			&coverage.StaleCount); err != nil {
 			return nil, fmt.Errorf("scan requirement coverage: %w", err)
-		}
-		if coverage.Requirement.TargetVersionSUTIDs, err = decodeIDArray(targetSUTs); err != nil {
-			return nil, err
 		}
 		coverages = append(coverages, coverage)
 	}
@@ -212,10 +209,10 @@ func (r *Repository) LatestDesignConversation(ctx context.Context, versionID int
 	var conversationID int64
 	err := r.pool.QueryRow(ctx, `
 		SELECT id FROM conversation
-		WHERE version_id = $1 AND kind = 'design'
+		WHERE version_id = $1 AND kind = $2
 		ORDER BY id DESC
 		LIMIT 1
-	`, versionID).Scan(&conversationID)
+	`, versionID, version.ConversationDesign).Scan(&conversationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -413,9 +410,9 @@ func (r *Repository) UpsertScope(ctx context.Context, scope design.Scope) (desig
 		scope.ID = existingID
 		if _, err := q.Exec(ctx, `
 			UPDATE design_scope
-			SET status = 'active', activated_by_round_id = $2, activated_at = $3, updated_at = $4
+			SET status = $5, activated_by_round_id = $2, activated_at = $3, updated_at = $4
 			WHERE id = $1
-		`, scope.ID, scope.ActivatedByRoundID, scope.ActivatedAt, scope.UpdatedAt); err != nil {
+		`, scope.ID, scope.ActivatedByRoundID, scope.ActivatedAt, scope.UpdatedAt, design.ScopeStatusActive); err != nil {
 			return design.Scope{}, false, fmt.Errorf("update design scope: %w", err)
 		}
 	}

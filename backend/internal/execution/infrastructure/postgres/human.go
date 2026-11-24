@@ -11,6 +11,35 @@ import (
 // HumanRequestRepository implements the matching executionapp repository port.
 type HumanRequestRepository struct{ base }
 
+// humanDecisionKinds is the v0.22 version-level decision kind set (R-W2-1),
+// mirrored as a query parameter (never SQL-inline literals). It is pinned against
+// HumanKind.IsDecision() by TestHumanKindSetsMatchDomain (value-derived from the
+// domain const block), so a new decision kind cannot join the domain without
+// joining the question read surface and the expiry sweep.
+var humanDecisionKinds = []execution.HumanKind{
+	execution.HumanApproval,
+	execution.HumanBlockedRecovery,
+	execution.HumanConflict,
+}
+
+// humanQuestionKinds is the version question read surface: the structured
+// clarification questions plus every decision kind. Login takeovers are execution
+// todos, not questions, so they are deliberately absent.
+var humanQuestionKinds = append([]execution.HumanKind{execution.HumanClarificationQuestion}, humanDecisionKinds...)
+
+// humanTodoKinds is the execution-todo kind set (login takeover plus every
+// decision kind): the pending todo read and the shared expiry sweep. Structured
+// questions have their own sweep so question.expired stays attributable.
+var humanTodoKinds = append([]execution.HumanKind{execution.HumanLoginTakeover}, humanDecisionKinds...)
+
+// humanResolverStatuses mirrors HumanRequestStatus.StoresResolver() as a query
+// parameter (the Transition resolver CASE). Pinned by
+// TestHumanResolverStatusSetMatchesDomain.
+var humanResolverStatuses = []execution.HumanRequestStatus{
+	execution.HumanAnswered,
+	execution.HumanCancelled,
+}
+
 const humanRequestColumns = `id, version_id, case_run_id, conversation_id, message_id, kind,
 	payload, question, status, response, expires_at, resolved_by, resolved_at, created_by,
 	created_at, updated_at`
@@ -61,9 +90,9 @@ func (r *HumanRequestRepository) GetOpenByCaseRun(ctx context.Context, caseRunID
 	ctx = contextOrBackground(ctx)
 	item, err := scanHumanRequest(r.pool.QueryRow(ctx, `
 		SELECT `+humanRequestColumns+` FROM human_request
-		WHERE case_run_id = $1 AND status = 'pending' AND kind = 'login_takeover'
+		WHERE case_run_id = $1 AND status = $2 AND kind = $3
 		ORDER BY id DESC LIMIT 1
-	`, caseRunID))
+	`, caseRunID, string(execution.HumanPending), string(execution.HumanLoginTakeover)))
 	if err != nil {
 		if isNoRows(err) {
 			return nil, nil
@@ -107,10 +136,10 @@ func (r *HumanRequestRepository) ListQuestions(ctx context.Context, versionID in
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+humanRequestColumns+` FROM human_request
 		WHERE version_id = $1
-		  AND kind IN ('clarification_question', 'approval', 'blocked_recovery', 'conflict')
-		  AND ($2 = '' OR status = $2) AND ($3::BIGINT IS NULL OR id < $3)
-		ORDER BY id DESC LIMIT $4
-	`, versionID, status, beforeID, fetchLimit(limit))
+		  AND kind = ANY($2::text[])
+		  AND ($3 = '' OR status = $3) AND ($4::BIGINT IS NULL OR id < $4)
+		ORDER BY id DESC LIMIT $5
+	`, versionID, statusStrings(humanQuestionKinds), status, beforeID, fetchLimit(limit))
 	if err != nil {
 		return nil, false, wrapDB("list questions", err)
 	}
@@ -132,8 +161,8 @@ func (r *HumanRequestRepository) ListOpen(ctx context.Context) ([]execution.Huma
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+humanRequestColumns+` FROM human_request
-		WHERE status = 'pending' AND kind = 'login_takeover' ORDER BY id
-	`)
+		WHERE status = $1 AND kind = $2 ORDER BY id
+	`, string(execution.HumanPending), string(execution.HumanLoginTakeover))
 	if err != nil {
 		return nil, wrapDB("list pending human requests", err)
 	}
@@ -165,7 +194,7 @@ func (r *HumanRequestRepository) Transition(ctx context.Context, id int64, from,
 	}
 	var resolvedBy *int64
 	var resolvedAt *time.Time
-	if to == execution.HumanAnswered || to == execution.HumanCancelled {
+	if to.StoresResolver() {
 		resolvedBy = nullableID(actorID)
 		resolvedAt = &at
 	}
@@ -176,13 +205,14 @@ func (r *HumanRequestRepository) Transition(ctx context.Context, id int64, from,
 				WHEN $7::timestamptz IS NULL THEN question
 				ELSE jsonb_set(question, '{expires_at}', to_jsonb($7::timestamptz))
 			END,
-			resolved_by = CASE WHEN $3 IN ('answered', 'cancelled') THEN $5
-				WHEN $3 = 'pending' THEN NULL ELSE resolved_by END,
-			resolved_at = CASE WHEN $3 IN ('answered', 'cancelled') THEN $6
-				WHEN $3 = 'pending' THEN NULL ELSE resolved_at END,
+			resolved_by = CASE WHEN $3 = ANY($8::text[]) THEN $5
+				WHEN $3 = $9::text THEN NULL ELSE resolved_by END,
+			resolved_at = CASE WHEN $3 = ANY($8::text[]) THEN $6
+				WHEN $3 = $9::text THEN NULL ELSE resolved_at END,
 			updated_at = now()
 		WHERE id = $1 AND status = $2
-	`, id, string(from), string(to), encodedResponse, resolvedBy, resolvedAt, expiresAt)
+	`, id, string(from), string(to), encodedResponse, resolvedBy, resolvedAt, expiresAt,
+		statusStrings(humanResolverStatuses), string(execution.HumanPending))
 	if err != nil {
 		return false, wrapDB("transition human request", err)
 	}
@@ -214,12 +244,12 @@ func (r *HumanRequestRepository) AttachMessage(ctx context.Context, id, messageI
 func (r *HumanRequestRepository) Expire(ctx context.Context, now time.Time) ([]execution.HumanRequest, error) {
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
-		UPDATE human_request SET status = 'expired', updated_at = now()
-		WHERE status = 'pending'
-		  AND kind IN ('login_takeover', 'approval', 'blocked_recovery', 'conflict')
+		UPDATE human_request SET status = $2, updated_at = now()
+		WHERE status = $3
+		  AND kind = ANY($4::text[])
 		  AND expires_at < $1
 		RETURNING `+humanRequestColumns+`
-	`, now)
+	`, now, string(execution.HumanExpired), string(execution.HumanPending), statusStrings(humanTodoKinds))
 	if err != nil {
 		return nil, wrapDB("expire human requests", err)
 	}
@@ -233,10 +263,10 @@ func (r *HumanRequestRepository) Expire(ctx context.Context, now time.Time) ([]e
 func (r *HumanRequestRepository) ExpireQuestions(ctx context.Context, now time.Time) ([]execution.HumanRequest, error) {
 	ctx = contextOrBackground(ctx)
 	rows, err := r.pool.Query(ctx, `
-		UPDATE human_request SET status = 'expired', updated_at = now()
-		WHERE status = 'pending' AND kind = 'clarification_question' AND expires_at < $1
+		UPDATE human_request SET status = $2, updated_at = now()
+		WHERE status = $3 AND kind = $4 AND expires_at < $1
 		RETURNING `+humanRequestColumns+`
-	`, now)
+	`, now, string(execution.HumanExpired), string(execution.HumanPending), string(execution.HumanClarificationQuestion))
 	if err != nil {
 		return nil, wrapDB("expire questions", err)
 	}

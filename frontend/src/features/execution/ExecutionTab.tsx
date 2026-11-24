@@ -5,10 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
-import { Tabs } from "@/components/ui/Tabs"
 import type { VersionEvent } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
-import { VisualView } from "@/features/visual/VisualView"
 import { ApiError } from "@/lib/api-client"
 
 import {
@@ -30,10 +28,11 @@ import { EvidenceViewer } from "./EvidenceViewer"
 import { ExecutionToolbar } from "./ExecutionToolbar"
 import { HumanRequestBanner } from "./HumanRequestBanner"
 import { LiveTrace } from "./LiveTrace"
-import { nextActionLabel, terminalCauseLabel } from "./labels"
+import { nextActionLabel, terminalCauseLabel, terminalCauseRemedy } from "./labels"
 import { PauseDialog, type PauseInput, type PauseTarget } from "./PauseDialog"
 import { PausedBanner } from "./PausedBanner"
 import { ResultsPanel } from "./ResultsPanel"
+import { SessionFixturePanel } from "./SessionFixturePanel"
 import type {
   CaseRun,
   CaseRunDetail,
@@ -46,8 +45,7 @@ import type {
   WaveCounts,
 } from "./types"
 import { WaveList } from "./WaveList"
-
-export type ExecutionSubView = "waves" | "visual"
+import { COUNT_STATUS_KEYS, type CountStatusKey } from "./wave-counts"
 
 export type ExecutionTabProps = {
   versionId: string
@@ -61,27 +59,9 @@ export type ExecutionTabProps = {
    * working while the page wiring is pending.
    */
   initialEvidenceId?: string
-  /** Sub-view selector; `?view=visual` in the URL is read when omitted. */
-  view?: ExecutionSubView
 }
 
 const REFRESH_DEBOUNCE_MS = 300
-
-const SUB_VIEW_TABS = [
-  { value: "waves", label: "波次" },
-  { value: "visual", label: "视觉断言" },
-]
-
-function parseSubView(value: string | null | undefined): ExecutionSubView {
-  return value === "visual" ? "visual" : "waves"
-}
-
-/** The version page owns the tab URL; this sub-view reads `?view=` itself. */
-function readInitialSubView(view: ExecutionSubView | undefined): ExecutionSubView {
-  if (view !== undefined) return view
-  if (typeof window === "undefined") return "waves"
-  return parseSubView(new URLSearchParams(window.location.search).get("view"))
-}
 
 /** `?evidence=` deep link (v0.22 FE-8); Task 37 forwards it as a prop. */
 function readInitialEvidenceId(prop: string | undefined): string | null {
@@ -90,21 +70,6 @@ function readInitialEvidenceId(prop: string | undefined): string | null {
   const value = new URLSearchParams(window.location.search).get("evidence")
   return value !== null && value.length > 0 ? value : null
 }
-
-const COUNT_STATUS_KEYS = [
-  "pending",
-  "running",
-  "paused",
-  "passed",
-  "failed",
-  "blocked",
-  "inconclusive",
-  "skipped",
-  "interrupted",
-  "superseded",
-] as const
-
-type CountStatusKey = (typeof COUNT_STATUS_KEYS)[number]
 
 function emptyWaveCounts(): WaveCounts {
   return {
@@ -120,7 +85,7 @@ function emptyWaveCounts(): WaveCounts {
     interrupted: 0,
     superseded: 0,
     evidence: 0,
-    by_version_sut: {},
+    by_sut: {},
   }
 }
 
@@ -134,8 +99,8 @@ function normalizeWaveCounts(counts: WaveCounts | null | undefined): WaveCounts 
       normalized[key] = value
     }
   }
-  if (counts.by_version_sut !== null && typeof counts.by_version_sut === "object") {
-    normalized.by_version_sut = counts.by_version_sut
+  if (counts.by_sut !== null && typeof counts.by_sut === "object") {
+    normalized.by_sut = counts.by_sut
   }
   return normalized
 }
@@ -169,14 +134,13 @@ function effectiveWaveCounts(wave: RunWave, caseRuns: CaseRun[]): WaveCounts {
   const server = normalizeWaveCounts(wave.counts)
   if (!countsAreEmpty(server) || caseRuns.length === 0) return server
   const derived = countsFromCaseRuns(caseRuns)
-  const serverByVersionSut = server.by_version_sut ?? {}
+  const serverByVersionSut = server.by_sut ?? {}
   return {
     ...derived,
     // The loaded page can be paginated, so its aggregate must not erase a
     // server-provided evidence/by-SUT projection.
     evidence: server.evidence > 0 ? server.evidence : derived.evidence,
-    by_version_sut:
-      Object.keys(serverByVersionSut).length > 0 ? serverByVersionSut : derived.by_version_sut,
+    by_sut: Object.keys(serverByVersionSut).length > 0 ? serverByVersionSut : derived.by_sut,
   }
 }
 
@@ -200,13 +164,14 @@ function executionQuotaText(overview: ExecutionOverview | null): string {
   if (
     quotas === null ||
     quotas === undefined ||
-    typeof quotas.global !== "number" ||
-    typeof quotas.per_sut !== "number" ||
-    typeof quotas.cross_system !== "number"
+    typeof quotas.max_concurrent_case_runs !== "number"
   ) {
     return "不可用"
   }
-  return `全局 ${quotas.global} / 每 SUT ${quotas.per_sut} / 跨系统 ${quotas.cross_system}`
+  // v0.2.4-F design P5: one global limit; 0 means unlimited, not "zero slots".
+  return quotas.max_concurrent_case_runs > 0
+    ? `全局并发 ${quotas.max_concurrent_case_runs}`
+    : "全局并发不限"
 }
 
 /** Stable `case_run.blocked` dispatch reasons (scheduler spec §5.6). */
@@ -217,6 +182,13 @@ const BLOCKED_EVENT_REASON_LABEL: Record<string, string> = {
 }
 
 function blockedRunReason(caseRun: CaseRun): string {
+  // T11's capacity termination persists an English last_error; prefer the
+  // Chinese cause label so the banner reason stays readable (the next step is
+  // already the capacity remedy). Other blocked rows keep their last_error.
+  if (caseRun.summary.terminal_cause === "context_requirement_exceeds_capacity") {
+    const capacityLabel = terminalCauseLabel(caseRun.summary.terminal_cause)
+    if (capacityLabel !== null) return capacityLabel
+  }
   const lastError =
     typeof caseRun.summary.last_error === "string" ? caseRun.summary.last_error.trim() : ""
   if (lastError.length > 0) return lastError
@@ -228,7 +200,9 @@ function blockedRunReason(caseRun: CaseRun): string {
 
 function blockedRunNextAction(caseRun: CaseRun): string {
   return (
-    nextActionLabel(caseRun.summary.next_action) ?? "先解决阻塞条件（账号/环境/数据），再重跑用例"
+    terminalCauseRemedy(caseRun.summary.terminal_cause) ??
+    nextActionLabel(caseRun.summary.next_action) ??
+    "先解决阻塞条件（账号/环境/数据），再重跑用例"
   )
 }
 
@@ -267,10 +241,8 @@ export function ExecutionTab({
   initialWaveId,
   initialCaseRunId,
   initialEvidenceId,
-  view,
 }: ExecutionTabProps) {
   const router = useRouter()
-  const [subView, setSubView] = useState<ExecutionSubView>(() => readInitialSubView(view))
 
   const [overview, setOverview] = useState<ExecutionOverview | null>(null)
   const [waves, setWaves] = useState<RunWave[]>([])
@@ -557,25 +529,15 @@ export function ExecutionTab({
   })
 
   const updateUrl = useCallback(
-    (waveId: string | null, caseRunId: string | null, nextView: ExecutionSubView) => {
+    (waveId: string | null, caseRunId: string | null) => {
       const params = new URLSearchParams({ tab: "execution" })
       if (waveId !== null) params.set("wave", waveId)
       if (caseRunId !== null) params.set("case_run", caseRunId)
-      if (nextView === "visual") params.set("view", "visual")
       router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`, {
         scroll: false,
       })
     },
     [router, versionId],
-  )
-
-  const changeSubView = useCallback(
-    (value: string) => {
-      const next = parseSubView(value)
-      setSubView(next)
-      updateUrl(selectedWaveId, selectedCaseRunId, next)
-    },
-    [selectedCaseRunId, selectedWaveId, updateUrl],
   )
 
   const selectWave = useCallback(
@@ -584,17 +546,17 @@ export function ExecutionTab({
       setSelectedCaseRunId(null)
       setDetail(null)
       setNotice(null)
-      updateUrl(waveId, null, subView)
+      updateUrl(waveId, null)
     },
-    [subView, updateUrl],
+    [updateUrl],
   )
 
   const selectCaseRun = useCallback(
     (caseRunId: string) => {
       setSelectedCaseRunId(caseRunId)
-      updateUrl(selectedWaveId, caseRunId, subView)
+      updateUrl(selectedWaveId, caseRunId)
     },
-    [selectedWaveId, subView, updateUrl],
+    [selectedWaveId, updateUrl],
   )
 
   const runAction = useCallback(
@@ -663,15 +625,15 @@ export function ExecutionTab({
 
   const sutOptions = Array.from(
     new Set([
-      ...caseRuns.flatMap((caseRun) => caseRun.version_sut_ids),
-      ...Object.keys(displayWave?.counts.by_version_sut ?? {}),
+      ...caseRuns.flatMap((caseRun) => caseRun.sut_ids),
+      ...Object.keys(displayWave?.counts.by_sut ?? {}),
     ]),
   ).sort()
 
   const visibleCaseRuns =
     sutFilter === "all"
       ? caseRuns
-      : caseRuns.filter((caseRun) => caseRun.version_sut_ids.includes(sutFilter))
+      : caseRuns.filter((caseRun) => caseRun.sut_ids.includes(sutFilter))
 
   async function handlePauseSubmit(input: PauseInput): Promise<void> {
     if (pauseTarget === null) return
@@ -735,13 +697,6 @@ export function ExecutionTab({
 
   return (
     <div data-testid="execution-tab" className="space-y-3">
-      <Tabs
-        items={SUB_VIEW_TABS}
-        value={subView}
-        onValueChange={changeSubView}
-        ariaLabel="执行视图"
-      />
-
       {pendingHumanRequests.length > 0 ? (
         <HumanRequestBanner
           requests={pendingHumanRequests}
@@ -772,146 +727,133 @@ export function ExecutionTab({
         </p>
       ) : null}
 
-      {subView === "visual" ? (
-        <VisualView versionId={versionId} initialWaveId={selectedWaveId ?? undefined} />
-      ) : (
-        <>
-          <div
-            data-testid="execution-settings"
-            className="surface-card flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-[11px] text-muted-foreground"
-          >
-            <span className="font-medium text-foreground">执行设置</span>
-            <span>
-              人工请求 TTL {formatSettingSeconds(overview?.human_request_timeout_seconds)}
-            </span>
-            <span>并发配额 {executionQuotaText(overview)}</span>
-            <span>用例超时：服务端设置（界面待接线）</span>
-          </div>
+      <div
+        data-testid="execution-settings"
+        className="surface-card flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-[11px] text-muted-foreground"
+      >
+        <span className="font-medium text-foreground">执行设置</span>
+        <span>人工请求 TTL {formatSettingSeconds(overview?.human_request_timeout_seconds)}</span>
+        <span>并发配额 {executionQuotaText(overview)}</span>
+        <span>用例超时：服务端设置（界面待接线）</span>
+      </div>
 
-          <ExecutionToolbar
-            wave={displayWave}
-            sseStatus={sseStatus}
-            executor={overview?.executor ?? null}
-            sutOptions={sutOptions}
-            sutFilter={sutFilter}
-            onSutFilterChange={setSutFilter}
-            onPause={() => {
-              if (selectedWave !== null) {
-                setPauseTarget({
-                  kind: "wave",
-                  id: selectedWave.id,
-                  title: `#${selectedWave.id}`,
-                  alreadyPaused: selectedWave.status === "paused",
-                })
-              }
-            }}
-            onResume={handleResumeWave}
-            onCancel={() => {
-              if (selectedWave !== null) {
-                void runAction(() => cancelWave(versionId, selectedWave.id))
-              }
-            }}
-            busy={busy}
-            actionError={actionError}
-            notice={notice}
-          />
+      <ExecutionToolbar
+        wave={displayWave}
+        sseStatus={sseStatus}
+        executor={overview?.executor ?? null}
+        sutOptions={sutOptions}
+        sutFilter={sutFilter}
+        onSutFilterChange={setSutFilter}
+        onPause={() => {
+          if (selectedWave !== null) {
+            setPauseTarget({
+              kind: "wave",
+              id: selectedWave.id,
+              title: `#${selectedWave.id}`,
+              alreadyPaused: selectedWave.status === "paused",
+            })
+          }
+        }}
+        onResume={handleResumeWave}
+        onCancel={() => {
+          if (selectedWave !== null) {
+            void runAction(() => cancelWave(versionId, selectedWave.id))
+          }
+        }}
+        busy={busy}
+        actionError={actionError}
+        notice={notice}
+      />
 
-          {displayWave !== null && countsFallbackActive ? (
-            <div
-              data-testid="execution-counts"
-              className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-muted-foreground"
-            >
-              <span className="font-medium text-foreground">实时统计</span>
-              <span>未定 {displayWave.counts.inconclusive}</span>
-              {displayWave.counts.skipped > 0 ? (
-                <span>已跳过 {displayWave.counts.skipped}</span>
-              ) : null}
-              {displayWave.counts.evidence > 0 ? (
-                <span>证据 {displayWave.counts.evidence}</span>
-              ) : null}
-            </div>
-          ) : null}
+      {displayWave !== null && countsFallbackActive ? (
+        <div
+          data-testid="execution-counts"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-muted-foreground"
+        >
+          <span className="font-medium text-foreground">实时统计</span>
+          <span>未定 {displayWave.counts.inconclusive}</span>
+          {displayWave.counts.skipped > 0 ? <span>已跳过 {displayWave.counts.skipped}</span> : null}
+          {displayWave.counts.evidence > 0 ? <span>证据 {displayWave.counts.evidence}</span> : null}
+        </div>
+      ) : null}
 
-          {showCountsEmpty ? (
+      {showCountsEmpty ? (
+        <p data-testid="execution-counts-empty" className="px-1 text-[11px] text-muted-foreground">
+          暂无执行数据（尚无用例结果，不计为通过）。
+        </p>
+      ) : null}
+
+      <PausedBanner
+        wave={pausedWave}
+        caseRun={pausedCaseRun}
+        onResumeWave={handleResumeWave}
+        onResumeCaseRun={() => handleResumeCaseRun()}
+        busy={busy}
+      />
+
+      {blockedCaseRuns.length > 0 ? (
+        <section
+          aria-label="阻塞用例"
+          data-testid="blocked-case-run-banner"
+          className="surface-card space-y-1 px-3 py-2"
+        >
+          {blockedCaseRuns.map((caseRun) => (
             <p
-              data-testid="execution-counts-empty"
-              className="px-1 text-[11px] text-muted-foreground"
+              key={caseRun.id}
+              role="status"
+              data-testid={`blocked-case-run-${caseRun.id}`}
+              className="text-[11px] leading-relaxed"
             >
-              暂无执行数据（尚无用例结果，不计为通过）。
+              <span className="font-medium text-warning">用例「{caseRun.title}」阻塞：</span>
+              <span className="text-foreground">{blockedRunReason(caseRun)}</span>
+              <span className="text-muted-foreground">
+                ；下一步：{blockedRunNextAction(caseRun)}
+              </span>
             </p>
-          ) : null}
+          ))}
+        </section>
+      ) : null}
 
-          <PausedBanner
-            wave={pausedWave}
-            caseRun={pausedCaseRun}
-            onResumeWave={handleResumeWave}
-            onResumeCaseRun={() => handleResumeCaseRun()}
-            busy={busy}
-          />
+      <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)_390px]">
+        <WaveList
+          waves={displayWaves}
+          selectedWaveId={selectedWaveId}
+          activeWaveId={overview?.active_wave?.id ?? null}
+          onSelect={selectWave}
+        />
+        <LiveTrace
+          wave={displayWave}
+          caseRun={caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId) ?? null}
+          detail={detail}
+          loading={detailLoading}
+          error={detailError}
+          onRetry={() => setDetailToken((token) => token + 1)}
+        />
+        <ResultsPanel
+          versionId={versionId}
+          caseRuns={visibleCaseRuns}
+          selectedCaseRunId={selectedCaseRunId}
+          onSelect={selectCaseRun}
+          onPause={(caseRun) =>
+            setPauseTarget({ kind: "case_run", id: caseRun.id, title: caseRun.title })
+          }
+          onResume={(caseRun) => handleResumeCaseRun(caseRun)}
+          onRerunComplete={() => {
+            void refresh()
+          }}
+          onOpenRequirement={(requirementId) => {
+            router.push(
+              `/versions/${encodeURIComponent(versionId)}?tab=requirements&requirement=${encodeURIComponent(requirementId)}`,
+            )
+          }}
+          detail={detail}
+          detailLoading={detailLoading}
+          detailError={detailError}
+          onRetryDetail={() => setDetailToken((token) => token + 1)}
+        />
+      </div>
 
-          {blockedCaseRuns.length > 0 ? (
-            <section
-              aria-label="阻塞用例"
-              data-testid="blocked-case-run-banner"
-              className="surface-card space-y-1 px-3 py-2"
-            >
-              {blockedCaseRuns.map((caseRun) => (
-                <p
-                  key={caseRun.id}
-                  role="status"
-                  data-testid={`blocked-case-run-${caseRun.id}`}
-                  className="text-[11px] leading-relaxed"
-                >
-                  <span className="font-medium text-warning">用例「{caseRun.title}」阻塞：</span>
-                  <span className="text-foreground">{blockedRunReason(caseRun)}</span>
-                  <span className="text-muted-foreground">
-                    ；下一步：{blockedRunNextAction(caseRun)}
-                  </span>
-                </p>
-              ))}
-            </section>
-          ) : null}
-
-          <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)_390px]">
-            <WaveList
-              waves={displayWaves}
-              selectedWaveId={selectedWaveId}
-              activeWaveId={overview?.active_wave?.id ?? null}
-              onSelect={selectWave}
-            />
-            <LiveTrace
-              wave={displayWave}
-              caseRun={caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId) ?? null}
-              detail={detail}
-              loading={detailLoading}
-              error={detailError}
-              onRetry={() => setDetailToken((token) => token + 1)}
-            />
-            <ResultsPanel
-              versionId={versionId}
-              caseRuns={visibleCaseRuns}
-              selectedCaseRunId={selectedCaseRunId}
-              onSelect={selectCaseRun}
-              onPause={(caseRun) =>
-                setPauseTarget({ kind: "case_run", id: caseRun.id, title: caseRun.title })
-              }
-              onResume={(caseRun) => handleResumeCaseRun(caseRun)}
-              onRerunComplete={() => {
-                void refresh()
-              }}
-              onOpenRequirement={(requirementId) => {
-                router.push(
-                  `/versions/${encodeURIComponent(versionId)}?tab=requirements&requirement=${encodeURIComponent(requirementId)}`,
-                )
-              }}
-              detail={detail}
-              detailLoading={detailLoading}
-              detailError={detailError}
-              onRetryDetail={() => setDetailToken((token) => token + 1)}
-            />
-          </div>
-        </>
-      )}
+      <SessionFixturePanel versionId={versionId} />
 
       <PauseDialog
         open={pauseTarget !== null}

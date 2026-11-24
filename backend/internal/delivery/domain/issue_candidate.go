@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -41,8 +42,14 @@ type ManualIssueInput struct {
 	CaseRunID     int64
 	CaseVersionID int64
 	RequirementID int64
-	VersionSUTID  *int64
+	SUTID         *int64
 	EvidenceIDs   []int64
+	// FailedExpected/FailedActual/FailedReason carry the linked case run's
+	// structured failure detail when a manual issue references a run (v0.2.4-G
+	// SC-G3); the application service resolves them from the run projection.
+	FailedExpected string
+	FailedActual   string
+	FailedReason   string
 }
 
 // NewManualIssue builds one open manual issue and its logical refs (v0.22
@@ -61,7 +68,7 @@ func NewManualIssue(in ManualIssueInput) (Issue, []IssueRef, error) {
 	if in.CaseRunID < 0 || in.CaseVersionID < 0 || in.RequirementID < 0 {
 		return Issue{}, nil, ErrInvalidArgument
 	}
-	if in.VersionSUTID != nil && *in.VersionSUTID <= 0 {
+	if in.SUTID != nil && *in.SUTID <= 0 {
 		return Issue{}, nil, ErrInvalidArgument
 	}
 	evidenceIDs, err := validateManualEvidenceIDs(in.EvidenceIDs)
@@ -76,6 +83,9 @@ func NewManualIssue(in ManualIssueInput) (Issue, []IssueRef, error) {
 		VersionID:        in.VersionID,
 		Title:            title,
 		Summary:          in.Summary,
+		FailedExpected:   in.FailedExpected,
+		FailedActual:     in.FailedActual,
+		FailedReason:     in.FailedReason,
 		Status:           IssueStatusOpen,
 		Category:         in.Category,
 		Severity:         in.Severity,
@@ -86,10 +96,10 @@ func NewManualIssue(in ManualIssueInput) (Issue, []IssueRef, error) {
 	refs := make([]IssueRef, 0, 2+len(evidenceIDs))
 	appendRef := func(kind string, refID int64) {
 		refs = append(refs, IssueRef{
-			Kind:         kind,
-			RefID:        refID,
-			VersionSUTID: in.VersionSUTID,
-			Role:         IssueRefRoleSource,
+			Kind:  kind,
+			RefID: refID,
+			SUTID: in.SUTID,
+			Role:  IssueRefRoleSource,
 		})
 	}
 	if in.CaseRunID > 0 {
@@ -183,7 +193,7 @@ const (
 const IssueRefRoleSource = "source"
 
 // CandidateInput is the deterministic truth of one failed(application) case_run
-// projection (spec §5.1). WaveID, VersionSUTID, RequirementID and the failed
+// projection (spec §5.1). WaveID, SUTID, RequirementID and the failed
 // result ids are optional; a valid DedupeHint wins over the recomputed P3 key.
 // FailedExpected/FailedActual/FailedReason feed the issue summary only when
 // CaseRunSummary is empty.
@@ -205,7 +215,7 @@ type CandidateInput struct {
 	FailedActual             string
 	FailedReason             string
 	DedupeHint               string
-	VersionSUTID             *int64
+	SUTID                    *int64
 	WaveID                   *int64
 	EvidenceIDs              []int64
 }
@@ -229,6 +239,9 @@ func NewIssueCandidate(in CandidateInput) (Issue, []IssueRef, error) {
 		VersionID:        in.VersionID,
 		Title:            title,
 		Summary:          summary,
+		FailedExpected:   in.FailedExpected,
+		FailedActual:     in.FailedActual,
+		FailedReason:     in.FailedReason,
 		Status:           IssueStatusOpen,
 		Category:         in.Category,
 		Severity:         in.Severity,
@@ -240,6 +253,32 @@ func NewIssueCandidate(in CandidateInput) (Issue, []IssueRef, error) {
 		CreatedByRunID:   nil,
 	}
 	return issue, candidateRefs(in), nil
+}
+
+// RepresentativeRunID selects the DEFINED representative run of an issue's
+// linked runs (v0.2.4-G SC-G2 I4): the newest FAILED run (largest ID) when any
+// linked run failed, otherwise the newest linked run; 0 when there are none.
+// The five-element expected/observed of a merged/deduplicated issue card come
+// from this one run only — never mixed across runs. The rule is deterministic
+// and independent of ref order (it reduces by ID, not by position). failed marks
+// which of ids carry a failed verdict; ids absent from the snapshot are simply
+// not passed in.
+func RepresentativeRunID(ids []int64, failed map[int64]bool) int64 {
+	var representative int64
+	var representativeFailed bool
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		isFailed := failed[id]
+		switch {
+		case isFailed && !representativeFailed:
+			representative, representativeFailed = id, true
+		case isFailed == representativeFailed && id > representative:
+			representative = id
+		}
+	}
+	return representative
 }
 
 // DeriveDedupeKey returns the P3-compatible dedupe key (spec §5.1): a valid
@@ -266,7 +305,7 @@ func validateCandidateInput(in CandidateInput) error {
 	if in.WaveID != nil && *in.WaveID <= 0 {
 		return ErrInvalidArgument
 	}
-	if in.VersionSUTID != nil && *in.VersionSUTID <= 0 {
+	if in.SUTID != nil && *in.SUTID <= 0 {
 		return ErrInvalidArgument
 	}
 	if in.RequirementID < 0 || in.FailedStepResultID < 0 {
@@ -302,13 +341,12 @@ func validIssueCategory(category string) bool {
 	}
 }
 
+// validIssueSeverity reads the ONE severity authority (IssueSeverities), so
+// the validator, the report projection and the schema pin cannot drift apart
+// and the authority function has a production reader (DoD: no test-only
+// authority -- the T11e-5 M1 lesson).
 func validIssueSeverity(severity string) bool {
-	switch severity {
-	case "major", "minor", "trivial":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(IssueSeverities(), severity)
 }
 
 func candidateTitle(in CandidateInput) string {
@@ -389,10 +427,10 @@ func candidateRefs(in CandidateInput) []IssueRef {
 	refs := make([]IssueRef, 0, 3+IssueAssertionRefsMax+IssueEvidenceRefsMax+2)
 	appendRef := func(kind string, refID int64) {
 		refs = append(refs, IssueRef{
-			Kind:         kind,
-			RefID:        refID,
-			VersionSUTID: in.VersionSUTID,
-			Role:         IssueRefRoleSource,
+			Kind:  kind,
+			RefID: refID,
+			SUTID: in.SUTID,
+			Role:  IssueRefRoleSource,
 		})
 	}
 	appendRef(IssueRefKindCaseRun, in.CaseRunID)

@@ -23,15 +23,15 @@ import (
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 )
 
-const scopeSnapshotFixtureBody = `{"version_id":7,"frozen_at":"2026-11-05T06:00:00Z","version_suts":[{"version_sut_id":5001,"page_ids":[10],"repository_ids":[7,9]}]}`
+const scopeSnapshotFixtureBody = `{"version_id":7,"frozen_at":"2026-11-05T06:00:00Z","suts":[{"sut_id":5001,"page_ids":[10],"repository_ids":[7,9]}]}`
 
 // scopeSnapshotSnowflakeBody is the Critical regression fixture: every id is a
 // snowflake above 2^53 and must survive the read as the exact same token.
-const scopeSnapshotSnowflakeBody = `{"version_id":375994775003729921,"version_suts":[{"version_sut_id":375994775003729922,"page_ids":[375994775003729923],"repository_ids":[9007199254740993]}]}`
+const scopeSnapshotSnowflakeBody = `{"version_id":375994775003729921,"suts":[{"sut_id":375994775003729922,"page_ids":[375994775003729923],"repository_ids":[9007199254740993]}]}`
 
 const (
 	snowflakeVersionID    = "375994775003729921"
-	snowflakeVersionSUT   = "375994775003729922"
+	snowflakeSUT          = "375994775003729922"
 	snowflakePageID       = "375994775003729923"
 	snowflakeRepositoryID = "9007199254740993"
 )
@@ -168,8 +168,8 @@ func TestScopeSnapshotReadAPI(t *testing.T) {
 	if !ok {
 		t.Fatalf("scope_snapshot = %T %v, want a JSON object", data["scope_snapshot"], data["scope_snapshot"])
 	}
-	if _, ok := snapshot["version_suts"]; !ok {
-		t.Fatalf("scope_snapshot = %v, want the frozen version_suts", snapshot)
+	if _, ok := snapshot["suts"]; !ok {
+		t.Fatalf("scope_snapshot = %v, want the frozen suts", snapshot)
 	}
 	if _, ok := data["counts"].(map[string]any); !ok {
 		t.Fatalf("counts = %T %v, want a JSON object", data["counts"], data["counts"])
@@ -196,16 +196,16 @@ func TestScopeSnapshotReadAPIPreservesSnowflakeIDs(t *testing.T) {
 	if id := jsonNumberString(t, snapshot["version_id"]); id != snowflakeVersionID {
 		t.Fatalf("version_id = %s, want %s", id, snowflakeVersionID)
 	}
-	suts, ok := snapshot["version_suts"].([]any)
+	suts, ok := snapshot["suts"].([]any)
 	if !ok || len(suts) != 1 {
-		t.Fatalf("version_suts = %T %v, want one entry", snapshot["version_suts"], snapshot["version_suts"])
+		t.Fatalf("suts = %T %v, want one entry", snapshot["suts"], snapshot["suts"])
 	}
 	sut, ok := suts[0].(map[string]any)
 	if !ok {
-		t.Fatalf("version_suts[0] = %T, want an object", suts[0])
+		t.Fatalf("suts[0] = %T, want an object", suts[0])
 	}
-	if id := jsonNumberString(t, sut["version_sut_id"]); id != snowflakeVersionSUT {
-		t.Fatalf("version_sut_id = %s, want %s", id, snowflakeVersionSUT)
+	if id := jsonNumberString(t, sut["sut_id"]); id != snowflakeSUT {
+		t.Fatalf("sut_id = %s, want %s", id, snowflakeSUT)
 	}
 	assertScopeSnapshotNumberArray(t, "page_ids", sut["page_ids"], []string{snowflakePageID})
 	assertScopeSnapshotNumberArray(t, "repository_ids", sut["repository_ids"], []string{snowflakeRepositoryID})

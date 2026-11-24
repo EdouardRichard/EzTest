@@ -83,20 +83,121 @@ func (f *fakeUsage) RepositoryInUse(context.Context, int64) (bool, error) {
 // fakeRepo is an in-memory resource.Repository with the same uniqueness
 // constraints as the PostgreSQL schema.
 type fakeRepo struct {
-	suts         []resource.SUT
-	environments []resource.Environment
-	pages        []resource.Page
-	apis         []resource.API
-	databases    []resource.TargetDatabase
-	accounts     []resource.TestAccount
-	repositories []resource.CodeRepository
-	sutRepos     []resource.SUTRepository
+	environments  []resource.Environment
+	suts          []resource.SUT
+	pages         []resource.Page
+	apis          []resource.API
+	databases     []resource.TargetDatabase
+	accounts      []resource.TestAccount
+	repositories  []resource.CodeRepository
+	sutRepos      []resource.SUTRepository
+	registrations []resource.SUTRegistration
 
+	lastEnvLimit    int
+	lastEnvBefore   *int64
 	lastSUTLimit    int
 	lastSUTBefore   *int64
 	lastRepoLimit   int
 	lastRepoBefore  *int64
 	createPageCalls int
+	baselineWrites  []baselineWrite
+	// createSUTWithRegistrationCalls pins that Service.CreateSUT uses the one-tx
+	// creation path (I-1). A rewire to sequential CreateSUT + AppendSUTRegistration
+	// leaves this at 0 and fails the admin-path test.
+	createSUTWithRegistrationCalls int
+}
+
+// baselineWrite records one SetSUTRepositoryBaselineCommit call.
+type baselineWrite struct {
+	sutID  int64
+	repoID int64
+	commit string
+}
+
+// ---------- environment (top level) ----------
+
+func (f *fakeRepo) ListEnvironments(_ context.Context, limit int, beforeID *int64) ([]resource.Environment, error) {
+	f.lastEnvLimit = limit
+	f.lastEnvBefore = beforeID
+	out := make([]resource.Environment, 0, len(f.environments))
+	for _, item := range f.environments {
+		if beforeID == nil || item.ID < *beforeID {
+			out = append(out, item)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) GetEnvironment(_ context.Context, id int64) (resource.Environment, error) {
+	for _, item := range f.environments {
+		if item.ID == id {
+			return item, nil
+		}
+	}
+	return resource.Environment{}, resource.ErrNotFound
+}
+
+func (f *fakeRepo) CreateEnvironment(_ context.Context, environment resource.Environment) (resource.Environment, error) {
+	for _, item := range f.environments {
+		if strings.EqualFold(item.Name, environment.Name) {
+			return resource.Environment{}, resource.ErrDuplicate
+		}
+	}
+	f.environments = append(f.environments, environment)
+	return environment, nil
+}
+
+func (f *fakeRepo) UpdateEnvironment(_ context.Context, environment resource.Environment) (resource.Environment, error) {
+	for i, item := range f.environments {
+		if item.ID != environment.ID {
+			continue
+		}
+		for _, other := range f.environments {
+			if other.ID != environment.ID && strings.EqualFold(other.Name, environment.Name) {
+				return resource.Environment{}, resource.ErrDuplicate
+			}
+		}
+		f.environments[i] = environment
+		return environment, nil
+	}
+	return resource.Environment{}, resource.ErrNotFound
+}
+
+func (f *fakeRepo) DeleteEnvironment(_ context.Context, id int64) error {
+	for i, item := range f.environments {
+		if item.ID != id {
+			continue
+		}
+		f.environments = append(f.environments[:i], f.environments[i+1:]...)
+		for _, sut := range f.sutsOfEnvironment(id) {
+			f.deleteBySUT(sut.ID)
+		}
+		f.suts = filterSlice(f.suts, func(sut resource.SUT) bool { return sut.EnvironmentID != id })
+		return nil
+	}
+	return resource.ErrNotFound
+}
+
+func (f *fakeRepo) sutsOfEnvironment(environmentID int64) []resource.SUT {
+	out := make([]resource.SUT, 0)
+	for _, sut := range f.suts {
+		if sut.EnvironmentID == environmentID {
+			out = append(out, sut)
+		}
+	}
+	return out
+}
+
+// ---------- SUT ----------
+
+func (f *fakeRepo) ListSUTsByEnvironment(_ context.Context, environmentID int64) ([]resource.SUT, error) {
+	out := f.sutsOfEnvironment(environmentID)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func (f *fakeRepo) ListSUTs(_ context.Context, limit int, beforeID *int64) ([]resource.SUT, error) {
@@ -126,7 +227,7 @@ func (f *fakeRepo) GetSUT(_ context.Context, id int64) (resource.SUT, error) {
 
 func (f *fakeRepo) CreateSUT(_ context.Context, sut resource.SUT) (resource.SUT, error) {
 	for _, item := range f.suts {
-		if strings.EqualFold(item.Name, sut.Name) {
+		if item.EnvironmentID == sut.EnvironmentID && strings.EqualFold(item.Name, sut.Name) {
 			return resource.SUT{}, resource.ErrDuplicate
 		}
 	}
@@ -140,7 +241,7 @@ func (f *fakeRepo) UpdateSUT(_ context.Context, sut resource.SUT) (resource.SUT,
 			continue
 		}
 		for _, other := range f.suts {
-			if other.ID != sut.ID && strings.EqualFold(other.Name, sut.Name) {
+			if other.ID != sut.ID && other.EnvironmentID == sut.EnvironmentID && strings.EqualFold(other.Name, sut.Name) {
 				return resource.SUT{}, resource.ErrDuplicate
 			}
 		}
@@ -162,76 +263,71 @@ func (f *fakeRepo) DeleteSUT(_ context.Context, id int64) error {
 }
 
 func (f *fakeRepo) deleteBySUT(id int64) {
-	f.environments = filterSlice(f.environments, func(item resource.Environment) bool { return item.SUTID != id })
 	f.pages = filterSlice(f.pages, func(item resource.Page) bool { return item.SUTID != id })
 	f.apis = filterSlice(f.apis, func(item resource.API) bool { return item.SUTID != id })
 	f.databases = filterSlice(f.databases, func(item resource.TargetDatabase) bool { return item.SUTID != id })
 	f.sutRepos = filterSlice(f.sutRepos, func(item resource.SUTRepository) bool { return item.SUTID != id })
+	f.registrations = filterSlice(f.registrations, func(item resource.SUTRegistration) bool { return item.SUTID != id })
+	f.accounts = filterSlice(f.accounts, func(item resource.TestAccount) bool {
+		return item.SUTID == nil || *item.SUTID != id
+	})
 }
 
-func (f *fakeRepo) ListEnvironments(_ context.Context, sutID int64) ([]resource.Environment, error) {
-	out := make([]resource.Environment, 0)
-	for _, item := range f.environments {
+// ---------- SUT registrations (append-only, R-B4) ----------
+
+func (f *fakeRepo) AppendSUTRegistration(_ context.Context, registration resource.SUTRegistration) (resource.SUTRegistration, error) {
+	found := false
+	for _, item := range f.suts {
+		if item.ID == registration.SUTID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return resource.SUTRegistration{}, resource.ErrNotFound
+	}
+	f.registrations = append(f.registrations, registration)
+	return registration, nil
+}
+
+func (f *fakeRepo) ListSUTRegistrations(_ context.Context, sutID int64) ([]resource.SUTRegistration, error) {
+	out := make([]resource.SUTRegistration, 0)
+	for _, item := range f.registrations {
 		if item.SUTID == sutID {
 			out = append(out, item)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
-func (f *fakeRepo) GetEnvironment(_ context.Context, id int64) (resource.Environment, error) {
-	for _, item := range f.environments {
-		if item.ID == id {
-			return item, nil
-		}
+// CreateSUTWithRegistration mirrors the one-transaction contract (I-1): if the
+// registration append fails, the SUT is rolled back so it never exists without its
+// birth record.
+func (f *fakeRepo) CreateSUTWithRegistration(ctx context.Context, sut resource.SUT, registration resource.SUTRegistration) (resource.SUT, error) {
+	f.createSUTWithRegistrationCalls++
+	created, err := f.CreateSUT(ctx, sut)
+	if err != nil {
+		return resource.SUT{}, err
 	}
-	return resource.Environment{}, resource.ErrNotFound
+	if _, err := f.AppendSUTRegistration(ctx, registration); err != nil {
+		f.suts = filterSlice(f.suts, func(s resource.SUT) bool { return s.ID != created.ID })
+		return resource.SUT{}, err
+	}
+	return created, nil
 }
 
-func (f *fakeRepo) CreateEnvironment(_ context.Context, environment resource.Environment) (resource.Environment, error) {
-	for _, item := range f.environments {
-		if item.SUTID == environment.SUTID && strings.EqualFold(item.Name, environment.Name) {
-			return resource.Environment{}, resource.ErrDuplicate
-		}
-	}
-	f.environments = append(f.environments, environment)
-	return environment, nil
-}
+// ---------- pages ----------
 
-func (f *fakeRepo) UpdateEnvironment(_ context.Context, environment resource.Environment) (resource.Environment, error) {
-	for i, item := range f.environments {
-		if item.ID != environment.ID {
-			continue
-		}
-		for _, other := range f.environments {
-			if other.ID != environment.ID && other.SUTID == environment.SUTID && strings.EqualFold(other.Name, environment.Name) {
-				return resource.Environment{}, resource.ErrDuplicate
-			}
-		}
-		f.environments[i] = environment
-		return environment, nil
-	}
-	return resource.Environment{}, resource.ErrNotFound
-}
-
-func (f *fakeRepo) DeleteEnvironment(_ context.Context, id int64) error {
-	for i, item := range f.environments {
-		if item.ID == id {
-			f.environments = append(f.environments[:i], f.environments[i+1:]...)
-			f.pages = filterSlice(f.pages, func(page resource.Page) bool { return page.EnvironmentID != id })
-			f.apis = filterSlice(f.apis, func(api resource.API) bool { return api.EnvironmentID != id })
-			f.databases = filterSlice(f.databases, func(db resource.TargetDatabase) bool { return db.EnvironmentID != id })
-			return nil
-		}
-	}
-	return resource.ErrNotFound
-}
-
-func (f *fakeRepo) ListPages(_ context.Context, environmentID int64) ([]resource.Page, error) {
+func (f *fakeRepo) ListPages(_ context.Context, sutID int64) ([]resource.Page, error) {
 	out := make([]resource.Page, 0)
 	for _, item := range f.pages {
-		if item.EnvironmentID == environmentID {
+		if item.SUTID == sutID {
 			out = append(out, item)
 		}
 	}
@@ -254,17 +350,17 @@ func normalizeTemplateTestKey(value string) string {
 	return strings.TrimRight(strings.TrimSpace(value), "/")
 }
 
-func (f *fakeRepo) GetPageByRouteTemplate(_ context.Context, environmentID int64, routeTemplate string) (resource.Page, error) {
+func (f *fakeRepo) GetPageByRouteTemplate(_ context.Context, sutID int64, routeTemplate string) (resource.Page, error) {
 	key := normalizeTemplateTestKey(routeTemplate)
 	for _, item := range f.pages {
-		if item.EnvironmentID == environmentID && normalizeTemplateTestKey(item.RouteTemplate) == key {
+		if item.SUTID == sutID && normalizeTemplateTestKey(item.RouteTemplate) == key {
 			return item, nil
 		}
 	}
 	return resource.Page{}, resource.ErrNotFound
 }
 
-// pageURLKey mirrors the sut_page unique key: (environment_id, normalized_url).
+// pageURLKey mirrors the sut_page unique key: (sut_id, normalized_url).
 func pageURLKey(page resource.Page) string {
 	normalized, err := resource.NormalizePageURL(page.URL)
 	if err != nil {
@@ -277,7 +373,7 @@ func (f *fakeRepo) CreatePage(_ context.Context, page resource.Page) (resource.P
 	f.createPageCalls++
 	key := pageURLKey(page)
 	for _, item := range f.pages {
-		if item.EnvironmentID == page.EnvironmentID && pageURLKey(item) == key {
+		if item.SUTID == page.SUTID && pageURLKey(item) == key {
 			return resource.Page{}, resource.ErrPageURLDuplicate
 		}
 	}
@@ -292,7 +388,7 @@ func (f *fakeRepo) UpdatePage(_ context.Context, page resource.Page) (resource.P
 		}
 		key := pageURLKey(page)
 		for _, other := range f.pages {
-			if other.ID != page.ID && other.EnvironmentID == page.EnvironmentID && pageURLKey(other) == key {
+			if other.ID != page.ID && other.SUTID == page.SUTID && pageURLKey(other) == key {
 				return resource.Page{}, resource.ErrPageURLDuplicate
 			}
 		}
@@ -312,10 +408,12 @@ func (f *fakeRepo) DeletePage(_ context.Context, id int64) error {
 	return resource.ErrNotFound
 }
 
-func (f *fakeRepo) ListAPIs(_ context.Context, environmentID int64) ([]resource.API, error) {
+// ---------- APIs ----------
+
+func (f *fakeRepo) ListAPIs(_ context.Context, sutID int64) ([]resource.API, error) {
 	out := make([]resource.API, 0)
 	for _, item := range f.apis {
-		if item.EnvironmentID == environmentID {
+		if item.SUTID == sutID {
 			out = append(out, item)
 		}
 	}
@@ -332,10 +430,10 @@ func (f *fakeRepo) GetAPI(_ context.Context, id int64) (resource.API, error) {
 	return resource.API{}, resource.ErrNotFound
 }
 
-func (f *fakeRepo) GetAPIByTemplate(_ context.Context, environmentID int64, method, pathTemplate string) (resource.API, error) {
+func (f *fakeRepo) GetAPIByTemplate(_ context.Context, sutID int64, method, pathTemplate string) (resource.API, error) {
 	key := normalizeTemplateTestKey(pathTemplate)
 	for _, item := range f.apis {
-		if item.EnvironmentID == environmentID && strings.EqualFold(item.Method, method) &&
+		if item.SUTID == sutID && strings.EqualFold(item.Method, method) &&
 			normalizeTemplateTestKey(item.PathTemplate) == key {
 			return item, nil
 		}
@@ -345,7 +443,7 @@ func (f *fakeRepo) GetAPIByTemplate(_ context.Context, environmentID int64, meth
 
 func (f *fakeRepo) CreateAPI(_ context.Context, api resource.API) (resource.API, error) {
 	for _, item := range f.apis {
-		if item.EnvironmentID == api.EnvironmentID && item.Method == api.Method && item.PathTemplate == api.PathTemplate {
+		if item.SUTID == api.SUTID && item.Method == api.Method && item.PathTemplate == api.PathTemplate {
 			return resource.API{}, resource.ErrDuplicate
 		}
 	}
@@ -359,7 +457,7 @@ func (f *fakeRepo) UpdateAPI(_ context.Context, api resource.API) (resource.API,
 			continue
 		}
 		for _, other := range f.apis {
-			if other.ID != api.ID && other.EnvironmentID == api.EnvironmentID &&
+			if other.ID != api.ID && other.SUTID == api.SUTID &&
 				other.Method == api.Method && other.PathTemplate == api.PathTemplate {
 				return resource.API{}, resource.ErrDuplicate
 			}
@@ -379,6 +477,8 @@ func (f *fakeRepo) DeleteAPI(_ context.Context, id int64) error {
 	}
 	return resource.ErrNotFound
 }
+
+// ---------- target databases ----------
 
 func (f *fakeRepo) ListDatabases(_ context.Context, sutID int64) ([]resource.TargetDatabase, error) {
 	out := make([]resource.TargetDatabase, 0)
@@ -402,7 +502,7 @@ func (f *fakeRepo) GetDatabase(_ context.Context, id int64) (resource.TargetData
 
 func (f *fakeRepo) CreateDatabase(_ context.Context, database resource.TargetDatabase) (resource.TargetDatabase, error) {
 	for _, item := range f.databases {
-		if item.EnvironmentID == database.EnvironmentID && strings.EqualFold(item.Name, database.Name) {
+		if item.SUTID == database.SUTID && strings.EqualFold(item.Name, database.Name) {
 			return resource.TargetDatabase{}, resource.ErrDuplicate
 		}
 	}
@@ -416,7 +516,7 @@ func (f *fakeRepo) UpdateDatabase(_ context.Context, database resource.TargetDat
 			continue
 		}
 		for _, other := range f.databases {
-			if other.ID != database.ID && other.EnvironmentID == database.EnvironmentID && strings.EqualFold(other.Name, database.Name) {
+			if other.ID != database.ID && other.SUTID == database.SUTID && strings.EqualFold(other.Name, database.Name) {
 				return resource.TargetDatabase{}, resource.ErrDuplicate
 			}
 		}
@@ -435,6 +535,8 @@ func (f *fakeRepo) DeleteDatabase(_ context.Context, id int64) error {
 	}
 	return resource.ErrNotFound
 }
+
+// ---------- test accounts (global pool) ----------
 
 func (f *fakeRepo) ListAccounts(_ context.Context) ([]resource.TestAccount, error) {
 	out := append([]resource.TestAccount(nil), f.accounts...)
@@ -487,6 +589,8 @@ func (f *fakeRepo) DeleteAccount(_ context.Context, id int64) error {
 	return resource.ErrNotFound
 }
 
+// ---------- repositories ----------
+
 func (f *fakeRepo) ListSUTRepositories(_ context.Context, sutID int64) ([]resource.SUTRepository, error) {
 	out := make([]resource.SUTRepository, 0)
 	for _, item := range f.sutRepos {
@@ -494,13 +598,35 @@ func (f *fakeRepo) ListSUTRepositories(_ context.Context, sutID int64) ([]resour
 			out = append(out, item)
 		}
 	}
+	sortSUTRepositories(out)
+	return out, nil
+}
+
+func (f *fakeRepo) ListEnvironmentSUTRepositories(_ context.Context, environmentID int64) ([]resource.SUTRepository, error) {
+	sutIDs := make(map[int64]struct{})
+	for _, sut := range f.sutsOfEnvironment(environmentID) {
+		sutIDs[sut.ID] = struct{}{}
+	}
+	out := make([]resource.SUTRepository, 0)
+	for _, item := range f.sutRepos {
+		if _, ok := sutIDs[item.SUTID]; ok {
+			out = append(out, item)
+		}
+	}
+	sortSUTRepositories(out)
+	return out, nil
+}
+
+func sortSUTRepositories(out []resource.SUTRepository) {
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].RepoID != out[j].RepoID {
 			return out[i].RepoID < out[j].RepoID
 		}
+		if out[i].SUTID != out[j].SUTID {
+			return out[i].SUTID < out[j].SUTID
+		}
 		return out[i].ID < out[j].ID
 	})
-	return out, nil
 }
 
 func (f *fakeRepo) CreateSUTRepository(_ context.Context, repository resource.SUTRepository) (resource.SUTRepository, error) {
@@ -517,6 +643,17 @@ func (f *fakeRepo) DeleteSUTRepository(_ context.Context, id int64) error {
 	for i, item := range f.sutRepos {
 		if item.ID == id {
 			f.sutRepos = append(f.sutRepos[:i], f.sutRepos[i+1:]...)
+			return nil
+		}
+	}
+	return resource.ErrNotFound
+}
+
+func (f *fakeRepo) SetSUTRepositoryBaselineCommit(_ context.Context, sutID, repoID int64, commit string) error {
+	for i, item := range f.sutRepos {
+		if item.SUTID == sutID && item.RepoID == repoID {
+			f.sutRepos[i].CodeBaselineCommit = commit
+			f.baselineWrites = append(f.baselineWrites, baselineWrite{sutID: sutID, repoID: repoID, commit: commit})
 			return nil
 		}
 	}
@@ -584,46 +721,52 @@ func (f *fakeRepo) DeleteRepository(_ context.Context, id int64) error {
 	return resource.ErrNotFound
 }
 
-func (f *fakeRepo) GetSUTGraph(_ context.Context, sutID int64) (resource.SUTGraph, error) {
-	sut, err := f.GetSUT(context.Background(), sutID)
+// ---------- aggregates ----------
+
+func (f *fakeRepo) GetEnvironmentGraph(_ context.Context, environmentID int64) (resource.EnvironmentGraph, error) {
+	environment, err := f.GetEnvironment(context.Background(), environmentID)
 	if err != nil {
-		return resource.SUTGraph{}, err
+		return resource.EnvironmentGraph{}, err
 	}
-	return f.graph(sut), nil
+	return f.graph(environment), nil
 }
 
-func (f *fakeRepo) ListCatalog(context.Context) ([]resource.SUTGraph, error) {
-	out := make([]resource.SUTGraph, 0, len(f.suts))
-	for _, sut := range f.suts {
-		out = append(out, f.graph(sut))
+func (f *fakeRepo) ListCatalog(context.Context) ([]resource.EnvironmentGraph, error) {
+	out := make([]resource.EnvironmentGraph, 0, len(f.environments))
+	for _, environment := range f.environments {
+		out = append(out, f.graph(environment))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SUT.ID < out[j].SUT.ID })
+	sort.Slice(out, func(i, j int) bool { return out[i].Environment.ID < out[j].Environment.ID })
 	return out, nil
 }
 
-func (f *fakeRepo) graph(sut resource.SUT) resource.SUTGraph {
-	graph := resource.SUTGraph{SUT: sut}
-	for _, env := range f.environments {
-		if env.SUTID == sut.ID {
-			graph.Environments = append(graph.Environments, env)
+func (f *fakeRepo) graph(environment resource.Environment) resource.EnvironmentGraph {
+	graph := resource.EnvironmentGraph{Environment: environment}
+	for _, sut := range f.suts {
+		if sut.EnvironmentID != environment.ID {
+			continue
+		}
+		graph.SUTs = append(graph.SUTs, sut)
+		for _, page := range f.pages {
+			if page.SUTID == sut.ID {
+				graph.Pages = append(graph.Pages, page)
+			}
+		}
+		for _, api := range f.apis {
+			if api.SUTID == sut.ID {
+				graph.APIs = append(graph.APIs, api)
+			}
+		}
+		for _, database := range f.databases {
+			if database.SUTID == sut.ID {
+				graph.Databases = append(graph.Databases, database)
+			}
 		}
 	}
-	for _, page := range f.pages {
-		if page.SUTID == sut.ID {
-			graph.Pages = append(graph.Pages, page)
-		}
-	}
-	for _, api := range f.apis {
-		if api.SUTID == sut.ID {
-			graph.APIs = append(graph.APIs, api)
-		}
-	}
-	for _, db := range f.databases {
-		if db.SUTID == sut.ID {
-			graph.Databases = append(graph.Databases, db)
-		}
-	}
-	graph.Accounts = append(graph.Accounts, f.accounts...)
+	sort.Slice(graph.SUTs, func(i, j int) bool { return graph.SUTs[i].ID < graph.SUTs[j].ID })
+	sort.Slice(graph.Pages, func(i, j int) bool { return graph.Pages[i].ID < graph.Pages[j].ID })
+	sort.Slice(graph.APIs, func(i, j int) bool { return graph.APIs[i].ID < graph.APIs[j].ID })
+	sort.Slice(graph.Databases, func(i, j int) bool { return graph.Databases[i].ID < graph.Databases[j].ID })
 	return graph
 }
 
@@ -641,6 +784,14 @@ var testNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 func familyPtr(value string) *string { return &value }
 
+// testEnvironmentID is the top-level environment newHarness pre-creates so the
+// SUTs the helpers add keep stable, predictable IDs (the first SUT is 1002 and
+// the assets created after it start at 1003).
+const testEnvironmentID = int64(1001)
+
+// testSUTID is the ID of the first SUT createTestSUT creates.
+const testSUTID = int64(1002)
+
 type harness struct {
 	svc    *Service
 	repo   *fakeRepo
@@ -655,7 +806,17 @@ func newHarness() *harness {
 	audit := &fakeAudit{}
 	events := &fakeEvents{}
 	svc := New(repo, &seqIDs{next: 1000}, fixedClock{at: testNow}, usage, audit, events)
-	return &harness{svc: svc, repo: repo, usage: usage, audit: audit, events: events}
+	h := &harness{svc: svc, repo: repo, usage: usage, audit: audit, events: events}
+	// v0.2.4-B: environments are top-level, so the harness owns one before any
+	// SUT can be created inside it.
+	if _, err := svc.CreateEnvironment(context.Background(), EnvironmentInput{
+		Name: "prod", Description: "production", Status: resource.StatusActive,
+	}, 42); err != nil {
+		panic("newHarness: seed environment: " + err.Error())
+	}
+	h.events.published = nil
+	h.audit.entries = nil
+	return h
 }
 
 func assertAPIError(t *testing.T, err error, status int, code string) *platform.Error {
@@ -673,31 +834,57 @@ func assertAPIError(t *testing.T, err error, status int, code string) *platform.
 	return apiErr
 }
 
+// createTestSUT creates one SUT inside the harness environment.
 func createTestSUT(t *testing.T, h *harness, name string) SUTView {
 	t.Helper()
-	view, err := h.svc.CreateSUT(context.Background(), SUTInput{Name: name, Intro: name + " intro"}, 42)
+	view, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: name, Intro: name + " intro", BaseURL: testBaseURL(name),
+	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT(%q): %v", name, err)
 	}
 	return view
 }
 
+// testBaseURL derives a valid absolute http(s) base_url from a SUT name.
+func testBaseURL(name string) string {
+	slug := strings.ToLower(strings.Join(strings.Fields(name), "-"))
+	return "https://" + slug + ".example.com"
+}
+
+// createTestEnvironment creates an extra top-level environment.
+func createTestEnvironment(t *testing.T, h *harness, name string) EnvironmentView {
+	t.Helper()
+	view, err := h.svc.CreateEnvironment(context.Background(), EnvironmentInput{
+		Name: name, Description: name + " environment",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateEnvironment(%q): %v", name, err)
+	}
+	return view
+}
+
 func TestCreateSUTAssignsIDsTimestampsAndRecords(t *testing.T) {
 	h := newHarness()
-	view, err := h.svc.CreateSUT(context.Background(), SUTInput{Name: "Order Center", Intro: "orders"}, 42)
+	view, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "Order Center", Intro: "orders", BaseURL: "https://order.example.com",
+	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT: %v", err)
 	}
-	if view.ID != "1001" || view.Name != "Order Center" || view.Intro != "orders" {
+	if view.ID != "1002" || view.Name != "Order Center" || view.Intro != "orders" {
 		t.Fatalf("view = %#v", view)
+	}
+	if view.EnvironmentID != "1001" || view.BaseURL != "https://order.example.com" {
+		t.Fatalf("hierarchy = %#v", view)
 	}
 	if !view.CreatedAt.Equal(testNow) || !view.UpdatedAt.Equal(testNow) {
 		t.Fatalf("timestamps = %v / %v", view.CreatedAt, view.UpdatedAt)
 	}
-	if len(view.Environments) != 0 {
-		t.Fatalf("environments = %#v", view.Environments)
+	if len(view.Pages) != 0 || len(view.APIs) != 0 || len(view.Databases) != 0 {
+		t.Fatalf("assets = %#v", view)
 	}
-	stored, err := h.repo.GetSUT(context.Background(), 1001)
+	stored, err := h.repo.GetSUT(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("stored SUT: %v", err)
 	}
@@ -712,14 +899,14 @@ func TestCreateSUTAssignsIDsTimestampsAndRecords(t *testing.T) {
 	if event.Channel != "system" || event.Type != "resource.sut.created" {
 		t.Fatalf("event = %#v", event)
 	}
-	if event.ActorID == nil || *event.ActorID != 42 || event.Payload["id"] != "1001" {
+	if event.ActorID == nil || *event.ActorID != 42 || event.Payload["id"] != "1002" {
 		t.Fatalf("event = %#v", event)
 	}
 	if len(h.audit.entries) != 1 {
 		t.Fatalf("audit = %d", len(h.audit.entries))
 	}
 	entry := h.audit.entries[0]
-	if entry.Action != "resource.sut.created" || entry.TargetKind != "sut" || entry.TargetID != "1001" {
+	if entry.Action != "resource.sut.created" || entry.TargetKind != "sut" || entry.TargetID != "1002" {
 		t.Fatalf("audit = %#v", entry)
 	}
 	if entry.ActorID == nil || *entry.ActorID != 42 {
@@ -731,10 +918,14 @@ func TestCreateSUTRejectsDuplicateAndInvalid(t *testing.T) {
 	h := newHarness()
 	createTestSUT(t, h, "Order Center")
 
-	_, err := h.svc.CreateSUT(context.Background(), SUTInput{Name: "order center"}, 42)
+	_, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "order center", BaseURL: "https://dup.example.com",
+	}, 42)
 	assertAPIError(t, err, 409, "conflict")
 
-	_, err = h.svc.CreateSUT(context.Background(), SUTInput{Name: "   "}, 42)
+	_, err = h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "   ", BaseURL: "https://blank.example.com",
+	}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "name" {
 		t.Fatalf("details = %#v", apiErr.Details)
@@ -749,7 +940,7 @@ func TestUpdateSUTAppliesPatchAndReportsMissing(t *testing.T) {
 	created := createTestSUT(t, h, "Order Center")
 
 	name := "Orders Platform"
-	view, err := h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Name: &name}, 42)
+	view, err := h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Name: &name}, 42)
 	if err != nil {
 		t.Fatalf("UpdateSUT: %v", err)
 	}
@@ -767,7 +958,7 @@ func TestUpdateSUTAppliesPatchAndReportsMissing(t *testing.T) {
 	assertAPIError(t, err, 404, "not_found")
 
 	blank := "  "
-	_, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Name: &blank}, 42)
+	_, err = h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Name: &blank}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "name" {
 		t.Fatalf("details = %#v", apiErr.Details)
@@ -776,8 +967,8 @@ func TestUpdateSUTAppliesPatchAndReportsMissing(t *testing.T) {
 
 func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
 	h := newHarness()
-	view, err := h.svc.CreateSUT(context.Background(), SUTInput{
-		Name: "Payments", Family: familyPtr("  payments  "),
+	view, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "Payments", BaseURL: "https://payments.example.com", Family: familyPtr("  payments  "),
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT: %v", err)
@@ -785,7 +976,7 @@ func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
 	if view.Family == nil || *view.Family != "payments" {
 		t.Fatalf("family = %v", view.Family)
 	}
-	stored, err := h.repo.GetSUT(context.Background(), 1001)
+	stored, err := h.repo.GetSUT(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("stored SUT: %v", err)
 	}
@@ -793,8 +984,8 @@ func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
 		t.Fatalf("stored family = %v", stored.Family)
 	}
 
-	without, err := h.svc.CreateSUT(context.Background(), SUTInput{
-		Name: "No Family", Family: familyPtr(""),
+	without, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "No Family", BaseURL: "https://nofamily.example.com", Family: familyPtr(""),
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT with empty family: %v", err)
@@ -812,8 +1003,8 @@ func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
 		{name: "inner whitespace", family: "order center"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := h.svc.CreateSUT(context.Background(), SUTInput{
-				Name: "Bad " + tc.name, Family: familyPtr(tc.family),
+			_, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+				Name: "Bad " + tc.name, BaseURL: "https://bad.example.com", Family: familyPtr(tc.family),
 			}, 42)
 			apiErr := assertAPIError(t, err, 400, "invalid_argument")
 			if apiErr.Details["field"] != "family" {
@@ -825,8 +1016,8 @@ func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
 
 func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
 	h := newHarness()
-	created, err := h.svc.CreateSUT(context.Background(), SUTInput{
-		Name: "Order Center", Family: familyPtr("payments"),
+	created, err := h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "Order Center", BaseURL: "https://order.example.com", Family: familyPtr("payments"),
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateSUT: %v", err)
@@ -837,7 +1028,7 @@ func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
 
 	// Omitted family keeps the stored value.
 	name := "Orders Platform"
-	view, err := h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Name: &name}, 42)
+	view, err := h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Name: &name}, 42)
 	if err != nil {
 		t.Fatalf("UpdateSUT: %v", err)
 	}
@@ -846,7 +1037,7 @@ func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
 	}
 
 	// A present family is trimmed and replaces the stored value.
-	view, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("  order-center  ")}, 42)
+	view, err = h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Family: familyPtr("  order-center  ")}, 42)
 	if err != nil {
 		t.Fatalf("UpdateSUT set family: %v", err)
 	}
@@ -855,14 +1046,14 @@ func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
 	}
 
 	// The empty string is the explicit clear.
-	view, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("")}, 42)
+	view, err = h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Family: familyPtr("")}, 42)
 	if err != nil {
 		t.Fatalf("UpdateSUT clear family: %v", err)
 	}
 	if view.Family != nil {
 		t.Fatalf("cleared family = %v", view.Family)
 	}
-	stored, err := h.repo.GetSUT(context.Background(), 1001)
+	stored, err := h.repo.GetSUT(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("stored SUT: %v", err)
 	}
@@ -871,12 +1062,12 @@ func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
 	}
 
 	// Invalid present values are rejected and leave the row untouched.
-	_, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("Payments")}, 42)
+	_, err = h.svc.UpdateSUT(context.Background(), testSUTID, SUTPatch{Family: familyPtr("Payments")}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "family" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
-	stored, err = h.repo.GetSUT(context.Background(), 1001)
+	stored, err = h.repo.GetSUT(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("stored SUT: %v", err)
 	}
@@ -898,14 +1089,14 @@ func TestListSUTsPaginatesByIDDesc(t *testing.T) {
 	if len(first) != 2 || !hasMore {
 		t.Fatalf("first page = %#v, hasMore = %v", first, hasMore)
 	}
-	if first[0].ID != "1005" || first[1].ID != "1004" {
+	if first[0].ID != "1010" || first[1].ID != "1008" {
 		t.Fatalf("order = %#v", first)
 	}
 	if h.repo.lastSUTLimit != 3 {
 		t.Fatalf("repo limit = %d", h.repo.lastSUTLimit)
 	}
 
-	before := int64(1004)
+	before := int64(1008)
 	second, hasMore, err := h.svc.ListSUTs(context.Background(), 2, &before)
 	if err != nil {
 		t.Fatalf("ListSUTs page 2: %v", err)
@@ -913,166 +1104,237 @@ func TestListSUTsPaginatesByIDDesc(t *testing.T) {
 	if len(second) != 2 || !hasMore {
 		t.Fatalf("second page = %#v, hasMore = %v", second, hasMore)
 	}
-	if second[0].ID != "1003" || second[1].ID != "1002" {
+	if second[0].ID != "1006" || second[1].ID != "1004" {
 		t.Fatalf("second page order = %#v", second)
 	}
-	if h.repo.lastSUTBefore == nil || *h.repo.lastSUTBefore != 1004 {
+	if h.repo.lastSUTBefore == nil || *h.repo.lastSUTBefore != 1008 {
 		t.Fatalf("before = %v", h.repo.lastSUTBefore)
 	}
 
-	before = int64(1002)
+	before = int64(1004)
 	last, hasMore, err := h.svc.ListSUTs(context.Background(), 2, &before)
 	if err != nil {
 		t.Fatalf("ListSUTs page 3: %v", err)
 	}
-	if len(last) != 1 || hasMore || last[0].ID != "1001" {
+	if len(last) != 1 || hasMore || last[0].ID != "1002" {
 		t.Fatalf("last page = %#v, hasMore = %v", last, hasMore)
 	}
 }
 
-func TestCreateEnvironmentKeepsDefaultUnique(t *testing.T) {
+func TestCreateEnvironmentIsTopLevelAndUniqueByName(t *testing.T) {
 	h := newHarness()
-	createTestSUT(t, h, "Order Center")
 
-	first, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "prod", BaseURL: "https://orders.example.com", IsDefault: true,
+	first, err := h.svc.CreateEnvironment(context.Background(), EnvironmentInput{
+		Name: "staging", Description: "staging environment",
 	}, 42)
 	if err != nil {
-		t.Fatalf("CreateEnvironment first: %v", err)
+		t.Fatalf("CreateEnvironment: %v", err)
 	}
-	if first.ID != "1002" || !first.IsDefault || first.Status != resource.StatusActive {
+	if first.ID != "1002" || first.Name != "staging" || first.Description != "staging environment" {
 		t.Fatalf("first = %#v", first)
 	}
-
-	second, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "staging", BaseURL: "https://staging.example.com", IsDefault: true,
-	}, 42)
-	if err != nil {
-		t.Fatalf("CreateEnvironment second: %v", err)
+	if first.Status != resource.StatusActive {
+		t.Fatalf("default status = %q", first.Status)
 	}
-	if !second.IsDefault {
-		t.Fatalf("second default = %v", second.IsDefault)
-	}
-	stored, err := h.repo.GetEnvironment(context.Background(), 1002)
-	if err != nil {
-		t.Fatalf("GetEnvironment: %v", err)
-	}
-	if stored.IsDefault {
-		t.Fatal("previous default environment was not unset")
-	}
-
-	views, err := h.svc.ListEnvironments(context.Background(), 1001)
-	if err != nil {
-		t.Fatalf("ListEnvironments: %v", err)
-	}
-	if len(views) != 2 || views[0].ID != "1002" || views[1].ID != "1003" {
-		t.Fatalf("environments = %#v", views)
-	}
-	if len(views[0].Pages) != 0 || views[0].Pages == nil {
-		t.Fatalf("nested pages = %#v", views[0].Pages)
+	if len(first.SUTs) != 0 || first.SUTs == nil {
+		t.Fatalf("nested suts = %#v", first.SUTs)
 	}
 	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.environment.created" {
 		t.Fatalf("event type = %q", got)
 	}
+
+	// The name is globally unique, case-insensitively.
+	_, err = h.svc.CreateEnvironment(context.Background(), EnvironmentInput{Name: "STAGING"}, 42)
+	assertAPIError(t, err, 409, "conflict")
+
+	views, hasMore, err := h.svc.ListEnvironments(context.Background(), 10, nil)
+	if err != nil {
+		t.Fatalf("ListEnvironments: %v", err)
+	}
+	if len(views) != 2 || hasMore {
+		t.Fatalf("environments = %#v hasMore=%v", views, views)
+	}
+	if views[0].ID != "1002" || views[1].ID != "1001" {
+		t.Fatalf("environments are not ordered by ID descending: %#v", views)
+	}
 }
 
-func TestUpdateEnvironmentToDefaultUnsetsOthers(t *testing.T) {
+func TestUpdateEnvironmentAppliesPatch(t *testing.T) {
 	h := newHarness()
-	createTestSUT(t, h, "Order Center")
-	first, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "prod", BaseURL: "https://orders.example.com", IsDefault: true,
-	}, 42)
-	if err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
-	}
-	second, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "staging", BaseURL: "https://staging.example.com",
-	}, 42)
-	if err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
-	}
+	created := createTestEnvironment(t, h, "staging")
 
-	isDefault := true
-	updated, err := h.svc.UpdateEnvironment(context.Background(), 1003, EnvironmentPatch{IsDefault: &isDefault}, 42)
+	name := "pre-production"
+	description := "renamed"
+	status := resource.StatusDisabled
+	updated, err := h.svc.UpdateEnvironment(context.Background(), mustID(t, created.ID), EnvironmentPatch{
+		Name: &name, Description: &description, Status: &status,
+	}, 42)
 	if err != nil {
 		t.Fatalf("UpdateEnvironment: %v", err)
 	}
-	if !updated.IsDefault {
-		t.Fatal("updated environment is not the default")
+	if updated.Name != "pre-production" || updated.Description != "renamed" || updated.Status != resource.StatusDisabled {
+		t.Fatalf("updated = %#v", updated)
 	}
-	stored, err := h.repo.GetEnvironment(context.Background(), 1002)
-	if err != nil {
-		t.Fatalf("GetEnvironment: %v", err)
+	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.environment.updated" {
+		t.Fatalf("event type = %q", got)
 	}
-	if stored.IsDefault {
-		t.Fatal("previous default environment was not unset")
-	}
-	if second.IsDefault {
-		t.Fatal("second environment unexpectedly default before update")
-	}
-	_ = first
+
+	_, err = h.svc.UpdateEnvironment(context.Background(), 9999, EnvironmentPatch{Name: &name}, 42)
+	assertAPIError(t, err, 404, "not_found")
 }
 
-func TestEnvironmentValidationAndLookupErrors(t *testing.T) {
+func TestEnvironmentValidationErrors(t *testing.T) {
 	h := newHarness()
-	createTestSUT(t, h, "Order Center")
 
-	_, err := h.svc.CreateEnvironment(context.Background(), 9999, EnvironmentInput{
-		Name: "prod", BaseURL: "https://orders.example.com",
+	_, err := h.svc.CreateEnvironment(context.Background(), EnvironmentInput{Name: "   "}, 42)
+	apiErr := assertAPIError(t, err, 400, "invalid_argument")
+	if apiErr.Details["field"] != "name" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+
+	_, err = h.svc.CreateEnvironment(context.Background(), EnvironmentInput{
+		Name: "prod", Status: "archived",
+	}, 42)
+	apiErr = assertAPIError(t, err, 400, "invalid_argument")
+	if apiErr.Details["field"] != "status" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+
+	_, err = h.svc.CreateEnvironment(context.Background(), EnvironmentInput{
+		Name: "prod", Description: strings.Repeat("x", resource.MaxEnvironmentDescriptionRunes+1),
+	}, 42)
+	apiErr = assertAPIError(t, err, 400, "invalid_argument")
+	if apiErr.Details["field"] != "description" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+}
+
+func TestCreateSUTRequiresAnExistingEnvironment(t *testing.T) {
+	h := newHarness()
+
+	_, err := h.svc.CreateSUT(context.Background(), 9999, SUTInput{
+		Name: "Order Center", BaseURL: "https://order.example.com",
 	}, 42)
 	assertAPIError(t, err, 404, "not_found")
 
-	_, err = h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "prod", BaseURL: "orders.example.com",
-	}, 42)
+	// base_url moved down from the environment to the SUT and is mandatory.
+	_, err = h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{Name: "Order Center"}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "base_url" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 
-	if _, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "prod", BaseURL: "https://orders.example.com",
+	// The SUT name is unique per environment, not globally: the same name in a
+	// second environment is accepted.
+	createTestSUT(t, h, "Order Center")
+	other := createTestEnvironment(t, h, "staging")
+	if _, err := h.svc.CreateSUT(context.Background(), mustID(t, other.ID), SUTInput{
+		Name: "Order Center", BaseURL: "https://staging.order.example.com",
 	}, 42); err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
+		t.Fatalf("the same SUT name in another environment must be accepted: %v", err)
 	}
-	_, err = h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "PROD", BaseURL: "https://orders2.example.com",
+	_, err = h.svc.CreateSUT(context.Background(), testEnvironmentID, SUTInput{
+		Name: "order center", BaseURL: "https://dup.example.com",
 	}, 42)
 	assertAPIError(t, err, 409, "conflict")
+}
 
-	_, err = h.svc.UpdateEnvironment(context.Background(), 9999, EnvironmentPatch{}, 42)
-	assertAPIError(t, err, 404, "not_found")
+func TestListSUTsByEnvironmentAndAssets(t *testing.T) {
+	h := newHarness()
+	ctx := context.Background()
+	first := createTestSUT(t, h, "Order Center")
+	other := createTestEnvironment(t, h, "staging")
+	second, err := h.svc.CreateSUT(ctx, mustID(t, other.ID), SUTInput{
+		Name: "Billing", BaseURL: "https://billing.example.com",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT in the second environment: %v", err)
+	}
 
-	badStatus := "archived"
-	_, err = h.svc.UpdateEnvironment(context.Background(), 1002, EnvironmentPatch{Status: &badStatus}, 42)
-	apiErr = assertAPIError(t, err, 400, "invalid_argument")
-	if apiErr.Details["field"] != "status" {
-		t.Fatalf("details = %#v", apiErr.Details)
+	suts, err := h.svc.ListSUTsByEnvironment(ctx, testEnvironmentID)
+	if err != nil {
+		t.Fatalf("ListSUTsByEnvironment: %v", err)
+	}
+	if len(suts) != 1 || suts[0].ID != first.ID {
+		t.Fatalf("suts = %#v", suts)
+	}
+	suts, err = h.svc.ListSUTsByEnvironment(ctx, mustID(t, other.ID))
+	if err != nil {
+		t.Fatalf("ListSUTsByEnvironment second: %v", err)
+	}
+	if len(suts) != 1 || suts[0].ID != second.ID {
+		t.Fatalf("second environment suts = %#v", suts)
+	}
+	if _, err := h.svc.ListSUTsByEnvironment(ctx, 9999); err == nil {
+		t.Fatal("a missing environment must be a 404")
+	} else {
+		assertAPIError(t, err, 404, "not_found")
+	}
+
+	if _, err := h.svc.CreatePage(ctx, mustID(t, first.ID), PageInput{
+		Name: "orders", URL: "https://order.example.com/orders",
+	}, 42); err != nil {
+		t.Fatalf("CreatePage: %v", err)
+	}
+	assets, err := h.svc.ListAssetsBySUT(ctx, mustID(t, first.ID))
+	if err != nil {
+		t.Fatalf("ListAssetsBySUT: %v", err)
+	}
+	if len(assets.Pages) != 1 || len(assets.APIs) != 0 || len(assets.Databases) != 0 {
+		t.Fatalf("assets = %#v", assets)
+	}
+	if _, err := h.svc.ListAssetsBySUT(ctx, 9999); err == nil {
+		t.Fatal("a missing SUT must be a 404")
 	}
 }
 
-func newPageEnv(t *testing.T, h *harness) { // creates SUT 1001 and env 1002
+func TestDeleteEnvironmentCascadesItsSUTs(t *testing.T) {
+	h := newHarness()
+	ctx := context.Background()
+	other := createTestEnvironment(t, h, "staging")
+	sut, err := h.svc.CreateSUT(ctx, mustID(t, other.ID), SUTInput{
+		Name: "Billing", BaseURL: "https://billing.example.com",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT: %v", err)
+	}
+	if _, err := h.svc.CreatePage(ctx, mustID(t, sut.ID), PageInput{
+		Name: "invoices", URL: "https://billing.example.com/invoices",
+	}, 42); err != nil {
+		t.Fatalf("CreatePage: %v", err)
+	}
+
+	if err := h.svc.DeleteEnvironment(ctx, mustID(t, other.ID), 42); err != nil {
+		t.Fatalf("DeleteEnvironment: %v", err)
+	}
+	if len(h.repo.suts) != 0 || len(h.repo.pages) != 0 || len(h.repo.environments) != 1 {
+		t.Fatalf("cascade left environments=%d suts=%d pages=%d",
+			len(h.repo.environments), len(h.repo.suts), len(h.repo.pages))
+	}
+	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.environment.deleted" {
+		t.Fatalf("event type = %q", got)
+	}
+}
+
+// newPageEnv creates the SUT (1002) the page/API tests hang their assets off.
+// The environment (1001) is pre-seeded by newHarness.
+func newPageEnv(t *testing.T, h *harness) {
 	t.Helper()
 	createTestSUT(t, h, "Order Center")
-	if _, err := h.svc.CreateEnvironment(context.Background(), 1001, EnvironmentInput{
-		Name: "prod", BaseURL: "https://app.example.com", IsDefault: true,
-	}, 42); err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
-	}
 }
 
 func TestCreatePageDerivesRouteAndDefaults(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
 
-	view, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+	view, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{
 		Name: "Order list",
 		URL:  "https://app.example.com/orders?state=open",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	if view.ID != "1003" || view.SUTID != "1001" || view.EnvironmentID != "1002" {
+	if view.ID != "1004" || view.SUTID != "1002" {
 		t.Fatalf("ids = %#v", view)
 	}
 	if view.RouteTemplate != "/orders" || view.PageType != "page" {
@@ -1082,18 +1344,18 @@ func TestCreatePageDerivesRouteAndDefaults(t *testing.T) {
 		t.Fatalf("status/source = %#v", view)
 	}
 
-	stored, err := h.svc.GetPage(context.Background(), 1003)
+	stored, err := h.svc.GetPage(context.Background(), 1004)
 	if err != nil {
 		t.Fatalf("GetPage: %v", err)
 	}
 	if stored.URL != "https://app.example.com/orders?state=open" {
 		t.Fatalf("stored = %#v", stored)
 	}
-	pages, err := h.svc.ListPages(context.Background(), 1002)
+	pages, err := h.svc.ListPages(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("ListPages: %v", err)
 	}
-	if len(pages) != 1 || pages[0].ID != "1003" {
+	if len(pages) != 1 || pages[0].ID != "1004" {
 		t.Fatalf("pages = %#v", pages)
 	}
 	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.page.created" {
@@ -1108,16 +1370,16 @@ func TestCreatePageValidationAndDuplicate(t *testing.T) {
 	_, err := h.svc.CreatePage(context.Background(), 9999, PageInput{Name: "x", URL: "https://app.example.com/x"}, 42)
 	assertAPIError(t, err, 404, "not_found")
 
-	_, err = h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "x", URL: "not-a-url"}, 42)
+	_, err = h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "x", URL: "not-a-url"}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "url" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 
-	if _, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
+	if _, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	_, err = h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders dup", URL: "https://app.example.com/orders?x=1"}, 42)
+	_, err = h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "orders dup", URL: "https://app.example.com/orders?x=1"}, 42)
 	apiErr = assertAPIError(t, err, 409, "page_url_exists")
 	if apiErr.Details["field"] != "url" {
 		t.Fatalf("details = %#v", apiErr.Details)
@@ -1127,14 +1389,14 @@ func TestCreatePageValidationAndDuplicate(t *testing.T) {
 func TestUpdatePageAppliesPatch(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
-	page, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42)
+	page, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
 
 	route := "/orders/list"
 	name := "Order list"
-	updated, err := h.svc.UpdatePage(context.Background(), 1003, PagePatch{RouteTemplate: &route, Name: &name}, 42)
+	updated, err := h.svc.UpdatePage(context.Background(), 1004, PagePatch{RouteTemplate: &route, Name: &name}, 42)
 	if err != nil {
 		t.Fatalf("UpdatePage: %v", err)
 	}
@@ -1151,14 +1413,14 @@ func TestUpdatePageAppliesPatch(t *testing.T) {
 	_, err = h.svc.UpdatePage(context.Background(), 9999, PagePatch{Name: &name}, 42)
 	assertAPIError(t, err, 404, "not_found")
 
-	second, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "users", URL: "https://app.example.com/users"}, 42)
+	second, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "users", URL: "https://app.example.com/users"}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage second: %v", err)
 	}
 	_ = second
 	// route_template is no longer unique: reusing one is accepted.
 	route = "/orders/list"
-	reused, err := h.svc.UpdatePage(context.Background(), 1004, PagePatch{RouteTemplate: &route}, 42)
+	reused, err := h.svc.UpdatePage(context.Background(), 1005, PagePatch{RouteTemplate: &route}, 42)
 	if err != nil {
 		t.Fatalf("reusing a route_template must be accepted: %v", err)
 	}
@@ -1167,7 +1429,7 @@ func TestUpdatePageAppliesPatch(t *testing.T) {
 	}
 	// The normalized URL is the unique key now.
 	duplicateURL := "https://app.example.com/orders?dup=1"
-	_, err = h.svc.UpdatePage(context.Background(), 1004, PagePatch{URL: &duplicateURL}, 42)
+	_, err = h.svc.UpdatePage(context.Background(), 1005, PagePatch{URL: &duplicateURL}, 42)
 	apiErr := assertAPIError(t, err, 409, "page_url_exists")
 	if apiErr.Details["field"] != "url" {
 		t.Fatalf("details = %#v", apiErr.Details)
@@ -1179,13 +1441,13 @@ func TestPageSameTemplateDifferentUrlsAccepted(t *testing.T) {
 	newPageEnv(t, h)
 	ctx := context.Background()
 
-	first, err := h.svc.CreatePage(ctx, 1002, PageInput{
+	first, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 		Name: "Orders list", URL: "https://app.example.com/orders", RouteTemplate: "/shared",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage first: %v", err)
 	}
-	second, err := h.svc.CreatePage(ctx, 1002, PageInput{
+	second, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 		Name: "Users list", URL: "https://app.example.com/users", RouteTemplate: "/shared",
 	}, 42)
 	if err != nil {
@@ -1200,7 +1462,7 @@ func TestPageSameTemplateDifferentUrlsAccepted(t *testing.T) {
 		{name: "Reports", url: "https://app.example.com/reports", route: "/reports"},
 		{name: "Settings", url: "https://app.example.com/settings", route: "/settings"},
 	} {
-		view, err := h.svc.CreatePage(ctx, 1002, PageInput{Name: tc.name, URL: tc.url}, 42)
+		view, err := h.svc.CreatePage(ctx, testSUTID, PageInput{Name: tc.name, URL: tc.url}, 42)
 		if err != nil {
 			t.Fatalf("CreatePage(%s): %v", tc.url, err)
 		}
@@ -1214,7 +1476,7 @@ func TestPageSameTemplateDifferentUrlsAccepted(t *testing.T) {
 
 	// Clearing route_template re-derives it from the page URL.
 	empty := ""
-	updated, err := h.svc.UpdatePage(ctx, 1004, PagePatch{RouteTemplate: &empty}, 42)
+	updated, err := h.svc.UpdatePage(ctx, 1005, PagePatch{RouteTemplate: &empty}, 42)
 	if err != nil {
 		t.Fatalf("empty route_template must derive from the URL: %v", err)
 	}
@@ -1228,13 +1490,13 @@ func TestDuplicateNormalizedUrlFieldError(t *testing.T) {
 	newPageEnv(t, h)
 	ctx := context.Background()
 
-	if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+	if _, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 		Name: "Orders", URL: "https://app.example.com/orders?state=open",
 	}, 42); err != nil {
 		t.Fatalf("CreatePage first: %v", err)
 	}
 
-	_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+	_, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 		Name: "Orders duplicate",
 		URL:  "HTTPS://APP.EXAMPLE.COM:443/orders/?tab=all",
 	}, 42)
@@ -1243,7 +1505,7 @@ func TestDuplicateNormalizedUrlFieldError(t *testing.T) {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 
-	users, err := h.svc.CreatePage(ctx, 1002, PageInput{
+	users, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 		Name: "Users", URL: "https://app.example.com/users",
 	}, 42)
 	if err != nil {
@@ -1267,12 +1529,12 @@ func TestSpaHashAndQueryNormalization(t *testing.T) {
 	t.Run("query is dropped", func(t *testing.T) {
 		h := newHarness()
 		newPageEnv(t, h)
-		if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		if _, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders", URL: "https://app.example.com/orders?state=open",
 		}, 42); err != nil {
 			t.Fatalf("CreatePage: %v", err)
 		}
-		_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		_, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders other query", URL: "https://app.example.com/orders?state=closed",
 		}, 42)
 		apiErr := assertAPIError(t, err, 409, "page_url_exists")
@@ -1284,13 +1546,13 @@ func TestSpaHashAndQueryNormalization(t *testing.T) {
 	t.Run("hash is kept", func(t *testing.T) {
 		h := newHarness()
 		newPageEnv(t, h)
-		first, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		first, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders list", URL: "https://app.example.com/orders#/list",
 		}, 42)
 		if err != nil {
 			t.Fatalf("CreatePage first: %v", err)
 		}
-		second, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		second, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders detail", URL: "https://app.example.com/orders#/detail",
 		}, 42)
 		if err != nil {
@@ -1304,12 +1566,12 @@ func TestSpaHashAndQueryNormalization(t *testing.T) {
 	t.Run("same hash with different query is duplicate", func(t *testing.T) {
 		h := newHarness()
 		newPageEnv(t, h)
-		if _, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		if _, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders list", URL: "https://app.example.com/orders?x=1#/list",
 		}, 42); err != nil {
 			t.Fatalf("CreatePage: %v", err)
 		}
-		_, err := h.svc.CreatePage(ctx, 1002, PageInput{
+		_, err := h.svc.CreatePage(ctx, testSUTID, PageInput{
 			Name: "Orders list other query", URL: "https://app.example.com/orders?y=2#/list",
 		}, 42)
 		apiErr := assertAPIError(t, err, 409, "page_url_exists")
@@ -1322,11 +1584,11 @@ func TestSpaHashAndQueryNormalization(t *testing.T) {
 func TestImportPagesSkipsDuplicates(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
-	if _, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
+	if _, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
 
-	result, err := h.svc.ImportPages(context.Background(), 1002, []PageInput{
+	result, err := h.svc.ImportPages(context.Background(), testSUTID, []PageInput{
 		{Name: "orders again", URL: "https://app.example.com/orders"},
 		{Name: "users", URL: "https://app.example.com/users"},
 		{Name: "users again", URL: "https://app.example.com/users?x=1"},
@@ -1344,7 +1606,7 @@ func TestImportPagesSkipsDuplicates(t *testing.T) {
 	if result.Items[0].RouteTemplate != "/users" || result.Items[1].RouteTemplate != "/reports" {
 		t.Fatalf("items = %#v", result.Items)
 	}
-	pages, err := h.svc.ListPages(context.Background(), 1002)
+	pages, err := h.svc.ListPages(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("ListPages: %v", err)
 	}
@@ -1357,7 +1619,7 @@ func TestImportPagesInvalidItemRejectsWholeBatch(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
 
-	_, err := h.svc.ImportPages(context.Background(), 1002, []PageInput{
+	_, err := h.svc.ImportPages(context.Background(), testSUTID, []PageInput{
 		{Name: "users", URL: "https://app.example.com/users"},
 		{Name: "bad", URL: "not-a-url"},
 	}, 42)
@@ -1380,13 +1642,13 @@ func TestAPICreateDefaultsAndDuplicate(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
 
-	view, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{
+	view, err := h.svc.CreateAPI(context.Background(), testSUTID, APIInput{
 		Method: "GET", PathTemplate: "/api/orders", Name: "List orders",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
-	if view.ID != "1003" || view.SUTID != "1001" || view.EnvironmentID != "1002" {
+	if view.ID != "1004" || view.SUTID != "1002" {
 		t.Fatalf("ids = %#v", view)
 	}
 	if view.Source != resource.APISourceManual || view.Status != resource.APIStatusApproved {
@@ -1396,10 +1658,10 @@ func TestAPICreateDefaultsAndDuplicate(t *testing.T) {
 		t.Fatalf("event = %q", got)
 	}
 
-	_, err = h.svc.CreateAPI(context.Background(), 1002, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "dup"}, 42)
+	_, err = h.svc.CreateAPI(context.Background(), testSUTID, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "dup"}, 42)
 	assertAPIError(t, err, 409, "conflict")
 
-	_, err = h.svc.CreateAPI(context.Background(), 1002, APIInput{Method: "get", PathTemplate: "/api/users", Name: "bad"}, 42)
+	_, err = h.svc.CreateAPI(context.Background(), testSUTID, APIInput{Method: "get", PathTemplate: "/api/users", Name: "bad"}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "method" {
 		t.Fatalf("details = %#v", apiErr.Details)
@@ -1409,14 +1671,14 @@ func TestAPICreateDefaultsAndDuplicate(t *testing.T) {
 	assertAPIError(t, err, 404, "not_found")
 
 	gem := "POST"
-	updated, err := h.svc.UpdateAPI(context.Background(), 1003, APIPatch{Method: &gem}, 42)
+	updated, err := h.svc.UpdateAPI(context.Background(), 1004, APIPatch{Method: &gem}, 42)
 	if err != nil {
 		t.Fatalf("UpdateAPI: %v", err)
 	}
 	if updated.Method != "POST" {
 		t.Fatalf("updated = %#v", updated)
 	}
-	apis, err := h.svc.ListAPIs(context.Background(), 1002)
+	apis, err := h.svc.ListAPIs(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("ListAPIs: %v", err)
 	}
@@ -1428,11 +1690,11 @@ func TestAPICreateDefaultsAndDuplicate(t *testing.T) {
 func TestImportAPIsSkipsDuplicates(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
-	if _, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
+	if _, err := h.svc.CreateAPI(context.Background(), testSUTID, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
 
-	result, err := h.svc.ImportAPIs(context.Background(), 1002, []APIInput{
+	result, err := h.svc.ImportAPIs(context.Background(), testSUTID, []APIInput{
 		{Method: "GET", PathTemplate: "/api/orders", Name: "orders again"},
 		{Method: "POST", PathTemplate: "/api/orders", Name: "create order"},
 		{Method: "POST", PathTemplate: "/api/orders", Name: "dup"},
@@ -1448,7 +1710,7 @@ func TestImportAPIsSkipsDuplicates(t *testing.T) {
 		t.Fatalf("items = %#v", result.Items)
 	}
 
-	_, err = h.svc.ImportAPIs(context.Background(), 1002, []APIInput{
+	_, err = h.svc.ImportAPIs(context.Background(), testSUTID, []APIInput{
 		{Method: "POST", PathTemplate: "/api/ok", Name: "ok"},
 		{Method: "TRACE", PathTemplate: "/api/bad", Name: "bad"},
 	}, 42)
@@ -1456,7 +1718,7 @@ func TestImportAPIsSkipsDuplicates(t *testing.T) {
 	if index, ok := apiErr.Details["index"].(int); !ok || index != 1 {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
-	apis, err := h.svc.ListAPIs(context.Background(), 1002)
+	apis, err := h.svc.ListAPIs(context.Background(), testSUTID)
 	if err != nil {
 		t.Fatalf("ListAPIs: %v", err)
 	}
@@ -1465,7 +1727,8 @@ func TestImportAPIsSkipsDuplicates(t *testing.T) {
 	}
 }
 
-func newDataEnv(t *testing.T, h *harness) { // SUT 1001, env 1002
+// newDataEnv creates the SUT (1002) the database/account tests hang off.
+func newDataEnv(t *testing.T, h *harness) {
 	t.Helper()
 	newPageEnv(t, h)
 }
@@ -1473,22 +1736,22 @@ func newDataEnv(t *testing.T, h *harness) { // SUT 1001, env 1002
 func TestDeleteGuardsUsageForEveryResource(t *testing.T) {
 	h := newHarness()
 	newDataEnv(t, h)
-	page, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42)
+	page, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42)
 	if err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	api, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42)
+	api, err := h.svc.CreateAPI(context.Background(), testSUTID, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42)
 	if err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
-	database, err := h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: 1002, Name: "orders-db", DSN: "postgres://db.example.com:5432/orders", Username: "reader",
+	database, err := h.svc.CreateDatabase(context.Background(), testSUTID, DatabaseInput{
+		Name: "orders-db", DSN: "postgres://db.example.com:5432/orders", Username: "reader",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
-	account, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "order_admin", Password: "s3cret",
+	account, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "order_admin", Password: "s3cret",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
@@ -1505,13 +1768,15 @@ func TestDeleteGuardsUsageForEveryResource(t *testing.T) {
 		id     int64
 		delete func() error
 	}{
-		{"page", 1003, func() error { return h.svc.DeletePage(context.Background(), 1003, 42) }},
-		{"api", 1004, func() error { return h.svc.DeleteAPI(context.Background(), 1004, 42) }},
-		{"database", 1005, func() error { return h.svc.DeleteDatabase(context.Background(), 1005, 42) }},
-		{"account", 1006, func() error { return h.svc.DeleteAccount(context.Background(), 1006, 42) }},
-		{"repository", 1007, func() error { return h.svc.DeleteRepository(context.Background(), 1007, 42) }},
-		{"environment", 1002, func() error { return h.svc.DeleteEnvironment(context.Background(), 1002, 42) }},
-		{"sut", 1001, func() error { return h.svc.DeleteSUT(context.Background(), 1001, 42) }},
+		{"page", 1004, func() error { return h.svc.DeletePage(context.Background(), 1004, 42) }},
+		{"api", 1005, func() error { return h.svc.DeleteAPI(context.Background(), 1005, 42) }},
+		{"database", 1006, func() error { return h.svc.DeleteDatabase(context.Background(), 1006, 42) }},
+		{"account", 1007, func() error { return h.svc.DeleteAccount(context.Background(), 1007, 42) }},
+		{"repository", 1008, func() error { return h.svc.DeleteRepository(context.Background(), 1008, 42) }},
+		// The SUT is deleted before its environment: deleting the environment
+		// would cascade the SUT and leave nothing for its own guard to check.
+		{"sut", testSUTID, func() error { return h.svc.DeleteSUT(context.Background(), testSUTID, 42) }},
+		{"environment", testEnvironmentID, func() error { return h.svc.DeleteEnvironment(context.Background(), testEnvironmentID, 42) }},
 	}
 	_ = page
 	_ = api
@@ -1560,7 +1825,7 @@ func TestDeleteGuardsUsageForEveryResource(t *testing.T) {
 		})
 	}
 
-	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.sut.deleted" {
+	if got := h.events.published[len(h.events.published)-1].Type; got != "resource.environment.deleted" {
 		t.Fatalf("last event = %q", got)
 	}
 }
@@ -1671,12 +1936,12 @@ func TestDeleteConflictDetailsCarryVersionStatusAndEditable(t *testing.T) {
 func TestDeleteReferencedConflictIsDistinctFromPageURLDuplicate(t *testing.T) {
 	h := newHarness()
 	newPageEnv(t, h)
-	if _, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+	if _, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{
 		Name: "orders", URL: "https://app.example.com/orders",
 	}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	_, err := h.svc.CreatePage(context.Background(), 1002, PageInput{
+	_, err := h.svc.CreatePage(context.Background(), testSUTID, PageInput{
 		Name: "orders dup", URL: "https://app.example.com/orders?x=1",
 	}, 42)
 	duplicate := assertAPIError(t, err, 409, "page_url_exists")
@@ -1712,8 +1977,8 @@ func TestAccountPasswordIsMaskedAndKeptOnUpdate(t *testing.T) {
 	h := newHarness()
 	newDataEnv(t, h)
 
-	account, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "order_admin", Password: "s3cret",
+	account, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "order_admin", Password: "s3cret",
 		Roles: []string{"order_admin"}, Notes: "seed",
 	}, 42)
 	if err != nil {
@@ -1722,7 +1987,7 @@ func TestAccountPasswordIsMaskedAndKeptOnUpdate(t *testing.T) {
 	if !account.PasswordSet || account.Roles[0] != "order_admin" {
 		t.Fatalf("account = %#v", account)
 	}
-	stored, err := h.repo.GetAccount(context.Background(), 1003)
+	stored, err := h.repo.GetAccount(context.Background(), 1004)
 	if err != nil {
 		t.Fatalf("GetAccount: %v", err)
 	}
@@ -1731,14 +1996,14 @@ func TestAccountPasswordIsMaskedAndKeptOnUpdate(t *testing.T) {
 	}
 
 	notes := "updated"
-	updated, err := h.svc.UpdateAccount(context.Background(), 1003, AccountPatch{Notes: &notes}, 42)
+	updated, err := h.svc.UpdateAccount(context.Background(), 1004, AccountPatch{Notes: &notes}, 42)
 	if err != nil {
 		t.Fatalf("UpdateAccount: %v", err)
 	}
 	if updated.Notes != "updated" || !updated.PasswordSet {
 		t.Fatalf("updated = %#v", updated)
 	}
-	stored, err = h.repo.GetAccount(context.Background(), 1003)
+	stored, err = h.repo.GetAccount(context.Background(), 1004)
 	if err != nil {
 		t.Fatalf("GetAccount: %v", err)
 	}
@@ -1747,7 +2012,7 @@ func TestAccountPasswordIsMaskedAndKeptOnUpdate(t *testing.T) {
 	}
 
 	password := "n3w-s3cret"
-	updated, err = h.svc.UpdateAccount(context.Background(), 1003, AccountPatch{Password: &password}, 42)
+	updated, err = h.svc.UpdateAccount(context.Background(), 1004, AccountPatch{Password: &password}, 42)
 	if err != nil {
 		t.Fatalf("UpdateAccount password: %v", err)
 	}
@@ -1755,33 +2020,47 @@ func TestAccountPasswordIsMaskedAndKeptOnUpdate(t *testing.T) {
 		t.Fatal("password_set = false after password update")
 	}
 
-	_, err = h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "no-password",
+	_, err = h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "no-password",
 	}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "password" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 
-	if _, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "order_admin", Password: "x",
+	if _, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "order_admin", Password: "x",
 	}, 42); err == nil {
 		t.Fatal("duplicate username accepted")
 	}
 
-	_, err = h.svc.CreateAccount(context.Background(), 9999, AccountInput{
-		EnvironmentID: 1002, Username: "other", Password: "x",
+	// The optional SUT affinity must name an existing SUT.
+	missing := int64(9999)
+	_, err = h.svc.CreateAccount(context.Background(), AccountInput{
+		SUTID: &missing, Username: "other", Password: "x",
 	}, 42)
 	assertAPIError(t, err, 404, "not_found")
+
+	// A valid affinity is stored and surfaced on the view.
+	affinity := testSUTID
+	bound, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		SUTID: &affinity, Username: "affinity", Password: "x",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateAccount with affinity: %v", err)
+	}
+	if bound.SUTID != "1002" {
+		t.Fatalf("affinity = %q, want 1002", bound.SUTID)
+	}
 }
 
-func TestDatabaseDefaultsAndEnvironmentOwnership(t *testing.T) {
+func TestDatabaseDefaultsAndSUTOwnership(t *testing.T) {
 	h := newHarness()
 	newDataEnv(t, h)
 
-	database, err := h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: 1002, Name: "orders-db",
-		DSN: "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
+	database, err := h.svc.CreateDatabase(context.Background(), testSUTID, DatabaseInput{
+		Name: "orders-db",
+		DSN:  "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
@@ -1789,7 +2068,7 @@ func TestDatabaseDefaultsAndEnvironmentOwnership(t *testing.T) {
 	if !database.ReadOnly || !database.PasswordSet || database.Status != resource.StatusActive {
 		t.Fatalf("database = %#v", database)
 	}
-	stored, err := h.repo.GetDatabase(context.Background(), 1003)
+	stored, err := h.repo.GetDatabase(context.Background(), 1004)
 	if err != nil {
 		t.Fatalf("GetDatabase: %v", err)
 	}
@@ -1798,14 +2077,14 @@ func TestDatabaseDefaultsAndEnvironmentOwnership(t *testing.T) {
 	}
 
 	readOnly := false
-	updated, err := h.svc.UpdateDatabase(context.Background(), 1003, DatabasePatch{ReadOnly: &readOnly}, 42)
+	updated, err := h.svc.UpdateDatabase(context.Background(), 1004, DatabasePatch{ReadOnly: &readOnly}, 42)
 	if err != nil {
 		t.Fatalf("UpdateDatabase: %v", err)
 	}
 	if updated.ReadOnly {
 		t.Fatal("read_only not updated")
 	}
-	stored, err = h.repo.GetDatabase(context.Background(), 1003)
+	stored, err = h.repo.GetDatabase(context.Background(), 1004)
 	if err != nil {
 		t.Fatalf("GetDatabase: %v", err)
 	}
@@ -1813,37 +2092,37 @@ func TestDatabaseDefaultsAndEnvironmentOwnership(t *testing.T) {
 		t.Fatalf("password = %q", stored.Password)
 	}
 
-	_, err = h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: 1002, Name: "bad-dsn", DSN: "mysql://db/orders", Username: "reader",
+	_, err = h.svc.CreateDatabase(context.Background(), testSUTID, DatabaseInput{
+		Name: "bad-dsn", DSN: "mysql://db/orders", Username: "reader",
 	}, 42)
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "dsn" {
 		t.Fatalf("details = %#v", apiErr.Details)
 	}
 
+	// v0.2.4-B: a target database belongs to a SUT alone, so its name is unique
+	// per SUT. A second SUT may register the same database name.
 	otherSUT := createTestSUT(t, h, "Other SUT")
-	_ = otherSUT
-	otherEnv, err := h.svc.CreateEnvironment(context.Background(), 1004, EnvironmentInput{
-		Name: "dev", BaseURL: "https://other.example.com",
+	if _, err := h.svc.CreateDatabase(context.Background(), mustID(t, otherSUT.ID), DatabaseInput{
+		Name: "orders-db", DSN: "postgres://db/other", Username: "reader",
+	}, 42); err != nil {
+		t.Fatalf("the same database name under another SUT must be accepted: %v", err)
+	}
+	_, err = h.svc.CreateDatabase(context.Background(), testSUTID, DatabaseInput{
+		Name: "ORDERS-DB", DSN: "postgres://db/dup", Username: "reader",
 	}, 42)
-	if err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
-	}
-	otherEnvID, err := strconv.ParseInt(otherEnv.ID, 10, 64)
-	if err != nil {
-		t.Fatalf("parse env id: %v", err)
-	}
-	_, err = h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: otherEnvID, Name: "cross-sut", DSN: "postgres://db/x", Username: "reader",
+	apiErr = assertAPIError(t, err, 409, "conflict")
+	_ = apiErr
+
+	// A missing SUT is a 404.
+	_, err = h.svc.CreateDatabase(context.Background(), 9999, DatabaseInput{
+		Name: "ghost", DSN: "postgres://db/ghost", Username: "reader",
 	}, 42)
-	apiErr = assertAPIError(t, err, 400, "invalid_argument")
-	if apiErr.Details["field"] != "environment_id" {
-		t.Fatalf("details = %#v", apiErr.Details)
-	}
-	// Accounts are a global pool (DB-15): the legacy environmentID field is
-	// ignored and the account is created regardless of the SUT/environment pair.
-	if _, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: otherEnvID, Username: "cross-sut", Password: "x",
+	assertAPIError(t, err, 404, "not_found")
+
+	// Accounts are a global pool (DB-15): creating one needs no SUT at all.
+	if _, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "cross-sut", Password: "x",
 	}, 42); err != nil {
 		t.Fatalf("global account creation rejected: %v", err)
 	}
@@ -1863,18 +2142,18 @@ func TestRepositoriesCRUDAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRepositories: %v", err)
 	}
-	if len(first) != 2 || !hasMore || first[0].ID != "1003" || first[1].ID != "1002" {
+	if len(first) != 2 || !hasMore || first[0].ID != "1004" || first[1].ID != "1003" {
 		t.Fatalf("first page = %#v, hasMore = %v", first, hasMore)
 	}
 	if first[0].CreatedBy != 42 || first[0].Include[0] != "src/**" {
 		t.Fatalf("first = %#v", first[0])
 	}
-	before := int64(1002)
+	before := int64(1003)
 	second, hasMore, err := h.svc.ListRepositories(context.Background(), 2, &before)
 	if err != nil {
 		t.Fatalf("ListRepositories page 2: %v", err)
 	}
-	if len(second) != 1 || hasMore || second[0].ID != "1001" {
+	if len(second) != 1 || hasMore || second[0].ID != "1002" {
 		t.Fatalf("second page = %#v, hasMore = %v", second, hasMore)
 	}
 
@@ -1884,7 +2163,7 @@ func TestRepositoriesCRUDAndPagination(t *testing.T) {
 	assertAPIError(t, err, 409, "conflict")
 
 	name := "renamed"
-	updated, err := h.svc.UpdateRepository(context.Background(), 1001, RepositoryPatch{Name: &name}, 42)
+	updated, err := h.svc.UpdateRepository(context.Background(), 1002, RepositoryPatch{Name: &name}, 42)
 	if err != nil {
 		t.Fatalf("UpdateRepository: %v", err)
 	}
@@ -1901,98 +2180,108 @@ func TestRepositoriesCRUDAndPagination(t *testing.T) {
 
 func TestCatalogAggregatesNestedResources(t *testing.T) {
 	h := newHarness()
+	ctx := context.Background()
 	newDataEnv(t, h)
-	if _, err := h.svc.CreatePage(context.Background(), 1002, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
+	if _, err := h.svc.CreatePage(ctx, testSUTID, PageInput{Name: "orders", URL: "https://app.example.com/orders"}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
-	if _, err := h.svc.CreateAPI(context.Background(), 1002, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
+	if _, err := h.svc.CreateAPI(ctx, testSUTID, APIInput{Method: "GET", PathTemplate: "/api/orders", Name: "orders"}, 42); err != nil {
 		t.Fatalf("CreateAPI: %v", err)
 	}
-	if _, err := h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: 1002, Name: "orders-db", DSN: "postgres://db.example.com/orders", Username: "reader",
+	if _, err := h.svc.CreateDatabase(ctx, testSUTID, DatabaseInput{
+		Name: "orders-db", DSN: "postgres://db.example.com/orders", Username: "reader",
 	}, 42); err != nil {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
-	if _, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "order_admin", Password: "x",
+	if _, err := h.svc.CreateAccount(ctx, AccountInput{
+		Username: "order_admin", Password: "x",
 	}, 42); err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	second := createTestSUT(t, h, "Billing")
-	secondEnv, err := h.svc.CreateEnvironment(context.Background(), mustID(t, second.ID), EnvironmentInput{
-		Name: "dev", BaseURL: "https://billing.example.com",
+	// A second environment with its own SUT: the catalog is a forest of
+	// environments, each nesting its SUTs and their assets.
+	secondEnv := createTestEnvironment(t, h, "dev")
+	secondSUT, err := h.svc.CreateSUT(ctx, mustID(t, secondEnv.ID), SUTInput{
+		Name: "Billing", BaseURL: "https://billing.example.com",
 	}, 42)
 	if err != nil {
-		t.Fatalf("CreateEnvironment: %v", err)
+		t.Fatalf("CreateSUT: %v", err)
 	}
-	if _, err := h.svc.CreatePage(context.Background(), mustID(t, secondEnv.ID), PageInput{
+	if _, err := h.svc.CreatePage(ctx, mustID(t, secondSUT.ID), PageInput{
 		Name: "invoices", URL: "https://billing.example.com/invoices",
 	}, 42); err != nil {
 		t.Fatalf("CreatePage: %v", err)
 	}
 
-	catalog, err := h.svc.Catalog(context.Background())
+	catalog, err := h.svc.Catalog(ctx)
 	if err != nil {
 		t.Fatalf("Catalog: %v", err)
 	}
 	if len(catalog) != 2 {
-		t.Fatalf("catalog = %d SUTs", len(catalog))
+		t.Fatalf("catalog = %d environments", len(catalog))
 	}
-	if catalog[0].ID != "1001" || catalog[1].ID != "1007" {
+	if catalog[0].ID != "1001" || catalog[1].ID != "1008" {
 		t.Fatalf("catalog order = %#v", catalog)
 	}
-	firstEnv := catalog[0].Environments[0]
-	if len(firstEnv.Pages) != 1 || len(firstEnv.APIs) != 1 || len(firstEnv.Databases) != 1 || len(firstEnv.Accounts) != 1 {
-		t.Fatalf("nested = %#v", firstEnv)
+	firstSUTs := catalog[0].SUTs
+	if len(firstSUTs) != 1 || firstSUTs[0].ID != "1002" {
+		t.Fatalf("first environment suts = %#v", firstSUTs)
 	}
-	if firstEnv.Databases[0].PasswordSet || firstEnv.Pages[0].Source != resource.PageSourceAdmin {
-		t.Fatalf("nested = %#v", firstEnv)
+	first := firstSUTs[0]
+	if len(first.Pages) != 1 || len(first.APIs) != 1 || len(first.Databases) != 1 {
+		t.Fatalf("nested = %#v", first)
 	}
-	if catalog[1].Environments[0].Pages[0].RouteTemplate != "/invoices" {
-		t.Fatalf("second nested = %#v", catalog[1].Environments[0])
+	if first.Databases[0].PasswordSet || first.Pages[0].Source != resource.PageSourceAdmin {
+		t.Fatalf("nested = %#v", first)
+	}
+	if first.EnvironmentID != "1001" {
+		t.Fatalf("sut parent = %#v", first)
+	}
+	if catalog[1].SUTs[0].Pages[0].RouteTemplate != "/invoices" {
+		t.Fatalf("second nested = %#v", catalog[1].SUTs[0])
 	}
 
-	detail, err := h.svc.GetSUT(context.Background(), 1001)
+	detail, err := h.svc.GetSUT(ctx, testSUTID)
 	if err != nil {
 		t.Fatalf("GetSUT: %v", err)
 	}
-	if len(detail.Environments) != 1 || len(detail.Environments[0].Pages) != 1 {
+	if len(detail.Pages) != 1 || len(detail.APIs) != 1 || len(detail.Databases) != 1 {
 		t.Fatalf("detail = %#v", detail)
 	}
 
-	environment, err := h.svc.GetEnvironment(context.Background(), 1002)
+	environment, err := h.svc.GetEnvironment(ctx, testEnvironmentID)
 	if err != nil {
 		t.Fatalf("GetEnvironment: %v", err)
 	}
-	if environment.ID != "1002" || environment.SUTID != "1001" || len(environment.Accounts) != 1 {
+	if environment.ID != "1001" || len(environment.SUTs) != 1 {
 		t.Fatalf("environment = %#v", environment)
 	}
-	if !environment.Accounts[0].PasswordSet {
-		t.Fatal("account password_set = false")
+	if len(environment.SUTs[0].Pages) != 1 {
+		t.Fatalf("environment suts = %#v", environment.SUTs)
 	}
 
-	page, err := h.svc.GetPage(context.Background(), 1003)
+	page, err := h.svc.GetPage(ctx, 1004)
 	if err != nil {
 		t.Fatalf("GetPage: %v", err)
 	}
-	if page.RouteTemplate != "/orders" {
+	if page.RouteTemplate != "/orders" || page.SUTID != "1002" {
 		t.Fatalf("page = %#v", page)
 	}
-	api, err := h.svc.GetAPI(context.Background(), 1004)
+	api, err := h.svc.GetAPI(ctx, 1005)
 	if err != nil {
 		t.Fatalf("GetAPI: %v", err)
 	}
-	if api.Method != "GET" {
+	if api.Method != "GET" || api.SUTID != "1002" {
 		t.Fatalf("api = %#v", api)
 	}
-	database, err := h.svc.GetDatabase(context.Background(), 1005)
+	database, err := h.svc.GetDatabase(ctx, 1006)
 	if err != nil {
 		t.Fatalf("GetDatabase: %v", err)
 	}
-	if database.PasswordSet {
+	if database.PasswordSet || database.SUTID != "1002" {
 		t.Fatalf("database = %#v", database)
 	}
-	account, err := h.svc.GetAccount(context.Background(), 1006)
+	account, err := h.svc.GetAccount(ctx, 1007)
 	if err != nil {
 		t.Fatalf("GetAccount: %v", err)
 	}
@@ -2000,8 +2289,19 @@ func TestCatalogAggregatesNestedResources(t *testing.T) {
 		t.Fatalf("account = %#v", account)
 	}
 
-	if _, err := h.svc.GetSUT(context.Background(), 9999); err == nil {
+	accounts, err := h.svc.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("ListAccounts: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("accounts = %#v", accounts)
+	}
+
+	if _, err := h.svc.GetSUT(ctx, 9999); err == nil {
 		t.Fatal("GetSUT missing returned nil error")
+	}
+	if _, err := h.svc.GetEnvironment(ctx, 9999); err == nil {
+		t.Fatal("GetEnvironment missing returned nil error")
 	}
 }
 
@@ -2017,8 +2317,8 @@ func mustID(t *testing.T, raw string) int64 {
 func TestGetAccountSecretReturnsStoredCredentials(t *testing.T) {
 	h := newHarness()
 	newDataEnv(t, h)
-	account, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
-		EnvironmentID: 1002, Username: "order_admin", Password: "s3cret", Roles: []string{"order_admin"},
+	account, err := h.svc.CreateAccount(context.Background(), AccountInput{
+		Username: "order_admin", Password: "s3cret", Roles: []string{"order_admin"},
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
@@ -2041,9 +2341,9 @@ func TestGetAccountSecretReturnsStoredCredentials(t *testing.T) {
 func TestGetDatabaseSecretReturnsStoredCredentials(t *testing.T) {
 	h := newHarness()
 	newDataEnv(t, h)
-	database, err := h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
-		EnvironmentID: 1002, Name: "orders-db",
-		DSN: "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
+	database, err := h.svc.CreateDatabase(context.Background(), testSUTID, DatabaseInput{
+		Name: "orders-db",
+		DSN:  "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
 	}, 42)
 	if err != nil {
 		t.Fatalf("CreateDatabase: %v", err)

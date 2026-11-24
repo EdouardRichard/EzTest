@@ -11,9 +11,11 @@ import (
 	"time"
 
 	agentcontext "github.com/EdouardRichard/EzTest/backend/internal/agent/application/context"
+	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	knowledge "github.com/EdouardRichard/EzTest/backend/internal/knowledge/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	resource "github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -190,25 +192,28 @@ func loadBriefingVersion(ctx context.Context, tx pgx.Tx, versionID int64, source
 func loadBriefingRequirements(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
 	// Closed requirements were confirmed before they closed, so they stay in
 	// the confirmed baseline; only draft requirements are open clarification
-	// gaps.
+	// gaps. The status set is passed as domain constants, never inlined as SQL
+	// literals (v0.2.4-B single source of truth; mirrors the handoff reader).
 	rows, err := tx.Query(ctx, `
 		SELECT rv.title, rv.acceptance_criteria
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1
-		  AND r.status IN ('clarified', 'closed')
+		  AND r.status = ANY($2::text[])
 		ORDER BY r.id
-		LIMIT $2
-	`, versionID, briefingRequirementLimit)
+		LIMIT $3
+	`, versionID, []string{string(versiondomain.RequirementClarified), string(versiondomain.RequirementClosed)}, briefingRequirementLimit)
 	if err != nil {
 		return fmt.Errorf("read briefing confirmed requirements: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var requirement agentcontext.RequirementSnapshot
-		if err := rows.Scan(&requirement.Title, &requirement.Acceptance); err != nil {
+		var acceptance []byte
+		if err := rows.Scan(&requirement.Title, &acceptance); err != nil {
 			return fmt.Errorf("scan briefing confirmed requirement: %w", err)
 		}
+		requirement.Acceptance = renderBriefingAcceptance(acceptance)
 		source.Requirements.Confirmed = append(source.Requirements.Confirmed, requirement)
 	}
 	if err := rows.Err(); err != nil {
@@ -220,10 +225,10 @@ func loadBriefingRequirements(ctx context.Context, tx pgx.Tx, versionID int64, s
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1
-		  AND r.status = 'draft'
+		  AND r.status = $2
 		ORDER BY r.id
-		LIMIT $2
-	`, versionID, briefingRequirementLimit)
+		LIMIT $3
+	`, versionID, string(versiondomain.RequirementDraft), briefingRequirementLimit)
 	if err != nil {
 		return fmt.Errorf("read briefing requirement gaps: %w", err)
 	}
@@ -239,6 +244,46 @@ func loadBriefingRequirements(ctx context.Context, tx pgx.Tx, versionID int64, s
 		return fmt.Errorf("read briefing requirement gaps: %w", err)
 	}
 	return nil
+}
+
+// renderBriefingAcceptance flattens the structured acceptance criteria into the
+// single line the briefing port carries.
+//
+// v0.2.4-B (T8) made requirement_version.acceptance_criteria a JSONB array of
+// {id, given, when, then} (design v1.3.1 §5.1). The agent briefing contract is
+// still one string per requirement and the model must not be shown the raw JSON
+// document, so the adapter renders it as "AC-1 given / when / then; AC-2 …",
+// skipping the parts extraction has not filled in yet. An undecodable document
+// falls back to the trimmed raw text rather than dropping the row.
+func renderBriefingAcceptance(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var criteria []struct {
+		ID    string `json:"id"`
+		Given string `json:"given"`
+		When  string `json:"when"`
+		Then  string `json:"then"`
+	}
+	if err := json.Unmarshal(raw, &criteria); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	rendered := make([]string, 0, len(criteria))
+	for _, criterion := range criteria {
+		segments := make([]string, 0, 4)
+		if id := strings.TrimSpace(criterion.ID); id != "" {
+			segments = append(segments, id)
+		}
+		for _, part := range []string{criterion.Given, criterion.When, criterion.Then} {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				segments = append(segments, trimmed)
+			}
+		}
+		if len(segments) > 0 {
+			rendered = append(rendered, strings.Join(segments, " / "))
+		}
+	}
+	return strings.Join(rendered, "; ")
 }
 
 func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
@@ -262,11 +307,11 @@ func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *
 			return fmt.Errorf("scan briefing case count: %w", err)
 		}
 		switch status {
-		case "draft":
+		case design.CaseStatusDraft:
 			source.Cases.Draft = count
-		case "confirmed":
+		case design.CaseStatusConfirmed:
 			source.Cases.Confirmed = count
-		case "stale":
+		case design.CaseStatusStale:
 			source.Cases.Stale = count
 		}
 	}
@@ -279,7 +324,7 @@ func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *
 		FROM requirement r
 		JOIN requirement_version rv ON rv.id = r.current_version_id
 		WHERE r.version_id = $1
-		  AND r.status = 'clarified'
+		  AND r.status = $2
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM case_scenario s
@@ -288,8 +333,8 @@ func loadBriefingCases(ctx context.Context, tx pgx.Tx, versionID int64, source *
 			WHERE s.version_id = $1 AND s.requirement_id = r.id
 		  )
 		ORDER BY r.id
-		LIMIT $2
-	`, versionID, briefingRequirementLimit)
+		LIMIT $3
+	`, versionID, string(versiondomain.RequirementClarified), briefingRequirementLimit)
 	if err != nil {
 		return fmt.Errorf("read briefing coverage gaps: %w", err)
 	}
@@ -312,10 +357,10 @@ func loadBriefingPlan(ctx context.Context, tx pgx.Tx, versionID int64, source *a
 		SELECT id, title, status, depends_on, revision
 		FROM version_plan_item
 		WHERE version_id = $1
-		  AND status NOT IN ('done', 'completed', 'cancelled', 'skipped', 'failed', 'closed')
+		  AND lower(btrim(status, E' \t\n\r\v\f')) <> ALL($2::text[])
 		ORDER BY sort_order, id
-		LIMIT $2
-	`, versionID, briefingPlanLimit)
+		LIMIT $3
+	`, versionID, versiondomain.PlanItemTerminalStatuses(), briefingPlanLimit)
 	if err != nil {
 		return fmt.Errorf("read briefing plan: %w", err)
 	}
@@ -376,12 +421,12 @@ func loadBriefingExecution(ctx context.Context, tx pgx.Tx, versionID int64, sour
 	// the previous pause reason.
 	err := tx.QueryRow(ctx, `
 		SELECT id, status,
-			CASE WHEN status = 'paused' THEN COALESCE(pause_reason, '') ELSE '' END
+			CASE WHEN status = $2 THEN COALESCE(pause_reason, '') ELSE '' END
 		FROM run_wave
 		WHERE version_id = $1
 		ORDER BY id DESC
 		LIMIT 1
-	`, versionID).Scan(&waveID, &source.Execution.WaveStatus, &source.Execution.Blocker)
+	`, versionID, string(execution.WavePaused)).Scan(&waveID, &source.Execution.WaveStatus, &source.Execution.Blocker)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -407,13 +452,13 @@ func loadBriefingExecution(ctx context.Context, tx pgx.Tx, versionID int64, sour
 			return fmt.Errorf("scan briefing wave case run: %w", err)
 		}
 		switch status {
-		case "passed":
+		case string(execution.CaseRunPassed):
 			source.Execution.Passed = count
-		case "failed":
+		case string(execution.CaseRunFailed):
 			source.Execution.Failed = count
-		case "blocked":
+		case string(execution.CaseRunBlocked):
 			source.Execution.Blocked = count
-		case "skipped":
+		case string(execution.CaseRunSkipped):
 			source.Execution.Skipped = count
 		}
 	}
@@ -425,12 +470,12 @@ func loadBriefingExecution(ctx context.Context, tx pgx.Tx, versionID int64, sour
 
 func loadBriefingOpenQuestions(ctx context.Context, tx pgx.Tx, versionID int64, source *agentcontext.Source) error {
 	rows, err := tx.Query(ctx, `
-		SELECT kind, COALESCE(payload ->> 'reason', '')
+		SELECT kind, COALESCE(payload ->> $4, '')
 		FROM human_request
-		WHERE version_id = $1 AND status = 'pending'
+		WHERE version_id = $1 AND status = $2
 		ORDER BY created_at, id
-		LIMIT $2
-	`, versionID, briefingOpenItemLimit)
+		LIMIT $3
+	`, versionID, string(execution.HumanPending), briefingOpenItemLimit, execution.HumanPayloadReason)
 	if err != nil {
 		return fmt.Errorf("read briefing open human requests: %w", err)
 	}
@@ -444,7 +489,7 @@ func loadBriefingOpenQuestions(ctx context.Context, tx pgx.Tx, versionID int64, 
 		if label == "" {
 			label = kind
 		}
-		if kind == "login_takeover" {
+		if kind == string(execution.HumanLoginTakeover) {
 			source.OpenQuestions.HumanRequests = append(source.OpenQuestions.HumanRequests, label)
 		} else {
 			source.OpenQuestions.Questions = append(source.OpenQuestions.Questions, label)
@@ -493,10 +538,10 @@ func loadBriefingKnowledge(ctx context.Context, tx pgx.Tx, versionID int64, sour
 				SELECT 1 FROM version v WHERE v.id = ki.source_version_id
 			)) AS source_stale
 		FROM knowledge_item ki
-		WHERE ki.status = 'approved'
+		WHERE ki.status = $1
 		ORDER BY ki.confidence DESC NULLS LAST, ki.id DESC
-		LIMIT $1
-	`, briefingKnowledgeCandidates)
+		LIMIT $2
+	`, string(knowledge.StatusApproved), briefingKnowledgeCandidates)
 	if err != nil {
 		return fmt.Errorf("read briefing knowledge: %w", err)
 	}
@@ -559,13 +604,20 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 		accountRoles:  map[string]struct{}{},
 	}
 
+	// v0.2.4-B: the version binds one environment directly; its SUTs are the
+	// rows of sut.environment_id = version.environment_id (the per-SUT binding
+	// chain is gone). R-B4: only approved SUTs contribute a system family — a
+	// proposed/rejected SUT contributes nothing to version scope. The gate mirrors
+	// resourceapp.SUTView.IsApproved (status = approved, empty treated as approved
+	// for the resource_0005 backfill), parameterized from the resource domain.
 	rows, err := tx.Query(ctx, `
 		SELECT DISTINCT s.family
-		FROM version_sut vs
-		JOIN sut s ON s.id = vs.sut_id
-		WHERE vs.version_id = $1 AND s.family IS NOT NULL AND btrim(s.family) <> ''
+		FROM version v
+		JOIN sut s ON s.environment_id = v.environment_id
+		WHERE v.id = $1 AND (s.status = $2 OR s.status = '')
+		  AND s.family IS NOT NULL AND btrim(s.family) <> ''
 		ORDER BY s.family
-	`, versionID)
+	`, versionID, resource.SUTStatusApproved)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing knowledge families: %w", err)
 	}
@@ -582,12 +634,16 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 		return scope, fmt.Errorf("read briefing knowledge families: %w", err)
 	}
 
+	// The binding projection is the APPROVED SUTs of the bound environment (R-B4).
+	// A proposed/rejected SUT contributes no system id to the knowledge scope, just
+	// as it contributes no page/API below; the gate mirrors IsApproved exactly.
 	rows, err = tx.Query(ctx, `
-		SELECT sut_id, environment_id
-		FROM version_sut
-		WHERE version_id = $1
-		ORDER BY id
-	`, versionID)
+		SELECT s.id, s.environment_id
+		FROM version v
+		JOIN sut s ON s.environment_id = v.environment_id
+		WHERE v.id = $1 AND (s.status = $2 OR s.status = '')
+		ORDER BY s.id
+	`, versionID, resource.SUTStatusApproved)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing version bindings: %w", err)
 	}
@@ -605,19 +661,21 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 		return scope, fmt.Errorf("read briefing version bindings: %w", err)
 	}
 
-	// v0.22 DB-11: version_sut.scope_exclude names resources removed from the
-	// environment-wide approved set. The effective page/API keys are therefore
-	// the environment's approved resources minus the excluded IDs, not an
-	// inclusion list.
+	// v0.2.4-B: the effective page keys are the approved pages of every APPROVED
+	// SUT in the bound environment (R-B4: a proposed/rejected SUT contributes
+	// nothing, even its approved pages). The old binding chain and its scope_exclude
+	// document were dropped, so there is no per-binding exclusion anymore: the
+	// approved set is the union across the environment's approved SUTs (sut_page is
+	// owned by sut_id alone). Both gates are resource domain constants.
 	rows, err = tx.Query(ctx, `
 		SELECT p.route_template
-		FROM version_sut vs
-		JOIN sut_page p ON p.sut_id = vs.sut_id AND p.environment_id = vs.environment_id
-		WHERE vs.version_id = $1 AND vs.status = 'active' AND p.status = 'approved'
+		FROM version v
+		JOIN sut s ON s.environment_id = v.environment_id
+		JOIN sut_page p ON p.sut_id = s.id
+		WHERE v.id = $1 AND p.status = $2 AND (s.status = $3 OR s.status = '')
 		  AND btrim(p.route_template) <> ''
-		  AND NOT (vs.scope_exclude -> 'pages' @> to_jsonb(p.id))
 		ORDER BY p.id
-	`, versionID)
+	`, versionID, resource.PageStatusApproved, resource.SUTStatusApproved)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing page keys: %w", err)
 	}
@@ -636,12 +694,12 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 
 	rows, err = tx.Query(ctx, `
 		SELECT a.method || ' ' || a.path_template
-		FROM version_sut vs
-		JOIN sut_api a ON a.sut_id = vs.sut_id AND a.environment_id = vs.environment_id
-		WHERE vs.version_id = $1 AND vs.status = 'active' AND a.status = 'approved'
-		  AND NOT (vs.scope_exclude -> 'apis' @> to_jsonb(a.id))
+		FROM version v
+		JOIN sut s ON s.environment_id = v.environment_id
+		JOIN sut_api a ON a.sut_id = s.id
+		WHERE v.id = $1 AND a.status = $2 AND (s.status = $3 OR s.status = '')
 		ORDER BY a.id
-	`, versionID)
+	`, versionID, resource.APIStatusApproved, resource.SUTStatusApproved)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing API keys: %w", err)
 	}
@@ -667,10 +725,10 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 		FROM version_account va
 		JOIN test_account a ON a.id = va.account_id
 		CROSS JOIN LATERAL jsonb_array_elements_text(a.roles) AS role
-		WHERE va.version_id = $1 AND va.enabled AND a.status = 'active'
+		WHERE va.version_id = $1 AND va.enabled AND a.status = $2
 		  AND btrim(role) <> ''
 		ORDER BY role
-	`, versionID)
+	`, versionID, resource.StatusActive)
 	if err != nil {
 		return scope, fmt.Errorf("read briefing account roles: %w", err)
 	}
@@ -695,12 +753,12 @@ func readBriefingKnowledgeScope(ctx context.Context, tx pgx.Tx, versionID int64)
 // version: a system-scoped item must match one of the bound SUT families, and
 // every binding dimension set on the item must match a version binding. The
 // dimensions are matched independently against the union of the version
-// bindings (not against a single version_sut row); an unset dimension is
+// bindings (not against a single SUT); an unset dimension is
 // unconstrained.
 func (s briefingKnowledgeScope) visible(scope, systemKey string, bindings knowledge.Bindings) bool {
 	switch scope {
-	case "global":
-	case "system":
+	case string(knowledge.ScopeGlobal):
+	case string(knowledge.ScopeSystem):
 		if _, ok := s.families[systemKey]; !ok {
 			return false
 		}

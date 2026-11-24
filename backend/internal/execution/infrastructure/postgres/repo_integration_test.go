@@ -32,7 +32,7 @@ func mustCreateIntent(t *testing.T, repo *Repository, id, versionID, caseVersion
 		ID:                     id,
 		VersionID:              versionID,
 		CaseVersionID:          caseVersionID,
-		VersionSUTIDs:          []int64{5001},
+		SUTIDs:                 []int64{5001},
 		EnvironmentFingerprint: fingerprint,
 		Purpose:                purpose,
 		Status:                 execution.IntentOpen,
@@ -92,7 +92,7 @@ func TestIntentActiveUniqueAndTransition(t *testing.T) {
 		ID:                     2,
 		VersionID:              100,
 		CaseVersionID:          300,
-		VersionSUTIDs:          []int64{5001},
+		SUTIDs:                 []int64{5001},
 		EnvironmentFingerprint: testFingerprint,
 		Purpose:                execution.PurposeInitial,
 		Status:                 execution.IntentOpen,
@@ -232,7 +232,7 @@ func TestWaveActiveUniqueAndClaim(t *testing.T) {
 	}
 }
 
-func TestWaveCountsByVersionSUT(t *testing.T) {
+func TestWaveCountsBySUT(t *testing.T) {
 	repo, _ := newTestRepository(t)
 	ctx := context.Background()
 
@@ -262,7 +262,7 @@ func TestWaveCountsByVersionSUT(t *testing.T) {
 		{501, 5002, "user"},
 	} {
 		if err := repo.SUTContexts.CreateSUTContext(ctx, execution.CaseRunSUTContext{
-			ID: 900 + item.runID + item.sutID, CaseRunID: item.runID, VersionSUTID: item.sutID,
+			ID: 900 + item.runID + item.sutID, CaseRunID: item.runID, SUTID: item.sutID,
 			AccountRole: item.account, Status: execution.SUTContextCreating, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 		}); err != nil {
 			t.Fatalf("create sut context: %v", err)
@@ -281,13 +281,13 @@ func TestWaveCountsByVersionSUT(t *testing.T) {
 	if counts.Total != 2 || counts.Passed != 1 || counts.Failed != 1 || counts.Evidence != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
-	firstSUT := counts.ByVersionSUT["5001"]
+	firstSUT := counts.BySUT["5001"]
 	if firstSUT.Total != 2 || firstSUT.Passed != 1 || firstSUT.Failed != 1 {
-		t.Fatalf("by_version_sut[5001] = %+v", firstSUT)
+		t.Fatalf("by_sut[5001] = %+v", firstSUT)
 	}
-	secondSUT := counts.ByVersionSUT["5002"]
+	secondSUT := counts.BySUT["5002"]
 	if secondSUT.Total != 1 || secondSUT.Failed != 1 {
-		t.Fatalf("by_version_sut[5002] = %+v", secondSUT)
+		t.Fatalf("by_sut[5002] = %+v", secondSUT)
 	}
 }
 
@@ -456,12 +456,13 @@ func TestCoverageUsesLatestNonSupersededRun(t *testing.T) {
 	mustCreateCaseRun(t, repo, 506, 51, 7, 303)
 	mustCreateCaseRun(t, repo, 507, 52, 8, 303)
 	setStatus := func(id int64, status execution.CaseRunStatus) {
-		run, err := repo.CaseRuns.Get(ctx, id)
-		if err != nil {
-			t.Fatalf("load case run %d: %v", id, err)
-		}
-		run.Status = status
-		ok, err := repo.CaseRuns.Update(ctx, run)
+		// Fixture seeding through the guarded settlement CAS: the generic
+		// Update primitive refuses terminal transitions (V-0022 single
+		// terminal entry).
+		ok, err := repo.CaseRuns.UpdateCAS(ctx, id, 0, "", func(run *execution.CaseRun) error {
+			run.Status = status
+			return nil
+		})
 		if err != nil || !ok {
 			t.Fatalf("set case run %d %s: ok=%v err=%v", id, status, ok, err)
 		}
@@ -571,16 +572,16 @@ func TestEvidenceAndSUTContext(t *testing.T) {
 
 	old := time.Now().UTC().Add(-time.Hour)
 	if err := repo.SUTContexts.CreateSUTContext(ctx, execution.CaseRunSUTContext{
-		ID: 900, CaseRunID: 500, VersionSUTID: 5001, AccountRole: "user",
+		ID: 900, CaseRunID: 500, SUTID: 5001, AccountRole: "user",
 		Status: execution.SUTContextCreating, CreatedAt: old, UpdatedAt: old,
 	}); err != nil {
 		t.Fatalf("create sut context: %v", err)
 	}
 	if err := repo.SUTContexts.CreateSUTContext(ctx, execution.CaseRunSUTContext{
-		ID: 901, CaseRunID: 500, VersionSUTID: 5001, AccountRole: "user",
+		ID: 901, CaseRunID: 500, SUTID: 5001, AccountRole: "user",
 		Status: execution.SUTContextCreating, CreatedAt: old, UpdatedAt: old,
 	}); err == nil {
-		t.Fatal("duplicate (case_run, version_sut, role) must conflict")
+		t.Fatal("duplicate (case_run, sut, role) must conflict")
 	}
 	created, err := repo.SUTContexts.ListByCaseRun(ctx, 500)
 	if err != nil || len(created) != 1 {
@@ -588,7 +589,7 @@ func TestEvidenceAndSUTContext(t *testing.T) {
 	}
 	ok, err := repo.SUTContexts.UpdateCAS(ctx, 900, func(item *execution.CaseRunSUTContext) error {
 		item.Status = execution.SUTContextActive
-		item.BrowserContextID = "ctx-1"
+		item.SessionID = "ctx-1"
 		return nil
 	})
 	if err != nil || !ok {
@@ -604,7 +605,7 @@ func TestEvidenceAndSUTContext(t *testing.T) {
 	}
 
 	evidence := execution.Evidence{
-		ID: 700, CaseRunID: 500, VersionSUTID: ptrInt64(5001), StepSeq: ptrInt(1),
+		ID: 700, CaseRunID: 500, SUTID: ptrInt64(5001), StepSeq: ptrInt(1),
 		Kind: execution.EvidenceScreenshot, ContentRefID: 42, SHA256: testFingerprint,
 		SizeBytes: 100, MIME: "image/png", Filename: "shot.png", CreatedAt: time.Now().UTC(),
 	}
@@ -754,6 +755,44 @@ func TestExecutorAndHumanRequest(t *testing.T) {
 	page, hasMore, err := repo.Humans.ListByVersion(ctx, 100, "", 10, nil)
 	if err != nil || len(page) != 3 || hasMore {
 		t.Fatalf("ListByVersion = %+v hasMore=%v err=%v", page, hasMore, err)
+	}
+}
+
+// TestEvidenceRecordingKindsPersist pins the v0.2.4-C migration
+// (execution_0009): the evidence.kind CHECK accepts the recording-layer kinds
+// command/file/trace end to end at the repository layer, while an undeclared
+// kind stays rejected by the database.
+func TestEvidenceRecordingKindsPersist(t *testing.T) {
+	repo, _ := newTestRepository(t)
+	ctx := context.Background()
+	mustCreateIntent(t, repo, 1, 100, 300, testFingerprint, execution.PurposeInitial)
+	mustCreateWave(t, repo, 50, 100)
+	mustCreateCaseRun(t, repo, 500, 50, 1, 300)
+
+	kinds := []execution.EvidenceKind{execution.EvidenceCommand, execution.EvidenceFile, execution.EvidenceTrace}
+	for i, kind := range kinds {
+		row := execution.Evidence{
+			ID: 700 + int64(i), CaseRunID: 500, Kind: kind, ContentRefID: int64(i + 1),
+			SHA256: testFingerprint, SizeBytes: 16, MIME: "application/octet-stream",
+			CreatedAt: time.Now().UTC(),
+		}
+		if err := repo.Evidence.Insert(ctx, row); err != nil {
+			t.Fatalf("insert %s evidence: %v", kind, err)
+		}
+		stored, err := repo.Evidence.Get(ctx, row.ID)
+		if err != nil || stored.Kind != kind {
+			t.Fatalf("stored %s evidence = %+v (err %v)", kind, stored, err)
+		}
+	}
+	byKind, _, err := repo.Evidence.ListByVersion(ctx, 100, execution.EvidenceFilter{Kind: execution.EvidenceCommand, Limit: 10})
+	if err != nil || len(byKind) != 1 || byKind[0].Kind != execution.EvidenceCommand {
+		t.Fatalf("command filter = %+v (err %v), want the single command row", byKind, err)
+	}
+	if err := repo.Evidence.Insert(ctx, execution.Evidence{
+		ID: 799, CaseRunID: 500, Kind: execution.EvidenceKind("video"), ContentRefID: 99,
+		SHA256: testFingerprint, SizeBytes: 16, MIME: "video/mp4", CreatedAt: time.Now().UTC(),
+	}); err == nil {
+		t.Fatal("undeclared evidence kind must stay rejected by the DB CHECK")
 	}
 }
 

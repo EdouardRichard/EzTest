@@ -88,7 +88,6 @@ const secondDetail = {
   title: "大额订单人工审核",
   priority: "P0" as const,
   status: "clarified" as const,
-  targets: { version_suts: ["1001"], pages: ["1301"], apis: [] },
 }
 
 describe("RequirementsTab integration", () => {
@@ -166,10 +165,14 @@ describe("RequirementsTab integration", () => {
     expect(screen.getByTestId("team-room-panel")).toBeInTheDocument()
     expect(sse.versionId).toBe("2001")
 
-    // The first conversation is selected by default; requirements keep their bound target names.
+    // The first conversation is selected by default and the requirement row is
+    // listed with its summary content. (v0.2.4-B removed the bound target-name
+    // chips: the Requirement summary no longer carries targets.)
     expect(screen.getByText(conversationFixture.title)).toBeInTheDocument()
     await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4001"))
-    expect(screen.getByTestId("requirement-item-6001")).toHaveTextContent("支付网关")
+    const item = screen.getByTestId("requirement-item-6001")
+    expect(item).toHaveTextContent("退款到账时效")
+    expect(item).toHaveTextContent("v1")
   })
 
   it("restores the conversation and requirement deep links from the URL", async () => {

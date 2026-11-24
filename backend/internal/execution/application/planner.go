@@ -57,16 +57,32 @@ func (s *Scheduler) planVersion(ctx context.Context, versionID int64) error {
 	if err != nil {
 		return err
 	}
+	frozen, err := execution.ParseWaveScopeSnapshot(scopeSnapshot)
+	if err != nil {
+		return err
+	}
 	frozenAt := now.UTC().Format(time.RFC3339)
 	wave := execution.RunWave{
 		ID:            s.ids.Next(),
 		VersionID:     versionID,
 		Status:        execution.WavePlanned,
 		Trigger:       plannedTrigger(open),
-		Counts:        execution.WaveCounts{ByVersionSUT: map[string]execution.SUTCounts{}},
+		Counts:        execution.WaveCounts{BySUT: map[string]execution.SUTCounts{}},
 		ScopeSnapshot: scopeSnapshot,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		// SC-F7 wave-level fingerprint carriers: the values frozen into the scope
+		// document, carried on the wave so a wave-level consumer reads the
+		// in-wave-stable fingerprint instead of recomputing from the live catalog.
+		EnvironmentFingerprint: frozen.EnvironmentFingerprint,
+		CodeBaseline:           frozen.CodeBaseline,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
+	// Freeze-time integrity gate (SC-F7): the wave-level consumer must be able to
+	// rebuild the carriers from the frozen inputs through the canonical hash
+	// functions. A divergence fails the plan closed rather than persisting a
+	// carrier that cannot be reconstructed from the scope it claims to summarize.
+	if _, _, err := WaveFrozenFingerprint(wave); err != nil {
+		return err
 	}
 	caseRuns := make([]execution.CaseRun, 0, len(open))
 	for _, intent := range open {
@@ -184,54 +200,50 @@ func (s *Scheduler) now() time.Time {
 	return s.clock.Now()
 }
 
-// waveScopeSnapshotPayload is the frozen effective scope recorded in
-// run_wave.scope_snapshot (R-C5-1, DB-19). IDs are normalized ascending so two
-// plans over the same binding produce the same document.
-type waveScopeSnapshotPayload struct {
-	VersionID   int64                  `json:"version_id"`
-	FrozenAt    string                 `json:"frozen_at"`
-	VersionSUTs []waveScopeSUTSnapshot `json:"version_suts"`
-}
-
-type waveScopeSUTSnapshot struct {
-	VersionSUTID  int64    `json:"version_sut_id"`
-	SUTID         int64    `json:"sut_id"`
-	EnvironmentID int64    `json:"environment_id"`
-	PageIDs       []int64  `json:"page_ids"`
-	APIIDs        []int64  `json:"api_ids"`
-	DatabaseIDs   []int64  `json:"database_ids"`
-	AccountRoles  []string `json:"account_roles"`
-	RepositoryIDs []int64  `json:"repository_ids"`
-}
-
 // buildWaveScopeSnapshot projects one version binding into the immutable scope
-// document of a new wave.
+// document of a new wave. The document shape is the domain's WaveScopeSnapshot
+// (the single authority shared by the planner, the wave repository read and the
+// wave-level fingerprint consumer). It freezes base_url and each repository's own
+// resolved commit so the fingerprint inputs are rebuildable from the frozen
+// document (SC-F7), and records the fingerprint carriers computed here via the
+// canonical hash functions. An unresolved code baseline fails the freeze closed.
 func buildWaveScopeSnapshot(binding VersionBinding, frozenAt time.Time) (string, error) {
-	payload := waveScopeSnapshotPayload{
-		VersionID:   binding.VersionID,
-		FrozenAt:    frozenAt.UTC().Format(time.RFC3339),
-		VersionSUTs: make([]waveScopeSUTSnapshot, 0, len(binding.SUTs)),
+	fingerprint, err := EnvironmentFingerprint(binding)
+	if err != nil {
+		return "", err
+	}
+	baseline, err := CodeBaseline(binding)
+	if err != nil {
+		return "", err
+	}
+	payload := execution.WaveScopeSnapshot{
+		VersionID:              binding.VersionID,
+		FrozenAt:               frozenAt.UTC().Format(time.RFC3339),
+		EnvironmentFingerprint: fingerprint,
+		CodeBaseline:           baseline,
+		SUTs:                   make([]execution.WaveScopeSUT, 0, len(binding.SUTs)),
 	}
 	for _, sut := range binding.SUTs {
-		item := waveScopeSUTSnapshot{
-			VersionSUTID:  sut.VersionSUTID,
-			SUTID:         sut.SUTID,
-			EnvironmentID: sut.EnvironmentID,
-			PageIDs:       append([]int64(nil), sut.PageIDs...),
-			APIIDs:        append([]int64(nil), sut.APIIDs...),
-			DatabaseIDs:   append([]int64(nil), sut.DatabaseIDs...),
-			AccountRoles:  append([]string(nil), sut.AccountRoles...),
-			RepositoryIDs: snapshotRepositoryIDs(sut),
+		item := execution.WaveScopeSUT{
+			SUTID:               sut.SUTID,
+			EnvironmentID:       sut.EnvironmentID,
+			BaseURL:             sut.BaseURL,
+			PageIDs:             append([]int64(nil), sut.PageIDs...),
+			APIIDs:              append([]int64(nil), sut.APIIDs...),
+			DatabaseIDs:         append([]int64(nil), sut.DatabaseIDs...),
+			AccountRoles:        append([]string(nil), sut.AccountRoles...),
+			RepositoryIDs:       snapshotRepositoryIDs(sut),
+			RepositoryBaselines: snapshotRepositoryBaselines(sut),
 		}
 		sort.Slice(item.PageIDs, func(i, j int) bool { return item.PageIDs[i] < item.PageIDs[j] })
 		sort.Slice(item.APIIDs, func(i, j int) bool { return item.APIIDs[i] < item.APIIDs[j] })
 		sort.Slice(item.DatabaseIDs, func(i, j int) bool { return item.DatabaseIDs[i] < item.DatabaseIDs[j] })
 		sort.Slice(item.RepositoryIDs, func(i, j int) bool { return item.RepositoryIDs[i] < item.RepositoryIDs[j] })
 		sort.Strings(item.AccountRoles)
-		payload.VersionSUTs = append(payload.VersionSUTs, item)
+		payload.SUTs = append(payload.SUTs, item)
 	}
-	sort.Slice(payload.VersionSUTs, func(i, j int) bool {
-		return payload.VersionSUTs[i].VersionSUTID < payload.VersionSUTs[j].VersionSUTID
+	sort.Slice(payload.SUTs, func(i, j int) bool {
+		return payload.SUTs[i].SUTID < payload.SUTs[j].SUTID
 	})
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -243,7 +255,7 @@ func buildWaveScopeSnapshot(binding VersionBinding, frozenAt time.Time) (string,
 // snapshotRepositoryIDs is the frozen repository_ids of one binding (DB-19):
 // the deduplicated ascending multi-repository set, or the legacy single
 // CodeRepoID when the binding predates the multi-repository projection.
-func snapshotRepositoryIDs(sut VersionSUTBinding) []int64 {
+func snapshotRepositoryIDs(sut SUTBinding) []int64 {
 	ids := sortedUniqueInt64(sut.RepositoryIDs)
 	if len(ids) > 0 {
 		return ids
@@ -252,4 +264,19 @@ func snapshotRepositoryIDs(sut VersionSUTBinding) []int64 {
 		return []int64{*sut.CodeRepoID}
 	}
 	return []int64{}
+}
+
+// snapshotRepositoryBaselines freezes each effective repository paired with its
+// OWN resolved commit (V-0024), ascending by repo_id, so the wave-level consumer
+// can rebuild the code baseline from the frozen document.
+func snapshotRepositoryBaselines(sut SUTBinding) []execution.WaveScopeRepositoryBaseline {
+	baselines := make([]execution.WaveScopeRepositoryBaseline, 0, len(sut.RepositoryBaselines))
+	for _, baseline := range sut.RepositoryBaselines {
+		baselines = append(baselines, execution.WaveScopeRepositoryBaseline{
+			RepoID:    baseline.RepoID,
+			CommitSHA: baseline.Commit,
+		})
+	}
+	sort.Slice(baselines, func(i, j int) bool { return baselines[i].RepoID < baselines[j].RepoID })
+	return baselines
 }

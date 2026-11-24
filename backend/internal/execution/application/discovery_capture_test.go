@@ -46,15 +46,16 @@ func (f *fakeDiscoveryWriter) count() int {
 	return len(f.calls)
 }
 
-// discoveryNetworkResult is the sanitized-shape browser.network payload the
-// executor returns: one navigated document, one API fetch (with a query secret
-// that the capture must drop) and one static script (which the capture must
-// filter).
-const discoveryNetworkResult = `[
+// discoveryNetworkResult is the verbatim recorded-traffic payload the executor's
+// passive recorder returns (T16): one navigated document, one API fetch (with a
+// query secret the observation normalizes away but the evidence keeps verbatim,
+// GD-01) and one static script (which the observation capture filters). The
+// {items,recording,degraded} envelope mirrors the GET /network read surface.
+const discoveryNetworkResult = `{"recording":true,"degraded":false,"items":[
   {"method":"GET","url":"https://shop.example.com/login","status":200,"duration_ms":12,"mime":"text/html; charset=utf-8","resource_type":"document"},
   {"method":"POST","url":"https://shop.example.com/api/orders?token=secret","status":201,"duration_ms":8,"mime":"application/json","resource_type":"fetch"},
   {"method":"GET","url":"https://shop.example.com/static/app.js","status":200,"duration_ms":3,"mime":"application/javascript","resource_type":"script"}
-]`
+]}`
 
 // seedDiscoverySUTContexts installs two active browser contexts plus the two
 // contexts the capture must ignore (one closed, one active without a browser
@@ -63,22 +64,22 @@ func seedDiscoverySUTContexts(fixture *caseRunnerFixture) {
 	executorID := int64(7)
 	for _, row := range []execution.CaseRunSUTContext{
 		{
-			ID: 4001, CaseRunID: 3001, VersionSUTID: 7, AccountRole: "admin",
-			BrowserContextID: "ctx_a", ExecutorID: &executorID,
+			ID: 4001, CaseRunID: 3001, SUTID: 7, AccountRole: "admin",
+			SessionID: "ctx_a", ExecutorID: &executorID,
 			Status: execution.SUTContextActive,
 		},
 		{
-			ID: 4002, CaseRunID: 3001, VersionSUTID: 7, AccountRole: "viewer",
-			BrowserContextID: "ctx_b", ExecutorID: &executorID,
+			ID: 4002, CaseRunID: 3001, SUTID: 7, AccountRole: "viewer",
+			SessionID: "ctx_b", ExecutorID: &executorID,
 			Status: execution.SUTContextActive,
 		},
 		{
-			ID: 4003, CaseRunID: 3001, VersionSUTID: 7, AccountRole: "closed",
-			BrowserContextID: "ctx_closed", ExecutorID: &executorID,
+			ID: 4003, CaseRunID: 3001, SUTID: 7, AccountRole: "closed",
+			SessionID: "ctx_closed", ExecutorID: &executorID,
 			Status: execution.SUTContextClosed,
 		},
 		{
-			ID: 4004, CaseRunID: 3001, VersionSUTID: 7, AccountRole: "empty",
+			ID: 4004, CaseRunID: 3001, SUTID: 7, AccountRole: "empty",
 			Status: execution.SUTContextActive,
 		},
 	} {
@@ -90,9 +91,7 @@ func seedDiscoverySUTContexts(fixture *caseRunnerFixture) {
 func newDiscoveryFixture(t *testing.T) *caseRunnerFixture {
 	t.Helper()
 	fixture := newCaseRunnerFixtureWithDiscovery(t)
-	fixture.browser.result = executionapp.BrowserActionResult{
-		OK: true, Result: json.RawMessage(discoveryNetworkResult),
-	}
+	fixture.execution.networkLog = json.RawMessage(discoveryNetworkResult)
 	return fixture
 }
 
@@ -104,19 +103,19 @@ func finishDiscoveryRun(t *testing.T, fixture *caseRunnerFixture, candidate exec
 	seedDiscoverySUTContexts(fixture)
 	switch candidate {
 	case execution.CaseRunPassed:
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "passed", Actual: "Login 按钮可见",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
 		}
 	case execution.CaseRunFailed:
-		if _, err := fixture.runner.StepRecord(context.Background(), p3Scope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
+		if _, err := fixture.runner.StepRecord(context.Background(), executionScope(), tools.StepRecordInput{Seq: 1, Status: "passed"}); err != nil {
 			t.Fatalf("StepRecord: %v", err)
 		}
-		if _, err := fixture.runner.AssertionRecord(context.Background(), p3Scope(), tools.AssertionRecordInput{
+		if _, err := fixture.runner.AssertionRecord(context.Background(), executionScope(), tools.AssertionRecordInput{
 			StepSeq: 1, AssertionSeq: 1, Verdict: "failed", Actual: "Login 按钮不存在",
 		}); err != nil {
 			t.Fatalf("AssertionRecord: %v", err)
@@ -125,7 +124,7 @@ func finishDiscoveryRun(t *testing.T, fixture *caseRunnerFixture, candidate exec
 		// blocked: explicit candidate with no executed result. inconclusive:
 		// candidate passed but no required result was recorded.
 	}
-	finished, err := fixture.runner.Finish(context.Background(), p3Scope(), execution.FinishCandidate{Verdict: candidate})
+	finished, err := fixture.runner.Finish(context.Background(), executionScope(), execution.FinishCandidate{Verdict: candidate})
 	if err != nil {
 		t.Fatalf("Finish: %v", err)
 	}
@@ -152,7 +151,7 @@ func TestCaptureTerminalObservationsAllVerdicts(t *testing.T) {
 			if finished.Status != tc.wantVerdict {
 				t.Fatalf("%s: verdict changed to %q", tc.candidate, finished.Status)
 			}
-			if got := fixture.browser.countActions("network"); got != 2 {
+			if got := fixture.execution.networkLogCalls; got != 2 {
 				t.Fatalf("%s: network calls = %d, want the 2 active contexts", tc.candidate, got)
 			}
 			observations := fixture.discovery.all()
@@ -177,69 +176,67 @@ func TestCaptureTerminalObservationsAllVerdicts(t *testing.T) {
 }
 
 // TestCaptureTerminalObservationsRequestsFullNetworkWindow pins the W1-15 fix:
-// the executor's network action defaults to the last 50 items, while a normal
-// SPA page load puts the document request first (the W1 SUT home page makes 52
+// the recorder's read tail defaults to the last 50 items, while a normal SPA
+// page load puts the document request first (the W1 SUT home page makes 52
 // requests), so the default window drops the page observation. The capture must
-// request the 200-item maximum the executor supports.
+// request the 200-item maximum the read surface supports.
 func TestCaptureTerminalObservationsRequestsFullNetworkWindow(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
-	fixture.browser.mu.Lock()
-	defer fixture.browser.mu.Unlock()
-	networkCalls := 0
-	for index, action := range fixture.browser.actions {
-		if action != "network" {
-			continue
-		}
-		networkCalls++
-		var args map[string]any
-		if len(fixture.browser.actionArgs[index]) > 0 {
-			if err := json.Unmarshal(fixture.browser.actionArgs[index], &args); err != nil {
-				t.Fatalf("network action args are not JSON: %v", err)
-			}
-		}
-		if args["tail"] != float64(200) {
-			t.Fatalf("network action args = %s, want tail=200 so the first document request survives",
-				string(fixture.browser.actionArgs[index]))
-		}
-	}
-	if networkCalls == 0 {
+	fixture.execution.mu.Lock()
+	defer fixture.execution.mu.Unlock()
+	if len(fixture.execution.networkLogTails) == 0 {
 		t.Fatal("the terminal capture never read the network log")
+	}
+	for _, tail := range fixture.execution.networkLogTails {
+		if tail != 200 {
+			t.Fatalf("network read tail = %d, want 200 so the first document request survives", tail)
+		}
 	}
 }
 
-// TestEvidenceCapDoesNotDropObservations: the 100-row evidence cap may drop the
-// evidence row, but the DB-29 observation write is independent of it.
+// TestEvidenceCapDoesNotDropObservations: a configured evidence cap (here 100
+// via execution.evidence_max_per_case_run) may drop the evidence row, but the
+// DB-29 observation write is independent of it. The dropped evidence still
+// degrades the verdict to inconclusive (constitution art.4.5, ruling T6-A) — the
+// observation surviving is not a licence to keep a passed verdict.
 func TestEvidenceCapDoesNotDropObservations(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	for i := 0; i < execution.EvidenceMaxPerCaseRun; i++ {
+	fixture.settings.ints["execution.evidence_max_per_case_run"] = 100
+	for i := 0; i < 100; i++ {
 		fixture.evidence.rows = append(fixture.evidence.rows, execution.Evidence{
 			ID: int64(9000 + i), CaseRunID: 3001, Kind: execution.EvidenceText,
 		})
 	}
 	finished := finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
-	if finished.Status != execution.CaseRunPassed {
-		t.Fatalf("verdict = %q, want passed", finished.Status)
+	if finished.Status != execution.CaseRunInconclusive {
+		t.Fatalf("verdict = %q, want inconclusive after the cap dropped evidence", finished.Status)
+	}
+	if finished.Summary.VerdictReason != execution.VerdictReasonEvidenceDropped {
+		t.Fatalf("verdict reason = %q, want %q", finished.Summary.VerdictReason, execution.VerdictReasonEvidenceDropped)
 	}
 	if len(fixture.discovery.all()) == 0 {
 		t.Fatal("observation must not depend on evidence rows")
 	}
-	if got := fixture.browser.countActions("network"); got != 2 {
+	if got := fixture.execution.networkLogCalls; got != 2 {
 		t.Fatalf("network calls = %d, want 2", got)
 	}
-	if got := len(fixture.evidence.rows); got != execution.EvidenceMaxPerCaseRun {
-		t.Fatalf("evidence rows = %d, want the cap to hold at %d", got, execution.EvidenceMaxPerCaseRun)
+	if got := len(fixture.evidence.rows); got != 100 {
+		t.Fatalf("evidence rows = %d, want the configured cap to hold at 100", got)
 	}
 }
 
-// TestCaptureTerminalObservationsDropsQueryAndUserinfo proves the observation
-// and the evidence payload carry only method/host/path/status/mime/duration/
-// resource_type: query values, userinfo, headers/cookies/bodies never appear.
-func TestCaptureTerminalObservationsDropsQueryAndUserinfo(t *testing.T) {
+// TestCaptureTerminalObservationsNormalizesObservationKeepsEvidencePlaintext
+// separates the two carriers: the DB-29 observation is functionally normalized
+// (query-free host/path/route template for fact-key dedup — kept), while the
+// network EVIDENCE row carries the raw executor payload verbatim. GD-01 (Q05=B):
+// credentials may enter evidence plaintext, so the legacy query/userinfo erasure
+// on the evidence payload is removed.
+func TestCaptureTerminalObservationsNormalizesObservationKeepsEvidencePlaintext(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	fixture.execution.networkLog = json.RawMessage(`[
 	  {"method":"GET","url":"https://alice:pw@shop.example.com/orders/42?token=secret#/receipt?token=secret","status":200,"duration_ms":9,"mime":"text/html","resource_type":"document"}
-	]`)}
+	]`)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 
 	observations := fixture.discovery.all()
@@ -247,6 +244,7 @@ func TestCaptureTerminalObservationsDropsQueryAndUserinfo(t *testing.T) {
 		t.Fatalf("observations = %d, want one per active context", len(observations))
 	}
 	observation := observations[0]
+	// Functional normalization (route template / fact key) is preserved.
 	if observation.Host != "shop.example.com" {
 		t.Fatalf("host = %q", observation.Host)
 	}
@@ -261,26 +259,27 @@ func TestCaptureTerminalObservationsDropsQueryAndUserinfo(t *testing.T) {
 			t.Fatalf("resource_template leaked %q: %q", leaked, observation.ResourceTemplate)
 		}
 	}
+	// GD-01: the network evidence keeps the raw URL/query/userinfo verbatim.
+	if len(fixture.content.puts) == 0 {
+		t.Fatal("no network evidence was stored")
+	}
 	for _, put := range fixture.content.puts {
 		payload := string(put)
-		for _, leaked := range []string{"secret", "token=", "alice", "pw"} {
-			if strings.Contains(payload, leaked) {
-				t.Fatalf("evidence payload leaked %q: %s", leaked, payload)
+		for _, want := range []string{"alice:pw", "token=secret", "https://alice:pw@shop.example.com/orders/42?token=secret"} {
+			if !strings.Contains(payload, want) {
+				t.Fatalf("evidence must keep %q verbatim (GD-01 plaintext): %s", want, payload)
 			}
 		}
 	}
-	if len(fixture.content.puts) == 0 {
-		t.Fatal("no sanitized network evidence was stored")
-	}
-	t.Logf("redacted sample: host=%s path=%s evidence=%s",
-		observation.Host, observation.Path, string(fixture.content.puts[0]))
+	t.Logf("normalized observation: host=%s path=%s template=%s; plaintext evidence=%s",
+		observation.Host, observation.Path, observation.ResourceTemplate, string(fixture.content.puts[0]))
 }
 
 // TestCaptureTerminalObservationResourceTypeMapping pins the deterministic
 // R-EX-2 page/api discrimination and the static-resource filter.
 func TestCaptureTerminalObservationResourceTypeMapping(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	fixture.execution.networkLog = json.RawMessage(`[
 	  {"method":"GET","url":"https://shop.example.com/page","status":200,"mime":"text/html","resource_type":"document"},
 	  {"method":"POST","url":"https://shop.example.com/api/x","status":201,"mime":"application/json","resource_type":"xhr"},
 	  {"method":"GET","url":"https://shop.example.com/api/y","status":200,"mime":"application/json","resource_type":"fetch"},
@@ -297,7 +296,7 @@ func TestCaptureTerminalObservationResourceTypeMapping(t *testing.T) {
 	  {"method":"GET","url":"https://shop.example.com/manifest.webmanifest","status":200,"mime":"application/manifest+json","resource_type":"manifest"},
 	  {"method":"GET","url":"https://shop.example.com/assets/logo","status":200,"mime":"image/png","resource_type":""},
 	  {"method":"GET","url":"https://shop.example.com/assets/thumb","status":200,"mime":"image/jpeg","resource_type":"other"}
-	]`)}
+	]`)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 
 	calls := fixture.discovery.calls
@@ -343,12 +342,12 @@ func TestCaptureTerminalObservationResourceTypeMapping(t *testing.T) {
 // never drops the others and never changes the verdict.
 func TestCaptureTerminalObservationsSurvivesOneFailingContext(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	fixture.browser.actionErrByContext = map[string]error{"ctx_a": errors.New("executor action failed")}
+	fixture.execution.networkLogErrBySession = map[string]error{"ctx_a": errors.New("executor network read failed")}
 	finished := finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 	if finished.Status != execution.CaseRunPassed {
 		t.Fatalf("verdict = %q, want passed", finished.Status)
 	}
-	if got := fixture.browser.countActions("network"); got != 2 {
+	if got := fixture.execution.networkLogCalls; got != 2 {
 		t.Fatalf("network attempts = %d, want one per active context", got)
 	}
 	observations := fixture.discovery.all()
@@ -374,7 +373,7 @@ func TestCaptureTerminalObservationsOnFinalize(t *testing.T) {
 	if stored.Status != execution.CaseRunInconclusive {
 		t.Fatalf("status = %q, want inconclusive", stored.Status)
 	}
-	if got := fixture.browser.countActions("network"); got != 2 {
+	if got := fixture.execution.networkLogCalls; got != 2 {
 		t.Fatalf("network calls = %d, want the 2 active contexts", got)
 	}
 	if len(fixture.discovery.all()) == 0 {
@@ -383,22 +382,22 @@ func TestCaptureTerminalObservationsOnFinalize(t *testing.T) {
 }
 
 // TestCaptureTerminalObservationsWithoutWriter: the port is optional in W1-10;
-// a nil writer skips the observation write while the sanitized evidence still
+// a nil writer skips the observation write while the network evidence still
 // flows through the existing evidence store.
 func TestCaptureTerminalObservationsWithoutWriter(t *testing.T) {
 	fixture := newCaseRunnerFixture(t) // nil discovery writer
-	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(discoveryNetworkResult)}
+	fixture.execution.networkLog = json.RawMessage(discoveryNetworkResult)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
-	if got := fixture.browser.countActions("network"); got != 2 {
+	if got := fixture.execution.networkLogCalls; got != 2 {
 		t.Fatalf("network calls = %d, want 2", got)
 	}
 	if len(fixture.content.puts) != 2 {
-		t.Fatalf("sanitized evidence puts = %d, want one per active context", len(fixture.content.puts))
+		t.Fatalf("network evidence puts = %d, want one per active context", len(fixture.content.puts))
 	}
 }
 
 // TestCaptureTerminalObservationsAttachIdentity: the capture fills the
-// version_sut, wave and case_run identity it has; version_id and environment_id
+// SUT, wave and case_run identity it has; version_id and environment_id
 // stay zero for the ingest/repository layer to resolve.
 func TestCaptureTerminalObservationsAttachIdentity(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
@@ -409,8 +408,8 @@ func TestCaptureTerminalObservationsAttachIdentity(t *testing.T) {
 		t.Fatal("no observation was written")
 	}
 	for _, observation := range observations {
-		if observation.VersionSUTID != 7 {
-			t.Fatalf("version_sut_id = %d, want 7", observation.VersionSUTID)
+		if observation.SUTID != 7 {
+			t.Fatalf("sut_id = %d, want 7", observation.SUTID)
 		}
 		if observation.WaveID != 2001 || observation.CaseRunID != 3001 {
 			t.Fatalf("wave/case_run = %d/%d, want 2001/3001", observation.WaveID, observation.CaseRunID)
@@ -429,11 +428,11 @@ func TestCaptureTerminalObservationsAttachIdentity(t *testing.T) {
 // good network entries when one entry is malformed (M6).
 func TestCaptureTerminalObservationsSkipsMalformedItem(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	fixture.execution.networkLog = json.RawMessage(`[
 	  {"method":"GET","url":"https://shop.example.com/home","status":200,"mime":"text/html","resource_type":"document"},
 	  "not-an-item",
 	  {"method":"GET","url":"https://shop.example.com/api/x","status":200,"mime":"application/json","resource_type":"fetch"}
-	]`)}
+	]`)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 
 	calls := fixture.discovery.calls
@@ -453,10 +452,10 @@ func TestCaptureTerminalObservationsSkipsMalformedItem(t *testing.T) {
 // resource types are still kept as api (M8).
 func TestCaptureTerminalObservationsSkipsBlockedWebSocket(t *testing.T) {
 	fixture := newDiscoveryFixture(t)
-	fixture.browser.result = executionapp.BrowserActionResult{OK: true, Result: json.RawMessage(`[
+	fixture.execution.networkLog = json.RawMessage(`[
 	  {"method":"WS","url":"wss://payments.example.com/socket","status":null,"duration_ms":0,"mime":null,"resource_type":"websocket","error":"host_not_allowed"},
 	  {"method":"GET","url":"https://shop.example.com/home","status":200,"mime":"text/html","resource_type":"document"}
-	]`)}
+	]`)
 	finishDiscoveryRun(t, fixture, execution.CaseRunPassed)
 
 	for _, observation := range fixture.discovery.all() {
