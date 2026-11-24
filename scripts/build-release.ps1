@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Builds the Docker-free EzTest release packages (Windows x64 + Linux x64).
@@ -924,8 +924,15 @@ function Build-ExecutorStage {
     $stage = Join-Path $script:WorkRoot "payload\executor"
     Remove-TreeSafe -Path $stage
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    foreach ($file in @("package.json", "pnpm-lock.yaml")) {
-        Copy-Item -LiteralPath (Join-Path $executorSrc $file) -Destination (Join-Path $stage $file) -Force
+    foreach ($file in @("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")) {
+        $sourceFile = Join-Path $executorSrc $file
+        # pnpm-workspace.yaml carries the dependency build-script approval that
+        # pnpm 11 requires (node-pty prebuilt bindings). A missing file would make
+        # the staging install fail on a clean CI machine, so fail early and loud.
+        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+            Write-Fail "Executor source is missing $file; the pnpm build approval for node-pty lives there."
+        }
+        Copy-Item -LiteralPath $sourceFile -Destination (Join-Path $stage $file) -Force
     }
     Copy-Item -LiteralPath (Join-Path $executorSrc "src") -Destination (Join-Path $stage "src") -Recurse -Force
 
