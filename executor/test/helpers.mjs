@@ -406,22 +406,63 @@ export function httpClient(baseUrl, token) {
   return async function request(path, options = {}) {
     const { method = "GET", body, raw, headers = {} } = options
     const requestToken = Object.prototype.hasOwnProperty.call(options, "token") ? options.token : token
-    const response = await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: {
-        ...(requestToken ? { authorization: `Bearer ${requestToken}` } : {}),
-        ...(body !== undefined || raw !== undefined ? { "content-type": "application/json" } : {}),
-        ...headers,
-      },
-      body: raw ?? (body !== undefined ? JSON.stringify(body) : undefined),
-    })
-    const text = await response.text()
-    let json
-    try {
-      json = JSON.parse(text)
-    } catch {
-      json = undefined
+    const payload = raw ?? (body !== undefined ? JSON.stringify(body) : undefined)
+    const requestHeaders = {
+      ...(requestToken ? { authorization: `Bearer ${requestToken}` } : {}),
+      ...(payload !== undefined ? { "content-type": "application/json" } : {}),
+      ...headers,
     }
-    return { status: response.status, json, text, headers: response.headers }
+    const url = `${baseUrl}${path}`
+    try {
+      const response = await fetch(url, { method, headers: requestHeaders, body: payload })
+      const text = await response.text()
+      let json
+      try {
+        json = JSON.parse(text)
+      } catch {
+        json = undefined
+      }
+      return { status: response.status, json, text, headers: response.headers }
+    } catch (error) {
+      // Undici (global fetch) refuses the Fetch-spec "bad ports" such as 10080.
+      // An ephemeral test listener can legitimately land on one, so fall back to
+      // node:http for that case instead of making the test flaky.
+      if (!isBadPortFetchError(error)) throw error
+      return nodeHttpRequest(url, { method, headers: requestHeaders, body: payload })
+    }
   }
 }
+
+function isBadPortFetchError(error) {
+  return error instanceof TypeError && error.cause?.message === "bad port"
+}
+
+function nodeHttpRequest(url, { method, headers, body }) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { method, headers }, (response) => {
+      const chunks = []
+      response.on("data", (chunk) => chunks.push(chunk))
+      response.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8")
+        let json
+        try {
+          json = JSON.parse(text)
+        } catch {
+          json = undefined
+        }
+        const responseHeaders = new Headers()
+        for (const [key, value] of Object.entries(response.headers)) {
+          if (value === undefined) continue
+          for (const item of Array.isArray(value) ? value : [value]) {
+            responseHeaders.append(key, item)
+          }
+        }
+        resolve({ status: response.statusCode, json, text, headers: responseHeaders })
+      })
+    })
+    request.on("error", reject)
+    if (body !== undefined) request.write(body)
+    request.end()
+  })
+}
+

@@ -183,6 +183,13 @@ describe("ShellEngine (PTY) core", () => {
     const created = await manager.create({ workspace: dir })
     const session = manager.sessions.get(created.sessionId)
     const secret = "pty-plain-9876"
+    const inherited = "pty-inherited-2468"
+    // A controlled inherited variable proves the artifact carries the process
+    // environment, without coupling the assertion to the host's PATH value.
+    process.env.EZTEST_T8_PTY_INHERITED = inherited
+    t.after(() => {
+      delete process.env.EZTEST_T8_PTY_INHERITED
+    })
     const shell = engine.create(session, {
       argv: [process.execPath],
       env: { EZTEST_T8_PTY_SECRET: secret },
@@ -201,9 +208,10 @@ describe("ShellEngine (PTY) core", () => {
     assert.equal(artifact.cwd, session.workspace)
     assert.equal(artifact.exit, 0)
     assert.equal(artifact.outcome, "exited")
-    // FULL environment verbatim, no scrub (GD-01 / R-C3).
+    // FULL environment verbatim, no scrub (GD-01 / R-C3): the controlled
+    // inherited variable and the explicit override both reach the artifact.
     assert.equal(artifact.env.EZTEST_T8_PTY_SECRET, secret)
-    assert.equal(artifact.env.PATH, process.env.PATH)
+    assert.equal(artifact.env.EZTEST_T8_PTY_INHERITED, inherited)
     assert.ok(artifact.stdout.includes(secret))
     assert.equal(artifact.stdout_sha256.length, 64)
     assert.equal(typeof artifact.base64, "string")
