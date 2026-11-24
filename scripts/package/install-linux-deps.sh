@@ -21,7 +21,7 @@ set -u
 
 PKG="$(cd "$(dirname "$0")" && pwd)"
 NODE="$PKG/runtime/node/bin/node"
-PLAYWRIGHT_CLI="$PKG/executor/node_modules/playwright/cli.js"
+PLAYWRIGHT_CLI="$PKG/renderer/node_modules/playwright/cli.js"
 
 fail() {
     printf 'ERROR: %s\n' "$1" >&2

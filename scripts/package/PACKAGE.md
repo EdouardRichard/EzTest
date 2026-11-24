@@ -11,7 +11,7 @@ external prerequisite.
 | Package | `__VERSION__` |
 | API | Go static binary (`bin/eztest.exe` / `bin/eztest`) |
 | Web | Next.js standalone (`web/`) |
-| Executor | Playwright `__PLAYWRIGHT_VERSION__` (`executor/`) |
+| Executor | Executor protocol v2 service (`executor/`); its browser domain needs the official `@playwright/cli` installed on the host |
 | PDF renderer | Playwright `__PLAYWRIGHT_VERSION__` (`renderer/`) |
 | Browsers | Chromium `__CHROMIUM_VERSION__` (revision `__CHROMIUM_REVISION__`), headless shell, FFmpeg `__FFMPEG_REVISION__` |
 | Node.js runtime | `__NODE_VERSION__` (LTS) |
@@ -34,7 +34,7 @@ eztest-<version>-<os>-x64/
   docs/openapi/api.yaml         OpenAPI 3 document (reference; 0.2 does not serve it)
   bin/eztest(.exe)              Go API binary
   web/                          Next.js standalone server (server.js, .next/)
-  executor/                     Playwright protocol service (src/, node_modules/)
+  executor/                     executor protocol v2 service (src/, node_modules/)
   renderer/                     headless HTML-to-PDF service (src/, node_modules/)
   playwright-browsers/          pinned Chromium, headless shell and FFmpeg
   runtime/node/                 bundled Node.js runtime

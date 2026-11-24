@@ -17,9 +17,11 @@
          .next/standalone + .next/static (and public/ if present), flatten the
          pnpm store into a symlink-free node_modules, prune sharp / @img and
          abort when any platform-native binary remains.
-      3. Executor + PDF renderer staging: copy package.json/pnpm-lock/src and
-         install production, hoisted, symlink-free node_modules for both
-         services.
+      3. Executor + PDF renderer staging: copy package.json/pnpm-lock/src (plus
+         the executor's pnpm-workspace.yaml) and install production, hoisted,
+         symlink-free node_modules for both services. The executor install skips
+         dependency build scripts and ships node-pty's per-platform prebuilds
+         unchanged; they are selected at runtime by process.platform.
       4. Pinned Playwright browsers per OS: cached download + extraction into
          playwright-browsers/<browser>/ with INSTALLATION_COMPLETE markers.
       5. Official Node 22 LTS runtime per OS (node.exe + LICENSE; bin/node +
@@ -941,9 +943,9 @@ function Build-ExecutorStage {
     $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        Write-Info "pnpm install --prod --frozen-lockfile --node-linker=hoisted"
+        Write-Info "pnpm install --prod --frozen-lockfile --node-linker=hoisted --ignore-scripts (node-pty prebuilds ship as-is)"
         $exitCode = Invoke-ProcessWithLog -FilePath $script:PnpmExe `
-            -Arguments @("install", "--prod", "--frozen-lockfile", "--node-linker=hoisted") `
+            -Arguments @("install", "--prod", "--frozen-lockfile", "--node-linker=hoisted", "--ignore-scripts") `
             -StdOutPath $logPath -StdErrPath ($logPath + ".err") -WorkingDirectory $stage
     } finally {
         $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $savedSkipDownload
@@ -963,20 +965,32 @@ function Build-ExecutorStage {
     if ($links.Count -gt 0) {
         Write-Fail ("The executor node_modules contains {0} symlink(s)/junction(s) (e.g. {1}); the package must be symlink-free." -f $links.Count, $links[0].FullName)
     }
-    $native = @($files | Where-Object { $_.Extension -in @(".node", ".dll", ".so", ".dylib") })
+    # node-pty ships per-platform prebuilt binaries (prebuilds/<os>-<arch> plus
+    # its third_party/conpty payload) and selects them at runtime by
+    # process.platform; they are the only native files the executor bundle may
+    # contain. Everything else in the stage must stay pure JavaScript.
+    $nodePtyRoot = Join-Path $nodeModules "@homebridge\node-pty-prebuilt-multiarch"
+    $native = @($files | Where-Object {
+            $_.Extension -in @(".node", ".dll", ".so", ".dylib") -and
+            -not $_.FullName.StartsWith($nodePtyRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        })
     if ($native.Count -gt 0) {
-        Write-Fail ("The executor node_modules contains platform-native binaries (e.g. {0}); the staged executor must be pure JavaScript." -f $native[0].FullName)
+        Write-Fail ("The executor node_modules contains platform-native binaries outside the approved node-pty package (e.g. {0})." -f $native[0].FullName)
     }
-    $playwrightPackageJson = Join-Path $nodeModules "playwright\package.json"
-    if (-not (Test-Path -LiteralPath $playwrightPackageJson -PathType Leaf)) {
-        Write-Fail "playwright is missing from the staged executor node_modules."
+    $nodePtyPackageJson = Join-Path $nodePtyRoot "package.json"
+    if (-not (Test-Path -LiteralPath $nodePtyPackageJson -PathType Leaf)) {
+        Write-Fail "node-pty is missing from the staged executor node_modules."
     }
-    $installedPlaywright = (Get-Content -LiteralPath $playwrightPackageJson -Raw | ConvertFrom-Json).version
-    if ($installedPlaywright -ne $script:PinnedPlaywrightVersion) {
-        Write-Fail "Expected playwright $($script:PinnedPlaywrightVersion) in the executor, found '$installedPlaywright'."
+    # One portable staging tree serves both release targets, so assert both
+    # platform prebuilds are present (Windows conpty + Linux pty).
+    foreach ($requiredPrebuild in @("prebuilds\win32-x64\conpty.node", "prebuilds\linux-x64\pty.node")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $nodePtyRoot $requiredPrebuild) -PathType Leaf)) {
+            Write-Fail ("The staged executor node-pty is missing {0}; the package must run on Windows and Linux." -f $requiredPrebuild)
+        }
     }
+    $installedNodePty = (Get-Content -LiteralPath $nodePtyPackageJson -Raw | ConvertFrom-Json).version
     $size = ($files | Measure-Object -Property Length -Sum).Sum
-    Write-Info ("Executor staged: {0} files, {1}, playwright {2}" -f $files.Count, (Format-Bytes ([long]$size)), $installedPlaywright)
+    Write-Info ("Executor staged: {0} files, {1}, node-pty {2} (win32-x64 + linux-x64 prebuilds)" -f $files.Count, (Format-Bytes ([long]$size)), $installedNodePty)
 }
 
 # ---------------------------------------------------------------------------
@@ -1616,7 +1630,7 @@ function Test-PackageTree {
         "VERSION", "manifest.json", "PACKAGE.md", "THIRD_PARTY_NOTICES.md", "LICENSE", ".env.example",
         "docs\openapi\api.yaml", $apiBinary, $nodeBinary, "runtime\node\LICENSE",
         "web\server.js", "web\package.json", "web\.next\required-server-files.json", "web\node_modules\next\package.json",
-        "executor\src\server.mjs", "executor\node_modules\playwright\package.json",
+        "executor\src\server.mjs", "executor\node_modules\@homebridge\node-pty-prebuilt-multiarch\package.json",
         "renderer\src\server.mjs", "renderer\src\render.mjs", "renderer\node_modules\playwright\package.json"
     )
     foreach ($name in $script:PackageScripts) { $expected += $name }
@@ -1728,13 +1742,18 @@ function Test-PackageTree {
         }
     }
 
-    # 4. Web and executor bundles must stay symlink-free and native-free.
+    # 4. Bundles must stay symlink-free. The web and renderer bundles must also be
+    # native-free; the executor bundle ships node-pty's per-platform prebuilt
+    # binaries (prebuilds/, third_party/) by design, so only those are allowed.
     foreach ($bundle in @("web\node_modules", "executor\node_modules", "renderer\node_modules")) {
         $bundlePath = Join-Path $PackageRoot $bundle
         if (-not (Test-Path -LiteralPath $bundlePath -PathType Container)) { continue }
         $links = @(Get-ChildItem -LiteralPath $bundlePath -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
         if ($links.Count -gt 0) { [void]$problems.Add("$bundle contains $($links.Count) symlink(s)/junction(s)") }
         $native = @(Get-ChildItem -LiteralPath $bundlePath -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @(".node", ".dll", ".so", ".dylib", ".exe") })
+        if ($bundle -eq "executor\node_modules") {
+            $native = @($native | Where-Object { $_.FullName -notmatch '[\\/]@homebridge[\\/]node-pty-prebuilt-multiarch[\\/]' })
+        }
         if ($native.Count -gt 0) { [void]$problems.Add("$bundle contains platform-native binaries (e.g. $($native[0].Name))") }
     }
 
@@ -2125,7 +2144,7 @@ PY
         chmod +x "$ROOT/$PACKAGE_NAME/runtime/node/bin/node" 2>/dev/null || true
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -qq >/dev/null 2>&1 || true
-            "$ROOT/$PACKAGE_NAME/runtime/node/bin/node" "$ROOT/$PACKAGE_NAME/executor/node_modules/playwright/cli.js" install-deps chromium >/dev/null 2>&1 || true
+            "$ROOT/$PACKAGE_NAME/runtime/node/bin/node" "$ROOT/$PACKAGE_NAME/renderer/node_modules/playwright/cli.js" install-deps chromium >/dev/null 2>&1 || true
             apt-get install -y --no-install-recommends fonts-liberation fonts-noto-color-emoji xvfb >/dev/null 2>&1 || true
             apt-get install -y --no-install-recommends libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 >/dev/null 2>&1 || true
         fi

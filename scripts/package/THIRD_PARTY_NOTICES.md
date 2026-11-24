@@ -9,7 +9,7 @@ that file is the binding copy.
 | Component | Version | License | Location in package |
 |---|---|---|---|
 | Node.js | `__NODE_VERSION__` | MIT (bundled `LICENSE`) | `runtime/node/` |
-| Playwright | `__PLAYWRIGHT_VERSION__` | Apache-2.0 (bundled `LICENSE`) | `executor/node_modules/playwright/` |
+| Playwright | `__PLAYWRIGHT_VERSION__` | Apache-2.0 (bundled `LICENSE`) | `renderer/node_modules/playwright/` |
 | Chromium (Chrome for Testing build) | `__CHROMIUM_VERSION__`, Playwright revision `__CHROMIUM_REVISION__` | BSD-3-Clause plus third-party notices embedded in the binary | `playwright-browsers/chromium-__CHROMIUM_REVISION__/` |
 | Chromium headless shell | `__CHROMIUM_VERSION__`, Playwright revision `__CHROMIUM_REVISION__` | BSD-3-Clause plus third-party notices embedded in the binary | `playwright-browsers/chromium_headless_shell-__CHROMIUM_REVISION__/` |
 | FFmpeg | Playwright build `__FFMPEG_REVISION__` | LGPL-2.1-or-later (as distributed by the Playwright project; see the build's own notices) | `playwright-browsers/ffmpeg-__FFMPEG_REVISION__/` |
@@ -19,7 +19,7 @@ that file is the binding copy.
 | @next/env | 16.4.3 | MIT | `web/node_modules/@next/env/` |
 | @swc/helpers | 0.5.x | Apache-2.0 | `web/node_modules/@swc/helpers/` |
 | client-only, semver, detect-libc | see `package.json` files | MIT / ISC / Apache-2.0 | `web/node_modules/` |
-| pixelmatch, pngjs (executor deps) | see `executor/node_modules/*/package.json` | ISC / MIT | `executor/node_modules/` |
+| node-pty (@homebridge/node-pty-prebuilt-multiarch, executor dependency) | 0.15.0 | MIT (bundled `LICENSE`) | `executor/node_modules/@homebridge/node-pty-prebuilt-multiarch/` |
 
 The Next.js standalone bundle also contains the application's own code and
 its traced production dependencies; every package under `web/node_modules/`
