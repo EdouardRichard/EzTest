@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Status: v0.2.3" src="https://img.shields.io/badge/status-v0.2.3-orange">
+  <img alt="Status: v0.2.4" src="https://img.shields.io/badge/status-v0.2.4-orange">
   <img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue">
   <img alt="Go 1.24" src="https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-black">
@@ -16,7 +16,7 @@
   <img alt="Playwright 1.64" src="https://img.shields.io/badge/Playwright-1.64-2EAD33">
 </p>
 
-> **状态：v0.2.3（预发布）。** EzTest 已实现下文完整链路，并在维护者主机上用真实浏览器、
+> **状态：v0.2.4（预发布）。** EzTest 已实现下文完整链路，并在维护者主机上用真实浏览器、
 > 真实 OpenAI 兼容模型完成端到端演练。这是供评估的预览版，不是生产版本——依赖它之前请先在自己的
 > 环境验证。
 
